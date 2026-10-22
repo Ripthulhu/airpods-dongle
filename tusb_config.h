@@ -101,7 +101,8 @@ extern "C" {
 //------------- CLASS -------------//
 #define CFG_TUD_CDC               1   // debug logging over USB serial (see debug_cdc.c)
 #define CFG_TUD_MSC               0
-#define CFG_TUD_HID               0
+#define CFG_TUD_HID               1
+#define CFG_TUD_HID_EP_BUFSIZE    16
 #define CFG_TUD_MIDI              0
 #define CFG_TUD_AUDIO             1
 #define CFG_TUD_VENDOR            0
@@ -150,7 +151,7 @@ extern "C" {
 // Mic (EP IN): 64 kHz mono 16-bit — (64+1) samples/ms * 2B = 130 bytes.
 #define CFG_TUD_AUDIO_ENABLE_EP_IN                1
 
-#define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN    TUD_AUDIO_EP_SIZE(64000, CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_TX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX)
+#define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN    TUD_AUDIO_EP_SIZE(USB_MIC_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_TX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX)
 
 #define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ      (CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN * 4)
 #define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX         CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_IN // Maximum EP IN size for all AS alternate settings used

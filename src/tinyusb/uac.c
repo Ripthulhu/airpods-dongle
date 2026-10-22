@@ -25,31 +25,34 @@
 
  #include <stdio.h>
  #include <string.h>
- 
+
  #include "bsp/board_api.h"
  #include "tusb.h"
  #include "usb_descriptors.h"
  #include "debug_cdc.h"
+ #include "mic_request.h"
+ #include "media_control.h"
+ #include "audio_control_validation.h"
 
  #include "../btstack/btstack_avdtp_source.h"
  #include "../btstack/aacp_mic_dec.h"
  #include "pico/flash.h"
 
 
- 
+
  //--------------------------------------------------------------------+
  // MACRO CONSTANT TYPEDEF PROTOTYPES
  //--------------------------------------------------------------------+
- 
+
  // List of supported sample rates
  const uint32_t sample_rates[] = {48000};
 
  uint32_t current_sample_rate  = 48000;
 
- bool need_change_bt_volume = false;
- 
+ static _Atomic bool need_change_bt_volume;
+
  #define N_SAMPLE_RATES  TU_ARRAY_SIZE(sample_rates)
- 
+
  /* Blink pattern
   * - 25 ms   : streaming data
   * - 250 ms  : device not mounted
@@ -63,7 +66,7 @@
    BLINK_MOUNTED = 1000,
    BLINK_SUSPENDED = 2500,
  };
- 
+
  enum
  {
    VOLUME_CTRL_0_DB = 0,
@@ -82,16 +85,32 @@
 
  #define BT_VOL_MAX   127
  #define USB_ATT_MAX  25600
- 
+
  static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
- 
+
  // Audio controls
  // Current states
- int8_t mute[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];       // +1 for master channel 0
- int16_t volume[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];    // +1 for master channel 0
- 
- int16_t volume0_last = 0;
- int8_t mute0_last = 0; 
+ static _Atomic int8_t mute[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];       // +1 for master channel 0
+ static _Atomic int16_t volume[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];    // +1 for master channel 0
+
+ static usb_mic_request_t mic_request;
+ static bool usb_mounted;
+ static bool usb_suspended;
+ static bool mic_interface_open;
+
+ static void usb_mic_update_request(void) {
+   bool wanted = usb_mounted && !usb_suspended && mic_interface_open;
+   if (wanted != usb_mic_request_wanted(&mic_request)) aacp_mic_pcm_reset();
+   usb_mic_request_set(&mic_request, wanted);
+ }
+
+ bool usb_mic_take_request(bool *wanted) {
+   return wanted != NULL && usb_mic_request_take(&mic_request, wanted);
+ }
+
+ bool usb_mic_requested(void) {
+   return usb_mic_request_wanted(&mic_request);
+ }
 
  // Buffer for microphone data
  //int32_t mic_buf[CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ / 4];
@@ -105,11 +124,11 @@
                                                                          CFG_TUD_AUDIO_FUNC_1_FORMAT_2_RESOLUTION_RX};
  // Current resolution, update on format change
  uint8_t current_resolution;
- 
+
  //void led_blinking_task(void);
  void audio_task(void);
  void audio_control_task(void);
- 
+
  /*------------- MAIN -------------*/
  void tinyusb_main(void)
  {
@@ -118,7 +137,7 @@
   flash_safe_execute_core_init();
 
   //board_init();
- 
+
    // init device stack on configured roothub port
    tusb_rhport_init_t dev_init = {
      .role = TUSB_ROLE_DEVICE,
@@ -133,9 +152,10 @@
  void tinyusb_task(void){
     tud_task(); // TinyUSB device task
     debug_cdc_task(); // drain buffered stdout to the CDC console (same context as tud_task)
+    usb_media_task();
     audio_task();
  }
- 
+
 
 void tinyusb_control_task(void){
   audio_control_task();
@@ -144,38 +164,52 @@ void tinyusb_control_task(void){
  //--------------------------------------------------------------------+
  // Device callbacks
  //--------------------------------------------------------------------+
- 
+
  // Invoked when device is mounted
  void tud_mount_cb(void)
  {
-   //blink_interval_ms = BLINK_MOUNTED;
+   usb_media_set_available(true);
+   usb_mounted = true;
+   usb_suspended = false;
+   mic_interface_open = false;
+   usb_mic_update_request();
  }
- 
+
  // Invoked when device is unmounted
  void tud_umount_cb(void)
  {
-   //blink_interval_ms = BLINK_NOT_MOUNTED;
+   usb_media_set_available(false);
+   usb_mounted = false;
+   mic_interface_open = false;
+   usb_mic_update_request();
+   set_usb_streaming(false);
  }
- 
+
  // Invoked when usb bus is suspended
  // remote_wakeup_en : if host allow us  to perform remote wakeup
  // Within 7ms, device must draw an average of current less than 2.5 mA from bus
  void tud_suspend_cb(bool remote_wakeup_en)
  {
    (void)remote_wakeup_en;
-   printf("tud_suspend_cb\n");
+   usb_media_set_available(false);
+   usb_suspended = true;
+   usb_mic_update_request();
+   set_usb_streaming(false);
  }
- 
+
  // Invoked when usb bus is resumed
  void tud_resume_cb(void)
  {
-  printf("tud_resume_cb\n");
+  usb_suspended = false;
+  usb_media_set_available(usb_mounted);
+  usb_mic_update_request();
  }
- 
+
  // Helper for the mic clock (fixed 64 kHz — see USB_MIC_SAMPLE_RATE)
  static bool tud_audio_mic_clock_get_request(uint8_t rhport, audio_control_request_t const *request)
  {
    TU_ASSERT(request->bEntityID == UAC2_ENTITY_MIC_CLOCK);
+   TU_VERIFY(request->bChannelNumber == 0);
 
    if (request->bControlSelector == AUDIO_CS_CTRL_SAM_FREQ)
    {
@@ -208,13 +242,14 @@ void tinyusb_control_task(void){
  static bool tud_audio_clock_get_request(uint8_t rhport, audio_control_request_t const *request)
  {
    TU_ASSERT(request->bEntityID == UAC2_ENTITY_CLOCK);
- 
+   TU_VERIFY(request->bChannelNumber == 0);
+
    if (request->bControlSelector == AUDIO_CS_CTRL_SAM_FREQ)
    {
      if (request->bRequest == AUDIO_CS_REQ_CUR)
      {
        TU_LOG1("Clock get current freq %" PRIu32 "\r\n", current_sample_rate);
- 
+
        audio_control_cur_4_t curf = { (int32_t) tu_htole32(current_sample_rate) };
        return tud_audio_buffer_and_schedule_control_xfer(rhport, (tusb_control_request_t const *)request, &curf, sizeof(curf));
      }
@@ -232,7 +267,7 @@ void tinyusb_control_task(void){
          rangef.subrange[i].bRes = 0;
          TU_LOG1("Range %d (%d, %d, %d)\r\n", i, (int)rangef.subrange[i].bMin, (int)rangef.subrange[i].bMax, (int)rangef.subrange[i].bRes);
        }
- 
+
        return tud_audio_buffer_and_schedule_control_xfer(rhport, (tusb_control_request_t const *)request, &rangef, sizeof(rangef));
      }
    }
@@ -247,23 +282,25 @@ void tinyusb_control_task(void){
            request->bEntityID, request->bControlSelector, request->bRequest);
    return false;
  }
- 
+
  // Helper for clock set requests
  static bool tud_audio_clock_set_request(uint8_t rhport, audio_control_request_t const *request, uint8_t const *buf)
  {
    (void)rhport;
- 
+
    TU_ASSERT(request->bEntityID == UAC2_ENTITY_CLOCK);
+   TU_VERIFY(request->bChannelNumber == 0);
    TU_VERIFY(request->bRequest == AUDIO_CS_REQ_CUR);
- 
+
    if (request->bControlSelector == AUDIO_CS_CTRL_SAM_FREQ)
    {
      TU_VERIFY(request->wLength == sizeof(audio_control_cur_4_t));
- 
-     current_sample_rate = (uint32_t) ((audio_control_cur_4_t const *)buf)->bCur;
- 
+
+     TU_VERIFY(usb_audio_fixed_rate(buf, request->wLength, sample_rates[0]));
+     current_sample_rate = sample_rates[0];
+
      TU_LOG1("Clock set current freq: %" PRIu32 "\r\n", current_sample_rate);
- 
+
      return true;
    }
    else
@@ -273,12 +310,13 @@ void tinyusb_control_task(void){
      return false;
    }
  }
- 
+
  // Helper for feature unit get requests
  static bool tud_audio_feature_unit_get_request(uint8_t rhport, audio_control_request_t const *request)
  {
    TU_ASSERT(request->bEntityID == UAC2_ENTITY_SPK_FEATURE_UNIT);
- 
+   TU_VERIFY(request->bChannelNumber == 0);
+
    if (request->bControlSelector == AUDIO_FU_CTRL_MUTE && request->bRequest == AUDIO_CS_REQ_CUR)
    {
      audio_control_cur_1_t mute1 = { .bCur = mute[request->bChannelNumber] };
@@ -306,44 +344,48 @@ void tinyusb_control_task(void){
    }
    TU_LOG1("Feature unit get request not supported, entity = %u, selector = %u, request = %u\r\n",
            request->bEntityID, request->bControlSelector, request->bRequest);
- 
+
    return false;
  }
- 
+
  // Helper for feature unit set requests
  static bool tud_audio_feature_unit_set_request(uint8_t rhport, audio_control_request_t const *request, uint8_t const *buf)
  {
    (void)rhport;
- 
+
    TU_ASSERT(request->bEntityID == UAC2_ENTITY_SPK_FEATURE_UNIT);
+   TU_VERIFY(request->bChannelNumber == 0);
    TU_VERIFY(request->bRequest == AUDIO_CS_REQ_CUR);
- 
+
    if (request->bControlSelector == AUDIO_FU_CTRL_MUTE)
    {
      TU_VERIFY(request->wLength == sizeof(audio_control_cur_1_t));
- 
-     mute[request->bChannelNumber] = ((audio_control_cur_1_t const *)buf)->bCur;
+
+     TU_VERIFY(buf != NULL && buf[0] <= 1);
+     mute[request->bChannelNumber] = (int8_t)buf[0];
 
      if(request->bChannelNumber == 0){
       need_change_bt_volume = true;
      }
- 
+
      TU_LOG1("Set channel %d Mute: %d\r\n", request->bChannelNumber, mute[request->bChannelNumber]);
- 
+
      return true;
    }
    else if (request->bControlSelector == AUDIO_FU_CTRL_VOLUME)
    {
      TU_VERIFY(request->wLength == sizeof(audio_control_cur_2_t));
- 
-     volume[request->bChannelNumber] = ((audio_control_cur_2_t const *)buf)->bCur;
- 
+
+     int16_t requested_volume;
+     TU_VERIFY(usb_audio_volume_value(buf, request->wLength, &requested_volume));
+     volume[request->bChannelNumber] = requested_volume;
+
      TU_LOG1("Set channel %d volume: %d dB\r\n", request->bChannelNumber, volume[request->bChannelNumber]/256);
 
      if(request->bChannelNumber == 0){
       need_change_bt_volume = true;
      }
- 
+
      return true;
    }
    else
@@ -353,16 +395,16 @@ void tinyusb_control_task(void){
      return false;
    }
  }
- 
+
  //--------------------------------------------------------------------+
  // Application Callback API Implementations
  //--------------------------------------------------------------------+
- 
+
  // Invoked when audio class specific get request received for an entity
  bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p_request)
  {
    audio_control_request_t const *request = (audio_control_request_t const *)p_request;
- 
+
    if (request->bEntityID == UAC2_ENTITY_CLOCK)
      return tud_audio_clock_get_request(rhport, request);
    if (request->bEntityID == UAC2_ENTITY_MIC_CLOCK)
@@ -376,93 +418,66 @@ void tinyusb_control_task(void){
    }
    return false;
  }
- 
+
  // Invoked when audio class specific set request received for an entity
  bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p_request, uint8_t *buf)
  {
    audio_control_request_t const *request = (audio_control_request_t const *)p_request;
- 
+
    if (request->bEntityID == UAC2_ENTITY_SPK_FEATURE_UNIT)
      return tud_audio_feature_unit_set_request(rhport, request, buf);
    if (request->bEntityID == UAC2_ENTITY_CLOCK)
      return tud_audio_clock_set_request(rhport, request, buf);
    if (request->bEntityID == UAC2_ENTITY_MIC_CLOCK)
    {
-     // Fixed 64 kHz clock — accept a redundant SET of the only valid rate.
-     (void)buf;
-     return (request->bControlSelector == AUDIO_CS_CTRL_SAM_FREQ &&
-             request->bRequest == AUDIO_CS_REQ_CUR);
+     return request->bControlSelector == AUDIO_CS_CTRL_SAM_FREQ &&
+            request->bRequest == AUDIO_CS_REQ_CUR && request->bChannelNumber == 0 &&
+            usb_audio_fixed_rate(buf, request->wLength, USB_MIC_SAMPLE_RATE);
    }
    TU_LOG1("Set request not handled, entity = %d, selector = %d, request = %d\r\n",
            request->bEntityID, request->bControlSelector, request->bRequest);
- 
+
    return false;
  }
- 
- // --- Mic lifecycle requests (the USB alt setting is the only trigger) ---
- // These callbacks run in USB (timer IRQ) context; BTstack must not be called
- // from here (same rule as the buttons in main.c). Latch a request; the main
- // loop executes aacp_mic_start/stop with the async-context lock held.
- static volatile bool mic_start_pending = false;
- static volatile bool mic_stop_pending  = false;
 
- bool usb_mic_take_start_request(void) {
-   if (!mic_start_pending) return false;
-   mic_start_pending = false;
-   return true;
- }
-
- bool usb_mic_take_stop_request(void) {
-   if (!mic_stop_pending) return false;
-   mic_stop_pending = false;
-   return true;
- }
-
- bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const * p_request)
+ // USB callbacks publish intent; the main loop owns Bluetooth calls.
+ bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const *request)
  {
    (void)rhport;
-
-   uint8_t const itf = tu_u16_low(tu_le16toh(p_request->wIndex));
-   uint8_t const alt = tu_u16_low(tu_le16toh(p_request->wValue));
-
-   if (ITF_NUM_AUDIO_STREAMING_SPK == itf && alt == 0)
+   uint16_t itf = tu_le16toh(request->wIndex);
+   uint16_t alt = tu_le16toh(request->wValue);
+   if (alt > 1) return false;
+   if (itf == ITF_NUM_AUDIO_STREAMING_SPK) {
+     if (alt == 0) {
        blink_interval_ms = BLINK_MOUNTED;
-
-   if (ITF_NUM_AUDIO_STREAMING_MIC == itf && alt == 0)
-   {
-       printf("[USB] mic interface closed (alt 0)\n");
-       mic_stop_pending = true;
+       set_usb_streaming(false);
+     }
+     return true;
    }
-
+   if (itf != ITF_NUM_AUDIO_STREAMING_MIC) return false;
+   if (alt == 0) {
+     mic_interface_open = false;
+     usb_mic_update_request();
+   }
    return true;
  }
 
- bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const * p_request)
+ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *request)
  {
    (void)rhport;
-   uint8_t const itf = tu_u16_low(tu_le16toh(p_request->wIndex));
-   uint8_t const alt = tu_u16_low(tu_le16toh(p_request->wValue));
-
-   TU_LOG2("Set interface %d alt %d\r\n", itf, alt);
-   if (ITF_NUM_AUDIO_STREAMING_SPK == itf && alt != 0)
-       blink_interval_ms = BLINK_STREAMING;
-
-   // Host opened/closed the recording stream (e.g. an app starts capturing).
-   if (ITF_NUM_AUDIO_STREAMING_MIC == itf)
-   {
-       printf("[USB] mic interface alt %d\n", alt);
-       if (alt != 0) mic_start_pending = true;
-       else          mic_stop_pending  = true;
-       return true;
+   uint16_t itf = tu_le16toh(request->wIndex);
+   uint16_t alt = tu_le16toh(request->wValue);
+   if (alt > 1) return false;
+   if (itf == ITF_NUM_AUDIO_STREAMING_MIC) {
+     mic_interface_open = alt == 1;
+     usb_mic_update_request();
+     return true;
    }
-
-   // Clear buffer when streaming format is changed
+   if (itf != ITF_NUM_AUDIO_STREAMING_SPK) return false;
    spk_data_size = 0;
-   if(alt != 0)
-   {
-     current_resolution = resolutions_per_format[alt-1];
-   }
-
+   current_resolution = alt == 1 ? resolutions_per_format[0] : 0;
+   blink_interval_ms = alt == 1 ? BLINK_STREAMING : BLINK_MOUNTED;
+   if (alt == 0) set_usb_streaming(false);
    return true;
  }
 
@@ -474,9 +489,15 @@ void tinyusb_control_task(void){
    (void)rhport;
    (void)func_id;
    (void)ep_out;
-   (void)cur_alt_setting;
- 
+
+   if (n_bytes_received > sizeof(spk_buf)) {
+     (void)tud_audio_read(spk_buf, sizeof(spk_buf));
+     return false;
+   }
    spk_data_size = tud_audio_read(spk_buf, n_bytes_received);
+   TU_VERIFY(spk_data_size % (2 * sizeof(int16_t)) == 0);
+   if (cur_alt_setting != 1 || current_resolution != 16 ||
+       !usb_mounted || usb_suspended) return true;
 
    if (spk_data_size)
    {
@@ -485,18 +506,21 @@ void tinyusb_control_task(void){
     if (current_resolution == 16)
     {
       int16_t *src = (int16_t *)spk_buf;
-      uint16_t sample_count = spk_data_size / 4; // should be 44-45
+      uint16_t sample_count = spk_data_size / (2u * sizeof(*src));
 
+      // USB mute must preserve the AirPods volume for a later unmute.
+      if (atomic_load_explicit(&mute[0], memory_order_acquire))
+        memset(src, 0, sample_count * 2u * sizeof(*src));
       audio_slot_push_samples(src, sample_count);
 
       is_usb_audio_running = true;
       spk_data_size = 0;
     }
-   } 
+   }
 
    return true;
  }
- 
+
  // Feed the mic EP IN: called by the audio driver before each IN transfer is
  // loaded. Pull 1ms of samples (64 @ 64 kHz) from the decoder's PCM ring and
  // zero-fill any shortfall so the host always gets a full frame.
@@ -505,16 +529,17 @@ void tinyusb_control_task(void){
    (void)rhport;
    (void)itf;
    (void)ep_in;
-   (void)cur_alt_setting;
 
    int16_t buf[USB_MIC_SAMPLE_RATE / 1000];   // 64 samples / ms, mono
-   uint32_t got = aacp_mic_pcm_read(buf, TU_ARRAY_SIZE(buf));
+   uint32_t got = 0;
+   if (cur_alt_setting == 1 && usb_mic_requested())
+     got = aacp_mic_pcm_read(buf, TU_ARRAY_SIZE(buf));
    for (uint32_t i = got; i < TU_ARRAY_SIZE(buf); i++) buf[i] = 0;
 
    tud_audio_write(buf, sizeof(buf));
    return true;
  }
- 
+
  //--------------------------------------------------------------------+
  // AUDIO Task
  //--------------------------------------------------------------------+
@@ -532,16 +557,16 @@ void tinyusb_control_task(void){
   }
   is_usb_audio_running = false;
  }
- 
+
 
 void audio_control_task(void)
  {
-   if (*get_is_bt_sink_volume_changed_ptr())
+   if (*get_is_bt_sink_volume_changed_ptr() &&
+       !atomic_load_explicit(&need_change_bt_volume, memory_order_acquire))
    {
 
     uint8_t bt_level = get_bt_volume();
 
-    mute[0] = get_bt_mute();
 
     // 2) invert & scale into 0…25600
     //    (BT_VOL_MAX - bt_level) maps 127→0, 0→127
@@ -565,29 +590,15 @@ void audio_control_task(void)
        .wIndex_ep_or_int = 0,                            // From the interface itself
        .wIndex_entity_id = UAC2_ENTITY_SPK_FEATURE_UNIT, // From feature unit
      };
- 
+
      tud_audio_int_write(&data);
      *get_is_bt_sink_volume_changed_ptr() = false;
    }
 
-   if (need_change_bt_volume){
+   if (atomic_exchange_explicit(&need_change_bt_volume, false, memory_order_acq_rel)){
 
-    //printf("vol is %d\n", volume[0]);
-    
-    if(mute[0] == 1 && volume0_last == volume[0]){
-      if (mute0_last == 1){
-        set_bt_volume(volume[0]/256);
-        mute0_last = 0;
-        mute[0] = 0;
-      }else{
-        mute0_last = 1;
-        set_bt_volume(-50);
-      }
-    }else{
-      set_bt_volume(volume[0]/256);
-    }
-    volume0_last = volume[0];
-    need_change_bt_volume = false;
+    // Mute is applied to PCM; AVRCP zero would erase the level on readback.
+    set_bt_volume(atomic_load_explicit(&volume[0], memory_order_acquire) / 256);
 
     const audio_interrupt_data_t data = {
       .bInfo = 0,                                       // Class-specific interrupt, originated from an interface
@@ -603,4 +614,4 @@ void audio_control_task(void)
    }
 
   }
- 
+

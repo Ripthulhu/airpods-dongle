@@ -1,10 +1,11 @@
-# this will handle to macos hidden folders
-# ignore all starts with .* except .git and so on
-.*
-!.git*
-!.editorconfig
-!.vscode/launch.json
-!.vscode/settings.json
-
-# build folder
-/build*
+/build*/
+/.sdk/
+/.vscode/
+__pycache__/
+*.uf2
+*.elf
+*.bin
+*.map
+*.pcap
+*.pcapng
+*.btsnoop

@@ -8,19 +8,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Slot queue constants
-// NOTE (hires-mic): the pool was 24 slots = 96KB of static RAM. The AAC-ELD
-// mic decoder needs ~260KB of heap and the encoder opens on top of that, so
-// the pool is trimmed to 8 slots (32KB) to make room. ELD (the AirPods path)
-// uses only 6 slots; SBC/AAC/LDAC sinks get a shallower queue (8) which
-// shortens their jitter buffer but keeps them functional.
-#define AUDIO_SLOT_COUNT_SBC   8    // SBC: 128 samples/slot, 8*2.67ms = 21ms buffer
-#define AUDIO_SLOT_COUNT_AAC   8    // AAC-LC: 1024 samples/slot, 8*21.3ms = 171ms buffer
-#define AUDIO_SLOT_COUNT_ELD   6    // AAC-ELD: 480 samples/slot, 6*10ms = 60ms buffer
-#define AUDIO_SLOT_COUNT_LDAC  8    // LDAC: 256 samples/slot, 8*5.3ms = 43ms buffer
-#define AUDIO_SLOT_COUNT_MAX   8    // pool size = max of all above
+// The packed 32KB PCM pool holds priming plus the existing 60ms ELD reserve.
+#define AUDIO_SLOT_COUNT_SBC   8
+#define AUDIO_SLOT_COUNT_AAC   8
+#define AUDIO_SLOT_COUNT_ELD   16
 #define AUDIO_SLOT_MAX_SAMPLES 1024
-#define AUDIO_SLOT_MAX_INT16   (AUDIO_SLOT_MAX_SAMPLES * 2)  // stereo
+#define AUDIO_SLOT_MAX_INT16   (AUDIO_SLOT_MAX_SAMPLES * 2)
 
 // Slot queue API (multicore-safe)
 void audio_slot_queue_init(void);
@@ -32,8 +25,6 @@ bool check_is_streaming();
 void set_bt_volume(int16_t);
 
 uint8_t get_bt_volume();
-
-bool get_bt_mute();
 
 void set_usb_streaming(bool flag);
 
@@ -59,11 +50,8 @@ static int setup_aac_configuration();
 
 static int setup_sbc_configuration();
 
-static int set_ldac_configuration();
-
 bool get_allow_switch_slot();
 
-void core1_aaceld_encoder_loop(void);
 
 void increase_vol_by_key();
 

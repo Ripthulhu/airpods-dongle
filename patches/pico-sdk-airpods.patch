@@ -1,0 +1,13 @@
+diff --git a/tools/Findpicotool.cmake b/tools/Findpicotool.cmake
+index e5bfaea..201648d 100644
+--- a/tools/Findpicotool.cmake
++++ b/tools/Findpicotool.cmake
+@@ -37,7 +37,7 @@ if (NOT TARGET picotool)
+         message("Downloading Picotool")
+         FetchContent_Populate(picotool QUIET
+             GIT_REPOSITORY https://github.com/raspberrypi/picotool.git
+-            GIT_TAG develop
++            GIT_TAG de8ae5ac334e1126993f72a5c67949712fd1e1a4
+ 
+             SOURCE_DIR ${picotool_INSTALL_DIR}/picotool-src
+             BINARY_DIR ${picotool_INSTALL_DIR}/picotool-build

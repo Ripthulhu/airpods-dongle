@@ -1,0 +1,232 @@
+#include <assert.h>
+#include <stdio.h>
+#include "hci_stubs/btstack.h"
+
+// The transport header has unrelated static encoder declarations.
+#define PICOW_USB_BT_AUDIO_SSP_COUNTER_H
+void avdtp_source_establish_stream(void);
+#include "../src/btstack/btstack_hci.c"
+
+static bd_addr_t saved[2];
+static bool has_key[2], non_flushable;
+static uint8_t slot, inquiry_result;
+static unsigned connect_calls, inquiry_calls, inquiry_stops, writes, pin_calls;
+static unsigned registered;
+static uint16_t flush_timeout;
+static btstack_packet_callback_registration_t *callbacks[2];
+static const bd_addr_t first = {0x10, 2, 3, 4, 5, 6};
+static const bd_addr_t second = {0x20, 8, 9, 10, 11, 12};
+static const bd_addr_t nearby = {0x30, 0x22, 0x33, 0x44, 0x55, 0x66};
+
+uint8_t gap_inquiry_start(uint8_t duration) {
+    assert(duration == A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS);
+    inquiry_calls++;
+    return inquiry_result;
+}
+void gap_inquiry_stop(void) { inquiry_stops++; }
+void gap_enable_link_watchdog(uint16_t timeout) { flush_timeout = timeout; }
+bool hci_non_flushable_packet_boundary_flag_supported(void) { return non_flushable; }
+void gap_pin_code_response(bd_addr_t address, const char *pin) {
+    (void)address;
+    assert(strcmp(pin, "0000") == 0);
+    pin_calls++;
+}
+bool gap_get_link_key_for_bd_addr(bd_addr_t address, link_key_t key, link_key_type_t *type) {
+    for (unsigned i = 0; i < 2; ++i) {
+        if (memcmp(address, saved[i], 6) == 0 && has_key[i]) {
+            memset(key, 0x11, sizeof(link_key_t));
+            *type = 1;
+            return true;
+        }
+    }
+    return false;
+}
+void gap_local_bd_addr(bd_addr_t address) { memcpy(address, first, 6); }
+void hci_add_event_handler(btstack_packet_callback_registration_t *registration) {
+    assert(registered < 2);
+    callbacks[registered++] = registration;
+}
+void hci_set_master_slave_policy(uint8_t policy) { assert(policy == 0); }
+void hci_set_inquiry_mode(uint8_t mode) { assert(mode == INQUIRY_MODE_RSSI_AND_EIR); }
+void gap_set_local_name(const char *name) { assert(name != NULL); }
+void gap_discoverable_control(uint8_t discoverable) { assert(discoverable == 0); }
+void gap_set_class_of_device(uint32_t cod) { assert(cod == 0x200408); }
+const char *bd_addr_to_str(const uint8_t *address) {
+    static char text[18];
+    snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X",
+             address[0], address[1], address[2], address[3], address[4], address[5]);
+    return text;
+}
+void avdtp_source_establish_stream(void) {
+    assert(peer_address_valid(device_addr));
+    connect_calls++;
+}
+void set_led_mode_off(void) {}
+void set_led_mode_pairing(void) {}
+uint8_t read_uint8_last_flash(void) { return slot; }
+void read_slot1_mac(uint8_t mac[MAC_LEN]) { memcpy(mac, saved[0], MAC_LEN); }
+void read_slot2_mac(uint8_t mac[MAC_LEN]) { memcpy(mac, saved[1], MAC_LEN); }
+bool write_slot1_mac(const uint8_t mac[MAC_LEN]) {
+    memcpy(saved[0], mac, MAC_LEN);
+    writes++;
+    return true;
+}
+bool write_slot2_mac(const uint8_t mac[MAC_LEN]) {
+    memcpy(saved[1], mac, MAC_LEN);
+    writes++;
+    return true;
+}
+
+static void fixture(void) {
+    memset(saved, 0xff, sizeof(saved));
+    memset(device_addr, 0, sizeof(device_addr));
+    memset(device_addr_list, 0, sizeof(device_addr_list));
+    has_key[0] = has_key[1] = false;
+    scan_active = selected_bonded = false;
+    non_flushable = true;
+    slot = 1;
+    inquiry_result = 0;
+    connect_calls = inquiry_calls = inquiry_stops = writes = pin_calls = registered = 0;
+    flush_timeout = UINT16_MAX;
+}
+static void working(void) {
+    uint8_t p[] = {BTSTACK_EVENT_STATE, 1, HCI_STATE_WORKING};
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+}
+static void complete(void) {
+    uint8_t p[] = {GAP_EVENT_INQUIRY_COMPLETE, 1, 0};
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+}
+static void result(uint8_t *p, unsigned size, const uint8_t *address, uint32_t cod) {
+    assert(size >= 27 && size <= 257);
+    memset(p, 0, size);
+    p[0] = GAP_EVENT_INQUIRY_RESULT;
+    p[1] = (uint8_t)(size - 2);
+    for (unsigned i = 0; i < 6; ++i) p[2 + i] = address[5 - i];
+    p[9] = (uint8_t)cod;
+    p[10] = (uint8_t)(cod >> 8);
+    p[11] = (uint8_t)(cod >> 16);
+}
+
+static void test_selected_bond_auto_connects(void) {
+    fixture();
+    memcpy(saved[0], first, 6);
+    memcpy(saved[1], second, 6);
+    has_key[0] = has_key[1] = true;
+    slot = 2;
+    bt_hci_init();
+    assert(registered == 2 && callbacks[0] != callbacks[1]);
+    assert(callbacks[0]->callback != callbacks[1]->callback);
+    assert(selected_bonded && memcmp(device_addr, second, 6) == 0);
+    assert(strcmp(get_device_addr_string(), "20:08:09:0A:0B:0C") == 0);
+    assert(get_device_addr_from_list(0) == &device_addr_list[0]);
+    assert(get_device_addr_from_list(2) == NULL);
+    working();
+    assert(connect_calls == 1 && inquiry_calls == 0 && flush_timeout == 200);
+    assert(writes == 0);
+
+    fixture();
+    memcpy(saved[0], first, 6);
+    has_key[0] = true;
+    non_flushable = false;
+    bt_hci_init();
+    working();
+    assert(connect_calls == 1 && inquiry_calls == 0 && flush_timeout == 0);
+}
+
+static void test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback(void) {
+    fixture();
+    bt_hci_init();
+    working();
+    assert(scan_active && inquiry_calls == 1 && connect_calls == 0);
+    complete();
+    assert(inquiry_calls == 2);
+
+    fixture();
+    memcpy(saved[0], first, 6);
+    memcpy(saved[1], second, 6);
+    has_key[1] = true;
+    slot = 1;
+    bt_hci_init();
+    working();
+    assert(!selected_bonded && !scan_active && !peer_address_valid(device_addr));
+    assert(inquiry_calls == 0 && connect_calls == 0);
+    complete();
+    assert(inquiry_calls == 0);
+
+    slot = 3;
+    get_link_keys();
+    working();
+    assert(inquiry_calls == 0 && connect_calls == 0 && !selected_bonded);
+}
+
+static void test_only_live_pairing_inquiry_can_select_a_peer(void) {
+    fixture();
+    memcpy(saved[0], first, 6);
+    has_key[0] = true;
+    bt_hci_init();
+    uint8_t p[27];
+    result(p, sizeof(p), nearby, 0x240404);
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(writes == 0 && connect_calls == 0 && memcmp(device_addr, first, 6) == 0);
+
+    gap_start_scanning();
+    result(p, sizeof(p), nearby, 0x000540); // Keyboard is not an audio sink.
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(scan_active && writes == 0 && connect_calls == 0);
+    result(p, sizeof(p), nearby, 0x240404);
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(!scan_active && writes == 1 && connect_calls == 1 && inquiry_stops == 1);
+    assert(memcmp(saved[0], nearby, 6) == 0 && memcmp(device_addr, nearby, 6) == 0);
+    result(p, sizeof(p), second, 0x240404);
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(writes == 1 && connect_calls == 1 && memcmp(device_addr, nearby, 6) == 0);
+
+    inquiry_result = 1;
+    gap_start_scanning();
+    assert(!scan_active);
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(writes == 1 && connect_calls == 1);
+}
+
+static void test_short_events_and_unbounded_names_are_rejected(void) {
+    fixture();
+    bt_hci_init();
+    for (unsigned n = 0; n < 27; ++n) {
+        uint8_t p[27] = {GAP_EVENT_INQUIRY_RESULT};
+        p[1] = n >= 2 ? (uint8_t)(n - 2) : 0;
+        hci_packet_handler(HCI_EVENT_PACKET, 0, p, (uint16_t)n);
+        assert(connect_calls == 0 && writes == 0);
+    }
+    for (unsigned n = 0; n < 8; ++n) {
+        uint8_t p[8] = {HCI_EVENT_PIN_CODE_REQUEST};
+        p[1] = n >= 2 ? (uint8_t)(n - 2) : 0;
+        hci_packet_handler(HCI_EVENT_PACKET, 0, p, (uint16_t)n);
+        assert(pin_calls == 0);
+    }
+    uint8_t state[] = {BTSTACK_EVENT_STATE, 0};
+    hci_packet_handler(HCI_EVENT_PACKET, 0, state, sizeof(state));
+    packet_handler(HCI_EVENT_PACKET, 0, state, sizeof(state));
+    assert(flush_timeout == UINT16_MAX);
+
+    gap_start_scanning();
+    uint8_t p[257];
+    result(p, sizeof(p), nearby, 0x240404);
+    p[25] = 1;
+    p[26] = 255;
+    memset(p + 27, 'x', sizeof(p) - 27);
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(scan_active && connect_calls == 0 && writes == 0);
+    p[26] = sizeof(p) - 27;
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(!scan_active && connect_calls == 1 && writes == 1);
+}
+
+int main(void) {
+    test_selected_bond_auto_connects();
+    test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback();
+    test_only_live_pairing_inquiry_can_select_a_peer();
+    test_short_events_and_unbounded_names_are_rejected();
+    puts("HCI selected-peer ownership and event bounds: 4 groups passed");
+    return 0;
+}

@@ -77,7 +77,8 @@ uint8_t const * tud_descriptor_device_cb(void)
 //--------------------------------------------------------------------+
 #define CONFIG_TOTAL_LEN    	(TUD_CONFIG_DESC_LEN \
     + CFG_TUD_AUDIO * TUD_AUDIO_HEADSET_STEREO_DESC_LEN \
-    + CFG_TUD_CDC * TUD_CDC_DESC_LEN)
+    + CFG_TUD_CDC * TUD_CDC_DESC_LEN \
+    + CFG_TUD_HID * TUD_HID_DESC_LEN)
 
 #if CFG_TUSB_MCU == OPT_MCU_LPC175X_6X || CFG_TUSB_MCU == OPT_MCU_LPC177X_8X || CFG_TUSB_MCU == OPT_MCU_LPC40XX
   // LPC 17xx and 40xx endpoint type (bulk/interrupt/iso) are fixed by its number
@@ -117,6 +118,14 @@ uint8_t const * tud_descriptor_device_cb(void)
 #define EPNUM_CDC_NOTIF   0x83
 #define EPNUM_CDC_OUT     0x04
 #define EPNUM_CDC_IN      0x84
+#define EPNUM_HID_IN      0x85
+
+// Standard Consumer Control collection; no vendor feature reports.
+static const uint8_t desc_hid_report[] = { TUD_HID_REPORT_DESC_CONSUMER() };
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
+    return instance == 0 ? desc_hid_report : NULL;
+}
 
 uint8_t const desc_configuration[] =
 {
@@ -127,7 +136,9 @@ uint8_t const desc_configuration[] =
     TUD_AUDIO_HEADSET_STEREO_DESCRIPTOR(2, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN | 0x80, EPNUM_AUDIO_INT | 0x80),
 
     // CDC-ACM debug console: control itf, string idx, notif EP, notif size, data OUT, data IN, data EP size
-    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 6, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64)
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 6, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, 7, HID_ITF_PROTOCOL_NONE,
+                       sizeof(desc_hid_report), EPNUM_HID_IN, 16, 5)
 
   };
 
@@ -162,12 +173,13 @@ enum {
 char const *string_desc_arr[] =
 {
   (const char[]) { 0x09, 0x04 },  // 0: is supported language is English (0x0409)
-  "TinyUSB",                      // 1: Manufacturer
-  "TinyUSB BT",              // 2: Product
+  "airpods-dongle",                      // 1: Manufacturer
+  "AirPods Dongle",              // 2: Product
   NULL,                           // 3: Serials will use unique ID if possible
-  "TinyUSB BT",             // 4: Audio Interface
-  "TinyUSB BT",                 // 5: Audio Interface
-  "Pico Debug Console",           // 6: CDC debug console
+  "AirPods Dongle",             // 4: Audio Interface
+  "AirPods Dongle",                 // 5: Audio Interface
+  "AirPods Dongle Console",           // 6: CDC debug console
+  "AirPods media controls",            // 7: Consumer Control interface
 };
 
 

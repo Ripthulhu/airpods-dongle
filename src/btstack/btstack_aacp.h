@@ -27,6 +27,10 @@ void aacp_connect(bd_addr_t addr);
 // Tear down the AACP channel if open.
 void aacp_disconnect(void);
 
+// Service deferred capture and bounded channel deadlines from the main loop,
+// with the same async-context lock used for START/STOP.
+void aacp_poll(void);
+
 // True once the channel is open (handshake may still be in flight).
 bool aacp_is_connected(void);
 
@@ -38,7 +42,7 @@ bool aacp_is_connected(void);
 void aacp_mic_start(void);
 void aacp_mic_stop(void);
 
-// True between aacp_mic_start() and aacp_mic_stop()/channel close.
+// True after START is sent or unsolicited audio arrives, until quiet after STOP/close.
 bool aacp_mic_active(void);
 
 #endif // BTSTACK_AACP_H

@@ -34,10 +34,8 @@
  #define UAC2_ENTITY_SPK_INPUT_TERMINAL  0x01
  #define UAC2_ENTITY_SPK_FEATURE_UNIT    0x02
  #define UAC2_ENTITY_SPK_OUTPUT_TERMINAL 0x03
- // Microphone path (AirPods hi-res mic). The mic runs at 64 kHz
- // (the AirPods deliver 133.3 AUs/s x 480 samples — librepods exposes its
- // virtual mic at 64000 Hz too) while the speaker runs at 48 kHz, so the mic
- // terminals reference their own fixed clock entity.
+ // Keep the inherited 64 kHz presentation clock separate from the ASC's 48 kHz
+ // coding rate. Pitch is listening-tested upstream; calibrated drift is pending.
  #define UAC2_ENTITY_MIC_INPUT_TERMINAL  0x11
  #define UAC2_ENTITY_MIC_OUTPUT_TERMINAL 0x13
  #define UAC2_ENTITY_MIC_CLOCK           0x14
@@ -51,6 +49,7 @@
    ITF_NUM_AUDIO_STREAMING_MIC,
    ITF_NUM_CDC,        // CDC-ACM control interface (debug console)
    ITF_NUM_CDC_DATA,   // CDC-ACM data interface
+   ITF_NUM_HID,
    ITF_NUM_TOTAL
  };
 

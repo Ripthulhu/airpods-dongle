@@ -30,6 +30,10 @@ bool aacp_mic_dec_decode(const uint8_t *au, uint16_t len);
 // counters. Called from the mic stats timer in btstack_aacp.c.
 void aacp_mic_dec_report(void);
 
+// Clear compressed input, prediction history and queued PCM without reallocating.
+// Call only from the decoder/BTstack context; false if the decoder is unavailable.
+bool aacp_mic_dec_reset(void);
+
 // Reset cumulative statistics (called on mic START).
 void aacp_mic_dec_reset_stats(void);
 
@@ -41,7 +45,8 @@ void aacp_mic_dec_reset_stats(void);
 // The USB callback zero-fills any shortfall.
 uint32_t aacp_mic_pcm_read(int16_t *dst, uint32_t n);
 
-// Drop any buffered samples (called on mic START for a clean session).
+// Request a discard on the next USB read. Safe from either context; the consumer
+// alone advances its cursor, so reset cannot race a read and roll it backwards.
 void aacp_mic_pcm_reset(void);
 
 #endif // AACP_MIC_DEC_H

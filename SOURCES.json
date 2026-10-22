@@ -1,0 +1,33 @@
+{
+  "baseline": {
+    "repository": "https://github.com/han-um/USBPods-Pico2W-2-way-audio-implement",
+    "revision": "d18d083bc52de3143d8d922c4abaae865cc0dc28"
+  },
+  "upstream": {
+    "repository": "https://github.com/wasdwasd0105/USBPods-Pico2W",
+    "revision": "6286ab1618ec1143d828b1fc377d8e22c449e567"
+  },
+  "pico_sdk": {
+    "version": "2.1.1",
+    "revision": "bddd20f928ce76142793bef434d4f75f4af6e433",
+    "patches": "patches/sdk.json"
+  },
+  "picotool": {
+    "version": "2.1.1",
+    "revision": "de8ae5ac334e1126993f72a5c67949712fd1e1a4"
+  },
+  "ntpods_reference": {
+    "repository": "https://github.com/Ripthulhu/ntpods",
+    "base_revision": "1f3bf3d5ebb51a9c4146a466b99520e0c7c6b404",
+    "includes_uncommitted_work": true,
+    "sha256": {
+      "windows/daemon/src/aap.rs": "3135fc2bc06723c7feff885fe41d09ed31b47ff86b8f794bc30e57525a3b8451",
+      "windows/daemon/src/eld.rs": "921606e56cfa2bc5c6516baf489740a63237f00bf443682e9cf98cef881a6530",
+      "windows/daemon/src/eld_shim.c": "343afd41eb7ff3c7baee8894a1ea4710e383186cca4d3dcc68f888547c2486c7",
+      "windows/daemon/src/playback/buffer.rs": "f125f4cfa17ba134b91de5b95b3f77b348141967065942f58f9b1ed44c2a38a3",
+      "windows/daemon/src/playback/protocol.rs": "cc276a7c4618a5e59562fb9ab3f7ea9addfdf2be7b64b5a09380f434e3001970",
+      "docs/WINDOWS-AIRPODS-AUDIO-PROTOCOL.md": "6b36bbc7d471e268960f8260b3ed2038040f2dba1ffe69a24ec258203795d8c9",
+      "docs/WINDOWS-MIC-PROTOCOL-RESEARCH.md": "fa42fd27dc2f1ab66318f0247d89da11b14b67bc26ba91af18f44558b074ad70"
+    }
+  }
+}

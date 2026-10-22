@@ -21,62 +21,46 @@
 #include "pico/time.h"
 
 #include "aacp_mic_dec.h"
+#include "mic_pcm_ring.h"
 
 // Fixed AudioSpecificConfig for the mic stream (from librepods):
-// AAC-ELD (AOT 39), mono, 480 samples/frame, nominal 64 kHz.
+// AAC-ELD (AOT 39), mono, 480 samples/frame, signalled 48 kHz.
+// The inherited USB presentation clock remains 64 kHz pending calibrated timing.
 static UCHAR aacp_mic_asc[] = { 0xF8, 0xE6, 0x30, 0x00 };
 
 // librepods ELD_INBUF_MAX — AUs above this are malformed, don't feed them.
-#define MIC_AU_MAX 512
+#define MIC_AU_MAX 255
 
-// Decoded PCM scratch. Expected mono 480; sized x2 in case GetStreamInfo
-// reports stereo (then frameSize*channels must still fit).
-#define MIC_PCM_MAX_SAMPLES 960
+// FDK must reject larger output; only mono 480 is accepted below.
+#define MIC_PCM_MAX_SAMPLES 480
 static INT_PCM mic_pcm[MIC_PCM_MAX_SAMPLES];
 
-static HANDLE_AACDECODER mic_dec = NULL;
+static _Atomic(HANDLE_AACDECODER) mic_dec;
 static bool mic_dec_streaminfo_logged = false;
+static UINT mic_dec_flags = AACDEC_CLRHIST;
 
-// --- Decoded-PCM ring (mono 16-bit @ 64 kHz) ---
-// 8192 samples = 16KB = 128ms of audio; absorbs the SDU batching jitter
-// (AUs arrive in ~30ms bursts of 4). Lock-free SPSC: producer is the decoder
-// (BTstack context), consumer is the USB IN callback (USB timer IRQ).
-#define MIC_RING_SAMPLES 8192u              // power of two
-#define MIC_RING_MASK    (MIC_RING_SAMPLES - 1u)
-static int16_t           mic_ring[MIC_RING_SAMPLES];
-static volatile uint32_t mic_ring_w = 0;    // producer index (monotonic)
-static volatile uint32_t mic_ring_r = 0;    // consumer index (monotonic)
-static uint32_t          mic_ring_overrun = 0;  // samples dropped, ring full
+// The USB consumer owns its cursor even when BTstack requests a reset.
+static mic_pcm_ring_t mic_ring;
+static uint32_t mic_ring_overrun;
 
-static void mic_pcm_write(const int16_t *src, uint32_t n) {
-    uint32_t w = mic_ring_w, r = mic_ring_r;
-    uint32_t space = MIC_RING_SAMPLES - (w - r);
-    if (n > space) {                        // full: drop the oldest new data
-        mic_ring_overrun += n - space;
-        n = space;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        mic_ring[(w + i) & MIC_RING_MASK] = src[i];
-    }
-    __asm volatile ("" ::: "memory");       // data before index
-    mic_ring_w = w + n;
+static void mic_pcm_write(const int16_t *src, uint32_t count) {
+    uint32_t written = mic_pcm_ring_write(&mic_ring, src, count);
+    mic_ring_overrun += count - written;
 }
 
-uint32_t aacp_mic_pcm_read(int16_t *dst, uint32_t n) {
-    uint32_t w = mic_ring_w, r = mic_ring_r;
-    uint32_t avail = w - r;
-    if (n > avail) n = avail;
-    for (uint32_t i = 0; i < n; i++) {
-        dst[i] = mic_ring[(r + i) & MIC_RING_MASK];
-    }
-    __asm volatile ("" ::: "memory");
-    mic_ring_r = r + n;
-    return n;
+uint32_t aacp_mic_pcm_read(int16_t *dst, uint32_t count) {
+    return mic_pcm_ring_read(&mic_ring, dst, count);
 }
 
 void aacp_mic_pcm_reset(void) {
-    mic_ring_r = mic_ring_w;
-    mic_ring_overrun = 0;
+    mic_pcm_ring_reset(&mic_ring);
+}
+
+bool aacp_mic_dec_reset(void) {
+    aacp_mic_pcm_reset();
+    mic_dec_flags = AACDEC_CLRHIST;
+    if (mic_dec == NULL) return false;
+    return aacDecoder_SetParam(mic_dec, AAC_TPDEC_CLEAR_BUFFER, 1) == AAC_DEC_OK;
 }
 
 static struct {
@@ -106,7 +90,7 @@ extern char end[];   // linker: end of .bss = start of heap
 static void dec_report_heap(const char *tag) {
     struct mallinfo mi = mallinfo();
     printf("[DEC] heap %s: region=%u arena=%u inuse=%u free=%u\n",
-           tag, (unsigned)(__StackLimit - end),
+           tag, (unsigned)((uintptr_t)__StackLimit - (uintptr_t)end),
            (unsigned) mi.arena, (unsigned) mi.uordblks, (unsigned) mi.fordblks);
 }
 
@@ -115,8 +99,8 @@ bool aacp_mic_dec_init(void) {
 
     dec_report_heap("before");
     printf("[DEC] aacDecoder_Open ...\n");
-    mic_dec = aacDecoder_Open(TT_MP4_RAW, /* nrOfLayers */ 1);
-    if (mic_dec == NULL) {
+    HANDLE_AACDECODER decoder = aacDecoder_Open(TT_MP4_RAW, /* nrOfLayers */ 1);
+    if (decoder == NULL) {
         printf("[DEC] aacDecoder_Open FAILED (out of heap?)\n");
         return false;
     }
@@ -124,21 +108,22 @@ bool aacp_mic_dec_init(void) {
     printf("[DEC] aacDecoder_ConfigRaw ...\n");
     UCHAR *conf[] = { aacp_mic_asc };
     UINT   clen   = sizeof(aacp_mic_asc);
-    AAC_DECODER_ERROR err = aacDecoder_ConfigRaw(mic_dec, conf, &clen);
+    AAC_DECODER_ERROR err = aacDecoder_ConfigRaw(decoder, conf, &clen);
     if (err != AAC_DEC_OK) {
         printf("[DEC] aacDecoder_ConfigRaw FAILED: 0x%x\n", err);
-        aacDecoder_Close(mic_dec);
-        mic_dec = NULL;
+        aacDecoder_Close(decoder);
         return false;
     }
 
+    // BTstack IRQs may ask for capture while main is still configuring FDK.
+    atomic_store_explicit(&mic_dec, decoder, memory_order_release);
     dec_report_heap("after");
     printf("[DEC] decoder ready (TT_MP4_RAW, ASC F8 E6 30 00)\n");
     return true;
 }
 
 bool aacp_mic_dec_ready(void) {
-    return mic_dec != NULL;
+    return atomic_load_explicit(&mic_dec, memory_order_acquire) != NULL;
 }
 
 void aacp_mic_dec_reset_stats(void) {
@@ -146,60 +131,54 @@ void aacp_mic_dec_reset_stats(void) {
     mic_dec_streaminfo_logged = false;
 }
 
+static bool mic_decode_failed(void) {
+    dstat.err_interval++;
+    dstat.err_total++;
+    // Broken input must not leave stale AAC prediction or PCM for the next AU.
+    (void)aacp_mic_dec_reset();
+    return false;
+}
+
 bool aacp_mic_dec_decode(const uint8_t *au, uint16_t len) {
-    if (mic_dec == NULL || len == 0 || len > MIC_AU_MAX) {
-        dstat.err_interval++;
-        dstat.err_total++;
-        return false;
+    if (mic_dec == NULL || au == NULL || len == 0 || len > MIC_AU_MAX)
+        return mic_decode_failed();
+
+    UCHAR *inb[] = { (UCHAR *)au };
+    UINT size = len;
+    UINT valid = len;
+    if (aacDecoder_Fill(mic_dec, inb, &size, &valid) != AAC_DEC_OK || valid != 0)
+        return mic_decode_failed();
+
+    uint32_t start = time_us_32();
+    AAC_DECODER_ERROR error = aacDecoder_DecodeFrame(mic_dec, mic_pcm,
+                                                   MIC_PCM_MAX_SAMPLES, mic_dec_flags);
+    uint32_t elapsed = time_us_32() - start;
+    if (error != AAC_DEC_OK) return mic_decode_failed();
+    mic_dec_flags = 0;
+
+    CStreamInfo *info = aacDecoder_GetStreamInfo(mic_dec);
+    if (info == NULL || info->numChannels != 1 || info->frameSize != 480 ||
+        info->sampleRate != 48000 || info->aot != 39)
+        return mic_decode_failed();
+
+    if (!mic_dec_streaminfo_logged) {
+        mic_dec_streaminfo_logged = true;
+        printf("[DEC] stream: sampleRate=%d numChannels=%d frameSize=%d aot=%d\n",
+               (int)info->sampleRate, (int)info->numChannels,
+               (int)info->frameSize, (int)info->aot);
     }
-
-    UCHAR *inb[]  = { (UCHAR *) au };
-    UINT   insz   = len;
-    UINT   valid  = len;
-    aacDecoder_Fill(mic_dec, inb, &insz, &valid);
-
-    uint32_t t0 = time_us_32();
-    AAC_DECODER_ERROR err = aacDecoder_DecodeFrame(mic_dec, mic_pcm, MIC_PCM_MAX_SAMPLES, 0);
-    uint32_t dt = time_us_32() - t0;
-
-    if (err != AAC_DEC_OK) {
-        // Keep PCM continuity for the USB stream: substitute one frame of
-        // silence for the failed AU.
-        static const int16_t silence[480] = { 0 };
-        mic_pcm_write(silence, 480);
-        dstat.err_interval++;
-        dstat.err_total++;
-        return false;
-    }
-
     dstat.ok_interval++;
     dstat.ok_total++;
-    dstat.dec_us_sum += dt;
-    if (dt > dstat.dec_us_max) dstat.dec_us_max = dt;
-
-    CStreamInfo *si = aacDecoder_GetStreamInfo(mic_dec);
-
-    // Log the decoder's reported stream parameters once per session.
-    if (!mic_dec_streaminfo_logged && si != NULL) {
-        mic_dec_streaminfo_logged = true;
-        printf("[DEC] *** stream info: sampleRate=%d numChannels=%d frameSize=%d aot=%d ***\n",
-               (int) si->sampleRate, (int) si->numChannels, (int) si->frameSize, (int) si->aot);
+    dstat.dec_us_sum += elapsed;
+    if (elapsed > dstat.dec_us_max) dstat.dec_us_max = elapsed;
+    mic_pcm_write(mic_pcm, 480);
+    for (unsigned i = 0; i < 480; ++i) {
+        int32_t sample = mic_pcm[i];
+        dstat.sq_sum += (uint64_t)((int64_t)sample * sample);
+        int32_t magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > dstat.peak) dstat.peak = magnitude;
     }
-
-    // Feed the USB mic path (mono: frameSize samples as-is at 64 kHz).
-    int samples = (si != NULL) ? (int)(si->frameSize * si->numChannels) : 480;
-    if (samples > MIC_PCM_MAX_SAMPLES) samples = MIC_PCM_MAX_SAMPLES;
-    mic_pcm_write(mic_pcm, (uint32_t) samples);
-
-    // PCM level stats over the decoded frame.
-    for (int i = 0; i < samples; i++) {
-        int32_t s = mic_pcm[i];
-        dstat.sq_sum += (uint64_t)((int64_t) s * s);
-        int32_t a = s < 0 ? -s : s;
-        if (a > dstat.peak) dstat.peak = a;
-    }
-    dstat.sq_samples += (uint32_t) samples;
-
+    dstat.sq_samples += 480;
     return true;
 }
 
@@ -219,7 +198,8 @@ void aacp_mic_dec_report(void) {
            (unsigned long) dstat.dec_us_max,
            (unsigned long) rms,
            (long) dstat.peak,
-           (unsigned long) (mic_ring_w - mic_ring_r),
+           (unsigned long)(atomic_load_explicit(&mic_ring.written, memory_order_relaxed) -
+                           atomic_load_explicit(&mic_ring.read, memory_order_relaxed)),
            mic_ring_overrun ? " OVERRUN" : "");
 
     dstat.ok_interval  = 0;

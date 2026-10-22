@@ -24,6 +24,7 @@
 #include "btstack.h"
 #include "btstack_aacp.h"
 #include "aacp_mic_dec.h"
+#include "../tinyusb/uac.h"
 
 #define AACP_PSM              0x1001
 // Requested local MTU. BTstack clamps this to l2cap_max_mtu() =
@@ -75,84 +76,85 @@ static const uint8_t aacp_mic_stop_bytes[] = {
     0x02, 0x00, 0x03, 0x01
 };
 
-// --- TX queue (ordered; one packet sent per CAN_SEND_NOW event) ---
-// Entries reference static const byte arrays only, so no payload copies.
+// TX entries reference static command bytes; there are no per-packet allocations.
 typedef struct {
     const uint8_t *data;
-    uint16_t       len;
+    uint16_t len;
 } aacp_pkt_t;
-
 #define AACP_TX_QUEUE_LEN 8
+#define AACP_CHANNEL_TIMEOUT_MS 5000
+#define AACP_MIC_RESTARTS 1
+#define AACP_MIC_QUIET_MS 500
+#define AACP_MIC_DRAIN_MS 2000
 static aacp_pkt_t aacp_tx_queue[AACP_TX_QUEUE_LEN];
-static uint8_t    aacp_tx_head = 0;   // next slot to send
-static uint8_t    aacp_tx_count = 0;  // pending packets
-
-static uint16_t   aacp_cid       = 0;
-static bool       aacp_connected = false;
-static bd_addr_t  aacp_addr;
-static uint8_t    aacp_attempts  = 0;      // connect attempts this A2DP session
-static bool       aacp_got_control = false; // first valid AACP control packet seen
-
+static uint8_t aacp_tx_head, aacp_tx_count;
+static uint16_t aacp_cid;
+static bool aacp_session, aacp_connected, aacp_got_control, aacp_init_sent;
+static bd_addr_t aacp_addr;
+static uint8_t aacp_attempts;
+static uint32_t aacp_channel_since_ms, aacp_tx_since_ms;
 static btstack_timer_source_t aacp_connect_timer;
 
-// --- Mic stream state ---
-
-// type-0x58 audio SDU layout: 22-byte header, then N x [ts:u32 LE][len:u8][au].
 #define TYPE58_HEADER_LEN 22
-
-static bool aacp_mic_running = false;   // START sent, STOP not yet sent
-static bool aacp_mic_want    = false;   // host wants the mic (USB alt 1),
-                                        // start deferred until channel is up
-static btstack_timer_source_t aacp_mic_stats_timer;    // 1 Hz report
-
-// RX statistics — cumulative since START, plus per-interval rates.
+static bool aacp_mic_running, aacp_mic_want, aacp_mic_failed, aacp_mic_remote_active;
+static bool aacp_mic_stopping;
+static uint8_t aacp_mic_restarts;
+static uint8_t aacp_mic_stop_retries;
+static uint32_t aacp_mic_stop_since_ms, aacp_last_uplink_ms;
+static btstack_timer_source_t aacp_mic_stats_timer;
 static struct {
-    uint32_t sdu_total;     // audio SDUs seen
-    uint32_t au_total;      // AUs demuxed
-    uint32_t sdu_interval;  // audio SDUs this report interval
-    uint32_t au_interval;   // AUs this report interval
-    uint32_t au_bytes_interval;
-    uint16_t au_min, au_max;        // AU size bounds (cumulative)
-    uint16_t sdu_max;               // largest audio SDU seen (cumulative)
-    uint16_t demux_short;           // SDUs whose trailer didn't parse cleanly
-    uint32_t last_sdu_ms;           // for stall observation in the report
+    uint32_t sdu_total, au_total, sdu_interval, au_interval, au_bytes_interval;
+    uint16_t au_min, au_max, sdu_max, demux_short;
+    uint32_t last_sdu_ms;
 } mic_stats;
 
-static void aacp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+static void aacp_packet_handler(uint8_t, uint16_t, uint8_t *, uint16_t);
+static void aacp_schedule_retry(void);
+static void aacp_try_mic_start(void);
 
-// ------------------------------------------------------------------
+static void aacp_mic_teardown(void) {
+    aacp_mic_running = false;
+    btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
+    aacp_mic_pcm_reset();
+}
+
+// Clear ownership before disconnect: a late event must not revive this channel.
+void aacp_disconnect(void) {
+    uint16_t cid = aacp_cid;
+    aacp_session = false;
+    aacp_cid = 0;
+    aacp_connected = aacp_got_control = aacp_init_sent = false;
+    aacp_mic_remote_active = false;
+    aacp_mic_stopping = false;
+    aacp_tx_head = aacp_tx_count = 0;
+    btstack_run_loop_remove_timer(&aacp_connect_timer);
+    aacp_mic_teardown();
+    if (cid != 0) l2cap_disconnect(cid);
+}
 
 void aacp_init(void) {
-    aacp_cid         = 0;
-    aacp_connected   = false;
-    aacp_tx_head     = 0;
-    aacp_tx_count    = 0;
-    aacp_mic_running = false;
+    aacp_disconnect();
+    aacp_mic_want = aacp_mic_failed = false;
+    aacp_mic_restarts = 0;
+    aacp_attempts = 0;
 }
 
 static void aacp_do_connect(btstack_timer_source_t *ts) {
     UNUSED(ts);
-    if (aacp_cid != 0) return;  // already connecting/connected
+    if (!aacp_session || aacp_cid != 0) return;
     aacp_attempts++;
-    printf("[AACP] connecting to %s PSM 0x%04x (attempt %u/%u, local mtu %u) ...\n",
-           bd_addr_to_str(aacp_addr), AACP_PSM, aacp_attempts, AACP_MAX_ATTEMPTS,
-           btstack_min(AACP_LOCAL_MTU, l2cap_max_mtu()));
+    aacp_channel_since_ms = btstack_run_loop_get_time_ms();
     uint8_t status = l2cap_create_channel(aacp_packet_handler, aacp_addr, AACP_PSM,
-                                          AACP_LOCAL_MTU, &aacp_cid);
+                                         AACP_LOCAL_MTU, &aacp_cid);
     if (status != ERROR_CODE_SUCCESS) {
-        printf("[AACP] l2cap_create_channel failed: 0x%02x\n", status);
+        printf("[AACP] channel request failed: 0x%02x\n", status);
         aacp_cid = 0;
+        aacp_schedule_retry();
     }
 }
 
-// Re-arm the connect timer for a retry, if attempts remain.
 static void aacp_schedule_retry(void) {
-    if (aacp_attempts >= AACP_MAX_ATTEMPTS) {
-        printf("[AACP] giving up after %u attempts. If this persists: re-pair "
-               "(BOOTSEL long press) so the AirPods pick up our DID record.\n", aacp_attempts);
-        return;
-    }
-    printf("[AACP] retrying in %d ms\n", AACP_RETRY_DELAY_MS);
+    if (!aacp_session || aacp_attempts >= AACP_MAX_ATTEMPTS) return;
     btstack_run_loop_remove_timer(&aacp_connect_timer);
     btstack_run_loop_set_timer_handler(&aacp_connect_timer, aacp_do_connect);
     btstack_run_loop_set_timer(&aacp_connect_timer, AACP_RETRY_DELAY_MS);
@@ -160,271 +162,304 @@ static void aacp_schedule_retry(void) {
 }
 
 void aacp_connect(bd_addr_t addr) {
-    if (aacp_cid != 0) {
-        printf("[AACP] connect ignored, channel already active (cid 0x%04x)\n", aacp_cid);
-        return;
-    }
+    if (aacp_session && memcmp(aacp_addr, addr, sizeof(bd_addr_t)) == 0) return;
+    aacp_disconnect();
     memcpy(aacp_addr, addr, sizeof(bd_addr_t));
-    aacp_attempts    = 0;
-    aacp_got_control = false;
-    printf("[AACP] scheduling connect in %d ms\n", AACP_CONNECT_DELAY_MS);
-    btstack_run_loop_remove_timer(&aacp_connect_timer);
+    aacp_session = true;
+    aacp_attempts = 0;
     btstack_run_loop_set_timer_handler(&aacp_connect_timer, aacp_do_connect);
     btstack_run_loop_set_timer(&aacp_connect_timer, AACP_CONNECT_DELAY_MS);
     btstack_run_loop_add_timer(&aacp_connect_timer);
 }
 
-static void aacp_mic_teardown(void);   // fwd
-
-void aacp_disconnect(void) {
-    btstack_run_loop_remove_timer(&aacp_connect_timer);
-    aacp_mic_teardown();
-    if (aacp_cid != 0) {
-        l2cap_disconnect(aacp_cid);
-    }
-    aacp_cid       = 0;
-    aacp_connected = false;
-    aacp_tx_head   = 0;
-    aacp_tx_count  = 0;
-}
-
-bool aacp_is_connected(void) {
-    return aacp_connected;
-}
-
-// ------------------------------------------------------------------
-// TX queue
+bool aacp_is_connected(void) { return aacp_connected; }
+bool aacp_mic_active(void) { return aacp_mic_remote_active; }
 
 static bool aacp_tx_enqueue(const uint8_t *data, uint16_t len) {
-    if (aacp_tx_count >= AACP_TX_QUEUE_LEN) {
-        printf("[AACP] TX queue full, dropping %u-byte packet\n", len);
+    if (aacp_cid == 0 || !aacp_connected || aacp_tx_count == AACP_TX_QUEUE_LEN)
         return false;
-    }
     uint8_t slot = (uint8_t)((aacp_tx_head + aacp_tx_count) % AACP_TX_QUEUE_LEN);
-    aacp_tx_queue[slot].data = data;
-    aacp_tx_queue[slot].len  = len;
-    aacp_tx_count++;
-    if (aacp_cid != 0) l2cap_request_can_send_now_event(aacp_cid);
+    aacp_tx_queue[slot] = (aacp_pkt_t){ data, len };
+    if (aacp_tx_count++ == 0) aacp_tx_since_ms = btstack_run_loop_get_time_ms();
+    l2cap_request_can_send_now_event(aacp_cid);
     return true;
 }
 
-static void aacp_handle_can_send_now(void) {
-    if (aacp_tx_count == 0) return;
-    aacp_pkt_t *p = &aacp_tx_queue[aacp_tx_head];
-    uint8_t status = l2cap_send(aacp_cid, (uint8_t *) p->data, p->len);
-    if (status != ERROR_CODE_SUCCESS) {
-        printf("[AACP] l2cap_send failed: 0x%02x (retrying)\n", status);
-        l2cap_request_can_send_now_event(aacp_cid);  // retry same packet
+static bool aacp_mic_start_queued(void) {
+    for (unsigned i = 0; i < aacp_tx_count; ++i) {
+        if (aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN].data == aacp_mic_start_bytes)
+            return true;
+    }
+    return false;
+}
+
+// USB close cancels queued STARTs too, including watchdog restarts.
+static void aacp_drop_mic_commands(void) {
+    uint8_t kept = 0;
+    for (unsigned i = 0; i < aacp_tx_count; ++i) {
+        aacp_pkt_t p = aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN];
+        if (p.data == aacp_mic_start_bytes || p.data == aacp_mic_stop_bytes) continue;
+        aacp_tx_queue[(aacp_tx_head + kept++) % AACP_TX_QUEUE_LEN] = p;
+    }
+    aacp_tx_count = kept;
+}
+
+static void aacp_channel_failed(void) {
+    uint16_t cid = aacp_cid;
+    aacp_cid = 0;
+    aacp_connected = aacp_got_control = aacp_init_sent = false;
+    aacp_mic_remote_active = false;
+    aacp_mic_stopping = false;
+    aacp_tx_head = aacp_tx_count = 0;
+    aacp_mic_teardown();
+    if (cid != 0) l2cap_disconnect(cid);
+    aacp_schedule_retry();
+}
+
+static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
+    if (aacp_mic_want && !usb_mic_requested()) {
+        aacp_mic_stop();
         return;
     }
-    printf("[AACP] sent %u bytes (%u queued)\n", p->len, (unsigned)(aacp_tx_count - 1));
-    aacp_tx_head = (uint8_t)((aacp_tx_head + 1) % AACP_TX_QUEUE_LEN);
-    aacp_tx_count--;
-    if (aacp_tx_count > 0) l2cap_request_can_send_now_event(aacp_cid);
-}
-
-static void aacp_queue_init_sequence(void) {
-    aacp_tx_enqueue(aacp_handshake,             sizeof(aacp_handshake));
-    aacp_tx_enqueue(aacp_set_feature_flags,     sizeof(aacp_set_feature_flags));
-    aacp_tx_enqueue(aacp_request_notifications, sizeof(aacp_request_notifications));
-}
-
-// ------------------------------------------------------------------
-// Mic stream
-
-// 1 Hz statistics report. Two short lines per second — safe log volume.
-// Doubles as the stream stall watchdog: no audio SDU for >2000ms while
-// capture is active → STOP + START to restart the stream.
-static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
+    if (!aacp_mic_want || !aacp_mic_running || !aacp_connected) return;
     uint32_t now = btstack_run_loop_get_time_ms();
-    // Covers BOTH stall cases: stream died mid-capture AND "START ignored"
-    // (no SDU ever arrived — happens when START lands too soon after the
-    // AACP handshake, e.g. host opened the mic before/during BT connect;
-    // last_sdu_ms is initialized to the START time so the retry kicks in
-    // 2s later either way).
-    bool stalled = (now - mic_stats.last_sdu_ms) > 2000;
-    uint32_t avg = mic_stats.au_interval ? (mic_stats.au_bytes_interval / mic_stats.au_interval) : 0;
-    printf("[MIC] sdu/s=%lu au/s=%lu au min/avg/max=%u/%lu/%u sdu_max=%u total_au=%lu%s%s\n",
-           (unsigned long) mic_stats.sdu_interval,
-           (unsigned long) mic_stats.au_interval,
-           mic_stats.au_min == 0xFFFF ? 0 : mic_stats.au_min,
-           (unsigned long) avg,
-           mic_stats.au_max,
-           mic_stats.sdu_max,
-           (unsigned long) mic_stats.au_total,
-           mic_stats.demux_short ? " DEMUX_SHORT!" : "",
-           stalled ? " STALLED>2s" : "");
+    printf("[MIC] sdu/s=%lu au/s=%lu malformed=%u\n",
+           (unsigned long)mic_stats.sdu_interval,
+           (unsigned long)mic_stats.au_interval, mic_stats.demux_short);
     aacp_mic_dec_report();
-    mic_stats.sdu_interval = 0;
-    mic_stats.au_interval = 0;
-    mic_stats.au_bytes_interval = 0;
-
-    if (stalled && aacp_cid != 0 && aacp_connected) {
-        printf("[MIC] stall watchdog: restarting stream (STOP + START)\n");
-        aacp_tx_enqueue(aacp_mic_stop_bytes,  sizeof(aacp_mic_stop_bytes));
-        aacp_tx_enqueue(aacp_mic_start_bytes, sizeof(aacp_mic_start_bytes));
-        mic_stats.last_sdu_ms = now;   // give the restart a fresh 2s window
+    mic_stats.sdu_interval = mic_stats.au_interval = mic_stats.au_bytes_interval = 0;
+    if ((uint32_t)(now - mic_stats.last_sdu_ms) >= 2000) {
+        aacp_drop_mic_commands();
+        bool restart = aacp_mic_restarts++ < AACP_MIC_RESTARTS;
+        aacp_mic_teardown();
+        if (!aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes))) {
+            aacp_channel_failed();
+            return;
+        }
+        if (!restart) {
+            aacp_mic_failed = true;
+            printf("[MIC] no valid audio after retry; close capture before retrying\n");
+        }
+        // The poll queues a new START behind STOP while USB still owns capture.
+        return;
     }
-
     btstack_run_loop_set_timer(ts, 1000);
     btstack_run_loop_add_timer(ts);
 }
 
-void aacp_mic_start(void) {
-    aacp_mic_want = true;
-    if (aacp_cid == 0 || !aacp_connected) {
-        printf("[MIC] start deferred — AACP channel not open yet\n");
+static void aacp_try_mic_start(void) {
+    if (!usb_mic_requested() || !aacp_mic_want || aacp_mic_failed || aacp_mic_running ||
+        aacp_mic_remote_active || aacp_mic_stopping ||
+        !aacp_connected || !aacp_got_control || !aacp_init_sent ||
+        !aacp_mic_dec_ready() || aacp_mic_start_queued()) return;
+    if (!aacp_mic_dec_reset()) {
+        aacp_mic_failed = true;
         return;
     }
-    if (aacp_mic_running) return;
-    aacp_mic_running = true;
-
-    memset(&mic_stats, 0, sizeof(mic_stats));
-    mic_stats.au_min = 0xFFFF;
-    mic_stats.last_sdu_ms = btstack_run_loop_get_time_ms();
-
-    // The decoder was opened at boot (thread context — opening it here, in
-    // the BTstack callback, hung the system). Stats-only if boot init failed.
-    if (!aacp_mic_dec_ready()) {
-        printf("[MIC] WARNING: decoder unavailable, continuing stats-only\n");
-    }
     aacp_mic_dec_reset_stats();
-    aacp_mic_pcm_reset();   // fresh USB PCM session
+    if (aacp_tx_enqueue(aacp_mic_start_bytes, sizeof(aacp_mic_start_bytes))) {
+        memset(&mic_stats, 0, sizeof(mic_stats));
+        mic_stats.au_min = UINT16_MAX;
+    }
+}
 
-    printf("[MIC] sending START (hi-res mic, AAC-ELD mono 64kHz expected)\n");
-    aacp_tx_enqueue(aacp_mic_start_bytes, sizeof(aacp_mic_start_bytes));
-
-    btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
-    btstack_run_loop_set_timer_handler(&aacp_mic_stats_timer, aacp_mic_stats_report);
-    btstack_run_loop_set_timer(&aacp_mic_stats_timer, 1000);
-    btstack_run_loop_add_timer(&aacp_mic_stats_timer);
+void aacp_mic_start(void) {
+    if (!aacp_mic_want) {
+        aacp_mic_failed = false;
+        aacp_mic_restarts = 0;
+    }
+    aacp_mic_want = true;
+    aacp_try_mic_start();
 }
 
 void aacp_mic_stop(void) {
     aacp_mic_want = false;
-    if (!aacp_mic_running) return;
-    printf("[MIC] sending STOP (total: %lu SDUs, %lu AUs)\n",
-           (unsigned long) mic_stats.sdu_total, (unsigned long) mic_stats.au_total);
-    if (aacp_cid != 0 && aacp_connected) {
-        aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes));
-    }
+    aacp_mic_failed = false;
+    aacp_mic_restarts = 0;
+    aacp_drop_mic_commands();
+    bool sent = aacp_mic_remote_active;
     aacp_mic_teardown();
+    if (sent && !aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes)))
+        aacp_channel_failed();
 }
 
-bool aacp_mic_active(void) {
-    return aacp_mic_running;
+static void aacp_handle_can_send_now(void) {
+    if (!aacp_connected || aacp_tx_count == 0) return;
+    aacp_pkt_t p = aacp_tx_queue[aacp_tx_head];
+    if (p.data == aacp_mic_start_bytes && !usb_mic_requested()) {
+        aacp_mic_stop();
+        return;
+    }
+    if (p.data == aacp_mic_start_bytes && (!aacp_mic_want || aacp_mic_failed)) {
+        aacp_drop_mic_commands();
+        return;
+    }
+    if (l2cap_send(aacp_cid, (uint8_t *)p.data, p.len) != ERROR_CODE_SUCCESS) {
+        l2cap_request_can_send_now_event(aacp_cid);
+        return;
+    }
+    aacp_tx_head = (uint8_t)((aacp_tx_head + 1) % AACP_TX_QUEUE_LEN);
+    aacp_tx_count--;
+    aacp_tx_since_ms = btstack_run_loop_get_time_ms();
+    if (p.data == aacp_request_notifications) aacp_init_sent = true;
+    if (p.data == aacp_mic_start_bytes) {
+        aacp_mic_running = true;
+        aacp_mic_remote_active = true;
+        mic_stats.last_sdu_ms = btstack_run_loop_get_time_ms();
+        btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
+        btstack_run_loop_set_timer_handler(&aacp_mic_stats_timer, aacp_mic_stats_report);
+        btstack_run_loop_set_timer(&aacp_mic_stats_timer, 1000);
+        btstack_run_loop_add_timer(&aacp_mic_stats_timer);
+    }
+    if (p.data == aacp_mic_stop_bytes) {
+        if (!aacp_mic_stopping) aacp_mic_stop_retries = 0;
+        aacp_mic_stopping = true;
+        aacp_mic_stop_since_ms = aacp_last_uplink_ms = btstack_run_loop_get_time_ms();
+    }
+    if (aacp_tx_count != 0) l2cap_request_can_send_now_event(aacp_cid);
+    aacp_try_mic_start();
 }
 
-// Stop timers / clear state without sending anything (channel may be gone).
-static void aacp_mic_teardown(void) {
-    aacp_mic_running = false;
-    btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
+void aacp_poll(void) {
+    // USB IRQs can revoke capture while the main loop still holds cached intent.
+    if (aacp_mic_want && !usb_mic_requested()) aacp_mic_stop();
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (aacp_cid != 0 &&
+        ((!aacp_connected || !aacp_got_control || !aacp_init_sent) &&
+         (uint32_t)(now - aacp_channel_since_ms) >= AACP_CHANNEL_TIMEOUT_MS)) {
+        aacp_channel_failed();
+        return;
+    }
+    if (aacp_tx_count != 0 &&
+        (uint32_t)(now - aacp_tx_since_ms) >= AACP_CHANNEL_TIMEOUT_MS) {
+        aacp_channel_failed();
+        return;
+    }
+    // A successful write is not proof the uplink stopped; drain before restarting.
+    if (aacp_mic_stopping) {
+        if ((uint32_t)(now - aacp_last_uplink_ms) >= AACP_MIC_QUIET_MS) {
+            aacp_mic_stopping = aacp_mic_remote_active = false;
+        } else if ((uint32_t)(now - aacp_mic_stop_since_ms) >= AACP_MIC_DRAIN_MS) {
+            if (aacp_mic_stop_retries++ == 0) {
+                aacp_mic_stop_since_ms = now;
+                if (!aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes)))
+                    aacp_channel_failed();
+            } else {
+                aacp_channel_failed();
+            }
+            return;
+        }
+    }
+    aacp_try_mic_start();
 }
 
-// --- type-0x58 audio SDU handling (port of librepods aacp_audio.rs) ---
-
-// Predicate for 0x58 *audio* frames (subtype 0x0001).
-static bool aacp_is_audio_sdu(const uint8_t *sdu, uint16_t size) {
-    return size >= 8
-        && sdu[0] == 0x04
-        && sdu[2] == 0x04
-        && little_endian_read_16(sdu, 4) == 0x0058
-        && little_endian_read_16(sdu, 6) == 0x0001;
+static bool aacp_has_header(const uint8_t *sdu, uint16_t size) {
+    return size >= 6 && sdu[0] == 4 && sdu[1] == 0 && sdu[2] == 4 && sdu[3] == 0;
 }
 
-// Walk the sub-frames of one 0x58 audio SDU: 22-byte header, then
-// N x [timestamp:u32 LE][au_len:u8][AU bytes]. Each AU goes to the AAC-ELD
-// decoder; size statistics feed the 1 Hz report.
+// Validate the entire SDU before decoding any AU, as in NTPods aap::for_each_au.
+static bool aacp_valid_audio_sdu(const uint8_t *sdu, uint16_t size) {
+    if (!aacp_has_header(sdu, size) || size <= TYPE58_HEADER_LEN ||
+        little_endian_read_16(sdu, 4) != 0x58 ||
+        little_endian_read_16(sdu, 6) != 1) return false;
+    unsigned off = TYPE58_HEADER_LEN;
+    while (off < size) {
+        if ((unsigned)size - off < 5) return false;
+        unsigned len = sdu[off + 4];
+        if (len == 0 || len > (unsigned)size - off - 5) return false;
+        off += 5 + len;
+    }
+    return true;
+}
+
 static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
+    if (!aacp_valid_audio_sdu(sdu, size)) {
+        mic_stats.demux_short++;
+        if (aacp_mic_want && aacp_mic_running) aacp_mic_dec_reset();
+        return;
+    }
+    uint32_t now = btstack_run_loop_get_time_ms();
+    // Late or unsolicited uplink packets must not reach a closed USB recording.
+    if (!usb_mic_requested() && aacp_mic_want) aacp_mic_stop();
+    if (!usb_mic_requested() || !aacp_mic_want || !aacp_mic_running) {
+        aacp_last_uplink_ms = now;
+        if (!aacp_mic_want && !aacp_mic_remote_active && !aacp_mic_stopping) {
+            aacp_mic_remote_active = true;
+            if (!aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes)))
+                aacp_channel_failed();
+        }
+        return;
+    }
+    if ((uint32_t)(now - mic_stats.last_sdu_ms) >= 2000 && !aacp_mic_dec_reset()) return;
     mic_stats.sdu_total++;
     mic_stats.sdu_interval++;
     if (size > mic_stats.sdu_max) mic_stats.sdu_max = size;
-    mic_stats.last_sdu_ms = btstack_run_loop_get_time_ms();
-
-    uint16_t off = TYPE58_HEADER_LEN;
-    while ((uint32_t) off + 5 <= size) {
-        uint8_t au_len = sdu[off + 4];
-        uint16_t start = off + 5;
-        uint32_t end   = (uint32_t) start + au_len;
-        if (end > size) {          // truncated trailer — count and stop
-            mic_stats.demux_short++;
-            break;
+    bool decoded = false;
+    for (unsigned off = TYPE58_HEADER_LEN; off < size;) {
+        if (!usb_mic_requested()) {
+            aacp_mic_stop();
+            return;
         }
-        aacp_mic_dec_decode(&sdu[start], au_len);
+        uint8_t len = sdu[off + 4];
+        decoded |= aacp_mic_dec_decode(sdu + off + 5, len);
         mic_stats.au_total++;
         mic_stats.au_interval++;
-        mic_stats.au_bytes_interval += au_len;
-        if (au_len < mic_stats.au_min) mic_stats.au_min = au_len;
-        if (au_len > mic_stats.au_max) mic_stats.au_max = au_len;
-        off = (uint16_t) end;
+        mic_stats.au_bytes_interval += len;
+        if (len < mic_stats.au_min) mic_stats.au_min = len;
+        if (len > mic_stats.au_max) mic_stats.au_max = len;
+        off += 5 + len;
     }
+    if (decoded) mic_stats.last_sdu_ms = now;
 }
 
-// ------------------------------------------------------------------
-
-static void aacp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
-    UNUSED(channel);
-    switch (packet_type) {
-        case HCI_EVENT_PACKET:
-            switch (hci_event_packet_get_type(packet)) {
-                case L2CAP_EVENT_CHANNEL_OPENED: {
-                    uint8_t  status = l2cap_event_channel_opened_get_status(packet);
-                    uint16_t cid    = l2cap_event_channel_opened_get_local_cid(packet);
-                    if (status != ERROR_CODE_SUCCESS) {
-                        printf("[AACP] channel open FAILED: status 0x%02x\n", status);
-                        aacp_cid       = 0;
-                        aacp_connected = false;
-                        aacp_schedule_retry();
-                        return;
-                    }
-                    aacp_cid       = cid;
-                    aacp_connected = true;
-                    printf("[AACP] channel OPEN cid 0x%04x remote_mtu %u — starting handshake\n",
-                           cid, l2cap_event_channel_opened_get_remote_mtu(packet));
-                    aacp_queue_init_sequence();
-                    break;
-                }
-                case L2CAP_EVENT_CAN_SEND_NOW:
-                    aacp_handle_can_send_now();
-                    break;
-                case L2CAP_EVENT_CHANNEL_CLOSED:
-                    printf("[AACP] channel CLOSED\n");
-                    aacp_cid       = 0;
-                    aacp_connected = false;
-                    aacp_tx_head   = 0;
-                    aacp_tx_count  = 0;
-                    aacp_mic_teardown();
-                    break;
-                default:
-                    break;
+static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {
+    if (type == L2CAP_DATA_PACKET) {
+        if (!aacp_session || !aacp_connected || channel != aacp_cid ||
+            !aacp_has_header(packet, size)) return;
+        // All microphone messages, including malformed ones, stay out of control readiness.
+        if (little_endian_read_16(packet, 4) == 0x58) {
+            aacp_handle_audio_sdu(packet, size);
+        } else {
+            aacp_got_control = true;
+            aacp_try_mic_start();
+        }
+        return;
+    }
+    if (type != HCI_EVENT_PACKET || size < 2 || (unsigned)packet[1] + 2 != size) return;
+    switch (hci_event_packet_get_type(packet)) {
+        case L2CAP_EVENT_CHANNEL_OPENED: {
+            if (size < 21) return;
+            uint8_t status = l2cap_event_channel_opened_get_status(packet);
+            uint16_t cid = l2cap_event_channel_opened_get_local_cid(packet);
+            bd_addr_t addr;
+            l2cap_event_channel_opened_get_address(packet, addr);
+            if (!aacp_session || aacp_cid == 0 || cid != aacp_cid ||
+                memcmp(addr, aacp_addr, sizeof(addr)) != 0) {
+                if (status == ERROR_CODE_SUCCESS) l2cap_disconnect(cid);
+                return;
             }
+            if (status != ERROR_CODE_SUCCESS) {
+                aacp_channel_failed();
+                return;
+            }
+            aacp_connected = true;
+            aacp_got_control = aacp_init_sent = false;
+            aacp_channel_since_ms = btstack_run_loop_get_time_ms();
+            aacp_tx_enqueue(aacp_handshake, sizeof(aacp_handshake));
+            aacp_tx_enqueue(aacp_set_feature_flags, sizeof(aacp_set_feature_flags));
+            aacp_tx_enqueue(aacp_request_notifications, sizeof(aacp_request_notifications));
             break;
-
-        case L2CAP_DATA_PACKET:
-            // Audio SDUs first (hot path once the mic runs — stats only, no logs).
-            if (aacp_is_audio_sdu(packet, size)) {
-                aacp_handle_audio_sdu(packet, size);
-                break;
-            }
-
-            // Control packets: 04 00 04 00 data header + u16le opcode.
-            // Not logged per packet — the AirPods send occasional multi-
-            // hundred-byte info bursts that must not stall the run loop.
-            if (size >= 6 && packet[0] == 0x04 && packet[1] == 0x00 &&
-                packet[2] == 0x04 && packet[3] == 0x00) {
-                if (!aacp_got_control) {
-                    aacp_got_control = true;
-                    printf("[AACP] control channel confirmed (first packet)\n");
-                    // Host already holds the mic open (USB alt 1)? Fire the
-                    // deferred START now that the channel is confirmed.
-                    if (aacp_mic_want && !aacp_mic_running) {
-                        printf("[MIC] firing deferred START\n");
-                        aacp_mic_start();
-                    }
-                }
-            }
+        }
+        case L2CAP_EVENT_CAN_SEND_NOW:
+            if (size >= 4 && aacp_session && aacp_connected &&
+                l2cap_event_can_send_now_get_local_cid(packet) == aacp_cid)
+                aacp_handle_can_send_now();
             break;
-
+        case L2CAP_EVENT_CHANNEL_CLOSED:
+            if (size >= 4 && aacp_session &&
+                l2cap_event_channel_closed_get_local_cid(packet) == aacp_cid)
+                aacp_channel_failed();
+            break;
         default:
             break;
     }

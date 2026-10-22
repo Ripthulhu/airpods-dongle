@@ -1,0 +1,64 @@
+diff --git a/src/hci.c b/src/hci.c
+index d3f4404..9720e0f 100644
+--- a/src/hci.c
++++ b/src/hci.c
+@@ -3763,13 +3763,9 @@ static void event_handler(uint8_t *packet, uint16_t size){
+ 
+ #ifdef ENABLE_CLASSIC
+         case HCI_EVENT_FLUSH_OCCURRED:
+-            // flush occurs only if automatic flush has been enabled by gap_enable_link_watchdog()
+-            handle = hci_event_flush_occurred_get_handle(packet);
+-            conn = hci_connection_for_handle(handle);
+-            if (conn) {
+-                log_info("Flush occurred, disconnect 0x%04x", handle);
+-                conn->state = SEND_DISCONNECT;
+-            }
++            // AirPods dongle: expired media must not tear down reliable control.
++            // The application enables a bounded media-only flush timeout.
++
+             break;
+ 
+         case HCI_EVENT_INQUIRY_COMPLETE:
+diff --git a/src/l2cap.c b/src/l2cap.c
+index 32d8a4c..8eb41c6 100644
+--- a/src/l2cap.c
++++ b/src/l2cap.c
+@@ -1408,8 +1408,12 @@ static void l2cap_rtx_timeout(btstack_timer_source_t * ts){
+     l2cap_free_channel_entry(channel);
+ }
+ 
++static uint16_t l2cap_flushable_local_cid;
++void l2cap_set_flushable_local_cid(uint16_t local_cid){
++    l2cap_flushable_local_cid = local_cid;
++}
+ static uint8_t l2cap_classic_packet_boundary_flag(void){
+-    return (hci_non_flushable_packet_boundary_flag_supported() && (hci_automatic_flush_timeout() == 0)) ? 0x00 : 0x02;
++    return hci_non_flushable_packet_boundary_flag_supported() ? 0x00 : 0x02;
+ }
+ #endif
+ 
+@@ -1516,6 +1520,10 @@ uint8_t l2cap_send_prepared(uint16_t local_cid, uint16_t len){
+     // set non-flushable packet boundary flag if supported on Controller
+     uint8_t *acl_buffer = hci_get_outgoing_packet_buffer();
+     uint8_t packet_boundary_flag = l2cap_classic_packet_boundary_flag();
++    // Only media expires; AVDTP signaling and AACP stay reliable.
++    if (l2cap_flushable_local_cid != 0 && channel->local_cid == l2cap_flushable_local_cid){
++        packet_boundary_flag = 0x02;
++    }
+     l2cap_setup_header(acl_buffer, channel->con_handle, packet_boundary_flag, channel->remote_cid, len + fcs_size);
+ 
+ #ifdef ENABLE_L2CAP_ENHANCED_RETRANSMISSION_MODE
+diff --git a/src/l2cap.h b/src/l2cap.h
+index d0abb8a..08d8a40 100644
+--- a/src/l2cap.h
++++ b/src/l2cap.h
+@@ -483,6 +483,9 @@ void l2cap_remove_event_handler(btstack_packet_callback_registration_t * callbac
+  */
+ uint16_t l2cap_max_mtu(void);
+ 
++/** Mark the single media channel auto-flushable. Pass zero on teardown. */
++void l2cap_set_flushable_local_cid(uint16_t local_cid);
++
+ /** 
+  * @brief Get max MTU for LE connections based on btstack configuration
+  */

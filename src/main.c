@@ -8,6 +8,7 @@
 #include "btstack/aacp_mic_dec.h"
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include "pico/stdlib.h"
 
 #include "pico/multicore.h"
@@ -73,31 +74,27 @@ static bool __no_inline_not_in_flash_func(get_bootsel_button)() {
 // — observed as a watchdog reset when pressing the reconnect button. The IRQ
 // handlers only latch a request; the main loop executes it with the
 // async-context lock held.
-static volatile bool btn_single_pending = false;
-static volatile bool btn_double_pending = false;
-static volatile bool btn_long_pending   = false;
+static atomic_bool btn_single_pending;
+static atomic_bool btn_double_pending;
+static atomic_bool btn_long_pending;
 
 void on_single_press(void){
-    printf("key pressed short (single tap)!\n");
-    btn_single_pending = true;
+    atomic_store(&btn_single_pending, true);
 }
 
 void on_double_press(void){
-    printf("key pressed double!\n");
-    btn_double_pending = true;
+    atomic_store(&btn_double_pending, true);
 }
 
 void on_long_press(void){
-    printf("key pressed long!\n");
-    btn_long_pending = true;
+    atomic_store(&btn_long_pending, true);
 }
 
 // Runs in main-loop (thread) context.
 static void process_button_actions(void){
     async_context_t *ctx = cyw43_arch_async_context();
 
-    if (btn_single_pending) {
-        btn_single_pending = false;
+    if (atomic_exchange(&btn_single_pending, false)) {
         async_context_acquire_lock_blocking(ctx);
         if (! get_a2dp_connected_flag()) {
             a2dp_source_reconnect();
@@ -107,34 +104,28 @@ static void process_button_actions(void){
         async_context_release_lock(ctx);
     }
 
-    if (btn_double_pending) {
-        btn_double_pending = false;
+    if (atomic_exchange(&btn_double_pending, false)) {
         async_context_acquire_lock_blocking(ctx);
         bool allow = get_allow_switch_slot();
         if (!allow) decrease_vol_by_key();
-        async_context_release_lock(ctx);
 
         if (allow) {
             uint8_t currect_slot = read_uint8_last_flash();
-            if (currect_slot == 0x1){
-                printf("switch to slot 2!\n");
+            uint8_t next_slot = currect_slot == 1 ? 2 : 1;
+            if (write_uint8_last_flash(next_slot)) {
                 set_led_mode_off();
-                set_led_mode_triple_blink();
-                write_uint8_last_flash(0x2);
-            } else{
-                printf("switch to slot 1!\n");
-                set_led_mode_off();
-                set_led_mode_double_blink();
-                write_uint8_last_flash(0x1);
+                if (next_slot == 2) set_led_mode_triple_blink();
+                else set_led_mode_double_blink();
+                get_link_keys();
+                avdtp_source_establish_stream();
+            } else {
+                printf("Slot selection could not be saved\n");
             }
-            async_context_acquire_lock_blocking(ctx);
-            get_link_keys();
-            async_context_release_lock(ctx);
         }
+        async_context_release_lock(ctx);
     }
 
-    if (btn_long_pending) {
-        btn_long_pending = false;
+    if (atomic_exchange(&btn_long_pending, false)) {
         async_context_acquire_lock_blocking(ctx);
         avdtp_disconnect_and_scan();
         async_context_release_lock(ctx);
@@ -257,19 +248,21 @@ int main() {
     btstack_main(0, NULL);
     sleep_ms(200);
 
-    // NOTE: FDK-AAC hangs on Core 1 (likely internal global state / malloc contention)
-    // Keep encoding on Core 0 for now
-    // multicore_launch_core1_with_stack(core1_aaceld_encoder_loop, core1_stack, sizeof(core1_stack));
-
     static repeating_timer_t usb_timer;
     // NEGATIVE interval (hard period): fire every 500us measured from the
     // previous START, so tinyusb_task() runs at a steady cadence regardless of
     // how long each call takes. USB audio is isochronous — the OUT endpoint
     // must be serviced on a fixed rhythm or samples drift/underrun.
-    add_repeating_timer_us(-500, usb_timer_callback, NULL, &usb_timer);
+    if (!add_repeating_timer_us(-500, usb_timer_callback, NULL, &usb_timer)) {
+        printf("USB service timer unavailable\n");
+        return 1;
+    }
 
     static repeating_timer_t bootsel_timer;
-    add_repeating_timer_us(20000, bootsel_timer_callback, NULL, &bootsel_timer);
+    if (!add_repeating_timer_us(20000, bootsel_timer_callback, NULL, &bootsel_timer)) {
+        printf("Button timer unavailable\n");
+        return 1;
+    }
 
     // Enable watchdog — auto-resets if the main loop stops feeding it.
     // 8s (upstream used 2s): the mic decoder init below allocates ~258KB in
@@ -280,33 +273,24 @@ int main() {
     while (1) {
         watchdog_update();  // feed the watchdog
         process_button_actions();
-        tinyusb_control_task();
 
-        // Mic lifecycle: USB alt-setting callbacks (IRQ context) may not call
-        // BTstack directly, so they only latch requests; execute them here
-        // with the async-context lock — same pattern as the buttons above.
-        if (usb_mic_take_start_request()) {
-            async_context_t *ctx = cyw43_arch_async_context();
-            async_context_acquire_lock_blocking(ctx);
-            aacp_mic_start();
-            async_context_release_lock(ctx);
-        }
-        if (usb_mic_take_stop_request()) {
-            async_context_t *ctx = cyw43_arch_async_context();
-            async_context_acquire_lock_blocking(ctx);
-            aacp_mic_stop();
-            async_context_release_lock(ctx);
-        }
-
-        // Open the AAC-ELD mic decoder from the main loop (plain thread
-        // context — opening it from a BTstack callback hung on hardware),
-        // delayed until well after boot so the ~258KB of decoder mallocs
-        // can't stall USB enumeration.
-        if (!dec_init_done && to_ms_since_boot(get_absolute_time()) > 8000) {
+        bool mic_wanted;
+        async_context_t *ctx = cyw43_arch_async_context();
+        async_context_acquire_lock_blocking(ctx);
+        // Keep decoder allocation in thread context and serialize malloc with
+        // Bluetooth encoder callbacks. The USB service timer remains active.
+        if (!dec_init_done && usb_mic_requested()) {
             dec_init_done = true;
-            aacp_mic_dec_init();
+            if (!aacp_mic_dec_init()) printf("Microphone decoder unavailable\n");
         }
-        sleep_ms(50);
+        tinyusb_control_task();
+        if (usb_mic_take_request(&mic_wanted)) {
+            if (mic_wanted) aacp_mic_start();
+            else aacp_mic_stop();
+        }
+        aacp_poll();
+        async_context_release_lock(ctx);
+        sleep_ms(1);
     }
 
 }
