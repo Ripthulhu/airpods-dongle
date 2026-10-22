@@ -13,6 +13,7 @@
 #include "btstack_ble_scan.h"
 #include "../pico_w_led.h"
 #include "../slot_storage.h"
+#include "btstack_tlv.h"
 
 
 #define A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS 12
@@ -25,6 +26,118 @@ static bd_addr_t device_addr_list[2];
 
 static bool scan_active;
 static bool selected_bonded;
+
+#define PHONE_TAG 0x4150484eu // APHN, independent of APSL and BTstack bond records.
+#define PHONE_PAIRING_MS 120000u
+static bd_addr_t phone_address, phone_candidate;
+static bool phone_bonded, phone_pairing, phone_storage_supported;
+static uint32_t phone_pairing_since;
+
+typedef struct {
+    uint8_t version;
+    uint8_t address[6];
+} phone_record_t;
+_Static_assert(sizeof(phone_record_t) == 7, "phone identity layout changed");
+
+static bool airpods_address(const uint8_t address[6]) {
+    return peer_address_valid(address) &&
+        (memcmp(address, device_addr, 6) == 0 ||
+         memcmp(address, device_addr_list[0], 6) == 0 ||
+         memcmp(address, device_addr_list[1], 6) == 0);
+}
+
+static void phone_load(void) {
+    const btstack_tlv_t *tlv;
+    void *context;
+    btstack_tlv_get_instance(&tlv, &context);
+    phone_record_t record;
+    memset(phone_address, 0, sizeof(phone_address));
+    memset(phone_candidate, 0, sizeof(phone_candidate));
+    phone_bonded = phone_pairing = false;
+    phone_storage_supported = tlv != NULL;
+    if (tlv == NULL) return;
+    int length = tlv->get_tag(context, PHONE_TAG, NULL, 0);
+    if (length == 0) return;
+    phone_storage_supported = length == (int)sizeof(record) &&
+        tlv->get_tag(context, PHONE_TAG, (uint8_t *)&record, sizeof(record)) == (int)sizeof(record) &&
+        record.version == 1 && peer_address_valid(record.address);
+    if (!phone_storage_supported || airpods_address(record.address)) return;
+    memcpy(phone_address, record.address, 6);
+    link_key_t key;
+    link_key_type_t type;
+    phone_bonded = gap_get_link_key_for_bd_addr(phone_address, key, &type);
+}
+
+bool bt_hci_phone_pairing_active(void) {
+    return phone_pairing &&
+        (uint32_t)(btstack_run_loop_get_time_ms() - phone_pairing_since) < PHONE_PAIRING_MS;
+}
+
+void bt_hci_phone_poll(void) {
+    if (!phone_pairing || bt_hci_phone_pairing_active()) return;
+    phone_pairing = false;
+    memset(phone_candidate, 0, sizeof(phone_candidate));
+    gap_discoverable_control(0);
+}
+
+void bt_hci_phone_pairing_start(void) {
+    if (!phone_storage_supported) {
+        printf("Phone identity storage unavailable or unsupported\n");
+        return;
+    }
+    memset(phone_candidate, 0, sizeof(phone_candidate));
+    phone_pairing_since = btstack_run_loop_get_time_ms();
+    phone_pairing = true;
+    gap_discoverable_control(1);
+    printf("Phone pairing available for 120 seconds\n");
+}
+
+bool bt_hci_phone_peer_allowed(const uint8_t address[6]) {
+    if (address == NULL || !peer_address_valid(address) || airpods_address(address)) return false;
+    if (phone_bonded && memcmp(address, phone_address, 6) == 0) return true;
+    return bt_hci_phone_pairing_active() && memcmp(address, phone_candidate, 6) == 0;
+}
+
+bool bt_hci_phone_peer_connected(const uint8_t address[6]) {
+    if (!bt_hci_phone_peer_allowed(address)) return false;
+    hci_connection_t *connection = hci_connection_for_bd_addr_and_type(address, BD_ADDR_TYPE_ACL);
+    if (connection == NULL || gap_security_level(connection->con_handle) < LEVEL_2) return false;
+    link_key_t key;
+    link_key_type_t type;
+    if (!gap_get_link_key_for_bd_addr((uint8_t *)address, key, &type)) return false;
+    if (phone_bonded && memcmp(address, phone_address, 6) == 0) return true;
+    const btstack_tlv_t *tlv;
+    void *context;
+    btstack_tlv_get_instance(&tlv, &context);
+    if (!phone_storage_supported || tlv == NULL) return false;
+    phone_record_t record = {.version = 1}, verify;
+    memcpy(record.address, address, 6);
+    if (tlv->store_tag(context, PHONE_TAG, (const uint8_t *)&record, sizeof(record)) != 0 ||
+        tlv->get_tag(context, PHONE_TAG, NULL, 0) != (int)sizeof(verify) ||
+        tlv->get_tag(context, PHONE_TAG, (uint8_t *)&verify, sizeof(verify)) != (int)sizeof(verify) ||
+        memcmp(&record, &verify, sizeof(record)) != 0) return false;
+    memcpy(phone_address, address, 6);
+    phone_bonded = true;
+    phone_pairing = false;
+    memset(phone_candidate, 0, sizeof(phone_candidate));
+    gap_discoverable_control(0);
+    return true;
+}
+
+static int accept_classic_peer(bd_addr_t address, hci_link_type_t link_type) {
+    if (link_type != HCI_LINK_TYPE_ACL || !peer_address_valid(address)) return 0;
+    if (peer_address_valid(device_addr) && memcmp(address, device_addr, 6) == 0) return 1;
+    if (bt_hci_phone_peer_allowed(address)) return 1;
+    if (!bt_hci_phone_pairing_active() || airpods_address(address) ||
+        peer_address_valid(phone_candidate)) return 0;
+    memcpy(phone_candidate, address, 6);
+    return 1;
+}
+
+static bool pairing_peer_allowed(const uint8_t address[6]) {
+    return (peer_address_valid(device_addr) && memcmp(address, device_addr, 6) == 0) ||
+        (bt_hci_phone_pairing_active() && bt_hci_phone_peer_allowed(address));
+}
 
 
 const char * get_device_addr_string(){
@@ -68,6 +181,9 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             ble_scan_controller_ready(btstack_event_state_get_state(packet) == HCI_STATE_WORKING);
             if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) {
                 scan_active = false;
+                phone_pairing = false;
+                memset(phone_candidate, 0, sizeof(phone_candidate));
+                gap_discoverable_control(0);
                 ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
                 return;
             }
@@ -92,9 +208,21 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             break;
         case HCI_EVENT_PIN_CODE_REQUEST:
             if (size < 8) return;
-            printf("Pin code request - using '0000'\n");
             hci_event_pin_code_request_get_bd_addr(packet, address);
-            gap_pin_code_response(address, "0000");
+            if (peer_address_valid(device_addr) && memcmp(address, device_addr, 6) == 0)
+                gap_pin_code_response(address, "0000");
+            else gap_pin_code_negative(address);
+            break;
+        case HCI_EVENT_USER_CONFIRMATION_REQUEST:
+            if (size < 12) return;
+            hci_event_user_confirmation_request_get_bd_addr(packet, address);
+            if (pairing_peer_allowed(address)) gap_ssp_confirmation_response(address);
+            else gap_ssp_confirmation_negative(address);
+            break;
+        case HCI_EVENT_USER_PASSKEY_REQUEST:
+            if (size < 8) return;
+            hci_event_user_passkey_request_get_bd_addr(packet, address);
+            gap_ssp_passkey_negative(address); // There is no local passkey input.
             break;
         case GAP_EVENT_INQUIRY_RESULT:
             if (size < 27) return;
@@ -116,7 +244,8 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 printf(", name '%s'", name_buffer);
             }
             printf("\n");
-            if (scan_active && (cod & bluetooth_speaker_cod) == bluetooth_speaker_cod){
+            if (scan_active && (cod & bluetooth_speaker_cod) == bluetooth_speaker_cod &&
+                memcmp(address, phone_address, 6) != 0 && memcmp(address, phone_candidate, 6) != 0){
                 scan_active = false;
                 gap_inquiry_stop();
                 ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
@@ -201,14 +330,20 @@ void bt_hci_init(void){
     // Set local name with a template Bluetooth address, that will be automatically
     // replaced with a actual address once it is available, i.e. when BTstack boots
     // up and starts talking to a Bluetooth module.
-    gap_set_local_name("Pico USB Audio");
+    gap_set_local_name("AirPods Dongle");
     gap_discoverable_control(0);
-    gap_set_class_of_device(0x200408);
+    gap_set_class_of_device(0x240408);
+    gap_connectable_control(1);
+    gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
+    gap_ssp_set_auto_accept(0);
+    gap_register_classic_connection_filter(accept_classic_peer);
 
     /* Register for HCI events */
     hci_event_callback_registration.callback = &hci_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
     get_link_keys();
+    phone_load();
 
 }

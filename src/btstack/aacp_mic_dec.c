@@ -50,6 +50,9 @@ static _Atomic uint32_t queue_overruns;
 static _Atomic bool reset_stats_requested, report_requested, report_ready;
 static _Atomic bool decoder_failed;
 static _Atomic(HANDLE_AACDECODER) mic_dec;
+static _Atomic bool release_requested;
+static _Atomic(HANDLE_AACDECODER) released_dec;
+static bool failure_reported; // Core0 only.
 
 // Everything below is owned by core1 after the configured handle is published.
 static uint32_t worker_generation;
@@ -76,6 +79,7 @@ static void report_heap(const char *tag) {
 }
 
 bool aacp_mic_dec_init(void) {
+    if (atomic_load_explicit(&release_requested, memory_order_acquire)) return false;
     if (atomic_load_explicit(&mic_dec, memory_order_acquire) != NULL)
         return !atomic_load_explicit(&decoder_failed, memory_order_acquire);
     // Keep large FDK allocations on core0, outside Bluetooth callbacks.
@@ -93,6 +97,9 @@ bool aacp_mic_dec_init(void) {
         printf("[DEC] configuration failed\n");
         return false;
     }
+    failure_reported = false;
+    atomic_store_explicit(&decoder_failed, false, memory_order_release);
+    aacp_mic_pcm_reset();
     atomic_store_explicit(&mic_dec, decoder, memory_order_release);
     report_heap("after");
     printf("[DEC] configured: AAC-ELD mono/480, core1 worker\n");
@@ -101,8 +108,25 @@ bool aacp_mic_dec_init(void) {
 }
 
 bool aacp_mic_dec_ready(void) {
-    return atomic_load_explicit(&mic_dec, memory_order_acquire) != NULL &&
+    return !atomic_load_explicit(&release_requested, memory_order_acquire) &&
+           atomic_load_explicit(&mic_dec, memory_order_acquire) != NULL &&
            !atomic_load_explicit(&decoder_failed, memory_order_acquire);
+}
+
+bool aacp_mic_dec_release(void) {
+    if (!atomic_load_explicit(&release_requested, memory_order_acquire)) {
+        if (atomic_load_explicit(&mic_dec, memory_order_acquire) == NULL) return true;
+        aacp_mic_pcm_reset();
+        atomic_store_explicit(&release_requested, true, memory_order_release);
+        aacp_mic_dec_wake_worker();
+    }
+    HANDLE_AACDECODER decoder = atomic_exchange_explicit(&released_dec, NULL, memory_order_acq_rel);
+    if (decoder == NULL) return false;
+    // Core1 cannot load this detached handle while release_requested remains set.
+    aacDecoder_Close(decoder);
+    atomic_store_explicit(&report_ready, false, memory_order_release);
+    atomic_store_explicit(&release_requested, false, memory_order_release);
+    return true;
 }
 
 void aacp_mic_pcm_reset(void) {
@@ -185,6 +209,21 @@ static bool decode_job(HANDLE_AACDECODER decoder, const mic_input_t *job) {
 }
 
 bool aacp_mic_dec_worker_step(void) {
+    if (atomic_load_explicit(&release_requested, memory_order_acquire)) {
+        HANDLE_AACDECODER detached = atomic_exchange_explicit(&mic_dec, NULL, memory_order_acq_rel);
+        if (detached == NULL) return false;
+        // Submission is gated; only the worker advances its compressed-input cursor.
+        atomic_store_explicit(&input_read,
+            atomic_load_explicit(&input_written, memory_order_acquire), memory_order_release);
+        worker_generation = atomic_load_explicit(&generation, memory_order_acquire) - 1u;
+        atomic_store_explicit(&reset_ack, worker_generation, memory_order_release);
+        atomic_store_explicit(&reset_stats_requested, false, memory_order_release);
+        atomic_store_explicit(&report_requested, false, memory_order_release);
+        memset(&stats, 0, sizeof(stats));
+        decode_flags = AACDEC_CLRHIST;
+        atomic_store_explicit(&released_dec, detached, memory_order_release);
+        return true;
+    }
     HANDLE_AACDECODER decoder = atomic_load_explicit(&mic_dec, memory_order_acquire);
     if (decoder == NULL || atomic_load_explicit(&decoder_failed, memory_order_acquire))
         return false;
@@ -246,10 +285,9 @@ void aacp_mic_dec_report(void) {
 }
 
 void aacp_mic_dec_poll(void) {
-    static bool failure_reported;
     if (!failure_reported && atomic_load_explicit(&decoder_failed, memory_order_acquire)) {
         failure_reported = true;
-        printf("[DEC] worker reset failed; microphone unavailable until restart\n");
+        printf("[DEC] worker reset failed; microphone decoder must be reinitialized\n");
     }
     if (!atomic_load_explicit(&report_ready, memory_order_acquire)) return;
     mic_stats_t snapshot = report;

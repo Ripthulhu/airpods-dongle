@@ -7,6 +7,7 @@
 #include "btstack/btstack_ble_scan.h"
 #include "btstack/btstack_aacp.h"
 #include "btstack/aacp_mic_dec.h"
+#include "btstack/phone_sink.h"
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -102,6 +103,7 @@ static bool __no_inline_not_in_flash_func(get_bootsel_button)() {
 static atomic_bool btn_single_pending;
 static atomic_bool btn_double_pending;
 static atomic_bool btn_long_pending;
+static atomic_bool btn_phone_pending;
 
 void on_single_press(void){
     atomic_store(&btn_single_pending, true);
@@ -118,6 +120,12 @@ void on_long_press(void){
 // Runs in main-loop (thread) context.
 static void process_button_actions(void){
     async_context_t *ctx = cyw43_arch_async_context();
+
+    if (atomic_exchange(&btn_phone_pending, false)) {
+        async_context_acquire_lock_blocking(ctx);
+        bt_hci_phone_pairing_start();
+        async_context_release_lock(ctx);
+    }
 
     if (atomic_exchange(&btn_single_pending, false)) {
         async_context_acquire_lock_blocking(ctx);
@@ -191,7 +199,10 @@ void check_bootsel_state(void)
                 uint64_t press_len = now - press_start_us;
 
                 // classify type of this press
-                if (press_len >= LONG_PRESS_MIN_US) {
+                if (press_len >= 3000000u) {
+                    atomic_store(&btn_phone_pending, true);
+                    button_gesture.pending = false;
+                } else if (press_len >= LONG_PRESS_MIN_US) {
                     on_long_press();
                     button_gesture.pending = false;
                 } else if (press_len >= SHORT_PRESS_MIN_US) {
@@ -288,7 +299,10 @@ int main() {
 
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
-    btstack_main(0, NULL);
+    if (btstack_main(0, NULL) != 0) {
+        printf("Bluetooth audio services unavailable\n");
+        return 1;
+    }
     sleep_ms(200);
 
     static repeating_timer_t usb_timer;
@@ -307,6 +321,7 @@ int main() {
     watchdog_enable(8000, true);
 
     bool dec_init_done = false;
+    bool dec_release_pending = false;
     uint32_t button_sample_ms = to_ms_since_boot(get_absolute_time());
     while (1) {
         watchdog_update();  // feed the watchdog
@@ -320,11 +335,24 @@ int main() {
         bool mic_wanted;
         async_context_t *ctx = cyw43_arch_async_context();
         async_context_acquire_lock_blocking(ctx);
-        ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND, !usb_host_active());
+        bt_hci_phone_poll();
+        // The idle microphone decoder is too large to retain during a phone
+        // session. Core 1 detaches it before core 0 frees its allocations.
+        if (dec_release_pending ||
+            (dec_init_done && phone_sink_connected() &&
+             !usb_mic_requested() && !aacp_mic_active())) {
+            dec_release_pending = !aacp_mic_dec_release();
+            if (!dec_release_pending) dec_init_done = false;
+        }
+        if ((usb_mic_requested() || get_usb_streaming()) && phone_sink_connected())
+            phone_sink_yield();
+        if (!dec_release_pending) phone_sink_poll();
+        ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND,
+                            !usb_host_active() && !phone_sink_connected());
         ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, usb_mic_requested() || aacp_mic_active());
         // Keep decoder allocation in thread context and serialize malloc with
         // Bluetooth encoder callbacks. The USB service timer remains active.
-        if (!dec_init_done && usb_mic_requested()) {
+        if (!dec_init_done && !dec_release_pending && usb_mic_requested()) {
             dec_init_done = true;
             if (!aacp_mic_dec_init()) printf("Microphone decoder unavailable\n");
         }

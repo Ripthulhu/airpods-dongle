@@ -30,5 +30,17 @@
       "docs/WINDOWS-MIC-PROTOCOL-RESEARCH.md": "fa42fd27dc2f1ab66318f0247d89da11b14b67bc26ba91af18f44558b074ad70",
       "windows/daemon/src/battery_ble.rs": "9558693266aa298e6392e412ddd1803f3d8ae3d5b8e2b63495075063a6181582"
     }
+  },
+  "libfreeaptx": {
+    "repository": "https://github.com/regularhunter/libfreeaptx",
+    "revision": "476e2d56b0374c643c50bc37ab5cfee3012e2144",
+    "version": "0.2.2",
+    "license": "LGPL-2.1-or-later",
+    "sha256": {
+      "freeaptx.c": "89a63c7ab10310775263f41555e085fd8e9ff3ce4c7fd14760f5c0dc94cc56c3",
+      "freeaptx.h": "d1847494b914fd0ffca65dca56fcdc4414231c1e061bd4e3aa7590d385025651",
+      "COPYING": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551",
+      "README": "523cc1c46fed6788f192e70075b55a3b4846a46f93c4bc54d246427e2bf3f086"
+    }
   }
 }

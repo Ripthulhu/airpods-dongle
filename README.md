@@ -1,7 +1,7 @@
 # airpods-dongle
 
-AirPods USB audio bridge for Raspberry Pi Pico 2 W. The board owns Bluetooth;
-Windows uses its standard USB audio, media-key and serial drivers.
+AirPods USB and wireless phone audio bridge for Raspberry Pi Pico 2 W. The board
+owns Bluetooth; Windows uses its standard USB audio, media-key and serial drivers.
 
 Based on [USBPods](https://github.com/wasdwasd0105/USBPods-Pico2W) and
 [han-um's two-way audio fork](https://github.com/han-um/USBPods-Pico2W-2-way-audio-implement),
@@ -15,11 +15,12 @@ This version has not been tested on a Pico or AirPods. The source fork reports
 Pro 3 testing; that does not validate these changes.
 
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
+- Phone Bluetooth input with classic aptX where negotiated and SBC fallback.
 - Simultaneous AACP microphone, opened only by a USB recording request.
 - Microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
-- 100 ms encoded startup silence for AAC-ELD; source audio stays buffered in order.
-- Play, Pause, Next, Previous and Stop forwarded as USB media controls.
+- 100 ms encoded startup silence for AAC-ELD, sent before accepting phone playback.
+- Stem media controls and volume routed to the active phone or USB input.
 - Two saved headset slots; reconnect uses the selected address and its bond.
 - Bounded recovery, packet validation and USB suspend/disconnect cleanup.
 
@@ -43,7 +44,7 @@ The firmware links both Classic and BLE through one BTstack controller. The
 
 BLE uses a provisional 30 ms scan window every 300 ms during stereo playback.
 It pauses for Classic pairing searches, microphone startup/capture/drain and USB
-suspension, then restores the scan policy. The CDC console reports aggregate
+suspension without a phone connection, then restores the scan policy. The CDC console reports aggregate
 counts at most once per five seconds; `requested` means a scan command was queued,
 not that controller acceptance was verified.
 
@@ -51,8 +52,8 @@ The eight-entry advertisement cache is an unassociated inventory. It does not
 identify the selected earbuds or case. Verified battery/finder data needs the
 selected pair's proximity keys and address resolution; case GATT also needs an
 explicit identity check. Scanning never pairs, opens an audio path or sends case
-commands. The current connection pool supports one Classic AirPods link and one
-additional LE link; passive scanning uses no connection slot.
+commands. The current connection pool supports two links: phone and AirPods occupy
+both during wireless playback. Passive scanning uses no connection slot.
 
 ## Build
 
@@ -75,8 +76,12 @@ picotool 2.1.1. Use a separate SDK checkout rather than modifying a shared one.
 
 ## Use
 
-Select **AirPods Dongle** as the playback and recording device. Long-press and
-release BOOTSEL to pair a headset already in pairing mode. While idle, a single
+Select **AirPods Dongle** as the USB playback and recording device. Hold BOOTSEL
+for at least one second but less than three and release to pair a headset already
+in pairing mode. Hold for at least three seconds to allow phone pairing for two
+minutes, then select **AirPods Dongle** in the phone's Bluetooth settings. For
+wireless use, power the Pico externally. USB playback and recording take priority
+over phone audio. See [phone bridge](docs/PHONE-TRANSPORT.md) for details. While idle, a single
 press reconnects the selected headset and a double press selects the other slot
 and connects it. During playback, those presses adjust volume instead.
 
@@ -89,9 +94,14 @@ Run native C and Python tests on Linux/WSL:
 
 ```sh
 python3 tools/test.py --sanitize
+python3 tools/test_phone_codecs.py --sdk .sdk/pico-sdk --sanitize
 ```
 
-The tests cover malformed packets, stale connections, cancelled recording,
+The second command checks the real aptX/SBC decoders and BTstack resampler.
+Use `--arm` instead of `--sanitize` for the ARM32 codec check; it requires QEMU.
+
+The tests cover malformed packets, phone codec negotiation and controls,
+early startup priming, stale connections, cancelled recording,
 decoder failures, PCM ordering, media-key release/retry, BLE pause/resume and
 advertisement bounds, and SDK patch validation.
 They do not measure radio behavior or acoustic latency. Slot migration, failed
@@ -108,13 +118,16 @@ heap margin and microphone clock drift remain unmeasured. The microphone uses
 the inherited 64 kHz USB presentation clock with a 48 kHz AAC coding configuration;
 this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
-Both cores have guarded 16 KiB stacks. The current build leaves 383 KiB of heap
-before codec allocations. A real-codec ARM emulation check leaves about 12 KiB
+Both cores have guarded 16 KiB stacks. The current build leaves 378 KiB of heap
+before codec allocations. A real-codec ARM emulation check leaves about 7 KiB
 after encoder/decoder initialization, before other runtime allocations. Hardware
 heap and stack measurements are still required.
+Phone playback releases the idle microphone decoder before preparing its input
+codec; USB recording releases the phone decoder before allocating the microphone.
 
-USB audio on Android needs an OTG/power and enumeration check. A wireless phone
-bridge is planned, not implemented; see [phone transport](docs/PHONE-TRANSPORT.md).
+USB audio on Android needs an OTG/power and enumeration check. Wireless stereo
+bridging also needs dual-link radio and latency checks. Phone calls are not
+implemented.
 
 See [implementation notes](docs/IMPLEMENTATION.md) for the reviewed differences
 and the boundaries that remain untested.

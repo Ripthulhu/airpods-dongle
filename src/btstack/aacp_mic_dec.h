@@ -6,9 +6,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Allocate/configure once in core0 thread context with the Bluetooth lock held.
+// Allocate/configure in core0 thread context with the Bluetooth lock held.
 bool aacp_mic_dec_init(void);
 bool aacp_mic_dec_ready(void);
+
+// Core0 thread only: request worker detachment, then free after its acknowledgement.
+// Returns false while work is in flight; keep polling before initializing again.
+bool aacp_mic_dec_release(void);
 
 // Core0 producer: copies a complete AU; success means queued, not decoded.
 bool aacp_mic_dec_submit(const uint8_t *au, uint16_t len);

@@ -5,7 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.3 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.4 LANGUAGES C CXX ASM)
 pico_sdk_init()
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
@@ -38,6 +38,9 @@ add_executable(airpods_dongle
     src/btstack/btstack_ble_scan.c
     src/btstack/btstack_aacp.c
     src/btstack/aacp_mic_dec.c
+    src/btstack/phone_sink.c
+    src/btstack/phone_codec.c
+    3rd-party/libfreeaptx/freeaptx.c
     src/tinyusb/uac.c
     src/tinyusb/usb_descriptors.c
     src/tinyusb/debug_cdc.c
@@ -46,10 +49,11 @@ add_executable(airpods_dongle
 target_include_directories(airpods_dongle PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"
     3rd-party/fdk-aac
+    3rd-party/libfreeaptx
 )
 target_link_libraries(airpods_dongle PRIVATE
     pico_stdlib pico_multicore pico_btstack_ble pico_btstack_classic pico_btstack_cyw43
-    pico_cyw43_arch_threadsafe_background pico_btstack_sbc_encoder
+    pico_cyw43_arch_threadsafe_background pico_btstack_sbc_encoder pico_btstack_sbc_decoder
     tinyusb_device tinyusb_board fdk-aac
 )
 pico_enable_stdio_uart(airpods_dongle 0)

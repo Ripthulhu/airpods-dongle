@@ -1,4 +1,5 @@
 * text=auto eol=lf
 patches/*.patch -whitespace
+3rd-party/libfreeaptx/README -whitespace
 *.png binary
 *.jpg binary

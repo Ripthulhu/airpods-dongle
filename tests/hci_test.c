@@ -15,6 +15,15 @@ static unsigned registered;
 static uint16_t flush_timeout;
 static bool ble_ready;
 static bool fail_storage;
+static uint32_t now;
+static unsigned pin_rejections, confirmations, confirmation_rejections, passkey_rejections;
+static uint8_t discoverable, security_level;
+static bool phone_has_key, missing_acl, tlv_missing, tlv_fail, tlv_corrupt;
+static unsigned phone_writes;
+static phone_record_t stored_phone;
+static int stored_phone_length;
+static bd_addr_t phone_key_address;
+static int (*connection_filter)(bd_addr_t, hci_link_type_t);
 static uint32_t ble_pauses;
 static btstack_packet_callback_registration_t *callbacks[2];
 static const bd_addr_t first = {0x10, 2, 3, 4, 5, 6};
@@ -40,6 +49,11 @@ void gap_pin_code_response(bd_addr_t address, const char *pin) {
     pin_calls++;
 }
 bool gap_get_link_key_for_bd_addr(bd_addr_t address, link_key_t key, link_key_type_t *type) {
+    if (phone_has_key && memcmp(address, phone_key_address, 6) == 0) {
+        memset(key, 0x22, sizeof(link_key_t));
+        *type = 1;
+        return true;
+    }
     for (unsigned i = 0; i < 2; ++i) {
         if (memcmp(address, saved[i], 6) == 0 && has_key[i]) {
             memset(key, 0x11, sizeof(link_key_t));
@@ -57,8 +71,53 @@ void hci_add_event_handler(btstack_packet_callback_registration_t *registration)
 void hci_set_master_slave_policy(uint8_t policy) { assert(policy == 0); }
 void hci_set_inquiry_mode(uint8_t mode) { assert(mode == INQUIRY_MODE_RSSI_AND_EIR); }
 void gap_set_local_name(const char *name) { assert(name != NULL); }
-void gap_discoverable_control(uint8_t discoverable) { assert(discoverable == 0); }
-void gap_set_class_of_device(uint32_t cod) { assert(cod == 0x200408); }
+void gap_discoverable_control(uint8_t enabled) { assert(enabled <= 1); discoverable = enabled; }
+void gap_set_class_of_device(uint32_t cod) { assert(cod == 0x240408); }
+void gap_connectable_control(uint8_t enabled) { assert(enabled == 1); }
+void gap_ssp_set_io_capability(int capability) { assert(capability == SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT); }
+void gap_ssp_set_authentication_requirement(int requirement) {
+    assert(requirement == SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
+}
+void gap_ssp_set_auto_accept(int auto_accept) { assert(auto_accept == 0); }
+void gap_register_classic_connection_filter(int (*callback)(bd_addr_t, hci_link_type_t)) {
+    connection_filter = callback;
+}
+int gap_pin_code_negative(bd_addr_t address) { (void)address; ++pin_rejections; return 0; }
+int gap_ssp_confirmation_response(const uint8_t address[6]) { (void)address; ++confirmations; return 0; }
+int gap_ssp_confirmation_negative(const uint8_t address[6]) { (void)address; ++confirmation_rejections; return 0; }
+int gap_ssp_passkey_negative(const uint8_t address[6]) { (void)address; ++passkey_rejections; return 0; }
+uint32_t btstack_run_loop_get_time_ms(void) { return now; }
+hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t address[6], uint8_t type) {
+    assert(type == BD_ADDR_TYPE_ACL && address != NULL);
+    static hci_connection_t connection = {.con_handle = 1};
+    return missing_acl ? NULL : &connection;
+}
+uint8_t gap_security_level(uint16_t handle) { assert(handle == 1); return security_level; }
+static int phone_get_tag(void *context, uint32_t tag, uint8_t *buffer, uint32_t size) {
+    (void)context;
+    assert(tag == PHONE_TAG);
+    if (buffer == NULL) return stored_phone_length;
+    unsigned copy = (unsigned)stored_phone_length;
+    if (copy > size) copy = size;
+    if (copy > sizeof(stored_phone)) copy = sizeof(stored_phone);
+    memcpy(buffer, &stored_phone, copy);
+    if (tlv_corrupt && copy != 0) buffer[0] ^= 1;
+    return (int)copy;
+}
+static int phone_store_tag(void *context, uint32_t tag, const uint8_t *buffer, uint32_t size) {
+    (void)context;
+    assert(tag == PHONE_TAG && size == sizeof(stored_phone));
+    if (tlv_fail) return -1;
+    memcpy(&stored_phone, buffer, size);
+    stored_phone_length = (int)size;
+    ++phone_writes;
+    return 0;
+}
+void btstack_tlv_get_instance(const btstack_tlv_t **tlv, void **context) {
+    static const btstack_tlv_t instance = {.get_tag = phone_get_tag, .store_tag = phone_store_tag};
+    *context = NULL;
+    *tlv = tlv_missing ? NULL : &instance;
+}
 const char *bd_addr_to_str(const uint8_t *address) {
     static char text[18];
     snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -101,6 +160,16 @@ static void fixture(void) {
     ble_ready = false;
     fail_storage = false;
     ble_pauses = 0;
+    now = 0;
+    pin_rejections = confirmations = confirmation_rejections = passkey_rejections = 0;
+    discoverable = 0;
+    security_level = LEVEL_2;
+    phone_has_key = missing_acl = tlv_missing = tlv_fail = tlv_corrupt = false;
+    phone_writes = 0;
+    stored_phone_length = 0;
+    memset(&stored_phone, 0, sizeof(stored_phone));
+    memset(phone_key_address, 0, sizeof(phone_key_address));
+    connection_filter = NULL;
 }
 static void working(void) {
     uint8_t p[] = {BTSTACK_EVENT_STATE, 1, HCI_STATE_WORKING};
@@ -298,6 +367,134 @@ static void test_failed_storage_cannot_replace_selected_peer(void) {
     assert(memcmp(device_addr, first, 6) == 0 && memcmp(saved[0], first, 6) == 0);
 }
 
+static int allow(const uint8_t address[6], hci_link_type_t type) {
+    bd_addr_t copy;
+    memcpy(copy, address, 6);
+    assert(connection_filter != NULL);
+    return connection_filter(copy, type);
+}
+
+static void authentication_event(uint8_t type, const uint8_t address[6]) {
+    uint8_t packet[12] = {type, 10};
+    if (type != HCI_EVENT_USER_CONFIRMATION_REQUEST) packet[1] = 6;
+    for (unsigned i = 0; i < 6; ++i) packet[2 + i] = address[5 - i];
+    hci_packet_handler(HCI_EVENT_PACKET, 0, packet, packet[1] + 2);
+}
+
+static void test_phone_pairing_is_bounded_and_keeps_airpods_slots(void) {
+    fixture();
+    memcpy(saved[0], first, 6);
+    memcpy(saved[1], second, 6);
+    has_key[0] = has_key[1] = true;
+    bt_hci_init();
+    assert(allow(first, HCI_LINK_TYPE_ACL));
+    assert(!allow(second, HCI_LINK_TYPE_ACL));
+    assert(!allow(nearby, HCI_LINK_TYPE_ACL));
+    assert(!bt_hci_phone_peer_allowed(nearby));
+    assert(!bt_hci_phone_peer_allowed(NULL));
+
+    bt_hci_phone_pairing_start();
+    assert(bt_hci_phone_pairing_active() && discoverable == 1);
+    assert(!allow(second, HCI_LINK_TYPE_ACL)); // A saved AirPods slot is never a phone.
+    assert(!allow(nearby, 0)); // No SCO/HFP support is advertised by this firmware.
+    assert(allow(nearby, HCI_LINK_TYPE_ACL));
+    assert(bt_hci_phone_peer_allowed(nearby));
+    const uint8_t another[] = {0x40, 1, 2, 3, 4, 5};
+    assert(!allow(another, HCI_LINK_TYPE_ACL)); // Only the first candidate can pair.
+    assert(!bt_hci_phone_peer_connected(nearby)); // ACL alone is not a bond.
+    memcpy(phone_key_address, nearby, 6);
+    phone_has_key = true;
+    security_level = 1;
+    assert(!bt_hci_phone_peer_connected(nearby)); // A cached key is not encryption.
+    security_level = LEVEL_2;
+    missing_acl = true;
+    assert(!bt_hci_phone_peer_connected(nearby));
+    missing_acl = false;
+    assert(bt_hci_phone_peer_connected(nearby));
+    assert(phone_writes == 1 && writes == 0 && !bt_hci_phone_pairing_active() && discoverable == 0);
+    assert(bt_hci_phone_peer_allowed(nearby) && allow(nearby, HCI_LINK_TYPE_ACL));
+    assert(bt_hci_phone_peer_connected(nearby) && phone_writes == 1);
+    assert(memcmp(saved[0], first, 6) == 0 && memcmp(saved[1], second, 6) == 0);
+    get_link_keys();
+    assert(memcmp(device_addr, first, 6) == 0 && selected_bonded);
+
+    registered = 0;
+    bt_hci_init();
+    assert(!bt_hci_phone_pairing_active() && bt_hci_phone_peer_allowed(nearby));
+    assert(allow(nearby, HCI_LINK_TYPE_ACL) && memcmp(device_addr, first, 6) == 0);
+    phone_has_key = false;
+    registered = 0;
+    bt_hci_init();
+    assert(!bt_hci_phone_peer_allowed(nearby) && !allow(nearby, HCI_LINK_TYPE_ACL));
+}
+
+static void test_phone_pairing_expiry_authentication_and_inquiry_roles(void) {
+    fixture();
+    memcpy(saved[0], first, 6);
+    has_key[0] = true;
+    bt_hci_init();
+    authentication_event(HCI_EVENT_USER_CONFIRMATION_REQUEST, nearby);
+    assert(confirmation_rejections == 1 && confirmations == 0);
+    authentication_event(HCI_EVENT_USER_CONFIRMATION_REQUEST, first);
+    authentication_event(HCI_EVENT_PIN_CODE_REQUEST, first);
+    assert(confirmations == 1 && pin_calls == 1);
+    bt_hci_phone_pairing_start();
+    assert(allow(nearby, HCI_LINK_TYPE_ACL));
+    authentication_event(HCI_EVENT_USER_CONFIRMATION_REQUEST, nearby);
+    authentication_event(HCI_EVENT_PIN_CODE_REQUEST, nearby);
+    authentication_event(HCI_EVENT_USER_PASSKEY_REQUEST, nearby);
+    assert(confirmations == 2 && pin_rejections == 1 && passkey_rejections == 1);
+    gap_start_scanning();
+    uint8_t packet[27];
+    result(packet, sizeof(packet), nearby, 0x240404); // Even misleading COD cannot steal a slot.
+    hci_packet_handler(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    assert(scan_active && writes == 0 && memcmp(device_addr, first, 6) == 0);
+    now = PHONE_PAIRING_MS;
+    assert(!bt_hci_phone_pairing_active() && !bt_hci_phone_peer_allowed(nearby));
+    authentication_event(HCI_EVENT_USER_CONFIRMATION_REQUEST, nearby);
+    assert(confirmation_rejections == 2);
+    bt_hci_phone_poll();
+    assert(discoverable == 0 && !peer_address_valid(phone_candidate));
+    assert(!allow(nearby, HCI_LINK_TYPE_ACL));
+    now = UINT32_MAX - 60000u;
+    bt_hci_phone_pairing_start();
+    now += PHONE_PAIRING_MS - 1u;
+    assert(bt_hci_phone_pairing_active());
+    ++now;
+    bt_hci_phone_poll();
+    assert(!bt_hci_phone_pairing_active() && discoverable == 0);
+}
+
+static void test_phone_storage_rejects_unknown_and_failed_writes(void) {
+    fixture();
+    stored_phone.version = 2;
+    memcpy(stored_phone.address, nearby, 6);
+    stored_phone_length = sizeof(stored_phone);
+    bt_hci_init();
+    bt_hci_phone_pairing_start();
+    assert(!bt_hci_phone_pairing_active() && discoverable == 0 && !allow(nearby, HCI_LINK_TYPE_ACL));
+    fixture();
+    tlv_missing = true;
+    bt_hci_init();
+    bt_hci_phone_pairing_start();
+    assert(!bt_hci_phone_pairing_active());
+
+    for (unsigned fault = 0; fault < 2; ++fault) {
+        fixture();
+        memcpy(saved[0], first, 6);
+        has_key[0] = true;
+        bt_hci_init();
+        bt_hci_phone_pairing_start();
+        assert(allow(nearby, HCI_LINK_TYPE_ACL));
+        memcpy(phone_key_address, nearby, 6);
+        phone_has_key = true;
+        tlv_fail = fault == 0;
+        tlv_corrupt = fault == 1;
+        assert(!bt_hci_phone_peer_connected(nearby));
+        assert(!phone_bonded && writes == 0 && memcmp(saved[0], first, 6) == 0);
+    }
+}
+
 int main(void) {
     test_selected_bond_auto_connects();
     test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback();
@@ -306,6 +503,9 @@ int main(void) {
     test_controller_off_and_failed_inquiry_release_ble_pause();
     test_controller_rejection_releases_ble_pause();
     test_failed_storage_cannot_replace_selected_peer();
-    puts("HCI selected-peer ownership, event bounds, storage failure and BLE coordination: 7 groups passed");
+    test_phone_pairing_is_bounded_and_keeps_airpods_slots();
+    test_phone_pairing_expiry_authentication_and_inquiry_roles();
+    test_phone_storage_rejects_unknown_and_failed_writes();
+    puts("HCI selected-peer ownership, phone pairing/authentication/storage and BLE coordination: 10 groups passed");
     return 0;
 }

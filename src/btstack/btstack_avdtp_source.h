@@ -26,6 +26,7 @@ void set_bt_volume(int16_t);
 uint8_t get_bt_volume();
 
 void set_usb_streaming(bool flag);
+bool get_usb_streaming(void);
 
 bool * get_is_bt_sink_volume_changed_ptr();
 

@@ -16,6 +16,8 @@ static CStreamInfo info = {48000, 480, 1, 39};
 static _Thread_local bool worker_thread;
 static _Atomic bool finished, worker_finished;
 static _Atomic unsigned delivered;
+static _Atomic bool decoder_live;
+static _Atomic unsigned codec_calls;
 static uint16_t sequence;
 
 static int checked_printf(const char *format, ...) {
@@ -30,35 +32,48 @@ static int checked_printf(const char *format, ...) {
 void aacp_mic_dec_wake_worker(void) {}
 HANDLE_AACDECODER aacDecoder_Open(int transport, UINT layers) {
     assert(!worker_thread && transport == TT_MP4_RAW && layers == 1);
+    assert(!atomic_exchange_explicit(&decoder_live, true, memory_order_acq_rel));
     return &info;
 }
-void aacDecoder_Close(HANDLE_AACDECODER decoder) { (void)decoder; assert(false); }
+void aacDecoder_Close(HANDLE_AACDECODER decoder) {
+    assert(!worker_thread && decoder == &info && atomic_load(&codec_calls) == 0);
+    assert(atomic_exchange_explicit(&decoder_live, false, memory_order_acq_rel));
+}
 AAC_DECODER_ERROR aacDecoder_ConfigRaw(HANDLE_AACDECODER decoder, UCHAR **config, UINT *size) {
     assert(!worker_thread && decoder == &info && config && *size == 4);
     return AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_SetParam(HANDLE_AACDECODER decoder, int param, int value) {
     assert(worker_thread && decoder == &info && param == AAC_TPDEC_CLEAR_BUFFER && value == 1);
+    assert(atomic_load_explicit(&decoder_live, memory_order_acquire));
     return AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_Fill(HANDLE_AACDECODER decoder, UCHAR **bytes, UINT *size, UINT *valid) {
     assert(worker_thread && decoder == &info && *size == 255 && *valid == *size);
+    atomic_fetch_add(&codec_calls, 1);
+    assert(atomic_load_explicit(&decoder_live, memory_order_acquire));
     uint16_t next = (uint16_t)((*bytes)[0] | ((*bytes)[1] << 8));
     assert(next > sequence);
     sequence = next;
     for (unsigned i = 2; i < *size; ++i) assert((*bytes)[i] == (uint8_t)(sequence + i));
     *valid = 0;
+    atomic_fetch_sub(&codec_calls, 1);
     return AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER decoder, INT_PCM *pcm, int capacity, UINT flags) {
     (void)flags;
     assert(worker_thread && decoder == &info && capacity == 480);
+    atomic_fetch_add(&codec_calls, 1);
+    assert(atomic_load_explicit(&decoder_live, memory_order_acquire));
     for (unsigned i = 0; i < 480; ++i) pcm[i] = (int16_t)sequence;
     if ((sequence & 31u) == 0) sched_yield();
+    assert(atomic_load_explicit(&decoder_live, memory_order_acquire));
+    atomic_fetch_sub(&codec_calls, 1);
     return AAC_DEC_OK;
 }
 CStreamInfo *aacDecoder_GetStreamInfo(HANDLE_AACDECODER decoder) {
     assert(worker_thread && decoder == &info);
+    assert(atomic_load_explicit(&decoder_live, memory_order_acquire));
     return &info;
 }
 uint32_t time_us_32(void) { static uint32_t now; assert(worker_thread); return ++now; }
@@ -104,6 +119,11 @@ int main(void) {
         if ((seq % 113u) == 0) aacp_mic_dec_reset_stats();
         (void)aacp_mic_dec_submit(bytes, sizeof(bytes));
         memset(bytes, 0xa5, sizeof(bytes));
+        if ((seq % 5000u) == 0) {
+            while (!aacp_mic_dec_release()) sched_yield();
+            assert(!aacp_mic_dec_ready() && !atomic_load(&decoder_live));
+            assert(aacp_mic_dec_init());
+        }
         if ((seq % 17u) == 0) {
             aacp_mic_dec_report();
             aacp_mic_dec_poll();

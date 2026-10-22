@@ -6,6 +6,7 @@
 #include "../src/btstack/playback_pcm.h"
 #include "../src/btstack/playback_peer.h"
 #include "../src/btstack/playback_format.h"
+#include "../src/btstack/phone_clock.h"
 
 static playback_pcm_t pcm;
 
@@ -194,6 +195,57 @@ static void test_fixed_usb_format_and_codec_transition(void) {
     assert(playback_aac_frame_samples(48000, 2, 65536, false) == 0);
 }
 
+static void test_prime_before_input_and_wire_ack(void) {
+    int16_t output[960], onset[960];
+    for (unsigned i = 0; i < 960; ++i) onset[i] = (int16_t)(i + 1);
+    assert(playback_pcm_reset(&pcm, 7680, true));
+    // The phone is not allowed to start while startup silence is still queued.
+    for (unsigned i = 0; i < 10; ++i) {
+        assert(!pcm.primed_on_wire);
+        assert(playback_pcm_read(&pcm, output, 480) == 0);
+        if (i != 9) playback_pcm_sent(&pcm);
+    }
+    assert(pcm.priming == 0 && !pcm.primed_on_wire);
+    playback_pcm_sent(&pcm);
+    assert(pcm.primed_on_wire);
+    playback_pcm_clear(&pcm, PHONE_PCM_CAPACITY);
+    playback_pcm_push(&pcm, onset, 480);
+    assert(playback_pcm_read(&pcm, output, 480) == 480);
+    assert(memcmp(onset, output, sizeof(onset)) == 0);
+    assert(pcm.primed_on_wire && pcm.used == 0);
+    // USB close/input cancellation must not shorten an unfinished prime.
+    assert(playback_pcm_reset(&pcm, 7680, true));
+    playback_pcm_read(&pcm, output, 480);
+    playback_pcm_clear(&pcm, 7680);
+    assert(pcm.priming == 4320 && !pcm.primed_on_wire);
+    // Capacity is a hard bound rather than a prefill requirement.
+    playback_pcm_clear(&pcm, PHONE_PCM_CAPACITY);
+    for (unsigned i = 0; i < 20; ++i) playback_pcm_push(&pcm, onset, 480);
+    assert(pcm.used == PHONE_PCM_CAPACITY);
+}
+
+static void test_phone_clock_bounded_correction(void) {
+    phone_clock_t clock;
+    assert(phone_clock_prefill(128) == 1440);
+    assert(phone_clock_prefill(480) == 1440);
+    assert(phone_clock_prefill(1024) == 1984);
+    phone_clock_init(&clock, 1024);
+    assert(clock.target_q8 == 1408 * 256);
+    phone_clock_init(&clock, 128);
+    assert(clock.target_q8 == 1408 * 256);
+    phone_clock_init(&clock, 480);
+    assert(clock.target_q8 == 1200 * 256);
+    for (unsigned i = 0; i < 1000; ++i)
+        assert(phone_clock_update(&clock, i % 2 ? 1440 : 960, 480) == 0x10000u);
+    for (unsigned i = 0; i < 1000; ++i) phone_clock_update(&clock, 0, 480);
+    assert(phone_clock_update(&clock, 0, 480) == 0x10000u - 32u);
+    for (unsigned i = 0; i < 1000; ++i) phone_clock_update(&clock, PHONE_PCM_CAPACITY, 480);
+    assert(phone_clock_update(&clock, PHONE_PCM_CAPACITY, 480) == 0x10000u + 32u);
+    for (unsigned i = 0; i < 3000; ++i)
+        phone_clock_update(&clock, i % 2 ? 1440 : 960, 480);
+    assert(phone_clock_update(&clock, 1200, 480) == 0x10000u);
+}
+
 int main(void) {
     test_priming_preserves_stereo_onset();
     test_short_source_and_reset();
@@ -203,6 +255,8 @@ int main(void) {
     test_eld_packet_bounds_and_sequence_wrap();
     test_peer_fences_cancelled_and_old_connections();
     test_fixed_usb_format_and_codec_transition();
+    test_prime_before_input_and_wire_ack();
+    test_phone_clock_bounded_correction();
     puts("playback tests passed");
     return 0;
 }

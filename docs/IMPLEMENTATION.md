@@ -22,18 +22,21 @@ reference file hashes used for these changes.
 | PCM queues | Racy cursor resets and repeated queue allocations | Use bounded storage, generation-tagged microphone frames and acquire/release publication |
 | USB controls | Invalid channel/format requests and repeated mute alter state | Reject unsupported requests; apply idempotent mute to PCM and preserve volume |
 | Stem controls | Play/Pause mutes the dongle instead of controlling the player | Send explicit USB Consumer Control commands, with bounded queues and ordered key releases |
-| BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity |
+| Phone bridge | No A2DP receiver or independent phone ownership | Negotiate 48 kHz classic aptX/SBC, decode into bounded PCM and route AVRCP by peer |
+| Phone startup | Input could accumulate behind AirPods priming | Open and prime the AirPods output before accepting phone Start; use one ELD frame per phone-output packet |
+| Phone memory | A retained idle microphone decoder competes with the phone decoder | Let core 1 detach it, then free on core 0; close the phone codec before USB microphone takeover |
+| BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity without a phone connection |
 | Build | Missing SDK patches can still produce a crashing or incompatible binary | Pin revisions and verify complete patched-file hashes before compilation |
 
 ## Hardware use
 
 Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
 
-| Linked layout | `bde77fb` | 0.1.2 | 0.1.3 |
-| --- | ---: | ---: | ---: |
-| Main-heap capacity before codec allocations | 413,920 bytes | 423,696 bytes | 392,512 bytes |
-| Flash image | 1,549,032 bytes | 1,551,824 bytes | 1,558,360 bytes |
-| Full BLE cache copy for aggregate logs | 700 bytes | 28 bytes | 28 bytes |
+| Linked layout | `bde77fb` | 0.1.2 | 0.1.3 | 0.1.4 |
+| --- | ---: | ---: | ---: | ---: |
+| Main-heap capacity before codec allocations | 413,920 bytes | 423,696 bytes | 392,512 bytes | 387,036 bytes |
+| Flash image | 1,549,032 bytes | 1,551,824 bytes | 1,558,360 bytes | 1,595,344 bytes |
+| Full BLE cache copy for aggregate logs | 700 bytes | 28 bytes | 28 bytes | 28 bytes |
 
 The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
 decode PCM use 3 KiB of scratch-Y. Core 1 has an explicit 16 KiB stack in ordinary
@@ -52,7 +55,7 @@ These measurements support the 16 KiB reservations but do not establish hardware
 stack high-water marks under USB/Bluetooth interrupts.
 
 The real-codec probe initializes stereo ELD at 48 kHz/256 kbps plus the microphone
-decoder with ASC `F8 E6 30 00`. Live allocator use is 379,864 bytes, leaving 12,648
+decoder with ASC `F8 E6 30 00`. Live allocator use is 379,864 bytes, leaving 7,172
 bytes of the current heap region before other application allocations. Allocator
 arena use also depends on heap alignment. Sixteen generated mono frames
 decode identically before and after the stack change. See
@@ -75,9 +78,9 @@ still require the board.
 
 ## Core ownership
 
-Core 0 retains Bluetooth, USB, playback encoding and control state. It allocates
-and configures the microphone decoder once in thread context under the Bluetooth
-async lock, then publishes the handle. Core 1 owns steady-state decode, codec
+Core 0 retains Bluetooth, USB, playback encoding, phone decoding and control state.
+It allocates and configures the microphone decoder in thread context under the
+Bluetooth async lock, then publishes the handle. Core 1 owns microphone decode, codec
 reset and decoder statistics. It never calls Bluetooth, USB or logging APIs.
 
 Eight copied compressed frames and sixteen tagged PCM frames bound worker memory.
@@ -86,6 +89,14 @@ consumer discards stale output, including an in-flight decode completed after
 cancellation. Start waits for reset acknowledgement; a stopped worker cannot feed
 the valid-audio watchdog merely by accepting queued input. Preparation times out
 after one second, and the existing valid-frame watchdog bounds capture recovery.
+
+Before phone codec preparation, core 0 requests release of an idle microphone
+decoder and waits for core 1's acknowledgement. Core 1 discards compressed work
+and atomically detaches the handle after any in-flight decode. Core 0 then closes
+it. No core 1 allocation/free occurs. USB microphone takeover closes the phone
+decoder first and can initialize a fresh microphone decoder; stale output remains
+generation-tagged. The aptX context adds 4,404 bytes while selected, and SBC uses
+1,636 bytes of static decoder state/workspace.
 
 Both cores register for SDK flash lockout before pairing/storage can write flash.
 The worker uses atomic queues and wake events, leaving the multicore FIFO to the
@@ -104,6 +115,13 @@ and 480 samples per frame. USB still presents the inherited 64 kHz clock.
 Calibrated duration/pitch and long-run drift checks must resolve that distinction
 before changing the rate or claiming calibrated measurements.
 
+The phone sink advertises only 48 kHz stereo classic aptX and SBC. Discovery
+prefers aptX; a phone may initiate either supported configuration. Raw aptX
+codewords and SBC's RTP framing have separate bounded parsers. SBC validates the
+entire packet before decoding a valid prefix. Phone Start waits for successful
+AirPods silence transmission, with a three-second deadline. See
+[phone bridge](PHONE-TRANSPORT.md) for buffering, pairing and hardware checks.
+
 The USB configuration contains playback, microphone, CDC diagnostics and HID
 consumer controls. Its PID bitmap changes when the HID interface is added so
 Windows does not reuse a cached descriptor layout from the original fork.
@@ -112,7 +130,7 @@ SDP Device ID record on Bluetooth, not a USB vendor-ID change.
 
 Classic and BLE share the CYW43 controller and its async-context lock. Scanning
 starts only after the controller reports Working and LE support, and after USB
-policy permits it. Scan start/stop calls express intent; controller acceptance
+or phone connection policy permits it. Scan start/stop calls express intent; controller acceptance
 and reception cadence still need a capture. Repeated policy updates do not queue
 repeated scan commands.
 

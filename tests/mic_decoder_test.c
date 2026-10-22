@@ -11,10 +11,11 @@
 char __StackLimit[1];
 static CStreamInfo info = {48000, 480, 1, 39};
 static bool fill_error, partial_fill, decode_error, no_info, config_error, reset_error;
-static unsigned core, closed, decoded, reset_count, wakes, logs;
+static unsigned core, opened, closed, decoded, reset_count, wakes, logs;
 static UINT last_flags;
 static uint8_t expected_au;
 static bool reset_in_decode;
+static bool release_in_decode, decoder_live;
 
 static int checked_printf(const char *format, ...) {
     assert(core == 0); // No worker access to the single-core CDC producer.
@@ -29,10 +30,14 @@ static int checked_printf(const char *format, ...) {
 void aacp_mic_dec_wake_worker(void) { ++wakes; }
 HANDLE_AACDECODER aacDecoder_Open(int transport, UINT layers) {
     assert(core == 0 && transport == TT_MP4_RAW && layers == 1);
+    assert(!decoder_live);
+    decoder_live = true;
+    ++opened;
     return &info;
 }
 void aacDecoder_Close(HANDLE_AACDECODER decoder) {
-    assert(core == 0 && decoder == &info);
+    assert(core == 0 && decoder == &info && decoder_live);
+    decoder_live = false;
     ++closed;
 }
 AAC_DECODER_ERROR aacDecoder_ConfigRaw(HANDLE_AACDECODER decoder, UCHAR **config, UINT *size) {
@@ -43,18 +48,18 @@ AAC_DECODER_ERROR aacDecoder_ConfigRaw(HANDLE_AACDECODER decoder, UCHAR **config
     return config_error ? 1 : AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_SetParam(HANDLE_AACDECODER decoder, int param, int value) {
-    assert(core == 1 && decoder == &info && param == AAC_TPDEC_CLEAR_BUFFER && value == 1);
+    assert(core == 1 && decoder == &info && decoder_live && param == AAC_TPDEC_CLEAR_BUFFER && value == 1);
     ++reset_count;
     return reset_error ? 1 : AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_Fill(HANDLE_AACDECODER decoder, UCHAR **bytes, UINT *size, UINT *valid) {
-    assert(core == 1 && decoder == &info && *size == *valid);
+    assert(core == 1 && decoder == &info && decoder_live && *size == *valid);
     assert((*bytes)[0] == expected_au); // Source caller may already have reused its SDU.
     *valid = partial_fill ? 1 : 0;
     return fill_error ? 1 : AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER decoder, INT_PCM *pcm, int capacity, UINT flags) {
-    assert(core == 1 && decoder == &info && capacity == 480);
+    assert(core == 1 && decoder == &info && decoder_live && capacity == 480);
     ++decoded;
     last_flags = flags;
     for (unsigned i = 0; i < 480; ++i) pcm[i] = (int16_t)(i + 1);
@@ -65,10 +70,18 @@ AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER decoder, INT_PCM *pcm
         core = 1;
         reset_in_decode = false;
     }
+    if (release_in_decode) {
+        unsigned previous_closes = closed;
+        core = 0;
+        assert(!aacp_mic_dec_release() && !aacp_mic_dec_ready());
+        assert(!aacp_mic_dec_init() && closed == previous_closes && decoder_live);
+        core = 1;
+        release_in_decode = false;
+    }
     return decode_error ? 1 : AAC_DEC_OK;
 }
 CStreamInfo *aacDecoder_GetStreamInfo(HANDLE_AACDECODER decoder) {
-    assert(core == 1 && decoder == &info);
+    assert(core == 1 && decoder == &info && decoder_live);
     return no_info ? NULL : &info;
 }
 uint32_t time_us_32(void) { static uint32_t now; return ++now; }
@@ -239,7 +252,31 @@ int main(void) {
     aacp_mic_dec_poll();
     assert(!step());
 
-    // Failed reset permanently gates capture instead of advertising false readiness.
+    // Release never frees an in-flight codec or publishes its cancelled PCM.
+    enqueue();
+    enqueue();
+    before = decoded;
+    done = aacp_mic_dec_completed();
+    release_in_decode = true;
+    assert(step() && decoded == before + 1 && aacp_mic_dec_completed() == done);
+    assert(aacp_mic_pcm_read(pcm, 480) == 0);
+    unsigned previous_closes = closed;
+    assert(!aacp_mic_dec_release() && closed == previous_closes);
+    assert(step() && closed == previous_closes && !aacp_mic_dec_ready());
+    assert(aacp_mic_dec_release() && closed == previous_closes + 1 && !decoder_live);
+    assert(aacp_mic_dec_release() && closed == previous_closes + 1 && !step());
+    assert(!aacp_mic_dec_ready() && !aacp_mic_dec_reset_done());
+    assert(!aacp_mic_dec_submit(au, sizeof(au)));
+    unsigned previous_opens = opened;
+    assert(aacp_mic_dec_init() && opened == previous_opens + 1 && aacp_mic_dec_ready());
+    assert(!aacp_mic_dec_reset_done());
+    drain();
+    assert(decoded == before + 1); // The second queued AU belonged to the retired handle.
+    assert(aacp_mic_dec_reset_done() && aacp_mic_pcm_read(pcm, 480) == 0);
+    enqueue();
+    assert(step() && last_flags == AACDEC_CLRHIST && aacp_mic_pcm_read(pcm, 480) == 480);
+
+    // Failed reset gates capture until the handle is safely replaced.
     reset_error = true;
     assert(aacp_mic_dec_reset());
     assert(step());
@@ -250,6 +287,15 @@ int main(void) {
     assert(logs == previous_logs + 1);
     aacp_mic_dec_poll();
     assert(logs == previous_logs + 1);
+    // Failed handles can also be detached and a later USB capture can initialize anew.
+    assert(!aacp_mic_dec_release());
+    assert(step() && aacp_mic_dec_release());
+    reset_error = false;
+    assert(aacp_mic_dec_init());
+    drain();
+    assert(aacp_mic_dec_ready() && aacp_mic_dec_reset_done());
+    enqueue();
+    assert(step() && aacp_mic_pcm_read(pcm, 480) == 480);
     assert(wakes != 0);
     puts("mic worker ownership, queue bounds, generations, cancellation and fault recovery: passed");
 }

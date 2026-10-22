@@ -16,6 +16,7 @@ typedef struct {
     uint32_t used;
     uint32_t capacity;
     uint32_t priming;
+    bool primed_on_wire;
 } playback_pcm_t;
 
 static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
@@ -25,7 +26,19 @@ static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
     pcm->read = pcm->used = 0;
     pcm->capacity = capacity;
     pcm->priming = prime ? PLAYBACK_PRIMING_FRAMES : 0;
+    pcm->primed_on_wire = false;
     return true;
+}
+
+// Changing input discards its PCM, without restarting the AirPods' warm stream.
+static inline void playback_pcm_clear(playback_pcm_t *pcm, uint32_t capacity) {
+    if (capacity == 0 || capacity > PLAYBACK_PCM_FRAMES) return;
+    pcm->read = pcm->used = 0;
+    pcm->capacity = capacity;
+}
+
+static inline void playback_pcm_sent(playback_pcm_t *pcm) {
+    if (pcm->priming == 0) pcm->primed_on_wire = true;
 }
 
 static inline void playback_pcm_push(playback_pcm_t *pcm, const int16_t *src,

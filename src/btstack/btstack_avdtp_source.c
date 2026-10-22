@@ -53,6 +53,10 @@
 #include "playback_eld.h"
 #include "playback_peer.h"
 #include "playback_format.h"
+#include "phone_sink.h"
+#include "phone_clock.h"
+#include "btstack_resample.h"
+#include "../tinyusb/uac.h"
 
 #include "btstack_hci.h"
 #include "btstack_ble_scan.h"
@@ -153,6 +157,10 @@ static uint16_t     cur_num_remote_seps;
 
 static uint8_t cur_capability = 0;
 static bool is_streaming = false;
+static bool phone_opened, phone_active, phone_buffer_started;
+static phone_clock_t phone_clock;
+static btstack_resample_t phone_resampler;
+static void playback_media_sent(void);
 static uint8_t cur_codec = 0;
 
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
@@ -312,6 +320,7 @@ static void a2dp_demo_send_media_packet(void) {
     }
     // Keep the fork's sample clock; failed sends retain the same payload and timestamp.
     context->rtp_timestamp += samples;
+    playback_media_sent();
     context->codec_storage_count = 0;
     context->codec_ready_to_send = 0;
     context->codec_num_frames = 0;
@@ -352,6 +361,84 @@ static bool suspend_recovery_pending;
 static bool recovery_reset_encoder;
 #define SUSPEND_RECOVERY_TIMEOUT_MS 3000
 
+static void playback_media_sent(void) {
+    critical_section_enter_blocking(&playback_pcm_lock);
+    playback_pcm_sent(&playback_pcm);
+    critical_section_exit(&playback_pcm_lock);
+}
+
+bool bridge_phone_open(void) {
+    if (is_usb_streaming || usb_mic_requested() ||
+        !peer_address_valid((const uint8_t *)get_device_addr())) return false;
+    phone_opened = true;
+    avdtp_source_establish_stream();
+    return true;
+}
+
+bool bridge_phone_ready(void) {
+    if (!phone_opened || is_usb_streaming || usb_mic_requested() ||
+        !a2dp_is_connected_flag || !media_tracker.streaming) return false;
+    critical_section_enter_blocking(&playback_pcm_lock);
+    bool warm = playback_pcm.primed_on_wire;
+    critical_section_exit(&playback_pcm_lock);
+    return warm;
+}
+
+bool bridge_phone_start(void) {
+    if (!bridge_phone_ready()) return false;
+    critical_section_enter_blocking(&playback_pcm_lock);
+    playback_pcm_clear(&playback_pcm, PHONE_PCM_CAPACITY);
+    phone_clock_init(&phone_clock, acc_num_simples);
+    btstack_resample_init(&phone_resampler, 2);
+    phone_buffer_started = false;
+    phone_active = true;
+    critical_section_exit(&playback_pcm_lock);
+    return true;
+}
+
+void bridge_phone_drop_pcm(void) {
+    critical_section_enter_blocking(&playback_pcm_lock);
+    if (phone_active) {
+        playback_pcm_clear(&playback_pcm, PHONE_PCM_CAPACITY);
+        phone_buffer_started = false;
+        phone_clock_init(&phone_clock, acc_num_simples);
+        btstack_resample_init(&phone_resampler, 2);
+    }
+    critical_section_exit(&playback_pcm_lock);
+}
+
+void bridge_phone_stop(void) {
+    critical_section_enter_blocking(&playback_pcm_lock);
+    if (phone_active)
+        playback_pcm_clear(&playback_pcm, pcm_frame_samples * active_slot_count);
+    phone_opened = phone_active = phone_buffer_started = false;
+    critical_section_exit(&playback_pcm_lock);
+}
+
+void bridge_phone_pcm_push(const int16_t *src, uint16_t frames) {
+    if (src == NULL || !phone_active || !bridge_phone_ready()) return;
+    while (frames != 0) {
+        uint16_t count = frames > 128 ? 128 : frames;
+        int16_t adjusted[130 * 2];
+        uint16_t output = btstack_resample_block(&phone_resampler, src, count, adjusted);
+        if (output > 130) { bridge_phone_drop_pcm(); return; }
+        critical_section_enter_blocking(&playback_pcm_lock);
+        playback_pcm_push(&playback_pcm, adjusted, output);
+        critical_section_exit(&playback_pcm_lock);
+        src += count * 2;
+        frames -= count;
+    }
+}
+
+void bridge_phone_volume(uint8_t volume) {
+    if (volume > 127 || is_usb_streaming || usb_mic_requested()) return;
+    media_tracker.volume = volume;
+    if (media_tracker.avrcp_cid != 0)
+        avrcp_controller_set_absolute_volume(media_tracker.avrcp_cid, volume);
+}
+
+uint8_t bridge_phone_get_volume(void) { return media_tracker.volume; }
+
 static bool a2dp_demo_timer_start(a2dp_media_sending_context_t *context);
 static void a2dp_demo_timer_stop(a2dp_media_sending_context_t *context);
 
@@ -386,13 +473,24 @@ static void audio_slot_queue_configure_with_count(uint16_t samples_per_slot, uin
 
 void audio_slot_push_samples(const int16_t *src, uint16_t stereo_pair_count) {
     critical_section_enter_blocking(&playback_pcm_lock);
-    playback_pcm_push(&playback_pcm, src, stereo_pair_count);
+    if (!phone_active) playback_pcm_push(&playback_pcm, src, stereo_pair_count);
     critical_section_exit(&playback_pcm_lock);
 }
 
 static void audio_pcm_read(uint16_t frames) {
     critical_section_enter_blocking(&playback_pcm_lock);
+    if (phone_active && !phone_buffer_started) {
+        if (playback_pcm.used < phone_clock_prefill(acc_num_simples)) {
+            memset(encoder_pcm, 0, (size_t)frames * 2 * sizeof(*encoder_pcm));
+            critical_section_exit(&playback_pcm_lock);
+            return;
+        }
+        phone_buffer_started = true;
+    }
     playback_pcm_read(&playback_pcm, encoder_pcm, frames);
+    if (phone_active)
+        btstack_resample_set_factor(&phone_resampler,
+                                   phone_clock_update(&phone_clock, playback_pcm.used, frames));
     critical_section_exit(&playback_pcm_lock);
 }
 
@@ -400,8 +498,14 @@ bool check_is_streaming(){
     return is_streaming;
 }
 
+bool get_usb_streaming(void) { return is_usb_streaming; }
+
 void set_usb_streaming(bool flag){
-    if (is_usb_streaming && !flag) audio_slot_queue_init();
+    if (is_usb_streaming && !flag && !phone_active) {
+        critical_section_enter_blocking(&playback_pcm_lock);
+        playback_pcm_clear(&playback_pcm, pcm_frame_samples * active_slot_count);
+        critical_section_exit(&playback_pcm_lock);
+    }
     is_usb_streaming = flag;
 }
 
@@ -542,8 +646,8 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
         }
         context->codec_num_frames++;
 
-        // AAC-ELD: max 3 frames per RTP packet
-        if (cur_codec == 4 && context->codec_num_frames >= 3) break;
+        // Use 10 ms packets during phone preparation as well as playback.
+        if (cur_codec == 4 && context->codec_num_frames >= (phone_opened ? 1 : 3)) break;
     }
     return total_samples_read;
 }
@@ -643,11 +747,11 @@ static void avdtp_audio_timeout_handler(btstack_timer_source_t * timer){
             uint32_t local_vendor_id = get_vendor_id(local_cap.media_codec_information);
             uint16_t local_codec_id = get_codec_id(local_cap.media_codec_information);
 
-            // Apple AAC-ELD: encode on Core 0 (FDK-AAC not safe for Core 1)
+            // Playback encoding stays with its packet/transport state on core 0.
             if (local_vendor_id == A2DP_CODEC_VENDOR_ID_APPLE && local_codec_id == A2DP_APPLE_CODEC_AAC_ELD) {
                 if (fill_aac_audio_buffer(context) < 0) return;
 
-                if (context->codec_num_frames >= 3 ||
+                if (context->codec_num_frames >= (phone_opened ? 1 : 3) ||
                     (context->codec_num_frames > 0 &&
                      (context->max_media_payload_size - context->codec_storage_count) <
                      (int)((aaceld_bitrate + 799) / 800 + 4))) {
@@ -777,6 +881,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
         case AVDTP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
             if (size < 14) break;
             avdtp_subevent_signaling_connection_established_get_bd_addr(packet, address);
+            // The raw AVDTP event is shared with the phone's independent sink role.
+            if (bt_hci_phone_peer_allowed(address)) return;
             // print info
             printf("Current Device found: %s \n",  bd_addr_to_str(address));
             avdtp_cid = avdtp_subevent_signaling_connection_established_get_avdtp_cid(packet);
@@ -1207,6 +1313,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 
 
         case AVDTP_SUBEVENT_SIGNALING_ACCEPT:
+            if (size < 8) break;
             if (avdtp_subevent_signaling_accept_get_avdtp_cid(packet) != media_tracker.avdtp_cid) break;
             signal_identifier = avdtp_subevent_signaling_accept_get_signal_identifier(packet);
             if (is_cmd_triggered_localy){
@@ -1215,6 +1322,10 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             }
             
             switch (signal_identifier){
+                case AVDTP_SI_ACCEPT_START:
+                    if (avdtp_subevent_signaling_accept_get_local_seid(packet) == media_tracker.local_seid)
+                        avdtp_start_stream_accept(media_tracker.avdtp_cid, media_tracker.local_seid);
+                    break;
                 case AVDTP_SI_OPEN:
                     break;
                 case AVDTP_SI_SET_CONFIGURATION:
@@ -1829,6 +1940,7 @@ bool * get_is_bt_sink_volume_changed_ptr(void){
 }
 
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
+    if (phone_sink_handle_avrcp(packet_type, channel, packet, size)) return;
     UNUSED(channel);
     bd_addr_t event_addr;
     uint16_t local_cid;
@@ -1884,6 +1996,7 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 
 
 static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
+    if (phone_sink_handle_target(packet_type, channel, packet, size)) return;
     UNUSED(channel);
     uint8_t  status = ERROR_CODE_SUCCESS;
 
@@ -1913,6 +2026,10 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
             if (!button_pressed){
                 break;
             }
+            if (phone_sink_owns_controls() && !is_usb_streaming && !usb_mic_requested()) {
+                phone_sink_media_control((uint8_t)operation_id);
+                break;
+            }
             switch (operation_id) {
                 case AVRCP_OPERATION_ID_PLAY: usb_media_enqueue(USB_MEDIA_PLAY); break;
                 case AVRCP_OPERATION_ID_PAUSE: usb_media_enqueue(USB_MEDIA_PAUSE); break;
@@ -1936,6 +2053,7 @@ uint8_t get_bt_volume(){
 }
 
 static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
+    if (phone_sink_handle_controller(packet_type, channel, packet, size)) return;
     UNUSED(channel);
     
     if (packet_type != HCI_EVENT_PACKET || size < 5 || packet[1] + 2u != size) return;
@@ -1948,7 +2066,9 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             if (size < 7) break;
             media_tracker.volume = avrcp_subevent_notification_volume_changed_get_absolute_volume(packet);
             
-            _bt_sink_volume_changed = true;
+            if (phone_sink_owns_controls() && !is_usb_streaming && !usb_mic_requested())
+                phone_sink_volume_changed(media_tracker.volume);
+            else _bt_sink_volume_changed = true;
             printf("AVRCP Controller: Notification Absolute Volume %d %%\n", media_tracker.volume * 100 / 127);\
 
             break;
@@ -2010,7 +2130,8 @@ int btstack_main(int argc, const char * argv[]){
 
     // Create AVRCP Target service record and register it with SDP. We receive Category 1 commands from the headphone, e.g. play/pause
     memset(sdp_avrcp_target_service_buffer, 0, sizeof(sdp_avrcp_target_service_buffer));
-    uint16_t supported_features = AVRCP_FEATURE_MASK_CATEGORY_PLAYER_OR_RECORDER;
+    uint16_t supported_features = AVRCP_FEATURE_MASK_CATEGORY_PLAYER_OR_RECORDER |
+                                  AVRCP_FEATURE_MASK_CATEGORY_MONITOR_OR_AMPLIFIER;
 #ifdef AVRCP_BROWSING_ENABLED
     supported_features |= AVRCP_FEATURE_MASK_BROWSING;
 #endif
@@ -2022,9 +2143,12 @@ int btstack_main(int argc, const char * argv[]){
 
     // Create AVRCP Controller service record and register it with SDP. We send Category 2 commands to the headphone, e.g. volume up/down
     memset(sdp_avrcp_controller_service_buffer, 0, sizeof(sdp_avrcp_controller_service_buffer));
-    uint16_t controller_supported_features = AVRCP_FEATURE_MASK_CATEGORY_MONITOR_OR_AMPLIFIER;
+    uint16_t controller_supported_features = AVRCP_FEATURE_MASK_CATEGORY_MONITOR_OR_AMPLIFIER |
+                                             AVRCP_FEATURE_MASK_CATEGORY_PLAYER_OR_RECORDER;
     avrcp_controller_create_sdp_record(sdp_avrcp_controller_service_buffer, 0x10003, controller_supported_features, NULL, NULL);
     sdp_register_service(sdp_avrcp_controller_service_buffer);
+
+    if (!phone_sink_init()) return 1;
 
 
 #ifdef HAVE_BTSTACK_STDIN

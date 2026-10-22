@@ -10,11 +10,20 @@
 #define BTSTACK_EVENT_STATE 0x60
 #define HCI_STATE_WORKING 2
 #define HCI_EVENT_PIN_CODE_REQUEST 0x16
+#define HCI_EVENT_USER_CONFIRMATION_REQUEST 0x33
+#define HCI_EVENT_USER_PASSKEY_REQUEST 0x34
 #define HCI_EVENT_COMMAND_STATUS 0x0f
 #define HCI_OPCODE_HCI_INQUIRY 0x0401
 #define GAP_EVENT_INQUIRY_RESULT 0xdc
 #define GAP_EVENT_INQUIRY_COMPLETE 0xdd
 #define INQUIRY_MODE_RSSI_AND_EIR 2
+#define HCI_LINK_TYPE_ACL 1
+#define BD_ADDR_TYPE_ACL 0xff
+#define SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT 3
+#define SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING 4
+#define LEVEL_2 2
+typedef uint8_t hci_link_type_t;
+typedef struct { uint16_t con_handle; } hci_connection_t;
 typedef uint8_t bd_addr_t[6];
 typedef uint8_t link_key_t[16];
 typedef uint8_t link_key_type_t;
@@ -35,6 +44,18 @@ void hci_set_inquiry_mode(uint8_t mode);
 void gap_set_local_name(const char *name);
 void gap_discoverable_control(uint8_t discoverable);
 void gap_set_class_of_device(uint32_t cod);
+void gap_connectable_control(uint8_t connectable);
+void gap_ssp_set_io_capability(int capability);
+void gap_ssp_set_authentication_requirement(int requirement);
+void gap_ssp_set_auto_accept(int auto_accept);
+void gap_register_classic_connection_filter(int (*callback)(bd_addr_t, hci_link_type_t));
+int gap_pin_code_negative(bd_addr_t address);
+int gap_ssp_confirmation_response(const uint8_t address[6]);
+int gap_ssp_confirmation_negative(const uint8_t address[6]);
+int gap_ssp_passkey_negative(const uint8_t address[6]);
+uint32_t btstack_run_loop_get_time_ms(void);
+hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t address[6], uint8_t type);
+uint8_t gap_security_level(uint16_t handle);
 const char *bd_addr_to_str(const uint8_t *address);
 
 static inline uint8_t hci_event_packet_get_type(const uint8_t *p) { return p[0]; }
@@ -45,6 +66,12 @@ static inline uint16_t hci_event_command_status_get_command_opcode(const uint8_t
 }
 static inline void hci_event_pin_code_request_get_bd_addr(const uint8_t *p, bd_addr_t address) {
     for (unsigned i = 0; i < 6; ++i) address[i] = p[7 - i];
+}
+static inline void hci_event_user_confirmation_request_get_bd_addr(const uint8_t *p, bd_addr_t address) {
+    hci_event_pin_code_request_get_bd_addr(p, address);
+}
+static inline void hci_event_user_passkey_request_get_bd_addr(const uint8_t *p, bd_addr_t address) {
+    hci_event_pin_code_request_get_bd_addr(p, address);
 }
 static inline void gap_event_inquiry_result_get_bd_addr(const uint8_t *p, bd_addr_t address) {
     for (unsigned i = 0; i < 6; ++i) address[i] = p[7 - i];

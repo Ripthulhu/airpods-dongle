@@ -1,52 +1,87 @@
-# Phone transport
-
-Target wireless path:
+# Phone bridge
 
 ```text
-Phone -- ordinary Bluetooth audio --> Pico -- Apple audio/control --> AirPods
+Phone -- aptX or SBC --> Pico 2 W -- AAC-ELD / AAC / SBC --> AirPods
 ```
 
-The phone pairs with the Pico as a normal A2DP output. The Pico owns the AirPods
-pairing, Apple Device ID, AAC-ELD negotiation and AACP. This requires no vendor-ID
-change on Android. USB audio remains a separate input; only one input owns playback
-at a time. A wireless Pico still needs battery or external power.
+The phone pairs with **AirPods Dongle** as an ordinary Bluetooth audio output.
+The Pico owns the AirPods bond, Apple Device ID, AACP and output codec. Android
+needs no vendor-ID modification. Power the Pico externally for wireless use;
+an active USB playback or recording stream takes priority over phone audio.
 
-## Implementation order
+## Pairing and controls
 
-1. Verify the existing USB audio device on Android with OTG and adequate power.
-2. Prove two simultaneous Classic links with A2DP sink and source on this radio.
-3. Receive SBC from Android, decode to PCM and feed the existing ELD encoder.
-4. Route AVRCP playback/volume between phone and AirPods with independent peer
-   and connection generations. Keep USB media controls confined to USB input.
-5. Add authenticated, bounded BLE settings access for LibrePods.
-6. Add phone calls through HFP Hands-Free and SCO separately. Translate call audio
-   to the AirPods playback/AACP microphone paths; the phone-side call codec still
-   limits fidelity.
+Pair the AirPods first: put them in pairing mode, then hold BOOTSEL for at least
+one second but less than three seconds and release. To pair the phone, hold for
+three seconds and release, then select **AirPods Dongle** in the phone's Bluetooth
+settings within two minutes. The phone bond is saved separately from the two
+AirPods slots. Only the selected AirPods and saved phone are accepted outside
+that explicit pairing window. A new phone must complete encrypted, bonded access
+before its identity is retained.
 
-The wireless bridge is not implemented. Pinned BTstack has sink/source roles and
-shared AVDTP routing, but this does not prove CYW43439 dual-stream reliability.
-Two AVDTP connections, another sink endpoint and larger AVRCP/L2CAP/SDP pools are
-required. Current HCI capacity is two: phone plus AirPods would leave no connected
-case slot. Shared discovery must be serialized, and one role must never deinitialize
-or reset the other's shared service.
+AirPods stem media commands and absolute volume go to the phone during phone
+playback. USB media commands stay on the USB path. Music only: phone calls, HFP,
+SCO and a BLE settings interface are not implemented.
 
-SBC input avoids another large FDK decoder. SBC-to-ELD adds a lossy encoding stage
-and buffering; it cannot improve information already lost on the phone link.
-AAC-LC passthrough is a later option only when both peers negotiate compatible
-configurations and framing. It would retain AAC-LC rather than produce ELD.
+## Codec and buffering
 
-Wi-Fi PCM could serve an app-controlled player, but ordinary Android playback
-capture cannot forward every app or phone call. Capture requires user approval,
-eligible audio usage and the originating app's permission. It is not a universal
-wireless audio output.
+- Input is 48 kHz stereo classic aptX where negotiated, with SBC fallback. The
+  dongle prefers aptX during its own discovery; a phone initiating configuration
+  can select either supported codec. aptX LL, HD, Adaptive, AAC and LDAC input
+  are not advertised. Unavailable aptX allocation withdraws that endpoint so a
+  subsequent connection can use SBC.
+- Classic aptX contains raw four-byte codewords, without RTP. SBC has RTP and its
+  SBC media header. The receiver validates framing and configuration, rejects
+  fragmented SBC, and resets on SBC sequence gaps instead of playing stale PCM.
+- Decode goes straight into a 64 ms maximum PCM queue. Initial prefill is 30 ms
+  for AAC-ELD/SBC output and about 41 ms for AAC; it leaves a small reserve for
+  packet arrival phase and clock drift. There is no compressed playout queue.
+  A bounded resampling correction follows queue fill to compensate for independent
+  clocks. Saturation discards the oldest complete PCM frames. These are buffer
+  thresholds, not measured acoustic delay.
+- Open the AirPods output before accepting the phone's Start. AAC-ELD's mandatory
+  100 ms of encoded silence must be sent successfully before that acceptance,
+  so phone audio cannot accumulate behind startup priming. Readiness has a
+  three-second deadline; failure rejects Start rather than claiming playback.
+- Phone AAC-ELD output uses one 10 ms frame per packet. USB retains its existing
+  packet grouping. Codec bitrate, output timestamps and controller flush policy
+  are unchanged.
 
-## First hardware checks
+The SBC demo's 60–80-frame buffer would hold 160–213 ms at 48 kHz. It is not used.
+Small codec frames alone do not establish end-to-end delay: Android's batching,
+radio scheduling, resampling and AirPods rendering must also be measured. aptX
+to AAC-ELD is still a lossy transcode.
 
-Keep settings, microphone, codec and scan policy constant during a dual-link music
-test. Measure packet loss, drift, queue occupancy and latency separately from CPU
-and heap use. Then test AVRCP, radio loss, phone disconnect, USB takeover and BLE
-coexistence. Add calls only after stable stereo forwarding; verify call-end recovery
-and the full-duplex memory budget independently.
+## Memory and ownership
+
+Bluetooth, USB, playback encoding and phone decoding run on core 0. Core 1 owns
+the USB microphone decoder. An idle microphone decoder is detached by core 1
+before core 0 releases its heap for a phone session. USB recording can initialize
+it again after the phone stops. Codec allocation/free stays in thread context
+under the Bluetooth lock; no packet callback allocates memory.
+
+The phone and AirPods use independent AVDTP and AVRCP connection IDs. Shared
+AVDTP discovery is filtered before the sink framework sees AirPods events.
+Two Classic links fill the controller connection pool; passive BLE scanning uses
+no connection slot. A connected BLE case would require a separate capacity review.
+
+## Validation and remaining checks
+
+Native sanitizer tests cover negotiation, framing, stale events, pairing-window
+ownership, startup gating, bounded queues, controls and decoder release. Eighteen
+ten-minute clock simulations cover the three output frame sizes at ±300 ppm,
+including fixed-packet arrival drift. Real
+aptX/SBC codec tests run natively and in ARM32 emulation. Firmware cross-compilation
+checks the pinned SDK API and RAM layout. These checks do not establish radio
+reliability, CPU headroom or acoustic latency on the Pico.
+
+On hardware, first verify simultaneous phone/AirPods links, negotiated codec and
+clean stereo. Measure first sound and steady delay separately, queue occupancy,
+drift and heap/stack use. Then test long playback, pause/resume, phone radio loss,
+AirPods case return, AVRCP/volume, USB takeover and microphone recovery. Compare
+aptX with an SBC-only phone and check passive BLE reception alongside both links.
 
 Sources: [pinned BTstack AVDTP](https://github.com/bluekitchen/btstack/blob/501e6d2b86e6c92bfb9c390bcf55709938e25ac1/src/classic/avdtp.c),
-[Android playback-capture requirements](https://developer.android.com/media/platform/av-capture).
+[pinned sink example](https://github.com/bluekitchen/btstack/blob/501e6d2b86e6c92bfb9c390bcf55709938e25ac1/example/a2dp_sink_demo.c),
+[AOSP classic aptX transport](https://android.googlesource.com/platform/packages/modules/Bluetooth/+/refs/heads/main/system/stack/a2dp/a2dp_vendor_aptx.cc),
+[pinned aptX decoder](https://github.com/regularhunter/libfreeaptx/tree/476e2d56b0374c643c50bc37ab5cfee3012e2144).

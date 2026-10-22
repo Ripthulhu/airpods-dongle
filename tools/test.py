@@ -21,6 +21,7 @@ def main():
         "button_gesture": ["tests/button_gesture_test.c"],
         "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
+        "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
         "ble_scan": ["-Itests/ble_scan_stubs", "tests/ble_scan_test.c"],
         "playback": ["tests/playback_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],
