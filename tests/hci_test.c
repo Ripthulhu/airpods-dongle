@@ -13,6 +13,8 @@ static uint8_t slot, inquiry_result;
 static unsigned connect_calls, inquiry_calls, inquiry_stops, writes, pin_calls;
 static unsigned registered;
 static uint16_t flush_timeout;
+static bool ble_ready;
+static uint32_t ble_pauses;
 static btstack_packet_callback_registration_t *callbacks[2];
 static const bd_addr_t first = {0x10, 2, 3, 4, 5, 6};
 static const bd_addr_t second = {0x20, 8, 9, 10, 11, 12};
@@ -24,6 +26,11 @@ uint8_t gap_inquiry_start(uint8_t duration) {
     return inquiry_result;
 }
 void gap_inquiry_stop(void) { inquiry_stops++; }
+void ble_scan_controller_ready(bool ready) { ble_ready = ready; }
+void ble_scan_set_paused(uint32_t reason, bool paused) {
+    if (paused) ble_pauses |= reason;
+    else ble_pauses &= ~reason;
+}
 void gap_enable_link_watchdog(uint16_t timeout) { flush_timeout = timeout; }
 bool hci_non_flushable_packet_boundary_flag_supported(void) { return non_flushable; }
 void gap_pin_code_response(bd_addr_t address, const char *pin) {
@@ -88,6 +95,8 @@ static void fixture(void) {
     inquiry_result = 0;
     connect_calls = inquiry_calls = inquiry_stops = writes = pin_calls = registered = 0;
     flush_timeout = UINT16_MAX;
+    ble_ready = false;
+    ble_pauses = 0;
 }
 static void working(void) {
     uint8_t p[] = {BTSTACK_EVENT_STATE, 1, HCI_STATE_WORKING};
@@ -123,6 +132,7 @@ static void test_selected_bond_auto_connects(void) {
     assert(get_device_addr_from_list(2) == NULL);
     working();
     assert(connect_calls == 1 && inquiry_calls == 0 && flush_timeout == 200);
+    assert(ble_ready && ble_pauses == 0);
     assert(writes == 0);
 
     fixture();
@@ -171,12 +181,14 @@ static void test_only_live_pairing_inquiry_can_select_a_peer(void) {
     assert(writes == 0 && connect_calls == 0 && memcmp(device_addr, first, 6) == 0);
 
     gap_start_scanning();
+    assert(ble_pauses & BLE_SCAN_PAUSE_INQUIRY);
     result(p, sizeof(p), nearby, 0x000540); // Keyboard is not an audio sink.
     hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
     assert(scan_active && writes == 0 && connect_calls == 0);
     result(p, sizeof(p), nearby, 0x240404);
     hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
     assert(!scan_active && writes == 1 && connect_calls == 1 && inquiry_stops == 1);
+    assert(!(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
     assert(memcmp(saved[0], nearby, 6) == 0 && memcmp(device_addr, nearby, 6) == 0);
     result(p, sizeof(p), second, 0x240404);
     hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
@@ -185,6 +197,7 @@ static void test_only_live_pairing_inquiry_can_select_a_peer(void) {
     inquiry_result = 1;
     gap_start_scanning();
     assert(!scan_active);
+    assert(!(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
     hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
     assert(writes == 1 && connect_calls == 1);
 }
@@ -222,11 +235,57 @@ static void test_short_events_and_unbounded_names_are_rejected(void) {
     assert(!scan_active && connect_calls == 1 && writes == 1);
 }
 
+static void test_controller_off_and_failed_inquiry_release_ble_pause(void) {
+    fixture();
+    bt_hci_init();
+    working();
+    assert(scan_active && ble_ready && (ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    inquiry_result = 1;
+    unsigned calls = inquiry_calls;
+    gap_start_scanning(); // A busy duplicate must not cancel ownership of the live inquiry.
+    assert(inquiry_calls == calls && scan_active && (ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    complete();
+    assert(!scan_active && !(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    inquiry_result = 0;
+    gap_start_scanning();
+    assert(scan_active && (ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    uint8_t state[] = {BTSTACK_EVENT_STATE, 1, 0};
+    hci_packet_handler(HCI_EVENT_PACKET, 0, state, sizeof(state));
+    assert(!ble_ready && !scan_active && !(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    complete();
+    assert(!scan_active);
+}
+
+static void test_controller_rejection_releases_ble_pause(void) {
+    fixture();
+    bt_hci_init();
+    working();
+    uint8_t status[] = {HCI_EVENT_COMMAND_STATUS, 4, 0x0c, 1, 1, 4};
+    hci_packet_handler(HCI_EVENT_PACKET, 0, status, 5);
+    assert(scan_active);
+    status[4] = 2; // A different rejected command does not own inquiry.
+    hci_packet_handler(HCI_EVENT_PACKET, 0, status, sizeof(status));
+    assert(scan_active);
+    status[4] = 1;
+    status[2] = 0;
+    hci_packet_handler(HCI_EVENT_PACKET, 0, status, sizeof(status));
+    assert(scan_active);
+    status[2] = 0x0c;
+    unsigned calls = inquiry_calls;
+    hci_packet_handler(HCI_EVENT_PACKET, 0, status, sizeof(status));
+    assert(!scan_active && !(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    assert(inquiry_calls == calls);
+    complete();
+    assert(inquiry_calls == calls);
+}
+
 int main(void) {
     test_selected_bond_auto_connects();
     test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback();
     test_only_live_pairing_inquiry_can_select_a_peer();
     test_short_events_and_unbounded_names_are_rejected();
-    puts("HCI selected-peer ownership and event bounds: 4 groups passed");
+    test_controller_off_and_failed_inquiry_release_ble_pause();
+    test_controller_rejection_releases_ble_pause();
+    puts("HCI selected-peer ownership, event bounds and BLE coordination: 6 groups passed");
     return 0;
 }

@@ -55,6 +55,7 @@
 #include "playback_format.h"
 
 #include "btstack_hci.h"
+#include "btstack_ble_scan.h"
 #include "btstack_aacp.h"
 #include "classic/device_id_server.h"
 
@@ -1985,6 +1986,7 @@ int btstack_main(int argc, const char * argv[]){
 
     l2cap_init();
     aacp_init();
+    ble_scan_init();
     bt_hci_init();
 
     // Initialize AVDTP Sink

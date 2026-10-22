@@ -21,6 +21,7 @@ reference file hashes used for these changes.
 | PCM queues | Racy cursor resets and repeated queue allocations | Use bounded storage, consumer-owned microphone reset and acquire/release publication |
 | USB controls | Invalid channel/format requests and repeated mute alter state | Reject unsupported requests; apply idempotent mute to PCM and preserve volume |
 | Stem controls | Play/Pause mutes the dongle instead of controlling the player | Send explicit USB Consumer Control commands, with bounded queues and ordered key releases |
+| BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity |
 | Build | Missing SDK patches can still produce a crashing or incompatible binary | Pin revisions and verify complete patched-file hashes before compilation |
 
 ## Protocol choices
@@ -40,6 +41,19 @@ Windows does not reuse a cached descriptor layout from the original fork.
 The prototype retains the inherited development USB VID; Apple identity is an
 SDP Device ID record on Bluetooth, not a USB vendor-ID change.
 
+Classic and BLE share the CYW43 controller and its async-context lock. Scanning
+starts only after the controller reports Working and LE support, and after USB
+policy permits it. Scan start/stop calls express intent; controller acceptance
+and reception cadence still need a capture. Repeated policy updates do not queue
+repeated scan commands.
+
+The BLE receiver validates the complete legacy event, AD structures and Apple
+type/length records before caching any prefix. It retains at most eight reports
+with exact address/type, RSSI validity and monotonic reception time. Address
+rotation creates a separate entry; neither model fields nor signal strength
+establish ownership. Type `0x12` is retained as an opaque offline record, with no
+Find My key derivation or assumption that it belongs to the paired AirPods.
+
 ## Validation limits
 
 Native tests exercise production parsers, lifecycle code, queues and decoder
@@ -50,5 +64,6 @@ the pinned Pico SDK APIs, descriptors and link limits.
 USB descriptors still need Windows enumeration tests. Radio retries, negotiated
 MTU, controller flush behavior, audio quality, heap high-water mark, overclock
 stability and microphone clock/gain require the board. Older models and HFP
-compatibility are unverified. No hearing profiles, calibration values or device
+compatibility are unverified. Classic audio with concurrent BLE reception and
+microphone pause/resume also needs hardware validation. No hearing profiles, calibration values or device
 settings are written by the offline tests.

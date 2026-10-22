@@ -10,5 +10,6 @@ void tinyusb_control_task(void);
 // Latest USB capture intent; consumed only by the main loop.
 bool usb_mic_take_request(bool *wanted);
 bool usb_mic_requested(void);
+bool usb_host_active(void);
 
 #endif

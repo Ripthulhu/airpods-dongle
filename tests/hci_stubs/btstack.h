@@ -10,6 +10,8 @@
 #define BTSTACK_EVENT_STATE 0x60
 #define HCI_STATE_WORKING 2
 #define HCI_EVENT_PIN_CODE_REQUEST 0x16
+#define HCI_EVENT_COMMAND_STATUS 0x0f
+#define HCI_OPCODE_HCI_INQUIRY 0x0401
 #define GAP_EVENT_INQUIRY_RESULT 0xdc
 #define GAP_EVENT_INQUIRY_COMPLETE 0xdd
 #define INQUIRY_MODE_RSSI_AND_EIR 2
@@ -37,6 +39,10 @@ const char *bd_addr_to_str(const uint8_t *address);
 
 static inline uint8_t hci_event_packet_get_type(const uint8_t *p) { return p[0]; }
 static inline uint8_t btstack_event_state_get_state(const uint8_t *p) { return p[2]; }
+static inline uint8_t hci_event_command_status_get_status(const uint8_t *p) { return p[2]; }
+static inline uint16_t hci_event_command_status_get_command_opcode(const uint8_t *p) {
+    return (uint16_t)p[4] | (uint16_t)p[5] << 8;
+}
 static inline void hci_event_pin_code_request_get_bd_addr(const uint8_t *p, bd_addr_t address) {
     for (unsigned i = 0; i < 6; ++i) address[i] = p[7 - i];
 }

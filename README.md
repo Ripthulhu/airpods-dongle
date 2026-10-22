@@ -16,6 +16,7 @@ Pro 3 testing; that does not validate these changes.
 
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
 - Simultaneous AACP microphone, opened only by a USB recording request.
+- Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
 - 100 ms encoded startup silence for AAC-ELD; source audio stays buffered in order.
 - Play, Pause, Next, Previous and Stop forwarded as USB media controls.
 - Two saved headset slots; reconnect uses the selected address and its bond.
@@ -25,6 +26,32 @@ The serial port currently carries diagnostics. NTPods settings, hearing controls
 battery display and LibrePods switching are not connected to this firmware yet.
 LDAC is unsupported: the inherited encoder path could exceed the negotiated packet
 limit, and AirPods do not need that codec.
+
+## Bluetooth paths
+
+The firmware links both Classic and BLE through one BTstack controller. The
+[Pico SDK supports dual mode](https://www.raspberrypi.com/documentation/pico-sdk/networking.html#pico_btstack).
+
+| Communication | Transport | Current implementation |
+| --- | --- | --- |
+| Playback and stem media controls | Classic AVDTP / AVRCP | Implemented |
+| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Microphone implemented; settings still need a host interface |
+| Hearing profiles and saved diagnostics | ATT over Classic, PSM `0x001F` | Not ported yet |
+| Proximity and offline advertisements | BLE | Passive reception, RSSI, reception time and raw records |
+| Case DULT / Find My service | BLE GATT | Not ported yet |
+
+BLE uses a provisional 30 ms scan window every 300 ms during stereo playback.
+It pauses for Classic pairing searches, microphone startup/capture/drain and USB
+suspension, then restores the scan policy. The CDC console reports aggregate
+counts at most once per five seconds; `requested` means a scan command was queued,
+not that controller acceptance was verified.
+
+The eight-entry advertisement cache is an unassociated inventory. It does not
+identify the selected earbuds or case. Verified battery/finder data needs the
+selected pair's proximity keys and address resolution; case GATT also needs an
+explicit identity check. Scanning never pairs, opens an audio path or sends case
+commands. The current connection pool supports one Classic AirPods link and one
+additional LE link; passive scanning uses no connection slot.
 
 ## Build
 
@@ -52,8 +79,8 @@ release BOOTSEL to pair a headset already in pairing mode. While idle, a single
 press reconnects the selected headset and a double press selects the other slot
 and connects it. During playback, those presses adjust volume instead.
 
-Opening the USB microphone starts capture; closing it or suspending/unplugging
-USB cancels capture. **AirPods Dongle Console** exposes bounded diagnostic logs.
+Opening the USB microphone starts capture; closing it, suspending USB or losing
+the USB configuration cancels capture. **AirPods Dongle Console** exposes bounded diagnostic logs.
 
 ## Tests and hardware checks
 
@@ -64,12 +91,15 @@ python3 tools/test.py --sanitize
 ```
 
 The tests cover malformed packets, stale connections, cancelled recording,
-decoder failures, PCM ordering, media-key release/retry and SDK patch validation.
+decoder failures, PCM ordering, media-key release/retry, BLE pause/resume and
+advertisement bounds, and SDK patch validation.
 They do not measure radio behavior or acoustic latency.
 
 Before using this firmware routinely, check USB enumeration, playback and mic
 together, repeated case returns, volume/mute, stem controls, and long-running
-capture. Capture the media flush flags and verify control traffic stays reliable.
+capture. Check BLE reception during playback and restoration after microphone
+use. Capture the media flush flags and verify control traffic stays reliable.
+Check USB reset/re-enumeration with recording open and during BLE reception.
 
 The inherited 250 MHz / 1.20 V overclock needs validation on each board. Runtime
 heap margin and microphone clock drift remain unmeasured. The microphone uses

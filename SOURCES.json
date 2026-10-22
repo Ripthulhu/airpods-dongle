@@ -27,7 +27,8 @@
       "windows/daemon/src/playback/buffer.rs": "f125f4cfa17ba134b91de5b95b3f77b348141967065942f58f9b1ed44c2a38a3",
       "windows/daemon/src/playback/protocol.rs": "cc276a7c4618a5e59562fb9ab3f7ea9addfdf2be7b64b5a09380f434e3001970",
       "docs/WINDOWS-AIRPODS-AUDIO-PROTOCOL.md": "6b36bbc7d471e268960f8260b3ed2038040f2dba1ffe69a24ec258203795d8c9",
-      "docs/WINDOWS-MIC-PROTOCOL-RESEARCH.md": "fa42fd27dc2f1ab66318f0247d89da11b14b67bc26ba91af18f44558b074ad70"
+      "docs/WINDOWS-MIC-PROTOCOL-RESEARCH.md": "fa42fd27dc2f1ab66318f0247d89da11b14b67bc26ba91af18f44558b074ad70",
+      "windows/daemon/src/battery_ble.rs": "9558693266aa298e6392e412ddd1803f3d8ae3d5b8e2b63495075063a6181582"
     }
   }
 }

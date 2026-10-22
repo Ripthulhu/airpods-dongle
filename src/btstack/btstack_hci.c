@@ -10,6 +10,7 @@
 #include "btstack_hci.h"
 #include "peer_address.h"
 #include "btstack_avdtp_source.h"
+#include "btstack_ble_scan.h"
 #include "../pico_w_led.h"
 
 
@@ -38,8 +39,11 @@ bd_addr_t * get_device_addr_from_list(uint8_t i){
 }
 
 void gap_start_scanning(void){
+    if (scan_active) return;
     printf("Start scanning...\n");
+    ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, true);
     scan_active = gap_inquiry_start(A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS) == ERROR_CODE_SUCCESS;
+    if (!scan_active) ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
     set_led_mode_off();
     set_led_mode_pairing();
 }
@@ -60,7 +64,12 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     switch (hci_event_packet_get_type(packet)){
         case  BTSTACK_EVENT_STATE:
             if (size < 3) return;
-            if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) return;
+            ble_scan_controller_ready(btstack_event_state_get_state(packet) == HCI_STATE_WORKING);
+            if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) {
+                scan_active = false;
+                ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
+                return;
+            }
             // Control must remain reliable when only media is allowed to expire.
             gap_enable_link_watchdog(hci_non_flushable_packet_boundary_flag_supported() ? 200 : 0);
             if (selected_bonded) {
@@ -71,6 +80,15 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             }
             break;
 
+        case HCI_EVENT_COMMAND_STATUS:
+            if (size < 6 || !scan_active ||
+                hci_event_command_status_get_command_opcode(packet) != HCI_OPCODE_HCI_INQUIRY ||
+                hci_event_command_status_get_status(packet) == ERROR_CODE_SUCCESS) break;
+            scan_active = false;
+            ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
+            set_led_mode_off();
+            printf("Pairing inquiry rejected: 0x%02x\n", hci_event_command_status_get_status(packet));
+            break;
         case HCI_EVENT_PIN_CODE_REQUEST:
             if (size < 8) return;
             printf("Pin code request - using '0000'\n");
@@ -103,6 +121,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 printf("Bluetooth speaker detected, trying to connect to %s...\n", bd_addr_to_str(device_addr));
                 scan_active = false;
                 gap_inquiry_stop();
+                ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
 
                 uint8_t currect_slot = read_uint8_last_flash();
 
@@ -119,7 +138,8 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
         case GAP_EVENT_INQUIRY_COMPLETE:
             if (scan_active){
                 printf("No Bluetooth speakers found, scanning again...\n");
-                gap_inquiry_start(A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS);
+                scan_active = gap_inquiry_start(A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS) == ERROR_CODE_SUCCESS;
+                if (!scan_active) ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
             }
             break;
         default:

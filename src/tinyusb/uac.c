@@ -96,9 +96,11 @@
  static usb_mic_request_t mic_request;
  static bool usb_mounted;
  static bool usb_suspended;
+ static _Atomic bool usb_host_available;
  static bool mic_interface_open;
 
  static void usb_mic_update_request(void) {
+   atomic_store_explicit(&usb_host_available, usb_mounted && !usb_suspended, memory_order_release);
    bool wanted = usb_mounted && !usb_suspended && mic_interface_open;
    if (wanted != usb_mic_request_wanted(&mic_request)) aacp_mic_pcm_reset();
    usb_mic_request_set(&mic_request, wanted);
@@ -110,6 +112,10 @@
 
  bool usb_mic_requested(void) {
    return usb_mic_request_wanted(&mic_request);
+ }
+
+ bool usb_host_active(void) {
+   return atomic_load_explicit(&usb_host_available, memory_order_acquire);
  }
 
  // Buffer for microphone data
@@ -151,6 +157,8 @@
 
  void tinyusb_task(void){
     tud_task(); // TinyUSB device task
+    // A bus reset clears TinyUSB configuration without an unmount callback.
+    if (usb_mounted && !tud_mounted()) tud_umount_cb();
     debug_cdc_task(); // drain buffered stdout to the CDC console (same context as tud_task)
     usb_media_task();
     audio_task();

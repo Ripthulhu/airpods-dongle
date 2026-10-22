@@ -5,7 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.0 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.1 LANGUAGES C CXX ASM)
 pico_sdk_init()
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
@@ -28,6 +28,7 @@ add_executable(airpods_dongle
     src/pico_w_led.c
     src/btstack/btstack_avdtp_source.c
     src/btstack/btstack_hci.c
+    src/btstack/btstack_ble_scan.c
     src/btstack/btstack_aacp.c
     src/btstack/aacp_mic_dec.c
     src/tinyusb/uac.c

@@ -4,6 +4,7 @@
 
 #include "btstack/btstack_avdtp_source.h"
 #include "btstack/btstack_hci.h"
+#include "btstack/btstack_ble_scan.h"
 #include "btstack/btstack_aacp.h"
 #include "btstack/aacp_mic_dec.h"
 
@@ -199,6 +200,29 @@ bool bootsel_timer_callback(repeating_timer_t *rt) {
     return true;    // keep repeating
 }
 
+static void ble_diagnostics_task(void) {
+    static uint32_t last_ms;
+    static ble_scan_snapshot_t current;
+    static uint32_t last_accepted, last_malformed, last_evicted, last_pauses = UINT32_MAX;
+    static bool last_requested;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if ((uint32_t)(now - last_ms) < 5000u) return;
+    last_ms = now;
+    ble_scan_snapshot(&current);
+    if (current.accepted == last_accepted && current.malformed == last_malformed &&
+        current.evicted == last_evicted && current.pause_reasons == last_pauses &&
+        current.scan_requested == last_requested) return;
+    printf("[BLE] requested=%u paused=%lu cached=%u reports=%lu malformed=%lu evicted=%lu\n",
+           current.scan_requested, (unsigned long)current.pause_reasons, current.cache_count,
+           (unsigned long)current.accepted, (unsigned long)current.malformed,
+           (unsigned long)current.evicted);
+    last_accepted = current.accepted;
+    last_malformed = current.malformed;
+    last_evicted = current.evicted;
+    last_pauses = current.pause_reasons;
+    last_requested = current.scan_requested;
+}
+
 int main() {
 
     vreg_set_voltage(VREG_VOLTAGE_1_20);
@@ -277,6 +301,8 @@ int main() {
         bool mic_wanted;
         async_context_t *ctx = cyw43_arch_async_context();
         async_context_acquire_lock_blocking(ctx);
+        ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND, !usb_host_active());
+        ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, usb_mic_requested() || aacp_mic_active());
         // Keep decoder allocation in thread context and serialize malloc with
         // Bluetooth encoder callbacks. The USB service timer remains active.
         if (!dec_init_done && usb_mic_requested()) {
@@ -285,10 +311,14 @@ int main() {
         }
         tinyusb_control_task();
         if (usb_mic_take_request(&mic_wanted)) {
-            if (mic_wanted) aacp_mic_start();
+            if (mic_wanted) {
+                ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, true);
+                aacp_mic_start();
+            }
             else aacp_mic_stop();
         }
         aacp_poll();
+        ble_diagnostics_task();
         async_context_release_lock(ctx);
         sleep_ms(1);
     }

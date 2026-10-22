@@ -19,6 +19,7 @@ def main():
     tests = {
         "peer": ["tests/peer_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
+        "ble_scan": ["-Itests/ble_scan_stubs", "tests/ble_scan_test.c"],
         "playback": ["tests/playback_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],
         "mic_ring": ["tests/mic_ring_test.c"],

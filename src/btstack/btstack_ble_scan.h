@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-3.0-only
+#ifndef BTSTACK_BLE_SCAN_H
+#define BTSTACK_BLE_SCAN_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#define BLE_SCAN_CACHE_SIZE 8u
+#define BLE_SCAN_DATA_MAX 31u
+#define BLE_SCAN_PAUSE_MIC (1u << 0)
+#define BLE_SCAN_PAUSE_INQUIRY (1u << 1)
+#define BLE_SCAN_PAUSE_USB_SUSPEND (1u << 2)
+
+typedef struct {
+    uint8_t address[6];
+    uint8_t address_type;
+    uint8_t event_type;
+    int8_t rssi;
+    bool rssi_valid;
+    uint32_t received_ms;  // BTstack monotonic clock; compare ages by unsigned subtraction.
+    uint32_t reports;
+    uint8_t data_length;
+    uint8_t data[BLE_SCAN_DATA_MAX];
+    uint8_t apple_types[32];  // Type presence only, not a device or component identity.
+} ble_scan_report_t;
+
+typedef struct {
+    bool controller_ready;
+    bool le_supported;
+    bool scan_requested;  // gap_start_scan queues a command; this is not confirmation.
+    uint32_t pause_reasons;
+    uint32_t accepted;
+    uint32_t malformed;
+    uint32_t ignored;
+    uint32_t evicted;
+    uint8_t cache_count;
+    ble_scan_report_t reports[BLE_SCAN_CACHE_SIZE];
+} ble_scan_snapshot_t;
+
+// Call these from the BTstack context or while holding its async-context lock.
+void ble_scan_init(void);
+void ble_scan_controller_ready(bool ready);
+void ble_scan_set_paused(uint32_t reason, bool paused);
+void ble_scan_snapshot(ble_scan_snapshot_t *snapshot);
+
+static inline bool ble_scan_report_has_type(const ble_scan_report_t *report, uint8_t type) {
+    return (report->apple_types[type / 8u] & (1u << (type % 8u))) != 0;
+}
+
+#endif
