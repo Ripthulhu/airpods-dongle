@@ -33,6 +33,34 @@
 #include "slot_storage.h"
 #include "button_gesture.h"
 #include "pico/flash.h"
+#include "pico/multicore.h"
+
+// Scratch-X holds encoder PCM; give the decoder worker its own main-RAM stack.
+static uint32_t codec_stack[4096] __attribute__((aligned(8)));
+static atomic_uint codec_core_state;
+
+void aacp_mic_dec_wake_worker(void) {
+    __sev();
+}
+
+static void codec_core_entry(void) {
+    bool safe = flash_safe_execute_core_init();
+    atomic_store_explicit(&codec_core_state, safe ? 1u : 2u, memory_order_release);
+    __sev();
+    for (;;) {
+        if (!safe || !aacp_mic_dec_worker_step()) __wfe();
+    }
+}
+
+static bool codec_core_start(void) {
+    if (!flash_safe_execute_core_init()) return false;
+    multicore_launch_core1_with_stack(codec_core_entry, codec_stack, sizeof(codec_stack));
+    absolute_time_t deadline = make_timeout_time_ms(1000);
+    unsigned state;
+    while ((state = atomic_load_explicit(&codec_core_state, memory_order_acquire)) == 0 &&
+           !time_reached(deadline)) tight_loop_contents();
+    return state == 1;
+}
 
 
 static bool __no_inline_not_in_flash_func(get_bootsel_button)() {
@@ -70,12 +98,7 @@ static bool __no_inline_not_in_flash_func(get_bootsel_button)() {
     return button_state;
 }
 
-// Button events are detected in the 20ms alarm-pool timer IRQ, but BTstack
-// APIs (and flash writes) must not be called from there: BTstack runs in the
-// cyw43 async context and a call from a foreign IRQ can deadlock on its lock
-// — observed as a watchdog reset when pressing the reconnect button. The IRQ
-// handlers only latch a request; the main loop executes it with the
-// async-context lock held.
+// Keep Bluetooth actions in thread context with its async lock held.
 static atomic_bool btn_single_pending;
 static atomic_bool btn_double_pending;
 static atomic_bool btn_long_pending;
@@ -145,10 +168,15 @@ static uint64_t last_edge_us     = 0;       // last time level changed
 static uint64_t press_start_us   = 0;       // when current press began
 static button_gesture_t button_gesture;
 
-// Called by the 20 ms button timer.
+static void __no_inline_not_in_flash_func(read_bootsel)(void *value) {
+    *(bool *)value = get_bootsel_button();
+}
+
+// BOOTSEL temporarily disconnects QSPI; pause core1 before sampling it.
 void check_bootsel_state(void)
 {
-    bool raw = get_bootsel_button();            // true == pressed
+    bool raw;
+    if (flash_safe_execute(read_bootsel, &raw, 1) != PICO_OK) return;
     uint64_t now = time_us_64();
 
     // --- debounce ---
@@ -183,12 +211,6 @@ void check_bootsel_state(void)
 bool usb_timer_callback(repeating_timer_t *rt){
     tinyusb_task();
     return true;
-}
-
-bool bootsel_timer_callback(repeating_timer_t *rt) {
-    (void)rt;
-    check_bootsel_state();
-    return true;    // keep repeating
 }
 
 static void ble_diagnostics_task(void) {
@@ -227,7 +249,10 @@ int main() {
     debug_cdc_init();   // route printf() into the CDC ring from the very start
                         // (drained over USB once tusb is up and a terminal opens)
 
-    flash_safe_execute_core_init();
+    if (!codec_core_start()) {
+        printf("Codec core flash coordination unavailable\n");
+        return 1;
+    }
 
     // Distinguish watchdog resets from clean power-on boots in the debug log.
     if (watchdog_caused_reboot()) {
@@ -276,20 +301,20 @@ int main() {
         return 1;
     }
 
-    static repeating_timer_t bootsel_timer;
-    if (!add_repeating_timer_us(20000, bootsel_timer_callback, NULL, &bootsel_timer)) {
-        printf("Button timer unavailable\n");
-        return 1;
-    }
-
     // Enable watchdog — auto-resets if the main loop stops feeding it.
     // 8s (upstream used 2s): the mic decoder init below allocates ~258KB in
     // many chunks from this loop, and long-term testing was done at this value.
     watchdog_enable(8000, true);
 
     bool dec_init_done = false;
+    uint32_t button_sample_ms = to_ms_since_boot(get_absolute_time());
     while (1) {
         watchdog_update();  // feed the watchdog
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if ((uint32_t)(now_ms - button_sample_ms) >= 20u) {
+            button_sample_ms = now_ms;
+            check_bootsel_state();
+        }
         process_button_actions();
 
         bool mic_wanted;
@@ -303,6 +328,7 @@ int main() {
             dec_init_done = true;
             if (!aacp_mic_dec_init()) printf("Microphone decoder unavailable\n");
         }
+        aacp_mic_dec_poll();
         tinyusb_control_task();
         if (usb_mic_take_request(&mic_wanted)) {
             if (mic_wanted) {

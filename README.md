@@ -16,6 +16,7 @@ Pro 3 testing; that does not validate these changes.
 
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
 - Simultaneous AACP microphone, opened only by a USB recording request.
+- Microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
 - 100 ms encoded startup silence for AAC-ELD; source audio stays buffered in order.
 - Play, Pause, Next, Previous and Stop forwarded as USB media controls.
@@ -107,9 +108,13 @@ heap margin and microphone clock drift remain unmeasured. The microphone uses
 the inherited 64 kHz USB presentation clock with a 48 kHz AAC coding configuration;
 this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
-The current build has 9,776 bytes more main-heap capacity than `bde77fb`, before
-codec allocations, using 2,792 extra flash bytes. See the implementation notes
-for the memory layout and remaining measurements.
+Both cores have guarded 16 KiB stacks. The current build leaves 383 KiB of heap
+before codec allocations. A real-codec ARM emulation check leaves about 12 KiB
+after encoder/decoder initialization, before other runtime allocations. Hardware
+heap and stack measurements are still required.
+
+USB audio on Android needs an OTG/power and enumeration check. A wireless phone
+bridge is planned, not implemented; see [phone transport](docs/PHONE-TRANSPORT.md).
 
 See [implementation notes](docs/IMPLEMENTATION.md) for the reviewed differences
 and the boundaries that remain untested.

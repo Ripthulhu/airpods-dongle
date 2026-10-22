@@ -5,7 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.2 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.3 LANGUAGES C CXX ASM)
 pico_sdk_init()
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
@@ -17,6 +17,14 @@ execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools
 if(NOT sdk_check EQUAL 0)
     message(FATAL_ERROR "Pinned SDK patches are required; see README.md")
 endif()
+set(dongle_linker "${CMAKE_CURRENT_BINARY_DIR}/airpods.ld")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/make_linker.py"
+    --sdk "${PICO_SDK_PATH}" --output "${dongle_linker}" RESULT_VARIABLE linker_check)
+if(NOT linker_check EQUAL 0)
+    message(FATAL_ERROR "The pinned SDK linker layout is required")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/tools/make_linker.py")
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static codec libraries" FORCE)
 set(BUILD_PROGRAMS OFF CACHE BOOL "No desktop codec tools" FORCE)
@@ -40,14 +48,16 @@ target_include_directories(airpods_dongle PRIVATE
     3rd-party/fdk-aac
 )
 target_link_libraries(airpods_dongle PRIVATE
-    pico_stdlib pico_btstack_ble pico_btstack_classic pico_btstack_cyw43
+    pico_stdlib pico_multicore pico_btstack_ble pico_btstack_classic pico_btstack_cyw43
     pico_cyw43_arch_threadsafe_background pico_btstack_sbc_encoder
     tinyusb_device tinyusb_board fdk-aac
 )
 pico_enable_stdio_uart(airpods_dongle 0)
 target_compile_definitions(airpods_dongle PRIVATE
-    CYW43_LWIP=0 PICO_FLASH_ASSUME_CORE1_SAFE=1 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
+    CYW43_LWIP=0 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
+    PICO_CORE1_STACK_SIZE=0 PICO_STACK_SIZE=16384 PICO_USE_STACK_GUARDS=1
 )
+pico_set_linker_script(airpods_dongle "${dongle_linker}")
 pico_set_program_name(airpods_dongle "AirPods Dongle")
 pico_set_program_version(airpods_dongle "${PROJECT_VERSION}")
 pico_add_extra_outputs(airpods_dongle)

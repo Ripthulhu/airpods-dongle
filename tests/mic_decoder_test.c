@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <aacdecoder_lib.h>
@@ -9,92 +10,246 @@
 
 char __StackLimit[1];
 static CStreamInfo info = {48000, 480, 1, 39};
-static bool fill_error, partial_fill, decode_error, no_info, config_error;
-static unsigned closed;
-static unsigned decoded, reset_count;
+static bool fill_error, partial_fill, decode_error, no_info, config_error, reset_error;
+static unsigned core, closed, decoded, reset_count, wakes, logs;
 static UINT last_flags;
+static uint8_t expected_au;
+static bool reset_in_decode;
 
+static int checked_printf(const char *format, ...) {
+    assert(core == 0); // No worker access to the single-core CDC producer.
+    (void)format;
+    ++logs;
+    return 0;
+}
+#define printf checked_printf
+#include "../src/btstack/aacp_mic_dec.c"
+#undef printf
+
+void aacp_mic_dec_wake_worker(void) { ++wakes; }
 HANDLE_AACDECODER aacDecoder_Open(int transport, UINT layers) {
-    assert(transport == TT_MP4_RAW && layers == 1);
+    assert(core == 0 && transport == TT_MP4_RAW && layers == 1);
     return &info;
 }
-void aacDecoder_Close(HANDLE_AACDECODER decoder) { assert(decoder == &info); ++closed; }
+void aacDecoder_Close(HANDLE_AACDECODER decoder) {
+    assert(core == 0 && decoder == &info);
+    ++closed;
+}
 AAC_DECODER_ERROR aacDecoder_ConfigRaw(HANDLE_AACDECODER decoder, UCHAR **config, UINT *size) {
     const UCHAR expected[] = {0xf8, 0xe6, 0x30, 0x00};
-    assert(decoder == &info && *size == sizeof(expected));
+    assert(core == 0 && decoder == &info && *size == sizeof(expected));
     assert(memcmp(*config, expected, sizeof(expected)) == 0);
-    assert(!aacp_mic_dec_ready()); // no half-configured handle is published to BTstack
+    assert(!aacp_mic_dec_ready());
     return config_error ? 1 : AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_SetParam(HANDLE_AACDECODER decoder, int param, int value) {
-    assert(decoder == &info && param == AAC_TPDEC_CLEAR_BUFFER && value == 1);
+    assert(core == 1 && decoder == &info && param == AAC_TPDEC_CLEAR_BUFFER && value == 1);
     ++reset_count;
-    return AAC_DEC_OK;
+    return reset_error ? 1 : AAC_DEC_OK;
 }
-AAC_DECODER_ERROR aacDecoder_Fill(HANDLE_AACDECODER decoder, UCHAR **input, UINT *size, UINT *valid) {
-    assert(decoder == &info && input != NULL && size != NULL && *size == *valid);
+AAC_DECODER_ERROR aacDecoder_Fill(HANDLE_AACDECODER decoder, UCHAR **bytes, UINT *size, UINT *valid) {
+    assert(core == 1 && decoder == &info && *size == *valid);
+    assert((*bytes)[0] == expected_au); // Source caller may already have reused its SDU.
     *valid = partial_fill ? 1 : 0;
     return fill_error ? 1 : AAC_DEC_OK;
 }
 AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER decoder, INT_PCM *pcm, int capacity, UINT flags) {
-    assert(decoder == &info && capacity >= 480);
+    assert(core == 1 && decoder == &info && capacity == 480);
     ++decoded;
     last_flags = flags;
-    for (int i = 0; i < 480; ++i) pcm[i] = (int16_t)(i + 1);
+    for (unsigned i = 0; i < 480; ++i) pcm[i] = (int16_t)(i + 1);
+    if (reset_in_decode) {
+        // Simulate a core0 USB-close/reset while core1 is inside the codec.
+        core = 0;
+        assert(aacp_mic_dec_reset());
+        core = 1;
+        reset_in_decode = false;
+    }
     return decode_error ? 1 : AAC_DEC_OK;
 }
 CStreamInfo *aacDecoder_GetStreamInfo(HANDLE_AACDECODER decoder) {
-    assert(decoder == &info);
+    assert(core == 1 && decoder == &info);
     return no_info ? NULL : &info;
 }
 uint32_t time_us_32(void) { static uint32_t now; return ++now; }
 
+static bool step(void) {
+    core = 1;
+    bool worked = aacp_mic_dec_worker_step();
+    core = 0;
+    return worked;
+}
+static void drain(void) {
+    unsigned iterations = 0;
+    while (step()) assert(++iterations <= MIC_INPUT_FRAMES + 4u);
+}
+static void enqueue(void) {
+    uint8_t au[] = {37, 2, 3};
+    expected_au = au[0];
+    assert(aacp_mic_dec_submit(au, sizeof(au)));
+    memset(au, 0xa5, sizeof(au));
+}
+static void reset_and_drain(void) {
+    assert(aacp_mic_dec_reset());
+    assert(!aacp_mic_dec_reset_done());
+    drain();
+    assert(aacp_mic_dec_reset_done());
+    int16_t discarded[480];
+    assert(aacp_mic_pcm_read(discarded, 480) == 0);
+}
+
 int main(void) {
-    const uint8_t au[] = {1, 2, 3};
-    int16_t output[480];
-    assert(!aacp_mic_dec_ready());
+    int16_t pcm[960];
+    assert(!step() && !aacp_mic_dec_ready());
+    assert(!aacp_mic_dec_reset_done());
     config_error = true;
     assert(!aacp_mic_dec_init() && !aacp_mic_dec_ready() && closed == 1);
     config_error = false;
     assert(aacp_mic_dec_init() && aacp_mic_dec_ready());
-    assert(aacp_mic_dec_reset());
-    assert(aacp_mic_pcm_read(output, 480) == 0);
-    assert(aacp_mic_dec_decode(au, sizeof(au)));
-    assert(last_flags == AACDEC_CLRHIST);
-    assert(aacp_mic_pcm_read(output, 480) == 480);
-    for (int i = 0; i < 480; ++i) assert(output[i] == i + 1);
-    assert(aacp_mic_dec_decode(au, sizeof(au)) && last_flags == 0);
+    assert(step() && aacp_mic_dec_reset_done());
+    assert(!step());
 
-    // A changed format must discard previously queued PCM, not play it as mono.
-    int *invalid_fields[] = {&info.numChannels, &info.frameSize, &info.sampleRate, &info.aot};
+    unsigned before = decoded;
+    enqueue();
+    assert(decoded == before && aacp_mic_dec_completed() == 0);
+    assert(step() && decoded == before + 1 && last_flags == AACDEC_CLRHIST);
+    assert(aacp_mic_dec_completed() == 1);
+    assert(aacp_mic_pcm_read(pcm, 64) == 64);
+    for (unsigned i = 0; i < 64; ++i) assert(pcm[i] == (int16_t)(i + 1));
+    assert(aacp_mic_pcm_read(pcm, 480) == 416);
+    for (unsigned i = 0; i < 416; ++i) assert(pcm[i] == (int16_t)(i + 65));
+    enqueue();
+    assert(step() && last_flags == 0);
+
+    // Both already-published PCM and queued input are invalidated by a reset.
+    enqueue();
+    before = decoded;
+    uint32_t done = aacp_mic_dec_completed();
+    assert(aacp_mic_dec_reset());
+    assert(aacp_mic_pcm_read(pcm, 960) == 0);
+    drain();
+    assert(decoded == before && aacp_mic_dec_completed() == done);
+    enqueue();
+    assert(step() && last_flags == AACDEC_CLRHIST);
+    assert(aacp_mic_pcm_read(pcm, 480) == 480);
+
+    // A stop while the codec is busy cannot publish its stale result.
+    enqueue();
+    reset_in_decode = true;
+    done = aacp_mic_dec_completed();
+    assert(step() && aacp_mic_dec_completed() == done);
+    assert(aacp_mic_pcm_read(pcm, 480) == 0);
+    drain();
+    assert(aacp_mic_dec_reset_done());
+
+    // A reset immediately AFTER publication rejects that frame too.
+    enqueue();
+    assert(step());
+    aacp_mic_pcm_reset();
+    assert(aacp_mic_pcm_read(pcm, 480) == 0);
+    drain();
+
+    // A partial read followed by cancellation must not expose its remainder.
+    enqueue();
+    assert(step() && aacp_mic_pcm_read(pcm, 27) == 27);
+    reset_and_drain();
+    enqueue();
+    assert(step() && aacp_mic_pcm_read(pcm, 480) == 480);
+    assert(pcm[0] == 1 && pcm[479] == 480);
+
+    // Queue exhaustion drops the generation; it does not grow or decode stale work.
+    for (unsigned i = 0; i < MIC_INPUT_FRAMES; ++i) enqueue();
+    uint8_t au[] = {37};
+    before = decoded;
+    done = aacp_mic_dec_completed();
+    assert(!aacp_mic_dec_submit(au, sizeof(au)));
+    drain();
+    assert(decoded == before && aacp_mic_dec_completed() == done);
+    assert(aacp_mic_dec_reset_done());
+
+    // Wrong format, fill/decode failures and malformed input discard all old PCM.
+    int *fields[] = {&info.numChannels, &info.frameSize, &info.sampleRate, &info.aot};
     const int wrong[] = {2, 960, 64000, 2};
     for (unsigned i = 0; i < 4; ++i) {
-        int original = *invalid_fields[i];
-        *invalid_fields[i] = wrong[i];
-        unsigned before = reset_count;
-        assert(!aacp_mic_dec_decode(au, sizeof(au)) && reset_count == before + 1);
-        assert(aacp_mic_pcm_read(output, 480) == 0);
-        *invalid_fields[i] = original;
-        assert(aacp_mic_dec_decode(au, sizeof(au)) && last_flags == AACDEC_CLRHIST);
+        int saved = *fields[i];
+        *fields[i] = wrong[i];
+        enqueue();
+        done = aacp_mic_dec_completed();
+        assert(step() && aacp_mic_dec_completed() == done);
+        assert(aacp_mic_pcm_read(pcm, 480) == 0);
+        *fields[i] = saved;
+        drain();
+        enqueue();
+        assert(step() && last_flags == AACDEC_CLRHIST);
+        assert(aacp_mic_pcm_read(pcm, 480) == 480);
     }
-    fill_error = true;
-    unsigned before = decoded;
-    assert(!aacp_mic_dec_decode(au, sizeof(au)) && decoded == before);
-    fill_error = false;
-    partial_fill = true;
-    assert(!aacp_mic_dec_decode(au, sizeof(au)) && decoded == before);
-    partial_fill = false;
-    decode_error = true;
-    assert(!aacp_mic_dec_decode(au, sizeof(au)));
-    decode_error = false;
-    no_info = true;
-    assert(!aacp_mic_dec_decode(au, sizeof(au)));
-    no_info = false;
-    assert(!aacp_mic_dec_decode(NULL, sizeof(au)));
-    assert(!aacp_mic_dec_decode(au, 0));
-    assert(!aacp_mic_dec_decode(au, 256));
-    assert(aacp_mic_pcm_read(output, 480) == 0);
-    assert(aacp_mic_dec_decode(au, sizeof(au)) && last_flags == AACDEC_CLRHIST);
-    assert(aacp_mic_pcm_read(output, 480) == 480);
-    puts("mic decoder format validation and interruption recovery: passed");
+    bool *errors[] = {&fill_error, &partial_fill, &decode_error, &no_info};
+    for (unsigned i = 0; i < 4; ++i) {
+        *errors[i] = true;
+        enqueue();
+        done = aacp_mic_dec_completed();
+        assert(step() && aacp_mic_dec_completed() == done);
+        assert(aacp_mic_pcm_read(pcm, 480) == 0);
+        *errors[i] = false;
+        drain();
+    }
+    assert(!aacp_mic_dec_submit(NULL, 3));
+    assert(!aacp_mic_dec_submit(au, 0));
+    assert(!aacp_mic_dec_submit(au, 256));
+    drain();
+
+    // Slow/closed USB cannot cause an unbounded output backlog.
+    for (unsigned i = 0; i < MIC_OUTPUT_FRAMES; ++i) {
+        enqueue();
+        assert(step());
+    }
+    enqueue();
+    done = aacp_mic_dec_completed();
+    assert(step() && aacp_mic_dec_completed() == done);
+    assert(aacp_mic_pcm_read(pcm, 960) == 0);
+    drain();
+
+    // Cursor wrap and generation wrap retain the same ownership rules.
+    atomic_store(&input_written, UINT32_MAX - 2u);
+    atomic_store(&input_read, UINT32_MAX - 2u);
+    atomic_store(&output_written, UINT32_MAX - 2u);
+    atomic_store(&output_read, UINT32_MAX - 2u);
+    atomic_store(&generation, UINT32_MAX);
+    drain();
+    for (unsigned i = 0; i < 8; ++i) {
+        enqueue();
+        assert(step() && aacp_mic_pcm_read(pcm, 480) == 480);
+    }
+    reset_and_drain();
+    assert(atomic_load(&generation) == 0);
+    done = aacp_mic_dec_completed();
+    aacp_mic_dec_reset_stats();
+    drain();
+    assert(aacp_mic_dec_completed() == done);
+
+    // Snapshot exchange is nonblocking and formatted only by core0.
+    unsigned previous_logs = logs;
+    aacp_mic_dec_report();
+    assert(step() && logs == previous_logs);
+    aacp_mic_dec_report();
+    assert(!step()); // One unread snapshot prevents overwrite.
+    aacp_mic_dec_poll();
+    assert(logs == previous_logs + 1);
+    assert(step());
+    aacp_mic_dec_poll();
+    assert(!step());
+
+    // Failed reset permanently gates capture instead of advertising false readiness.
+    reset_error = true;
+    assert(aacp_mic_dec_reset());
+    assert(step());
+    assert(!aacp_mic_dec_ready() && !aacp_mic_dec_reset_done());
+    assert(!aacp_mic_dec_submit(au, sizeof(au)) && !step());
+    previous_logs = logs;
+    aacp_mic_dec_poll();
+    assert(logs == previous_logs + 1);
+    aacp_mic_dec_poll();
+    assert(logs == previous_logs + 1);
+    assert(wakes != 0);
+    puts("mic worker ownership, queue bounds, generations, cancellation and fault recovery: passed");
 }

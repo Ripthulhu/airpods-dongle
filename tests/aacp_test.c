@@ -7,6 +7,8 @@ static uint16_t next_cid, last_disconnected;
 static unsigned connects, disconnects, sends, starts, stops, decoded, resets;
 static uint8_t create_result, send_result;
 static bool decoder_ready = true, decode_ok = true;
+static bool decoder_reset_done = true, complete_on_submit = true;
+static uint32_t completed;
 static bool usb_capture_wanted;
 static bd_addr_t peer = {1, 2, 3, 4, 5, 6};
 
@@ -39,12 +41,15 @@ uint8_t l2cap_send(uint16_t cid, uint8_t *data, uint16_t len) {
 bool aacp_mic_dec_ready(void) { return decoder_ready; }
 bool usb_mic_requested(void) { return usb_capture_wanted; }
 bool aacp_mic_dec_reset(void) { resets++; return decoder_ready; }
+bool aacp_mic_dec_reset_done(void) { return decoder_reset_done; }
+uint32_t aacp_mic_dec_completed(void) { return completed; }
 void aacp_mic_dec_reset_stats(void) {}
 void aacp_mic_dec_report(void) {}
 void aacp_mic_pcm_reset(void) {}
-bool aacp_mic_dec_decode(const uint8_t *au, uint16_t len) {
+bool aacp_mic_dec_submit(const uint8_t *au, uint16_t len) {
     assert(au != NULL && len != 0);
     decoded++;
+    if (decode_ok && complete_on_submit) completed++;
     return decode_ok;
 }
 
@@ -86,6 +91,8 @@ static void fixture(void) {
     connects = disconnects = sends = starts = stops = decoded = resets = 0;
     create_result = send_result = 0;
     decoder_ready = decode_ok = true;
+    decoder_reset_done = complete_on_submit = true;
+    completed = 0;
     usb_capture_wanted = false;
 }
 static void request_capture(void) {
@@ -114,6 +121,7 @@ static void capture(void) {
 }
 static unsigned audio(uint8_t *p, uint16_t cid, unsigned size) {
     aacp_packet_handler(L2CAP_DATA_PACKET, cid, p, (uint16_t)size);
+    aacp_poll();
     return decoded;
 }
 
@@ -375,6 +383,95 @@ static void test_usb_irq_cancel_precedes_main_loop_notification(void) {
     assert(starts == 1 && stops == 1 && !aacp_mic_active());
 }
 
+static void test_worker_reset_ack_and_timeout(void) {
+    fixture();
+    ready();
+    decoder_reset_done = false;
+    unsigned before = resets;
+    request_capture();
+    for (unsigned i = 0; i < 20; ++i) aacp_poll();
+    assert(resets == before + 1 && starts == 0 && !aacp_mic_start_queued());
+    decoder_reset_done = true;
+    aacp_poll();
+    drain();
+    assert(starts == 1);
+
+    fixture();
+    ready();
+    decoder_reset_done = false;
+    request_capture();
+    now = AACP_MIC_PREPARE_TIMEOUT_MS;
+    aacp_poll();
+    assert(aacp_mic_failed && starts == 0 && !aacp_mic_start_queued());
+    decoder_reset_done = true;
+    aacp_poll();
+    assert(starts == 0);
+    close_capture();
+    request_capture();
+    drain();
+    assert(starts == 1);
+}
+
+static void test_queued_frames_do_not_feed_decode_watchdog(void) {
+    fixture();
+    capture();
+    complete_on_submit = false;
+    uint8_t p[29] = {4, 0, 4, 0, 0x58, 0, 1, 0};
+    p[26] = 2;
+    now = 1500;
+    audio(p, aacp_cid, sizeof(p));
+    assert(decoded == 1 && mic_stats.last_sdu_ms == 0);
+    now = 2000;
+    fire(&aacp_mic_stats_timer);
+    assert(!aacp_mic_running); // arrivals cannot hide a stalled worker
+
+    fixture();
+    capture();
+    now = 1500;
+    completed++;
+    aacp_poll();
+    assert(mic_stats.last_sdu_ms == 1500);
+    now = 2000;
+    fire(&aacp_mic_stats_timer);
+    assert(aacp_mic_running);
+    close_capture();
+    completed++;
+    aacp_poll();
+    assert(mic_stats.last_sdu_ms == 1500);
+}
+
+static void test_worker_fault_and_reset_after_start_queued(void) {
+    fixture();
+    ready();
+    decoder_reset_done = false;
+    request_capture();
+    decoder_ready = false;
+    aacp_poll();
+    assert(aacp_mic_failed && !aacp_mic_preparing && starts == 0);
+
+    fixture();
+    ready();
+    request_capture();
+    assert(aacp_mic_start_queued());
+    decoder_reset_done = false;
+    event(L2CAP_EVENT_CAN_SEND_NOW, aacp_cid);
+    assert(starts == 0 && aacp_mic_start_waiting_for_reset);
+    aacp_poll();
+    assert(starts == 0);
+    decoder_reset_done = true;
+    aacp_poll();
+    assert(!aacp_mic_start_waiting_for_reset);
+    drain();
+    assert(starts == 1);
+
+    fixture();
+    ready();
+    request_capture();
+    decoder_ready = decoder_reset_done = false;
+    drain();
+    assert(starts == 0 && aacp_mic_failed && !aacp_mic_start_queued());
+}
+
 int main(void) {
     test_handshake_and_decoder_gate();
     test_usb_cancel_and_stop_are_not_lost();
@@ -387,6 +484,9 @@ int main(void) {
     test_gap_and_wrap_clear_predictor_history();
     test_short_events_cannot_change_channel();
     test_usb_irq_cancel_precedes_main_loop_notification();
-    puts("AACP lifecycle and packet validation: 11 groups passed");
+    test_worker_reset_ack_and_timeout();
+    test_queued_frames_do_not_feed_decode_watchdog();
+    test_worker_fault_and_reset_after_start_queued();
+    puts("AACP lifecycle and packet validation: 14 groups passed");
     return 0;
 }

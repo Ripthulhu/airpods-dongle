@@ -17,9 +17,9 @@ reference file hashes used for these changes.
 | Media flushing | Expired controller media can stall control or trigger disconnect | Mark only the media CID flushable, use 200 ms when non-flushable control is supported, and keep flush events from tearing down the ACL |
 | Microphone lifecycle | Queued Start survives USB close; endless restart attempts | Check live USB demand, cancel queued Start, bound retries and wait for uplink quiet after Stop |
 | Microphone parsing | A valid prefix can be decoded before a malformed tail | Validate the whole SDU before any decode; reject zero-length/truncated AUs |
-| Decoder | Partially configured handle can become visible to callbacks | Publish the configured handle atomically; validate mono/480-sample AAC-ELD output and reset after interrupted input |
+| Decoder | Codec work blocks the Bluetooth callback | Copy bounded AUs to core 1, acknowledge resets before Start and validate completed mono/480-sample output |
 | Codec allocation | Bluetooth encoder callbacks can interrupt decoder allocation and deadlock the heap mutex | Allocate the decoder in thread context while holding the Bluetooth async lock; USB servicing remains active |
-| PCM queues | Racy cursor resets and repeated queue allocations | Use bounded storage, consumer-owned microphone reset and acquire/release publication |
+| PCM queues | Racy cursor resets and repeated queue allocations | Use bounded storage, generation-tagged microphone frames and acquire/release publication |
 | USB controls | Invalid channel/format requests and repeated mute alter state | Reject unsupported requests; apply idempotent mute to PCM and preserve volume |
 | Stem controls | Play/Pause mutes the dongle instead of controlling the player | Send explicit USB Consumer Control commands, with bounded queues and ordered key releases |
 | BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity |
@@ -27,18 +27,36 @@ reference file hashes used for these changes.
 
 ## Hardware use
 
-Measured with GCC 13.2.1, SDK 2.1.1 and the same Release build, against `bde77fb`:
+Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
 
-| Linked layout | Before | Current |
-| --- | ---: | ---: |
-| Main-heap capacity before codec allocations | 413,920 bytes | 423,696 bytes |
-| Flash image | 1,549,032 bytes | 1,551,824 bytes |
-| Full BLE cache copy for aggregate logs | 700 bytes | 28 bytes |
+| Linked layout | `bde77fb` | 0.1.2 | 0.1.3 |
+| --- | ---: | ---: | ---: |
+| Main-heap capacity before codec allocations | 413,920 bytes | 423,696 bytes | 392,512 bytes |
+| Flash image | 1,549,032 bytes | 1,551,824 bytes | 1,558,360 bytes |
+| Full BLE cache copy for aggregate logs | 700 bytes | 28 bytes | 28 bytes |
 
-The encoder's 4 KiB scratch buffer uses the otherwise idle scratch-X bank.
-The unused multicore library and stack reservation are removed; the linker
-rejects adding a core1 stack while that bank is full. Allocator locking remains
-enabled. This moves memory between banks; it does not make the encoder use less RAM.
+The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
+decode PCM use 3 KiB of scratch-Y. Core 1 has an explicit 16 KiB stack in ordinary
+RAM; a hash-checked SDK linker derivative reserves another 16 KiB at the top of
+ordinary RAM for core 0, outside the heap. Stack guards are enabled on both cores.
+The lower heap capacity accounts for real stack reservations rather than assuming
+the SDK's small default stacks are sufficient. Allocator locking stays enabled.
+
+The inherited FDK decoder reserved 35,392 bytes in its internal decode function
+for a coupling-element parser, even on the mono ELD path. That parser now lives
+in a separate non-inlined function; ELD rejects coupling elements. The internal
+function's ARM static frame is 840 bytes. Other supported codec paths retain the
+original coupling parser. ARM emulation measured about 7.5 KiB of nested decoder
+stack writes and 7.4 KiB for stereo ELD encoding, including the probe's margin.
+These measurements support the 16 KiB reservations but do not establish hardware
+stack high-water marks under USB/Bluetooth interrupts.
+
+The real-codec probe initializes stereo ELD at 48 kHz/256 kbps plus the microphone
+decoder with ASC `F8 E6 30 00`. Live allocator use is 379,864 bytes, leaving 12,648
+bytes of the current heap region before other application allocations. Allocator
+arena use also depends on heap alignment. Sixteen generated mono frames
+decode identically before and after the stack change. See
+[`tools/codec_probe`](../tools/codec_probe/) for reproduction and emulator limits.
 
 Unused Bluetooth HFP, HID, network and serial profile pools are disabled. The
 implemented audio/control profiles, two HCI connections, GATT client capacity
@@ -54,6 +72,26 @@ their result from retained raw data rather than a duplicate bitmap.
 checksums match the old implementation; host timings do not measure Pico codec
 load or acoustic latency. Actual peak heap usage, IRQ duration and codec deadlines
 still require the board.
+
+## Core ownership
+
+Core 0 retains Bluetooth, USB, playback encoding and control state. It allocates
+and configures the microphone decoder once in thread context under the Bluetooth
+async lock, then publishes the handle. Core 1 owns steady-state decode, codec
+reset and decoder statistics. It never calls Bluetooth, USB or logging APIs.
+
+Eight copied compressed frames and sixteen tagged PCM frames bound worker memory.
+Stop, reset, disconnect and queue saturation invalidate the generation. The USB
+consumer discards stale output, including an in-flight decode completed after
+cancellation. Start waits for reset acknowledgement; a stopped worker cannot feed
+the valid-audio watchdog merely by accepting queued input. Preparation times out
+after one second, and the existing valid-frame watchdog bounds capture recovery.
+
+Both cores register for SDK flash lockout before pairing/storage can write flash.
+The worker uses atomic queues and wake events, leaving the multicore FIFO to the
+SDK. BOOTSEL sampling also disconnects QSPI briefly, so it runs in thread context
+under flash lockout instead of directly in a timer interrupt. Logs cross through
+a coherent mailbox and are formatted only on core 0.
 
 ## Protocol choices
 

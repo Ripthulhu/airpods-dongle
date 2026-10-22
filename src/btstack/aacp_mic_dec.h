@@ -1,52 +1,38 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 han-um
-//
-// AAC-ELD decoder for the AirPods hi-res mic stream.
-//
-// Wraps fdk-aac's aacDecoder_* API: TT_MP4_RAW transport, mono, configured
-// with the fixed 4-byte AudioSpecificConfig from librepods. Decoded PCM
-// lands in a lock-free ring consumed by the USB mic endpoint (uac.c).
-//
-
 #ifndef AACP_MIC_DEC_H
 #define AACP_MIC_DEC_H
 
 #include <stdint.h>
 #include <stdbool.h>
 
-// Open + configure the decoder. MUST be called from plain thread context at
-// boot (main()) — never from a BTstack/async callback; the bulk mallocs hang
-// there (see aacp_mic_dec.c). Idempotent; the instance persists forever.
+// Allocate/configure once in core0 thread context with the Bluetooth lock held.
 bool aacp_mic_dec_init(void);
-
-// True if the decoder was successfully opened at boot.
 bool aacp_mic_dec_ready(void);
 
-// Decode one AAC-ELD access unit. Updates internal statistics.
-// Returns true on a successfully decoded frame.
-bool aacp_mic_dec_decode(const uint8_t *au, uint16_t len);
+// Core0 producer: copies a complete AU; success means queued, not decoded.
+bool aacp_mic_dec_submit(const uint8_t *au, uint16_t len);
 
-// Emit the once-per-second "[DEC]" statistics line and reset interval
-// counters. Called from the mic stats timer in btstack_aacp.c.
-void aacp_mic_dec_report(void);
-
-// Clear compressed input, prediction history and queued PCM without reallocating.
-// Call only from the decoder/BTstack context; false if the decoder is unavailable.
+// Invalidate pending input/output immediately; core1 acknowledges codec reset.
 bool aacp_mic_dec_reset(void);
-
-// Reset cumulative statistics (called on mic START).
+bool aacp_mic_dec_reset_done(void);
 void aacp_mic_dec_reset_stats(void);
 
-// --- Decoded-PCM ring buffer (mono 16-bit @ 64 kHz) ---
-// Single producer (decoder, BTstack context) / single consumer (USB IN
-// callback in the USB timer IRQ) — lock-free.
+// Core1 only: bounded work, no allocation, logging, Bluetooth or USB calls.
+bool aacp_mic_dec_worker_step(void);
 
-// Pull up to `n` samples into dst; returns the number actually read.
-// The USB callback zero-fills any shortfall.
+// Successful frame counter is monotonic across resets; enqueue is not progress.
+uint32_t aacp_mic_dec_completed(void);
+
+// Core0 requests/retrieves a coherent statistics report without blocking core1.
+void aacp_mic_dec_report(void);
+void aacp_mic_dec_poll(void);
+
+// Platform hook: publish a wake event after submitting work or control requests.
+void aacp_mic_dec_wake_worker(void);
+
+// USB consumer only; stale-generation frames are discarded before delivery.
 uint32_t aacp_mic_pcm_read(int16_t *dst, uint32_t n);
-
-// Request a discard on the next USB read. Safe from either context; the consumer
-// alone advances its cursor, so reset cannot race a read and roll it backwards.
 void aacp_mic_pcm_reset(void);
 
-#endif // AACP_MIC_DEC_H
+#endif

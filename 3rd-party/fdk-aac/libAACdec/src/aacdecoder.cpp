@@ -92,6 +92,10 @@ www.iis.fraunhofer.de/amm
 amm-info@iis.fraunhofer.de
 ----------------------------------------------------------------------------- */
 
+/* Third-Party Modified Version of the Fraunhofer FDK AAC Codec Library for Android.
+ * Modified 2026-10-22: isolate unsupported coupling-element parser stack use.
+ */
+
 /**************************** AAC decoder library ******************************
 
    Author(s):   Josef Hoepfl
@@ -2480,6 +2484,55 @@ bail:
   return AAC_DEC_OUT_OF_MEMORY;
 }
 
+// Keep this rarely used dummy parser's large local buffers off normal decode stacks.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#elif defined(_MSC_VER)
+__declspec(noinline)
+#endif
+static AAC_DECODER_ERROR CAacDecoder_ParseCouplingElement(
+    HANDLE_AACDECODER self, HANDLE_FDK_BITSTREAM bs, CProgramConfig *pce,
+    UCHAR *previous_element_index) {
+  CAacDecoderCommonData commonData;
+  CAacDecoderCommonStaticData commonStaticData;
+  CWorkBufferCore1 workBufferCore1;
+  commonStaticData.pWorkBufferCore1 = &workBufferCore1;
+  C_AALLOC_SCRATCH_START(mdctSpec, FIXP_DBL, 1024);
+
+  CAacDecoderChannelInfo tmpAacDecoderChannelInfo, *pTmpAacDecoderChannelInfo;
+  FDKmemclear(mdctSpec, 1024 * sizeof(FIXP_DBL));
+  tmpAacDecoderChannelInfo.pDynData = commonData.pAacDecoderDynamicData;
+  tmpAacDecoderChannelInfo.pComData = &commonData;
+  tmpAacDecoderChannelInfo.pComStaticData = &commonStaticData;
+  tmpAacDecoderChannelInfo.pSpectralCoefficient = (SPECTRAL_PTR)mdctSpec;
+  /* Assume AAC-LC. */
+  tmpAacDecoderChannelInfo.granuleLength = self->streamInfo.aacSamplesPerFrame / 8;
+  CPns_ResetData(&tmpAacDecoderChannelInfo.data.aac.PnsData,
+                &tmpAacDecoderChannelInfo.pComData->pnsInterChannelData);
+  pTmpAacDecoderChannelInfo = &tmpAacDecoderChannelInfo;
+  AAC_DECODER_ERROR error = CChannelElement_Read(
+      bs, &pTmpAacDecoderChannelInfo, NULL, self->streamInfo.aot,
+      &self->samplingRateInfo[0], self->flags[0], AC_EL_GA_CCE,
+      self->streamInfo.aacSamplesPerFrame, 1, self->streamInfo.epConfig,
+      self->hInput);
+
+  C_AALLOC_SCRATCH_END(mdctSpec, FIXP_DBL, 1024);
+  if (error) {
+    self->frameOK = 0;
+  }
+  if (self->frameOK) {
+    if (!CProgramConfig_LookupElement(
+            pce, self->streamInfo.channelConfig,
+            pTmpAacDecoderChannelInfo->ElementInstanceTag, 0, self->chMapping,
+            self->channelType, self->channelIndices, (8), previous_element_index,
+            self->elements, ID_CCE)) {
+      self->frameOK = 0;
+    }
+    /* Decoding of CCE is not supported; preserve its parsing behavior. */
+  }
+  return error;
+}
+
 LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
     HANDLE_AACDECODER self, const UINT flags, PCM_DEC *pTimeData,
     const INT timeDataSize, const int timeDataChannelOffset) {
@@ -2786,59 +2839,15 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
           break;
         }
 
+        /* Coupling elements are not part of the configured ELD channel map. */
+        if (self->flags[streamIndex] & AC_ELD) {
+          ErrorStatus = AAC_DEC_UNSUPPORTED_FORMAT;
+          self->frameOK = 0;
+          break;
+        }
         if (self->frameOK) {
-          CAacDecoderCommonData commonData;
-          CAacDecoderCommonStaticData commonStaticData;
-          CWorkBufferCore1 workBufferCore1;
-          commonStaticData.pWorkBufferCore1 = &workBufferCore1;
-          /* memory for spectral lines temporal on scratch */
-          C_AALLOC_SCRATCH_START(mdctSpec, FIXP_DBL, 1024);
-
-          /* create dummy channel for CCE parsing on stack */
-          CAacDecoderChannelInfo tmpAacDecoderChannelInfo,
-              *pTmpAacDecoderChannelInfo;
-
-          FDKmemclear(mdctSpec, 1024 * sizeof(FIXP_DBL));
-
-          tmpAacDecoderChannelInfo.pDynData = commonData.pAacDecoderDynamicData;
-          tmpAacDecoderChannelInfo.pComData = &commonData;
-          tmpAacDecoderChannelInfo.pComStaticData = &commonStaticData;
-          tmpAacDecoderChannelInfo.pSpectralCoefficient =
-              (SPECTRAL_PTR)mdctSpec;
-          /* Assume AAC-LC */
-          tmpAacDecoderChannelInfo.granuleLength =
-              self->streamInfo.aacSamplesPerFrame / 8;
-          /* Reset PNS data. */
-          CPns_ResetData(
-              &tmpAacDecoderChannelInfo.data.aac.PnsData,
-              &tmpAacDecoderChannelInfo.pComData->pnsInterChannelData);
-          pTmpAacDecoderChannelInfo = &tmpAacDecoderChannelInfo;
-          /* do CCE parsing */
-          ErrorStatus = CChannelElement_Read(
-              bs, &pTmpAacDecoderChannelInfo, NULL, self->streamInfo.aot,
-              &self->samplingRateInfo[streamIndex], self->flags[streamIndex],
-              AC_EL_GA_CCE, self->streamInfo.aacSamplesPerFrame, 1,
-              self->streamInfo.epConfig, self->hInput);
-
-          C_AALLOC_SCRATCH_END(mdctSpec, FIXP_DBL, 1024);
-
-          if (ErrorStatus) {
-            self->frameOK = 0;
-          }
-
-          if (self->frameOK) {
-            /* Lookup the element and decode it only if it belongs to the
-             * current program */
-            if (CProgramConfig_LookupElement(
-                    pce, self->streamInfo.channelConfig,
-                    pTmpAacDecoderChannelInfo->ElementInstanceTag, 0,
-                    self->chMapping, self->channelType, self->channelIndices,
-                    (8), &previous_element_index, self->elements, type)) {
-              /* decoding of CCE not supported */
-            } else {
-              self->frameOK = 0;
-            }
-          }
+          ErrorStatus = CAacDecoder_ParseCouplingElement(
+              self, bs, pce, &previous_element_index);
         }
         el_cnt[type]++;
         break;

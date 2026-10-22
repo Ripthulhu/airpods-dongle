@@ -86,6 +86,7 @@ typedef struct {
 #define AACP_MIC_RESTARTS 1
 #define AACP_MIC_QUIET_MS 500
 #define AACP_MIC_DRAIN_MS 2000
+#define AACP_MIC_PREPARE_TIMEOUT_MS 1000
 static aacp_pkt_t aacp_tx_queue[AACP_TX_QUEUE_LEN];
 static uint8_t aacp_tx_head, aacp_tx_count;
 static uint16_t aacp_cid;
@@ -98,6 +99,11 @@ static btstack_timer_source_t aacp_connect_timer;
 #define TYPE58_HEADER_LEN 22
 static bool aacp_mic_running, aacp_mic_want, aacp_mic_failed, aacp_mic_remote_active;
 static bool aacp_mic_stopping;
+static bool aacp_mic_preparing;
+static bool aacp_mic_start_waiting_for_reset;
+static bool aacp_mic_gap_reset;
+static uint32_t aacp_mic_prepare_since_ms;
+static uint32_t aacp_mic_completed_seen;
 static uint8_t aacp_mic_restarts;
 static uint8_t aacp_mic_stop_retries;
 static uint32_t aacp_mic_stop_since_ms, aacp_last_uplink_ms;
@@ -114,6 +120,8 @@ static void aacp_try_mic_start(void);
 
 static void aacp_mic_teardown(void) {
     aacp_mic_running = false;
+    aacp_mic_preparing = false;
+    aacp_mic_gap_reset = false;
     btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
     aacp_mic_pcm_reset();
 }
@@ -195,6 +203,7 @@ static bool aacp_mic_start_queued(void) {
 
 // USB close cancels queued STARTs too, including watchdog restarts.
 static void aacp_drop_mic_commands(void) {
+    aacp_mic_start_waiting_for_reset = false;
     uint8_t kept = 0;
     for (unsigned i = 0; i < aacp_tx_count; ++i) {
         aacp_pkt_t p = aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN];
@@ -216,12 +225,23 @@ static void aacp_channel_failed(void) {
     aacp_schedule_retry();
 }
 
+static void aacp_mic_update_progress(void) {
+    uint32_t completed = aacp_mic_dec_completed();
+    if (completed == aacp_mic_completed_seen) return;
+    aacp_mic_completed_seen = completed;
+    if (aacp_mic_want && aacp_mic_running && usb_mic_requested()) {
+        mic_stats.last_sdu_ms = btstack_run_loop_get_time_ms();
+        aacp_mic_gap_reset = false;
+    }
+}
+
 static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
     if (aacp_mic_want && !usb_mic_requested()) {
         aacp_mic_stop();
         return;
     }
     if (!aacp_mic_want || !aacp_mic_running || !aacp_connected) return;
+    aacp_mic_update_progress();
     uint32_t now = btstack_run_loop_get_time_ms();
     printf("[MIC] sdu/s=%lu au/s=%lu malformed=%u\n",
            (unsigned long)mic_stats.sdu_interval,
@@ -251,12 +271,32 @@ static void aacp_try_mic_start(void) {
     if (!usb_mic_requested() || !aacp_mic_want || aacp_mic_failed || aacp_mic_running ||
         aacp_mic_remote_active || aacp_mic_stopping ||
         !aacp_connected || !aacp_got_control || !aacp_init_sent ||
-        !aacp_mic_dec_ready() || aacp_mic_start_queued()) return;
-    if (!aacp_mic_dec_reset()) {
-        aacp_mic_failed = true;
+        aacp_mic_start_queued()) return;
+    if (!aacp_mic_dec_ready()) {
+        if (aacp_mic_preparing) {
+            aacp_mic_failed = true;
+            aacp_mic_preparing = false;
+            printf("[MIC] decoder worker reset failed\n");
+        }
         return;
     }
-    aacp_mic_dec_reset_stats();
+    if (!aacp_mic_preparing) {
+        if (!aacp_mic_dec_reset()) {
+            aacp_mic_failed = true;
+            return;
+        }
+        aacp_mic_dec_reset_stats();
+        aacp_mic_preparing = true;
+        aacp_mic_prepare_since_ms = btstack_run_loop_get_time_ms();
+    }
+    if (!aacp_mic_dec_reset_done()) {
+        if ((uint32_t)(btstack_run_loop_get_time_ms() - aacp_mic_prepare_since_ms) >=
+            AACP_MIC_PREPARE_TIMEOUT_MS) {
+            aacp_mic_failed = true;
+            printf("[MIC] decoder worker reset timed out\n");
+        }
+        return;
+    }
     if (aacp_tx_enqueue(aacp_mic_start_bytes, sizeof(aacp_mic_start_bytes))) {
         memset(&mic_stats, 0, sizeof(mic_stats));
     }
@@ -293,6 +333,17 @@ static void aacp_handle_can_send_now(void) {
         aacp_drop_mic_commands();
         return;
     }
+    if (p.data == aacp_mic_start_bytes && !aacp_mic_dec_reset_done()) {
+        if (!aacp_mic_dec_ready()) {
+            aacp_mic_failed = true;
+            aacp_mic_preparing = false;
+            aacp_drop_mic_commands();
+            printf("[MIC] decoder worker unavailable before Start\n");
+        } else {
+            aacp_mic_start_waiting_for_reset = true;
+        }
+        return;
+    }
     if (l2cap_send(aacp_cid, (uint8_t *)p.data, p.len) != ERROR_CODE_SUCCESS) {
         l2cap_request_can_send_now_event(aacp_cid);
         return;
@@ -302,8 +353,10 @@ static void aacp_handle_can_send_now(void) {
     aacp_tx_since_ms = btstack_run_loop_get_time_ms();
     if (p.data == aacp_request_notifications) aacp_init_sent = true;
     if (p.data == aacp_mic_start_bytes) {
+        aacp_mic_preparing = false;
         aacp_mic_running = true;
         aacp_mic_remote_active = true;
+        aacp_mic_completed_seen = aacp_mic_dec_completed();
         mic_stats.last_sdu_ms = btstack_run_loop_get_time_ms();
         btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
         btstack_run_loop_set_timer_handler(&aacp_mic_stats_timer, aacp_mic_stats_report);
@@ -322,6 +375,12 @@ static void aacp_handle_can_send_now(void) {
 void aacp_poll(void) {
     // USB IRQs can revoke capture while the main loop still holds cached intent.
     if (aacp_mic_want && !usb_mic_requested()) aacp_mic_stop();
+    aacp_mic_update_progress();
+    if (aacp_mic_start_waiting_for_reset && aacp_mic_dec_reset_done()) {
+        aacp_mic_start_waiting_for_reset = false;
+        if (aacp_cid != 0 && aacp_tx_count != 0)
+            l2cap_request_can_send_now_event(aacp_cid);
+    }
     uint32_t now = btstack_run_loop_get_time_ms();
     if (aacp_cid != 0 &&
         ((!aacp_connected || !aacp_got_control || !aacp_init_sent) &&
@@ -389,20 +448,21 @@ static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
         }
         return;
     }
-    if ((uint32_t)(now - mic_stats.last_sdu_ms) >= 2000 && !aacp_mic_dec_reset()) return;
     mic_stats.sdu_interval++;
-    bool decoded = false;
+    if (!aacp_mic_gap_reset && (uint32_t)(now - mic_stats.last_sdu_ms) >= 2000) {
+        if (!aacp_mic_dec_reset()) return;
+        aacp_mic_gap_reset = true;
+    }
     for (unsigned off = TYPE58_HEADER_LEN; off < size;) {
         if (!usb_mic_requested()) {
             aacp_mic_stop();
             return;
         }
         uint8_t len = sdu[off + 4];
-        decoded |= aacp_mic_dec_decode(sdu + off + 5, len);
+        aacp_mic_dec_submit(sdu + off + 5, len);
         mic_stats.au_interval++;
         off += 5 + len;
     }
-    if (decoded) mic_stats.last_sdu_ms = now;
 }
 
 static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {
