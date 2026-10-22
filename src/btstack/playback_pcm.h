@@ -38,30 +38,41 @@ static inline void playback_pcm_push(playback_pcm_t *pcm, const int16_t *src,
     }
     if (frames > pcm->capacity - pcm->used) {
         uint32_t drop = frames - (pcm->capacity - pcm->used);
-        pcm->read = (pcm->read + drop) % pcm->capacity;
+        pcm->read += drop;
+        if (pcm->read >= pcm->capacity) pcm->read -= pcm->capacity;
         pcm->used -= drop;
     }
-    uint32_t write = (pcm->read + pcm->used) % pcm->capacity;
-    for (uint32_t i = 0; i < frames; ++i) {
-        pcm->samples[write * 2] = src[i * 2];
-        pcm->samples[write * 2 + 1] = src[i * 2 + 1];
-        write = (write + 1) % pcm->capacity;
-    }
+    uint32_t write = pcm->read + pcm->used;
+    if (write >= pcm->capacity) write -= pcm->capacity;
+    uint32_t first = pcm->capacity - write;
+    if (first > frames) first = frames;
+    memcpy(pcm->samples + write * 2, src, (size_t)first * 2 * sizeof(*src));
+    if (frames > first)
+        memcpy(pcm->samples, src + first * 2, (size_t)(frames - first) * 2 * sizeof(*src));
     pcm->used += frames;
 }
 
 static inline uint32_t playback_pcm_read(playback_pcm_t *pcm, int16_t *dst,
                                          uint32_t frames) {
-    memset(dst, 0, (size_t)frames * 2 * sizeof(*dst));
     uint32_t prefix = pcm->priming < frames ? pcm->priming : frames;
     pcm->priming -= prefix;
+    if (prefix) memset(dst, 0, (size_t)prefix * 2 * sizeof(*dst));
     uint32_t copied = frames - prefix;
     if (copied > pcm->used) copied = pcm->used;
-    for (uint32_t i = 0; i < copied; ++i) {
-        dst[(prefix + i) * 2] = pcm->samples[pcm->read * 2];
-        dst[(prefix + i) * 2 + 1] = pcm->samples[pcm->read * 2 + 1];
-        pcm->read = (pcm->read + 1) % pcm->capacity;
+    if (copied) {
+        uint32_t first = pcm->capacity - pcm->read;
+        if (first > copied) first = copied;
+        memcpy(dst + prefix * 2, pcm->samples + pcm->read * 2,
+               (size_t)first * 2 * sizeof(*dst));
+        if (copied > first)
+            memcpy(dst + (prefix + first) * 2, pcm->samples,
+                   (size_t)(copied - first) * 2 * sizeof(*dst));
+        pcm->read += copied;
+        if (pcm->read >= pcm->capacity) pcm->read -= pcm->capacity;
     }
+    uint32_t filled = prefix + copied;
+    if (filled < frames)
+        memset(dst + filled * 2, 0, (size_t)(frames - filled) * 2 * sizeof(*dst));
     pcm->used -= copied;
     return copied;
 }

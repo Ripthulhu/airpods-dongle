@@ -75,6 +75,48 @@ static void test_overflow_and_usb_chunk_boundaries(void) {
     assert(memcmp(in + 4, out, 32) == 0);
 }
 
+static void test_pcm_matches_linear_queue(void) {
+    static int16_t queue[PLAYBACK_PCM_FRAMES * 2];
+    static int16_t input[(PLAYBACK_PCM_FRAMES + 31) * 2];
+    int16_t out[1100 * 2], expected[1100 * 2];
+    const uint32_t capacities[] = {1, 7, 8, 17, 128, 480, 1024, 7680, 8192};
+    const uint32_t chunks[] = {0, 1, 47, 48, 128, 480, 1024, 8192 + 31};
+    for (unsigned i = 0; i < sizeof(input) / sizeof(input[0]); ++i) input[i] = (int16_t)(i * 37);
+    uint32_t random = 12345;
+    for (unsigned c = 0; c < sizeof(capacities) / sizeof(capacities[0]); ++c) {
+        uint32_t capacity = capacities[c], used = 0;
+        uint32_t priming = capacity >= PLAYBACK_PRIMING_FRAMES ? PLAYBACK_PRIMING_FRAMES : 0;
+        assert(playback_pcm_reset(&pcm, capacity, priming != 0));
+        for (unsigned action = 0; action < 2048; ++action) {
+            random = random * 1664525u + 1013904223u;
+            if (random & 0x100) {
+                uint32_t count = chunks[(random >> 16) % (sizeof(chunks) / sizeof(chunks[0]))];
+                playback_pcm_push(&pcm, input, count);
+                const int16_t *source = input;
+                if (count > capacity) { source += (count - capacity) * 2; count = capacity; }
+                uint32_t drop = count > capacity - used ? count - (capacity - used) : 0;
+                memmove(queue, queue + drop * 2, (size_t)(used - drop) * 2 * sizeof(*queue));
+                used -= drop;
+                memcpy(queue + used * 2, source, (size_t)count * 2 * sizeof(*queue));
+                used += count;
+            } else {
+                uint32_t count = (random >> 16) % 1101;
+                uint32_t prefix = priming < count ? priming : count;
+                priming -= prefix;
+                uint32_t copied = count - prefix < used ? count - prefix : used;
+                memset(expected, 0, sizeof(expected));
+                memcpy(expected + prefix * 2, queue, (size_t)copied * 2 * sizeof(*queue));
+                memmove(queue, queue + copied * 2, (size_t)(used - copied) * 2 * sizeof(*queue));
+                used -= copied;
+                memset(out, 0xa5, sizeof(out));
+                assert(playback_pcm_read(&pcm, out, count) == copied);
+                assert(memcmp(out, expected, (size_t)count * 2 * sizeof(*out)) == 0);
+            }
+            assert(pcm.used == used && pcm.priming == priming && pcm.read < capacity);
+        }
+    }
+}
+
 static void test_eld_negotiation(void) {
     uint8_t cap[] = {0x4c,0,0,0,1,0x80,0,0x80,0,0x8c,0,0x83,0xe8,0};
     uint8_t config[14];
@@ -98,7 +140,7 @@ static void test_eld_negotiation(void) {
 }
 
 static void test_eld_packet_bounds_and_sequence_wrap(void) {
-    uint8_t packet[986];
+    uint8_t packet[PLAYBACK_ELD_PAYLOAD_CEILING];
     memset(packet, 0xa5, sizeof(packet));
     uint16_t used = 0, sequence = 4095;
     assert(playback_eld_append(packet, sizeof(packet), &used, &sequence, 320));
@@ -107,7 +149,7 @@ static void test_eld_packet_bounds_and_sequence_wrap(void) {
     assert(playback_eld_append(packet, sizeof(packet), &used, &sequence, 320));
     assert(playback_eld_append(packet, sizeof(packet), &used, &sequence, 320));
     assert(used == 972 && sequence == 2);
-    uint8_t before[986];
+    uint8_t before[PLAYBACK_ELD_PAYLOAD_CEILING];
     memcpy(before, packet, sizeof(packet));
     assert(!playback_eld_append(packet, sizeof(packet), &used, &sequence, 320));
     assert(used == 972 && sequence == 2 && memcmp(before, packet, sizeof(packet)) == 0);
@@ -156,6 +198,7 @@ int main(void) {
     test_priming_preserves_stereo_onset();
     test_short_source_and_reset();
     test_overflow_and_usb_chunk_boundaries();
+    test_pcm_matches_linear_queue();
     test_eld_negotiation();
     test_eld_packet_bounds_and_sequence_wrap();
     test_peer_fences_cancelled_and_old_connections();

@@ -103,8 +103,8 @@ static uint8_t aacp_mic_stop_retries;
 static uint32_t aacp_mic_stop_since_ms, aacp_last_uplink_ms;
 static btstack_timer_source_t aacp_mic_stats_timer;
 static struct {
-    uint32_t sdu_total, au_total, sdu_interval, au_interval, au_bytes_interval;
-    uint16_t au_min, au_max, sdu_max, demux_short;
+    uint32_t sdu_interval, au_interval;
+    uint16_t demux_short;
     uint32_t last_sdu_ms;
 } mic_stats;
 
@@ -227,7 +227,7 @@ static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
            (unsigned long)mic_stats.sdu_interval,
            (unsigned long)mic_stats.au_interval, mic_stats.demux_short);
     aacp_mic_dec_report();
-    mic_stats.sdu_interval = mic_stats.au_interval = mic_stats.au_bytes_interval = 0;
+    mic_stats.sdu_interval = mic_stats.au_interval = 0;
     if ((uint32_t)(now - mic_stats.last_sdu_ms) >= 2000) {
         aacp_drop_mic_commands();
         bool restart = aacp_mic_restarts++ < AACP_MIC_RESTARTS;
@@ -259,7 +259,6 @@ static void aacp_try_mic_start(void) {
     aacp_mic_dec_reset_stats();
     if (aacp_tx_enqueue(aacp_mic_start_bytes, sizeof(aacp_mic_start_bytes))) {
         memset(&mic_stats, 0, sizeof(mic_stats));
-        mic_stats.au_min = UINT16_MAX;
     }
 }
 
@@ -391,9 +390,7 @@ static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
         return;
     }
     if ((uint32_t)(now - mic_stats.last_sdu_ms) >= 2000 && !aacp_mic_dec_reset()) return;
-    mic_stats.sdu_total++;
     mic_stats.sdu_interval++;
-    if (size > mic_stats.sdu_max) mic_stats.sdu_max = size;
     bool decoded = false;
     for (unsigned off = TYPE58_HEADER_LEN; off < size;) {
         if (!usb_mic_requested()) {
@@ -402,11 +399,7 @@ static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
         }
         uint8_t len = sdu[off + 4];
         decoded |= aacp_mic_dec_decode(sdu + off + 5, len);
-        mic_stats.au_total++;
         mic_stats.au_interval++;
-        mic_stats.au_bytes_interval += len;
-        if (len < mic_stats.au_min) mic_stats.au_min = len;
-        if (len > mic_stats.au_max) mic_stats.au_max = len;
         off += 5 + len;
     }
     if (decoded) mic_stats.last_sdu_ms = now;

@@ -21,7 +21,6 @@ typedef struct {
     uint32_t reports;
     uint8_t data_length;
     uint8_t data[BLE_SCAN_DATA_MAX];
-    uint8_t apple_types[32];  // Type presence only, not a device or component identity.
 } ble_scan_report_t;
 
 typedef struct {
@@ -34,6 +33,10 @@ typedef struct {
     uint32_t ignored;
     uint32_t evicted;
     uint8_t cache_count;
+} ble_scan_stats_t;
+
+typedef struct {
+    ble_scan_stats_t stats;
     ble_scan_report_t reports[BLE_SCAN_CACHE_SIZE];
 } ble_scan_snapshot_t;
 
@@ -41,10 +44,8 @@ typedef struct {
 void ble_scan_init(void);
 void ble_scan_controller_ready(bool ready);
 void ble_scan_set_paused(uint32_t reason, bool paused);
+void ble_scan_get_stats(ble_scan_stats_t *stats);
 void ble_scan_snapshot(ble_scan_snapshot_t *snapshot);
-
-static inline bool ble_scan_report_has_type(const ble_scan_report_t *report, uint8_t type) {
-    return (report->apple_types[type / 8u] & (1u << (type % 8u))) != 0;
-}
+bool ble_scan_report_has_type(const ble_scan_report_t *report, uint8_t type);
 
 #endif

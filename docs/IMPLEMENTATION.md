@@ -13,6 +13,7 @@ reference file hashes used for these changes.
 | Recovery | Encoder resets or playback resumes without confirmed remote state | Confirm Suspend before resetting; close on rejected or timed-out recovery |
 | Connection ownership | Late events can replace the selected peer or revive a cancelled connection | Validate address, CID and pending intent; ignore stale AVRCP and AVDTP events |
 | Saved slots | Key iteration order can substitute another paired device | Require the selected saved address and its matching bond |
+| Slot storage | Two custom buffers erase a sector on each slot/address update | Reuse the SDK's two-bank TLV journal, import the old page, skip unchanged writes and verify readback |
 | Media flushing | Expired controller media can stall control or trigger disconnect | Mark only the media CID flushable, use 200 ms when non-flushable control is supported, and keep flush events from tearing down the ACL |
 | Microphone lifecycle | Queued Start survives USB close; endless restart attempts | Check live USB demand, cancel queued Start, bound retries and wait for uplink quiet after Stop |
 | Microphone parsing | A valid prefix can be decoded before a malformed tail | Validate the whole SDU before any decode; reject zero-length/truncated AUs |
@@ -23,6 +24,36 @@ reference file hashes used for these changes.
 | Stem controls | Play/Pause mutes the dongle instead of controlling the player | Send explicit USB Consumer Control commands, with bounded queues and ordered key releases |
 | BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity |
 | Build | Missing SDK patches can still produce a crashing or incompatible binary | Pin revisions and verify complete patched-file hashes before compilation |
+
+## Hardware use
+
+Measured with GCC 13.2.1, SDK 2.1.1 and the same Release build, against `bde77fb`:
+
+| Linked layout | Before | Current |
+| --- | ---: | ---: |
+| Main-heap capacity before codec allocations | 413,920 bytes | 423,696 bytes |
+| Flash image | 1,549,032 bytes | 1,551,824 bytes |
+| Full BLE cache copy for aggregate logs | 700 bytes | 28 bytes |
+
+The encoder's 4 KiB scratch buffer uses the otherwise idle scratch-X bank.
+The unused multicore library and stack reservation are removed; the linker
+rejects adding a core1 stack while that bank is full. Allocator locking remains
+enabled. This moves memory between banks; it does not make the encoder use less RAM.
+
+Unused Bluetooth HFP, HID, network and serial profile pools are disabled. The
+implemented audio/control profiles, two HCI connections, GATT client capacity
+and security tables remain allocated. HFP is not implemented by this firmware.
+
+Playback and microphone queues use bounded contiguous copies instead of
+per-sample division/copy loops. CDC drains directly into TinyUSB and retains
+bytes on partial writes. Idle CDC/HID avoid up to 4,000 endpoint-state queries
+per second at the existing USB service rate. Advertisement type queries derive
+their result from retained raw data rather than a duplicate bitmap.
+
+`tests/playback_benchmark.c` provides a manual host PCM benchmark. Its output
+checksums match the old implementation; host timings do not measure Pico codec
+load or acoustic latency. Actual peak heap usage, IRQ duration and codec deadlines
+still require the board.
 
 ## Protocol choices
 
@@ -63,7 +94,9 @@ the pinned Pico SDK APIs, descriptors and link limits.
 
 USB descriptors still need Windows enumeration tests. Radio retries, negotiated
 MTU, controller flush behavior, audio quality, heap high-water mark, overclock
-stability and microphone clock/gain require the board. Older models and HFP
-compatibility are unverified. Classic audio with concurrent BLE reception and
-microphone pause/resume also needs hardware validation. No hearing profiles, calibration values or device
-settings are written by the offline tests.
+stability and microphone clock/gain require the board. Older models need separate
+compatibility checks. Classic audio with concurrent BLE reception and microphone
+pause/resume also needs hardware validation. No hearing profiles, calibration
+values or device settings are written by the offline tests.
+Physical interruption during flash programming and storage-bank compaction is
+also pending hardware validation; slot records use the SDK's existing journal.

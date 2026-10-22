@@ -5,6 +5,9 @@
 
 #include "../src/btstack/btstack_ble_scan.c"
 
+_Static_assert(sizeof(ble_scan_report_t) <= 52, "Keep advertisements without redundant type storage");
+_Static_assert(sizeof(ble_scan_stats_t) <= 28, "Aggregate diagnostics must not copy report payloads");
+
 static unsigned registrations, starts, stops, params, duplicate_calls;
 static uint32_t now;
 static bool supports_le;
@@ -32,7 +35,7 @@ static void reset(void) {
     callback = NULL;
     ble_scan_init();
     ble_scan_controller_ready(true);
-    assert(starts == 0 && !scan_state.scan_requested); // Mount policy must explicitly allow scanning.
+    assert(starts == 0 && !scan_state.stats.scan_requested); // Mount policy must explicitly allow scanning.
     ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND, false);
 }
 
@@ -73,25 +76,25 @@ static void lifecycle(void) {
     assert(starts == 2);
     const uint8_t apple[] = {5, 0xff, 0x4c, 0, 0x12, 0};
     receive(1, 1, apple, sizeof(apple));
-    assert(scan_state.cache_count == 1);
+    assert(scan_state.stats.cache_count == 1);
     ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, true);
     receive(2, 1, apple, sizeof(apple));
-    assert(scan_state.cache_count == 1 && scan_state.accepted == 1);
+    assert(scan_state.stats.cache_count == 1 && scan_state.stats.accepted == 1);
     ble_scan_controller_ready(false);
-    assert(scan_state.cache_count == 0 && stops == 2 && !scan_state.scan_requested);
+    assert(scan_state.stats.cache_count == 0 && stops == 2 && !scan_state.stats.scan_requested);
     ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
     assert(starts == 2);
     ble_scan_controller_ready(true);
     assert(starts == 3);
     ble_scan_controller_ready(false);
     ble_scan_controller_ready(false);
-    assert(stops == 3 && !scan_state.controller_ready);
+    assert(stops == 3 && !scan_state.stats.controller_ready);
     supports_le = false;
     ble_scan_controller_ready(true);
-    assert(starts == 3 && !scan_state.scan_requested && !scan_state.le_supported);
+    assert(starts == 3 && !scan_state.stats.scan_requested && !scan_state.stats.le_supported);
     supports_le = true;
     ble_scan_controller_ready(true);
-    assert(starts == 4 && scan_state.scan_requested && scan_state.le_supported);
+    assert(starts == 4 && scan_state.stats.scan_requested && scan_state.stats.le_supported);
 }
 
 static void retain_exact_reports(void) {
@@ -103,7 +106,7 @@ static void retain_exact_reports(void) {
     ble_scan_snapshot_t snapshot;
     ble_scan_snapshot(&snapshot);
     ble_scan_report_t *report = &snapshot.reports[0];
-    assert(snapshot.cache_count == 1 && snapshot.accepted == 1 && snapshot.scan_requested);
+    assert(snapshot.stats.cache_count == 1 && snapshot.stats.accepted == 1 && snapshot.stats.scan_requested);
     assert(report->address[0] == 0xc0 && report->address[5] == 1 && report->address_type == 1);
     assert(report->event_type == 3 && report->rssi == -42 && report->rssi_valid);
     assert(report->received_ms == now && report->reports == 1 && report->data_length == 31);
@@ -114,7 +117,7 @@ static void retain_exact_reports(void) {
     now++;
     receive(1, 1, multi, sizeof(multi));
     receive(1, 0, multi, sizeof(multi));
-    assert(scan_state.cache_count == 2 && scan_state.reports[0].reports == 2);
+    assert(scan_state.stats.cache_count == 2 && scan_state.reports[0].reports == 2);
     assert(!ble_scan_report_has_type(&scan_state.reports[0], 7));
     assert(ble_scan_report_has_type(&scan_state.reports[0], 0x12));
     assert(ble_scan_report_has_type(&scan_state.reports[0], 0xff));
@@ -123,6 +126,13 @@ static void retain_exact_reports(void) {
     packet[10] = 127;
     callback->callback(HCI_EVENT_PACKET, 0, packet, length);
     assert(!scan_state.reports[1].rssi_valid && scan_state.reports[1].rssi == 127);
+    ble_scan_stats_t stats;
+    ble_scan_get_stats(&stats);
+    ble_scan_snapshot(&snapshot);
+    assert(memcmp(&stats, &snapshot.stats, sizeof(stats)) == 0);
+    stats.accepted = 0;
+    assert(scan_state.stats.accepted == 4);
+    ble_scan_get_stats(NULL);
     ble_scan_snapshot(NULL);
 }
 
@@ -136,7 +146,7 @@ static void reject_malformed(void) {
     }
     callback->callback(HCI_EVENT_PACKET, 0, NULL, 20);
     callback->callback(HCI_EVENT_PACKET, 0, packet, 0);
-    assert(scan_state.malformed == 11);
+    assert(scan_state.stats.malformed == 11);
     packet[1]--;
     callback->callback(HCI_EVENT_PACKET, 0, packet, length);
     packet[1]++;
@@ -148,7 +158,7 @@ static void reject_malformed(void) {
     packet[3] = 1;
     packet[2] = 5;
     callback->callback(HCI_EVENT_PACKET, 0, packet, length);
-    assert(scan_state.malformed == 15);
+    assert(scan_state.stats.malformed == 15);
     uint8_t oversized[32] = {0};
     receive(1, 1, oversized, sizeof(oversized));
     const uint8_t bad[][12] = {
@@ -163,14 +173,21 @@ static void reject_malformed(void) {
     const unsigned sizes[] = {2, 2, 3, 5, 7, 8, 8};
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i)
         receive(1, 1, bad[i], sizes[i]);
-    assert(scan_state.malformed == 23 && scan_state.cache_count == 0 && scan_state.accepted == 0);
+    assert(scan_state.stats.malformed == 23 && scan_state.stats.cache_count == 0 && scan_state.stats.accepted == 0);
     const uint8_t other[] = {3, 0xff, 0x34, 0x12, 0, 0};
     receive(1, 1, other, sizeof(other));
     receive(1, 1, NULL, 0);
-    assert(scan_state.ignored == 2 && scan_state.cache_count == 0);
+    assert(scan_state.stats.ignored == 2 && scan_state.stats.cache_count == 0);
     const uint8_t padded[] = {5, 0xff, 0x4c, 0, 7, 0, 0, 0};
     receive(1, 1, padded, sizeof(padded));
-    assert(scan_state.accepted == 1);
+    assert(scan_state.stats.accepted == 1);
+    ble_scan_report_t report = {0};
+    memcpy(report.data, bad[6], sizes[6]);
+    report.data_length = (uint8_t)sizes[6];
+    assert(!ble_scan_report_has_type(&report, 7)); // A matching prefix cannot hide a malformed tail.
+    report.data_length = BLE_SCAN_DATA_MAX + 1;
+    assert(!ble_scan_report_has_type(&report, 7));
+    assert(!ble_scan_report_has_type(NULL, 7));
 }
 
 static void bounded_cache_and_wrap(void) {
@@ -181,15 +198,15 @@ static void bounded_cache_and_wrap(void) {
         receive((uint8_t)i, 1, offline, sizeof(offline));
         now++;
     }
-    assert(scan_state.cache_count == BLE_SCAN_CACHE_SIZE && scan_state.evicted == 0);
+    assert(scan_state.stats.cache_count == BLE_SCAN_CACHE_SIZE && scan_state.stats.evicted == 0);
     receive(2, 1, offline, sizeof(offline)); // Refresh this exact address, even after clock wrap.
     now++;
     receive(9, 1, offline, sizeof(offline));
-    assert(scan_state.cache_count == BLE_SCAN_CACHE_SIZE && scan_state.evicted == 1);
+    assert(scan_state.stats.cache_count == BLE_SCAN_CACHE_SIZE && scan_state.stats.evicted == 1);
     assert(scan_state.reports[0].address[5] == 9 && scan_state.reports[1].reports == 2);
     now++;
     receive(10, 1, offline, sizeof(offline));
-    assert(scan_state.evicted == 2 && scan_state.reports[2].address[5] == 10);
+    assert(scan_state.stats.evicted == 2 && scan_state.reports[2].address[5] == 10);
     ble_scan_snapshot_t snapshot;
     ble_scan_snapshot(&snapshot);
     memset(snapshot.reports, 0, sizeof(snapshot.reports));

@@ -12,6 +12,7 @@
 #define PLAYBACK_ELD_MIN_BITRATE 128000u
 #define PLAYBACK_ELD_HEADER_SIZE 4u
 #define PLAYBACK_ELD_FRAME_SAMPLES 480u
+#define PLAYBACK_ELD_PAYLOAD_CEILING 986u
 
 static inline bool playback_eld_capability(const uint8_t *cap, size_t len) {
     static const uint8_t id[6] = {0x4c, 0, 0, 0, 1, 0x80};

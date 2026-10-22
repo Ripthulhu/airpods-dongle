@@ -59,9 +59,9 @@ static bool send_usage(uint16_t usage) {
 
 void usb_media_task(void) {
     uint32_t state = atomic_load_explicit(&host_state, memory_order_acquire);
-    if (!(state & 1u) || !tud_hid_ready()) return;
+    if (!(state & 1u)) return;
     if (release_pending) {
-        if (send_usage(0)) release_pending = false;
+        if (tud_hid_ready() && send_usage(0)) release_pending = false;
         return;
     }
     // Stale events can be published by a Bluetooth callback interrupted by reset.
@@ -74,7 +74,7 @@ void usb_media_task(void) {
             atomic_store_explicit(&read, r + 1u, memory_order_release);
             continue;
         }
-        if (send_usage(event.usage)) {
+        if (tud_hid_ready() && send_usage(event.usage)) {
             release_pending = true;
             atomic_store_explicit(&read, r + 1u, memory_order_release);
         }

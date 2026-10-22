@@ -63,6 +63,7 @@ void debug_cdc_init(void) {
 }
 
 void debug_cdc_task(void) {
+    if (dbg_tail == dbg_head && dbg_dropped == 0) return;
     // Drain only while a terminal is actually attached (DTR asserted). Until
     // then, output accumulates in the 8KB ring, so boot/pairing logs are still
     // delivered when the user opens the terminal late.
@@ -89,13 +90,13 @@ void debug_cdc_task(void) {
     uint32_t avail = tud_cdc_write_available();
     if (avail == 0) return;
 
-    uint8_t  tmp[64];
-    uint32_t n = 0;
-    while (n < avail && n < sizeof(tmp) && dbg_tail != dbg_head) {
-        tmp[n++] = dbg_buf[dbg_tail];
-        dbg_tail = (dbg_tail + 1u) & DBG_BUF_MASK;
-    }
-    if (n == 0) return;
-    tud_cdc_write(tmp, n);
-    tud_cdc_write_flush();
+    uint32_t tail = dbg_tail;
+    uint32_t n = (dbg_head - tail) & DBG_BUF_MASK;
+    if (n > avail) n = avail;
+    if (n > 64u) n = 64u;
+    if (n > DBG_BUF_SIZE - tail) n = DBG_BUF_SIZE - tail;
+    // Keep this span reserved until TinyUSB has copied the bytes it accepted.
+    uint32_t sent = tud_cdc_write(dbg_buf + tail, n);
+    dbg_tail = (tail + sent) & DBG_BUF_MASK;
+    if (sent != 0) tud_cdc_write_flush();
 }

@@ -4,6 +4,7 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
 
 #define MIC_RING_SAMPLES 8192u
 #define MIC_RING_MASK (MIC_RING_SAMPLES - 1u)
@@ -22,7 +23,11 @@ static inline uint32_t mic_pcm_ring_write(mic_pcm_ring_t *ring, const int16_t *s
     uint32_t r = atomic_load_explicit(&ring->read, memory_order_acquire);
     uint32_t space = MIC_RING_SAMPLES - (w - r);
     if (count > space) count = space;
-    for (uint32_t i = 0; i < count; ++i) ring->samples[(w + i) & MIC_RING_MASK] = src[i];
+    uint32_t at = w & MIC_RING_MASK;
+    uint32_t first = MIC_RING_SAMPLES - at;
+    if (first > count) first = count;
+    if (first != 0) memcpy(ring->samples + at, src, first * sizeof(*src));
+    if (count > first) memcpy(ring->samples, src + first, (count - first) * sizeof(*src));
     atomic_store_explicit(&ring->written, w + count, memory_order_release);
     return count;
 }
@@ -44,7 +49,11 @@ static inline uint32_t mic_pcm_ring_read(mic_pcm_ring_t *ring, int16_t *dst,
     }
     uint32_t available = w - r;
     if (count > available) count = available;
-    for (uint32_t i = 0; i < count; ++i) dst[i] = ring->samples[(r + i) & MIC_RING_MASK];
+    uint32_t at = r & MIC_RING_MASK;
+    uint32_t first = MIC_RING_SAMPLES - at;
+    if (first > count) first = count;
+    if (first != 0) memcpy(dst, ring->samples + at, first * sizeof(*dst));
+    if (count > first) memcpy(dst + first, ring->samples, (count - first) * sizeof(*dst));
     uint32_t after = atomic_load_explicit(&ring->reset, memory_order_acquire);
     if (after != reset) {
         ring->seen_reset = after;

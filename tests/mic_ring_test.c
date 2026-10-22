@@ -29,6 +29,24 @@ int main(void) {
     mic_pcm_ring_reset(&ring);
     assert(mic_pcm_ring_read(&ring, output, 1) == 0);
 
+    const uint32_t starts[] = {0, 1, MIC_RING_SAMPLES - 1u, UINT32_MAX - 7u, UINT32_MAX};
+    const uint32_t counts[] = {0, 1, 63, 64, 479, 480, MIC_RING_SAMPLES};
+    for (unsigned i = 0; i < sizeof(starts) / sizeof(*starts); ++i) {
+        for (unsigned j = 0; j < sizeof(counts) / sizeof(*counts); ++j) {
+            atomic_store(&ring.written, starts[i]);
+            atomic_store(&ring.read, starts[i]);
+            uint32_t count = counts[j];
+            assert(mic_pcm_ring_write(&ring, input, count) == count);
+            uint32_t first = count / 2;
+            assert(mic_pcm_ring_read(&ring, output, first) == first);
+            assert(mic_pcm_ring_read(&ring, output + first, count - first) == count - first);
+            for (uint32_t k = 0; k < count; ++k) assert(output[k] == input[k]);
+            assert(mic_pcm_ring_read(&ring, output, 1) == 0);
+        }
+    }
+    assert(mic_pcm_ring_write(&ring, NULL, 0) == 0);
+    assert(mic_pcm_ring_read(&ring, NULL, 0) == 0);
+
     usb_mic_request_t request = {0};
     bool wanted = true;
     assert(!usb_mic_request_take(&request, &wanted));

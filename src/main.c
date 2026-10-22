@@ -12,7 +12,6 @@
 #include <stdatomic.h>
 #include "pico/stdlib.h"
 
-#include "pico/multicore.h"
 
 #include "btstack_event.h"
 
@@ -31,6 +30,8 @@
 #include "tinyusb/uac.h"
 #include "tinyusb/debug_cdc.h"
 #include "pico_w_led.h"
+#include "slot_storage.h"
+#include "button_gesture.h"
 #include "pico/flash.h"
 
 
@@ -137,16 +138,14 @@ static void process_button_actions(void){
 #define DEBOUNCE_US          5000          // 5 ms
 #define SHORT_PRESS_MIN_US  100000         // 100 ms
 #define LONG_PRESS_MIN_US  1000000         // 1  s
-#define DOUBLE_WINDOW_US    500000         // 500 ms
 
 // ---------- state ----------
 static bool     debounced_state  = false;   // last stable level
 static uint64_t last_edge_us     = 0;       // last time level changed
 static uint64_t press_start_us   = 0;       // when current press began
-static uint64_t last_release_us  = 0;       // when previous press ended
-static uint8_t  tap_counter      = 0;
+static button_gesture_t button_gesture;
 
-// call every 1 ms
+// Called by the 20 ms button timer.
 void check_bootsel_state(void)
 {
     bool raw = get_bootsel_button();            // true == pressed
@@ -166,26 +165,18 @@ void check_bootsel_state(void)
                 // classify type of this press
                 if (press_len >= LONG_PRESS_MIN_US) {
                     on_long_press();
-                    tap_counter = 0;            // long press stands alone
+                    button_gesture.pending = false;
                 } else if (press_len >= SHORT_PRESS_MIN_US) {
-                    tap_counter++;
-                    if (tap_counter == 1) {
-                        last_release_us = now;  // start double-tap window
-                    } else if (tap_counter == 2 &&
-                               (now - last_release_us) <= DOUBLE_WINDOW_US) {
-                        on_double_press();
-                        tap_counter = 0;
-                    }
+                    button_gesture_event_t event = button_gesture_release(&button_gesture, now);
+                    if (event == BUTTON_GESTURE_SINGLE) on_single_press();
+                    else if (event == BUTTON_GESTURE_DOUBLE) on_double_press();
                 }
             }
         }
     }
 
     // timeout: single tap
-    if (tap_counter == 1 && (now - last_release_us) > DOUBLE_WINDOW_US) {
-        on_single_press();
-        tap_counter = 0;
-    }
+    if (button_gesture_poll(&button_gesture, now) == BUTTON_GESTURE_SINGLE) on_single_press();
 }
 
 
@@ -202,13 +193,13 @@ bool bootsel_timer_callback(repeating_timer_t *rt) {
 
 static void ble_diagnostics_task(void) {
     static uint32_t last_ms;
-    static ble_scan_snapshot_t current;
+    static ble_scan_stats_t current;
     static uint32_t last_accepted, last_malformed, last_evicted, last_pauses = UINT32_MAX;
     static bool last_requested;
     uint32_t now = btstack_run_loop_get_time_ms();
     if ((uint32_t)(now - last_ms) < 5000u) return;
     last_ms = now;
-    ble_scan_snapshot(&current);
+    ble_scan_get_stats(&current);
     if (current.accepted == last_accepted && current.malformed == last_malformed &&
         current.evicted == last_evicted && current.pause_reasons == last_pauses &&
         current.scan_requested == last_requested) return;
@@ -245,16 +236,6 @@ int main() {
         printf("boot reason: normal power-on/reset\n");
     }
 
-    uint8_t currect_slot = read_uint8_last_flash();
-
-    printf("init slot is %d\n", currect_slot);
-
-    if (currect_slot != 0x1 && currect_slot != 0x2){
-        printf("Doesn't has slot, set the slot to 1\n");
-        write_uint8_last_flash(0x1);
-        currect_slot = read_uint8_last_flash();
-    }
-
     tinyusb_main();
 
     audio_slot_queue_init();
@@ -265,6 +246,19 @@ int main() {
     if (cyw43_arch_init()) {
         printf("cyw43_arch_init() failed.\n");
         return -1;
+    }
+
+    uint8_t currect_slot = read_uint8_last_flash();
+
+    printf("init slot is %d\n", currect_slot);
+
+    if (currect_slot != 0x1 && currect_slot != 0x2){
+        printf("Doesn't has slot, set the slot to 1\n");
+        if (!write_uint8_last_flash(0x1)) {
+            printf("Slot storage unavailable or unsupported\n");
+            return 1;
+        }
+        currect_slot = read_uint8_last_flash();
     }
 
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);

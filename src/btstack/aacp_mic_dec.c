@@ -59,8 +59,9 @@ void aacp_mic_pcm_reset(void) {
 bool aacp_mic_dec_reset(void) {
     aacp_mic_pcm_reset();
     mic_dec_flags = AACDEC_CLRHIST;
-    if (mic_dec == NULL) return false;
-    return aacDecoder_SetParam(mic_dec, AAC_TPDEC_CLEAR_BUFFER, 1) == AAC_DEC_OK;
+    HANDLE_AACDECODER decoder = atomic_load_explicit(&mic_dec, memory_order_acquire);
+    if (decoder == NULL) return false;
+    return aacDecoder_SetParam(decoder, AAC_TPDEC_CLEAR_BUFFER, 1) == AAC_DEC_OK;
 }
 
 static struct {
@@ -95,7 +96,7 @@ static void dec_report_heap(const char *tag) {
 }
 
 bool aacp_mic_dec_init(void) {
-    if (mic_dec != NULL) return true;
+    if (atomic_load_explicit(&mic_dec, memory_order_acquire) != NULL) return true;
 
     dec_report_heap("before");
     printf("[DEC] aacDecoder_Open ...\n");
@@ -140,23 +141,24 @@ static bool mic_decode_failed(void) {
 }
 
 bool aacp_mic_dec_decode(const uint8_t *au, uint16_t len) {
-    if (mic_dec == NULL || au == NULL || len == 0 || len > MIC_AU_MAX)
+    HANDLE_AACDECODER decoder = atomic_load_explicit(&mic_dec, memory_order_acquire);
+    if (decoder == NULL || au == NULL || len == 0 || len > MIC_AU_MAX)
         return mic_decode_failed();
 
     UCHAR *inb[] = { (UCHAR *)au };
     UINT size = len;
     UINT valid = len;
-    if (aacDecoder_Fill(mic_dec, inb, &size, &valid) != AAC_DEC_OK || valid != 0)
+    if (aacDecoder_Fill(decoder, inb, &size, &valid) != AAC_DEC_OK || valid != 0)
         return mic_decode_failed();
 
     uint32_t start = time_us_32();
-    AAC_DECODER_ERROR error = aacDecoder_DecodeFrame(mic_dec, mic_pcm,
+    AAC_DECODER_ERROR error = aacDecoder_DecodeFrame(decoder, mic_pcm,
                                                    MIC_PCM_MAX_SAMPLES, mic_dec_flags);
     uint32_t elapsed = time_us_32() - start;
     if (error != AAC_DEC_OK) return mic_decode_failed();
     mic_dec_flags = 0;
 
-    CStreamInfo *info = aacDecoder_GetStreamInfo(mic_dec);
+    CStreamInfo *info = aacDecoder_GetStreamInfo(decoder);
     if (info == NULL || info->numChannels != 1 || info->frameSize != 480 ||
         info->sampleRate != 48000 || info->aot != 39)
         return mic_decode_failed();

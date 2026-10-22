@@ -12,6 +12,7 @@
 #include "btstack_avdtp_source.h"
 #include "btstack_ble_scan.h"
 #include "../pico_w_led.h"
+#include "../slot_storage.h"
 
 
 #define A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS 12
@@ -116,22 +117,21 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             }
             printf("\n");
             if (scan_active && (cod & bluetooth_speaker_cod) == bluetooth_speaker_cod){
-                memcpy(device_addr, address, 6);
-                snprintf(device_addr_string, sizeof(device_addr_string), "%s", bd_addr_to_str(address));
-                printf("Bluetooth speaker detected, trying to connect to %s...\n", bd_addr_to_str(device_addr));
                 scan_active = false;
                 gap_inquiry_stop();
                 ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
 
                 uint8_t currect_slot = read_uint8_last_flash();
-
-                if (currect_slot == 0x1){
-                    write_slot1_mac(device_addr);
+                bool saved = (currect_slot == 1 && write_slot1_mac(address)) ||
+                             (currect_slot == 2 && write_slot2_mac(address));
+                if (!saved) {
+                    set_led_mode_off();
+                    printf("Pairing address could not be saved\n");
+                    break;
                 }
-    
-                if (currect_slot == 0x2){
-                    write_slot2_mac(device_addr);
-                }
+                memcpy(device_addr, address, 6);
+                snprintf(device_addr_string, sizeof(device_addr_string), "%s", bd_addr_to_str(address));
+                printf("Bluetooth speaker detected, trying to connect to %s...\n", bd_addr_to_str(device_addr));
                 avdtp_source_establish_stream();
             }
             break;

@@ -18,6 +18,8 @@ def main():
     args = parser.parse_args()
     tests = {
         "peer": ["tests/peer_test.c"],
+        "button_gesture": ["tests/button_gesture_test.c"],
+        "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "ble_scan": ["-Itests/ble_scan_stubs", "tests/ble_scan_test.c"],
         "playback": ["tests/playback_test.c"],
@@ -27,6 +29,7 @@ def main():
                         "tests/mic_decoder_test.c", "src/btstack/aacp_mic_dec.c", "-lm"],
         "media_control": ["-Itests/media_stubs", "tests/media_control_test.c",
                           "src/tinyusb/media_control.c"],
+        "debug_cdc": ["-Itests/cdc_stubs", "tests/debug_cdc_test.c"],
     }
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:
         for name, sources in tests.items():

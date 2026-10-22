@@ -17,7 +17,6 @@
 
 // Slot queue API (multicore-safe)
 void audio_slot_queue_init(void);
-void audio_slot_queue_configure(uint16_t samples_per_slot);
 void audio_slot_push_samples(const int16_t *src, uint16_t stereo_pair_count);
 
 bool check_is_streaming();

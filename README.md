@@ -93,7 +93,8 @@ python3 tools/test.py --sanitize
 The tests cover malformed packets, stale connections, cancelled recording,
 decoder failures, PCM ordering, media-key release/retry, BLE pause/resume and
 advertisement bounds, and SDK patch validation.
-They do not measure radio behavior or acoustic latency.
+They do not measure radio behavior or acoustic latency. Slot migration, failed
+storage, partial console writes and button timing boundaries also have regression tests.
 
 Before using this firmware routinely, check USB enumeration, playback and mic
 together, repeated case returns, volume/mute, stem controls, and long-running
@@ -105,6 +106,10 @@ The inherited 250 MHz / 1.20 V overclock needs validation on each board. Runtime
 heap margin and microphone clock drift remain unmeasured. The microphone uses
 the inherited 64 kHz USB presentation clock with a 48 kHz AAC coding configuration;
 this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
+
+The current build has 9,776 bytes more main-heap capacity than `bde77fb`, before
+codec allocations, using 2,792 extra flash bytes. See the implementation notes
+for the memory layout and remaining measurements.
 
 See [implementation notes](docs/IMPLEMENTATION.md) for the reviewed differences
 and the boundaries that remain untested.

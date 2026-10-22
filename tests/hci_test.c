@@ -14,6 +14,7 @@ static unsigned connect_calls, inquiry_calls, inquiry_stops, writes, pin_calls;
 static unsigned registered;
 static uint16_t flush_timeout;
 static bool ble_ready;
+static bool fail_storage;
 static uint32_t ble_pauses;
 static btstack_packet_callback_registration_t *callbacks[2];
 static const bd_addr_t first = {0x10, 2, 3, 4, 5, 6};
@@ -74,11 +75,13 @@ uint8_t read_uint8_last_flash(void) { return slot; }
 void read_slot1_mac(uint8_t mac[MAC_LEN]) { memcpy(mac, saved[0], MAC_LEN); }
 void read_slot2_mac(uint8_t mac[MAC_LEN]) { memcpy(mac, saved[1], MAC_LEN); }
 bool write_slot1_mac(const uint8_t mac[MAC_LEN]) {
+    if (fail_storage) return false;
     memcpy(saved[0], mac, MAC_LEN);
     writes++;
     return true;
 }
 bool write_slot2_mac(const uint8_t mac[MAC_LEN]) {
+    if (fail_storage) return false;
     memcpy(saved[1], mac, MAC_LEN);
     writes++;
     return true;
@@ -96,6 +99,7 @@ static void fixture(void) {
     connect_calls = inquiry_calls = inquiry_stops = writes = pin_calls = registered = 0;
     flush_timeout = UINT16_MAX;
     ble_ready = false;
+    fail_storage = false;
     ble_pauses = 0;
 }
 static void working(void) {
@@ -279,6 +283,21 @@ static void test_controller_rejection_releases_ble_pause(void) {
     assert(inquiry_calls == calls);
 }
 
+static void test_failed_storage_cannot_replace_selected_peer(void) {
+    fixture();
+    memcpy(saved[0], first, 6);
+    has_key[0] = true;
+    bt_hci_init();
+    gap_start_scanning();
+    fail_storage = true;
+    uint8_t packet[27];
+    result(packet, sizeof(packet), nearby, 0x240404);
+    hci_packet_handler(HCI_EVENT_PACKET, 0, packet, sizeof(packet));
+    assert(!scan_active && writes == 0 && connect_calls == 0);
+    assert(!(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    assert(memcmp(device_addr, first, 6) == 0 && memcmp(saved[0], first, 6) == 0);
+}
+
 int main(void) {
     test_selected_bond_auto_connects();
     test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback();
@@ -286,6 +305,7 @@ int main(void) {
     test_short_events_and_unbounded_names_are_rejected();
     test_controller_off_and_failed_inquiry_release_ble_pause();
     test_controller_rejection_releases_ble_pause();
-    puts("HCI selected-peer ownership, event bounds and BLE coordination: 6 groups passed");
+    test_failed_storage_cannot_replace_selected_peer();
+    puts("HCI selected-peer ownership, event bounds, storage failure and BLE coordination: 7 groups passed");
     return 0;
 }

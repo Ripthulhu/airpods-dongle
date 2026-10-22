@@ -11,8 +11,9 @@ static bool ready = true;
 static bool reject_report;
 static uint16_t reports[128];
 static unsigned count;
+static unsigned ready_queries;
 
-bool tud_hid_ready(void) { return ready; }
+bool tud_hid_ready(void) { ready_queries++; return ready; }
 bool tud_hid_report(uint8_t report_id, const void *report, uint16_t length) {
     assert(report_id == 0 && length == 2 && ready);
     if (reject_report) return false;
@@ -31,6 +32,9 @@ int main(void) {
     usb_media_set_available(true);
     tick();
     assert(count == 1 && reports[0] == 0);
+    unsigned queries = ready_queries;
+    for (unsigned i = 0; i < 2000; ++i) tick();
+    assert(ready_queries == queries && count == 1); // idle ticks do not poll the endpoint
     assert(!usb_media_enqueue((enum usb_media_command)99));
     assert(usb_media_enqueue(USB_MEDIA_PLAY));
     tick();

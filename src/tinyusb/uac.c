@@ -122,7 +122,8 @@
  //int32_t mic_buf[CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ / 4];
 
  // Buffer for speaker data
- int32_t spk_buf[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ / 4];
+ // One receive callback carries at most one descriptor-sized USB packet.
+ static int32_t spk_buf[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(int32_t)];
  // Speaker data size received in the last frame
  int spk_data_size;
  // Resolution per format
