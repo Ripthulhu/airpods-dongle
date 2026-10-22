@@ -35,7 +35,7 @@ The check covers:
 
 With GCC 13.2.1 and firmware 0.1.8, live stereo/microphone allocations total
 186,872 bytes; the tested allocator peak is 188,040 bytes. The linked heap is
-386,800 bytes, leaving 198,760 bytes at that peak before other runtime allocations.
+386,792 bytes, leaving 198,752 bytes at that peak before other runtime allocations.
 The 64 KiB reserve is a policy allowance, not a measured application requirement.
 
 Stack markers start 128 bytes below the helper's stack pointer. Tested decoder

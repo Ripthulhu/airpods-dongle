@@ -21,6 +21,7 @@ Pro 3 testing; that does not validate these changes.
 - Phone or microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
 - 100 ms encoded startup silence for AAC-ELD, sent before accepting phone playback.
+- Confirmed AVDTP suspension after one second without input; fresh input restarts and primes the stream.
 - Stem media controls and volume routed to the active phone or USB input.
 - NTPods USB controls and LibrePods controls over an encrypted, bonded phone connection.
 - Model-gated AirPods settings, hearing profiles, saved hardware checks and app-owned ear detection.
@@ -147,8 +148,8 @@ this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
 Both cores have guarded 16 KiB stacks. The build measures codec allocation peaks
 against the linked heap and requires at least 64 KiB left for runtime use.
-The 0.1.8 link leaves 386,800 bytes of heap; the ARM codec probe peaks at
-188,040 bytes, leaving 198,760 bytes before other runtime allocations.
+The 0.1.8 link leaves 386,792 bytes of heap; the ARM codec probe peaks at
+188,040 bytes, leaving 198,752 bytes before other runtime allocations.
 The [codec probe](tools/codec_probe/README.md) covers the real encoders, VBR frame
 bounds and decoder lifecycles; emulation does not measure full runtime heap or
 stack use. Performance readings expose queue fill, dropped/underflow frames,

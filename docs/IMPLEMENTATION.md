@@ -10,6 +10,8 @@ reference file hashes used for these changes.
 | AAC-ELD | Encoder requests 265 kbps while negotiation caps 256 kbps | Validate capabilities and select matching CBR at or below the peer's ceiling and 256 kbps |
 | Unused LDAC path | Encoder output has no capacity argument and its configured packet size exceeds the transport limit | Remove LDAC selection and encoding; keep AAC-ELD, AAC-LC and SBC |
 | Media packets | Unchecked lengths and clearing buffered data on failed sends | Bound capability/MTU/packet sizes; retain failed payloads and their timestamps |
+| Playback pacing | Short SBC frames lose timer debt; small packets cannot drain it | Retain bounded scheduling debt, refill after successful sends and limit SBC packets to 15 frames; AAC-LC uses one access unit per packet |
+| Idle playback | Encoding and radio transmission continue without an input | Request Suspend after one second idle; await confirmation, restart on demand and re-prime AAC-ELD while retaining new USB PCM |
 | Recovery | Encoder resets or playback resumes without confirmed remote state | Confirm Suspend before resetting; close on rejected or timed-out recovery |
 | Connection ownership | Late events can replace the selected peer or revive a cancelled connection | Validate address, CID and pending intent; ignore stale AVRCP and AVDTP events |
 | Saved slots | Key iteration order can substitute another paired device | Require the selected saved address and its matching bond |
@@ -39,8 +41,8 @@ Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
 
 | Linked layout | 0.1.8 |
 | --- | ---: |
-| Main-heap capacity before codec allocations | 386,800 bytes |
-| Flash image | 1,643,528 bytes |
+| Main-heap capacity before codec allocations | 386,792 bytes |
+| Flash image | 1,644,696 bytes |
 | Full BLE cache copy for aggregate logs | 28 bytes |
 
 The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
@@ -75,7 +77,7 @@ their original dimensions.
 
 The real-codec probe keeps stereo ELD at 48 kHz/256 kbps and the microphone
 decoder open together. Live allocator use is 186,872 bytes, down from 379,864.
-The tested allocator peak is 188,040 bytes, leaving 198,760 bytes before other
+The tested allocator peak is 188,040 bytes, leaving 198,752 bytes before other
 application allocations. Heap alignment and allocation order affect arena use.
 Every firmware link verifies its exact codec archive fingerprint, derives capacity
 from the ELF and reserves 64 KiB for other runtime use. The reserve is a build
@@ -151,6 +153,19 @@ a coherent mailbox and are formatted only on core 0.
 The existing 48 kHz playback sample-counter RTP clock and encoder SBR setting are
 preserved. A Mac capture's different clock or framing is not enough to establish
 safe start, stop and recovery behavior on this radio.
+
+Playback sends retain at least 40 ms of bounded timer debt, or four codec frames
+when larger. Successful sends can drain another packet from that debt without
+advancing the clock again. Failed sends retry from the main loop, preserving the
+original 200 ms recovery deadline instead of recursively requesting callbacks.
+
+One second without USB playback, phone preparation/playback or HQ microphone
+demand requests AVDTP Suspend. Only its acknowledgement marks playback stopped.
+Fresh input restarts this locally suspended stream; AAC-ELD resets its encoder
+and sends 100 ms of priming before source PCM. Start/Suspend have three-second
+deadlines, and pending transitions block in-case self-checks. An unsolicited peer
+suspension is not automatically reclaimed. Board checks must verify restart
+timing, radio savings and diagnostics after idle.
 
 The microphone ASC is `F8 E6 30 00`: AAC-ELD, mono, a signalled 48 kHz coding rate
 and 480 samples per frame. USB still presents the inherited 64 kHz clock.

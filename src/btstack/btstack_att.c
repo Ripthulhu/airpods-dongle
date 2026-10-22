@@ -104,7 +104,7 @@ static bool guarded_write_ready(void) {
     // The host's confirmed self-check request is a one-byte ASCII '1' Write
     // Request. Recheck at the radio boundary, including after send retries.
     if (tx_length != 4 || tx[0] != 0x12 || tx[3] != '1') return true;
-    if (get_usb_streaming() || check_is_streaming() || usb_mic_requested() ||
+    if (get_usb_streaming() || check_is_streaming() || dongle_playback_transitioning() || usb_mic_requested() ||
         aacp_mic_active() || phone_sink_connected()) return false;
     uint8_t ears[40];
     static const uint8_t header[] = {4,0,4,0,6,0};

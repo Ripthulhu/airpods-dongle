@@ -15,6 +15,7 @@ uint32_t aacp_control_session(void) { return peer_session; }
 bool aacp_control_address(bd_addr_t out) { if (!ready) return false; memcpy(out, selected, 6); return true; }
 bool get_usb_streaming(void) { return (busy_routes & 1) != 0; }
 bool check_is_streaming(void) { return (busy_routes & 2) != 0; }
+bool dongle_playback_transitioning(void) { return (busy_routes & 32) != 0; }
 bool usb_mic_requested(void) { return (busy_routes & 4) != 0; }
 bool aacp_mic_active(void) { return (busy_routes & 8) != 0; }
 bool phone_sink_connected(void) { return (busy_routes & 16) != 0; }
@@ -128,7 +129,7 @@ int main(void) {
     ear_packet[6] = 0; // Taken out after host validation, before radio send.
     event(L2CAP_EVENT_CAN_SEND_NOW, att_cid);
     assert(!sends && dongle_att_take(out,sizeof(out),&length) == DONGLE_ATT_FAILED);
-    for (unsigned i = 0; i < 5; ++i) {
+    for (unsigned i = 0; i < 6; ++i) {
         fixture(); assert(dongle_att_request(self_check, sizeof(self_check)));
         open_event(att_cid, 0, true); busy_routes = (uint8_t)(1u << i);
         event(L2CAP_EVENT_CAN_SEND_NOW, att_cid);

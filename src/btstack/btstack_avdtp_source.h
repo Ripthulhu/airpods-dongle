@@ -20,6 +20,7 @@ void audio_slot_queue_init(void);
 void audio_slot_push_samples(const int16_t *src, uint16_t stereo_pair_count);
 
 bool check_is_streaming();
+bool dongle_playback_transitioning(void);
 
 void set_bt_volume(int16_t);
 

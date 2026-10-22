@@ -26,6 +26,33 @@ def playback_lifecycle_sources(directory):
     end = source.index("        default:", start)
     (directory / "playback_release.inc").write_text(source[start:end])
 
+    functions = []
+    for signature in ["static int fill_sbc_audio_buffer(", "static int fill_aac_audio_buffer(",
+                      "static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint32_t now)",
+                      "static void avdtp_audio_timeout_handler(",
+                      "static void a2dp_demo_send_media_packet("]:
+        if "\n" + signature not in source:
+            continue
+        start = source.index("\n" + signature) + 1
+        end = source.index("\n}", start) + 2
+        functions.append(source[start:end])
+    (directory / "playback_timing.inc").write_text("\n".join(functions))
+
+    functions = []
+    for signature in ["static void playback_idle_reset(void) {",
+                      "static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){",
+                      "static int playback_encoder_failed(",
+                      "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
+                      "static void playback_idle_poll(", "bool bridge_phone_ready(void)",
+                      "void set_usb_streaming(bool flag)", "void bridge_phone_stop(void)"]:
+        start = source.index("\n" + signature) + 1
+        end = source.index("\n}", start) + 2
+        functions.append(source[start:end])
+    (directory / "playback_idle.inc").write_text("\n".join(functions))
+    start = source.index("                case  AVDTP_SI_START:")
+    end = source.index("                case AVDTP_SI_ABORT:", start)
+    (directory / "playback_accept.inc").write_text(source[start:end])
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -46,6 +73,8 @@ def main():
         "playback": ["tests/playback_test.c"],
         "playback_options": ["tests/playback_options_test.c"],
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],
+        "playback_timing": ["tests/playback_timing_test.c"],
+        "playback_idle": ["tests/playback_idle_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],
         "dongle_settings": ["tests/dongle_settings_test.c"],
         "att": ["-Itests/aacp_stubs", "-Wno-unused-function", "tests/att_test.c"],

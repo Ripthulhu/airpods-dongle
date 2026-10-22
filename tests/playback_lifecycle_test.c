@@ -17,7 +17,7 @@ static uint8_t cur_codec, cur_capability;
 static uint32_t now, profile_since, game_session, delay_revision, actual_bitrate;
 static uint16_t reported_delay;
 static void *handleAAC;
-static struct { uint16_t avdtp_cid, avrcp_cid, local_seid; bool streaming; } media_tracker;
+static struct { uint16_t avdtp_cid, avrcp_cid, local_seid; bool streaming; uint8_t codec_ready_to_send; } media_tracker;
 static unsigned connects, disconnects, scans, keys_dropped;
 static bool slot_write_ok, inquiry_ok, slot_cleared;
 
@@ -42,6 +42,8 @@ static bool aacp_control_ready(void) { return false; }
 static bool playback_game_eligible(void) { return false; }
 static uint8_t playback_input(void) { return 0; }
 static uint8_t aacp_receive_buffer(uint16_t target) { (void)target; return 0; }
+static void playback_idle_poll(uint32_t time) { (void)time; }
+static void playback_prepare_packet(void *context, uint32_t time) { (void)context; (void)time; }
 static void l2cap_set_flushable_local_cid(uint16_t cid) { (void)cid; }
 static void avrcp_disconnect(uint16_t cid) { (void)cid; }
 static void audio_slot_queue_init(void) {}

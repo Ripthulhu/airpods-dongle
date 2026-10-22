@@ -60,6 +60,11 @@ revokes that ownership. Stored device ear detection is a separate AirPods settin
   100 ms of encoded silence must be sent successfully before that acceptance,
   so phone audio cannot accumulate behind startup priming. Readiness has a
   three-second deadline; failure rejects Start rather than claiming playback.
+- After one second without USB input, phone preparation/playback or HQ microphone
+  demand, the output requests Suspend and waits for confirmation. New input
+  restarts a locally suspended stream; AAC-ELD resets and repeats its 100 ms prime.
+  USB PCM arriving during that restart is retained. Each transition has a
+  three-second deadline; phone Start waits until restart and priming finish.
 - Phone AAC-ELD output uses one 10 ms frame per packet. USB retains its existing
   packet grouping. Output profiles offer discrete supported AAC/ELD bitrates;
   an explicit unsupported choice never falls back silently. Profile changes
