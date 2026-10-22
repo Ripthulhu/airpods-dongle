@@ -10,6 +10,7 @@
 #include "btstack/mic_decoder_lifecycle.h"
 #include "btstack/phone_sink.h"
 #include "btstack/phone_worker.h"
+#include "btstack/phone_benchmark.h"
 #include "btstack/phone_control.h"
 #include "btstack/dongle_finder.h"
 #include "tinyusb/dongle_features.h"
@@ -256,6 +257,12 @@ static void ble_diagnostics_task(void) {
     last_requested = current.scan_requested;
 }
 
+static bool benchmark_idle(void) {
+    tinyusb_task();
+    sleep_ms(1);
+    return true;
+}
+
 int main() {
 
     vreg_set_voltage(VREG_VOLTAGE_1_20);
@@ -281,9 +288,19 @@ int main() {
         printf("boot reason: normal power-on/reset\n");
     }
 
+    // USB may deliver PCM while the silent startup benchmark services its tasks.
+    audio_slot_queue_init();
     tinyusb_main();
 
-    audio_slot_queue_init();
+    phone_benchmark_result_t phone_benchmark;
+    bool lhdc_ready = phone_benchmark_lhdc(time_us_32, benchmark_idle, &phone_benchmark);
+    printf("[PHONE] LHDC benchmark: enabled=%u frames=%lu max_us=%lu cleanup=%u\n",
+           lhdc_ready, (unsigned long)phone_benchmark.frames,
+           (unsigned long)phone_benchmark.max_decode_us, phone_benchmark.cleanup);
+    if (!phone_benchmark.cleanup) {
+        printf("Phone decoder did not detach; Bluetooth startup cancelled\n");
+        return 1;
+    }
 
     printf("init ctw43.\n");
 

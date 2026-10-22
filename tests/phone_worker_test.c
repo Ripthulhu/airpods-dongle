@@ -15,6 +15,8 @@ static atomic_bool codec_busy, hold_decode, decode_entered, quit_worker;
 static bool codec_configured;
 static unsigned delivered, callbacks;
 static int16_t expected_sample;
+static uint32_t fake_time;
+#define PHONE_WORKER_TIME_US() fake_time
 
 static void *test_calloc(size_t count, size_t size) {
     assert(pthread_equal(pthread_self(), controller));
@@ -61,6 +63,7 @@ void phone_codec_reset(void) {
 bool phone_codec_decode(const uint8_t *payload, size_t length, uint8_t count,
                         phone_codec_pcm_callback callback, void *context) {
     (void)count;
+    fake_time += 1250u;
     assert(!atomic_exchange(&codec_busy, true));
     assert(codec_configured && length != 0);
     atomic_store(&decode_entered, true);
@@ -123,6 +126,7 @@ static void deterministic(void) {
     assert(phone_worker_step());
     assert(phone_worker_poll(receive, &delivered));
     assert(delivered == 4 && callbacks == 1);
+    assert(phone_worker_last_decode_us() == 1250u);
     for (unsigned bad = 0xfe; bad <= 0xff; ++bad) {
         data[0] = bad;
         assert(phone_worker_submit(data, sizeof(data), 0));

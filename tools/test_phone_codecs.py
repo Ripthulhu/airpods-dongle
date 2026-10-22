@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test the phone decoders against the pinned SDK's real SBC codec."""
+"""Test the real phone decoders against pinned codecs and synthetic fixtures."""
 import argparse
 from pathlib import Path
 import shutil
@@ -49,10 +49,11 @@ def main():
     sdk = args.sdk.resolve()
     subprocess.run(["python3", str(ROOT / "tools/prepare_sdk.py"), "--sdk", str(sdk), "--check"], check=True)
     codec = sdk / "lib/btstack/3rd-party/bluedroid"
+    lhdc = ROOT / "3rd-party/lhdcv5"
     command = [args.cc or ("arm-none-eabi-gcc" if args.arm else "cc"),
                "-std=c11", "-O3", "-g", "-Wall", "-Wextra", "-Werror",
                "-Wno-unused-parameter", "-Wno-sign-compare", "-Wno-unused-variable",
-               "-Wno-unused-but-set-variable", "-Wno-missing-field-initializers"]
+               "-Wno-unused-but-set-variable", "-Wno-missing-field-initializers", "-ffp-contract=off"]
     if args.arm:
         command += ["-mcpu=cortex-m33", "-mthumb", "-march=armv8-m.main+fp+dsp",
                     "-mfloat-abi=softfp", "-ffunction-sections", "-fdata-sections", "-DPHONE_TEST_ARM"]
@@ -60,12 +61,15 @@ def main():
         command += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                     "-fno-omit-frame-pointer", "-no-pie"]
     command += ["-I", str(ROOT / "3rd-party/libfreeaptx"),
+                "-I", str(lhdc), "-I", str(lhdc / "decoder"), "-I", str(lhdc / "port"),
                 "-I", str(ROOT), "-I", str(sdk / "lib/btstack/src"),
                 "-I", str(codec / "decoder/include"), "-I", str(codec / "encoder/include")]
     sources = [ROOT / "tests/phone_codec_test.c", ROOT / "tests/phone_resample_test.c",
                sdk / "lib/btstack/src/btstack_resample.c", ROOT / "src/btstack/phone_codec.c",
                ROOT / "src/btstack/phone_worker.c",
-               ROOT / "3rd-party/libfreeaptx/freeaptx.c"]
+               ROOT / "src/btstack/phone_benchmark.c",
+               ROOT / "3rd-party/libfreeaptx/freeaptx.c", lhdc / "lhdc48.c"]
+    sources += sorted((lhdc / "decoder").glob("*.c"))
     sources += sorted((codec / "decoder/srce").glob("*.c"))
     sources += sorted((codec / "encoder/srce").glob("*.c"))
     with tempfile.TemporaryDirectory(prefix="phone-codecs-") as temporary:
@@ -77,6 +81,8 @@ def main():
         for index, source in enumerate(sources):
             obj = Path(temporary) / f"{index}.o"
             flags = command.copy()
+            if source.name == "phone_worker.c":
+                flags += ["-include", str(ROOT / "tests/phone_codec_clock.h")]
             if args.arm and source.name == "phone_worker.c":
                 # The installed QEMU M33 model has no FPU, so this harness uses
                 # M7. Compile its C11 atomics as equivalent DMB/load/store ops;
@@ -95,7 +101,7 @@ def main():
         linker = ["-nostartfiles", "-Wl,--gc-sections", "-Wl,--wrap=printf", "-Wl,--wrap=puts",
                   "-T", str(ROOT / "tools/codec_probe/probe.ld")] if args.arm else []
         linker += ["-Wl,--wrap=malloc", "-Wl,--wrap=calloc", "-Wl,--wrap=free"]
-        libraries = ["-Wl,--start-group", "-lc", "-lm", "-lnosys", "-Wl,--end-group"] if args.arm else []
+        libraries = ["-Wl,--start-group", "-lc", "-lm", "-lnosys", "-Wl,--end-group"] if args.arm else ["-lm"]
         subprocess.run(command + linker + objects + libraries + ["-o", str(binary)],
                        check=True, timeout=90)
         run = ["qemu-system-arm", "-M", "mps2-an500", "-nographic", "-semihosting-config",

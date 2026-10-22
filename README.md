@@ -10,13 +10,13 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Experimental firmware **0.1.8**. The firmware cross-compiles and the host
+Experimental firmware **0.1.9**. The firmware cross-compiles and the host
 regression tests pass.
 This version has not been tested on a Pico or AirPods. The source fork reports
 Pro 3 testing; that does not validate these changes.
 
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
-- Phone Bluetooth input with classic aptX where negotiated and SBC fallback.
+- Phone Bluetooth input with guarded LHDC v5 at 48 kHz, then classic aptX/SBC fallback.
 - Simultaneous AACP microphone, opened only by a USB recording request.
 - Phone or microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
@@ -91,8 +91,10 @@ applies the reviewed patches, and verifies readback. Configuration and builds
 reject missing patches or unknown patch states. The UF2 tool is pinned to
 picotool 2.1.1. Use a separate SDK checkout rather than modifying a shared one.
 Every firmware link runs the [real-codec memory check](tools/codec_probe/README.md)
-against that ELF and its fingerprinted codec archive. The build fails if the
-tested allocations cannot leave a 64 KiB runtime reserve.
+against that ELF and its fingerprinted codec archives, including LHDC gain and
+signal-error checks against the original synthetic PCM. UF2 publication waits
+for successful validation; a failed or interrupted recheck removes stale flash
+outputs. Tested allocations must leave a 64 KiB runtime reserve.
 
 ## Use
 
@@ -120,10 +122,13 @@ Run native C and Python tests on Linux/WSL:
 ```sh
 python3 tools/test.py --sanitize
 python3 tools/test_phone_codecs.py --sdk .sdk/pico-sdk --sanitize
+python3 tools/lhdc_probe/run.py --sanitize
 ```
 
-The second command checks the real aptX/SBC decoders and BTstack resampler.
-Use `--arm` instead of `--sanitize` for the ARM32 codec check; it requires QEMU.
+The codec tests check LHDC/aptX/SBC, the actual worker, startup gate and BTstack
+resampler. The LHDC probe compares decoded synthetic music with its original PCM
+and checks malformed input and allocation failure. Both accept `--arm` instead
+of `--sanitize` for an ARM32 functional check; it requires QEMU.
 
 The tests cover malformed packets, phone codec negotiation and controls,
 early startup priming, stale connections, cancelled recording,
@@ -148,14 +153,15 @@ this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
 Both cores have guarded 16 KiB stacks. The build measures codec allocation peaks
 against the linked heap and requires at least 64 KiB left for runtime use.
-The 0.1.8 link leaves 386,792 bytes of heap; the ARM codec probe peaks at
-188,040 bytes, leaving 198,752 bytes before other runtime allocations.
+The 0.1.9 link leaves 385,184 bytes of heap. The ARM probe peaks at 90,816 bytes
+for LHDC plus AAC-ELD, or 188,040 bytes for playback plus USB microphone. The
+heavier case leaves 197,144 bytes before other runtime allocations.
 The [codec probe](tools/codec_probe/README.md) covers the real encoders, VBR frame
 bounds and decoder lifecycles; emulation does not measure full runtime heap or
 stack use. Performance readings expose queue fill, dropped/underflow frames,
 encode time and allocator use for hardware checks.
 Phone playback releases the idle microphone decoder before preparing its input
-codec and 9,772-byte worker queue; USB recording waits for worker detachment and
+codec and 9,776-byte worker queue; USB recording waits for worker detachment and
 frees both before allocating the microphone. Diagnostic history is limited to
 2 KiB, with dropped-byte counts, to leave more memory for audio.
 If microphone initialization fails, reopening recording makes one fresh attempt

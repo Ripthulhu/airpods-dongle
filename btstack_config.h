@@ -19,7 +19,7 @@
 #define HCI_ACL_PAYLOAD_SIZE (1691 + 4)
 #define HCI_ACL_CHUNK_SIZE_ALIGNMENT 4
 #define MAX_NR_AVDTP_CONNECTIONS 2
-#define MAX_NR_AVDTP_STREAM_ENDPOINTS 5
+#define MAX_NR_AVDTP_STREAM_ENDPOINTS 6 // Three persistent output codecs and three phone input codecs.
 #define MAX_NR_AVRCP_CONNECTIONS 4
 // These profiles are not initialized; bonds use the SDK's persistent TLV database.
 #define MAX_NR_BNEP_CHANNELS 0

@@ -5,7 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.8 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.9 LANGUAGES C CXX ASM)
 pico_sdk_init()
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
@@ -30,14 +30,27 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static codec libraries" FORCE)
 set(BUILD_PROGRAMS OFF CACHE BOOL "No desktop codec tools" FORCE)
 add_subdirectory(3rd-party/fdk-aac)
 target_compile_definitions(fdk-aac PRIVATE FDK_AIRPODS_PROFILE=1)
+file(GLOB lhdc_sources CONFIGURE_DEPENDS "3rd-party/lhdcv5/decoder/*.c")
+add_library(lhdcv5 STATIC 3rd-party/lhdcv5/lhdc48.c ${lhdc_sources})
+target_include_directories(lhdcv5 PUBLIC 3rd-party/lhdcv5
+    PRIVATE 3rd-party/lhdcv5/decoder 3rd-party/lhdcv5/port)
+target_compile_options(lhdcv5 PRIVATE -ffp-contract=off)
+target_link_libraries(lhdcv5 PRIVATE pico_stdlib m)
 set(codec_fingerprint "${CMAKE_CURRENT_BINARY_DIR}/codec_fingerprint.c")
+set(lhdc_fingerprint "${CMAKE_CURRENT_BINARY_DIR}/lhdc_fingerprint.c")
 add_custom_command(OUTPUT "${codec_fingerprint}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/stamp.py"
         --library "$<TARGET_FILE:fdk-aac>" --output "${codec_fingerprint}"
     DEPENDS fdk-aac "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/stamp.py"
     VERBATIM)
+add_custom_command(OUTPUT "${lhdc_fingerprint}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/stamp.py"
+        --label LHDC --library "$<TARGET_FILE:lhdcv5>" --output "${lhdc_fingerprint}"
+    DEPENDS lhdcv5 "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/stamp.py"
+    VERBATIM)
 add_executable(airpods_dongle
     "${codec_fingerprint}"
+    "${lhdc_fingerprint}"
     src/main.c
     src/pico_w_led.c
     src/slot_storage.c
@@ -52,6 +65,7 @@ add_executable(airpods_dongle
     src/btstack/dongle_finder.c
     src/btstack/phone_codec.c
     src/btstack/phone_worker.c
+    src/btstack/phone_benchmark.c
     3rd-party/libfreeaptx/freeaptx.c
     src/tinyusb/uac.c
     src/tinyusb/usb_descriptors.c
@@ -69,10 +83,12 @@ target_include_directories(airpods_dongle PRIVATE
 target_link_libraries(airpods_dongle PRIVATE
     pico_stdlib pico_multicore pico_btstack_ble pico_btstack_classic pico_btstack_cyw43
     pico_cyw43_arch_threadsafe_background pico_btstack_sbc_encoder pico_btstack_sbc_decoder
-    tinyusb_device tinyusb_board fdk-aac
+    tinyusb_device tinyusb_board fdk-aac lhdcv5
 )
 pico_enable_stdio_uart(airpods_dongle 0)
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_codec_fingerprint")
+target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_lhdc_fingerprint"
+    "-Wl,--undefined=airpods_phone_worker_storage_bytes")
 target_compile_definitions(airpods_dongle PRIVATE
     CYW43_LWIP=0 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
     PICO_CORE1_STACK_SIZE=0 PICO_STACK_SIZE=16384 PICO_USE_STACK_GUARDS=1
@@ -80,24 +96,31 @@ target_compile_definitions(airpods_dongle PRIVATE
 pico_set_linker_script(airpods_dongle "${dongle_linker}")
 pico_set_program_name(airpods_dongle "AirPods Dongle")
 pico_set_program_version(airpods_dongle "${PROJECT_VERSION}")
-pico_add_extra_outputs(airpods_dongle)
+pico_init_picotool()
+include(tools/codec_probe/publish.cmake)
 set(codec_check_command
     "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/run.py"
     --firmware "$<TARGET_FILE:airpods_dongle>" --library "$<TARGET_FILE:fdk-aac>"
+    --lhdc-library "$<TARGET_FILE:lhdcv5>"
     --compiler "${CMAKE_C_COMPILER}" --nm "${CMAKE_NM}"
+    --picotool "$<TARGET_FILE:picotool>" --uf2-family "${PICO_PLATFORM}"
     --output "${CMAKE_CURRENT_BINARY_DIR}/codec-probe")
-add_custom_command(TARGET airpods_dongle POST_BUILD
-    COMMAND ${codec_check_command}
-    COMMENT "Checking codec allocations against the linked firmware heap"
-    VERBATIM)
+if(PICO_RP2350_A2_SUPPORTED)
+    list(APPEND codec_check_command --uf2-abs-block)
+endif()
+airpods_add_checked_outputs(airpods_dongle ${codec_check_command})
 set_property(TARGET airpods_dongle APPEND PROPERTY LINK_DEPENDS
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/run.py"
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/probe.c"
+    "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/lhdc_quality.h"
+    "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/publish.cmake"
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/profile_checks.h"
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/startup.c"
-    "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/probe.ld")
+    "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/probe.ld"
+    "${CMAKE_CURRENT_LIST_DIR}/3rd-party/lhdcv5/lhdc48_bench_fixture.h"
+    "${CMAKE_CURRENT_LIST_DIR}/tests/lhdc/music_reference.h")
 add_custom_target(check_codec_memory COMMAND ${codec_check_command}
-    DEPENDS airpods_dongle fdk-aac VERBATIM)
+    DEPENDS airpods_dongle fdk-aac lhdcv5 VERBATIM)
 add_custom_target(check_sdk ALL
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/prepare_sdk.py"
         --sdk "${PICO_SDK_PATH}" --check

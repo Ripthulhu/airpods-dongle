@@ -3,6 +3,7 @@
 #include <string.h>
 #include "freeaptx.h"
 #include "oi_codec_sbc.h"
+#include "lhdc48.h"
 
 static phone_codec_t selected;
 static phone_sbc_config_t configuration;
@@ -10,18 +11,24 @@ static struct aptx_context *aptx;
 static OI_CODEC_SBC_DECODER_CONTEXT sbc;
 static OI_UINT32 sbc_data[CODEC_DATA_WORDS(2, SBC_CODEC_MIN_FILTER_BUFFERS)];
 static bool sbc_ready;
+static bool lhdc_enabled;
 
 bool phone_codec_available(phone_codec_t codec) {
-    return codec == PHONE_CODEC_SBC || codec == PHONE_CODEC_APTX;
+    return codec == PHONE_CODEC_SBC || codec == PHONE_CODEC_APTX ||
+           (codec == PHONE_CODEC_LHDCV5 && lhdc_enabled);
 }
+void phone_codec_enable_lhdc(bool enabled) { lhdc_enabled = enabled; }
 
 void phone_codec_reset(void) {
     if (aptx != NULL) aptx_reset(aptx);
+    if (selected == PHONE_CODEC_LHDCV5) lhdc48_reset();
     sbc_ready = OI_CODEC_SBC_DecoderReset(&sbc, sbc_data, sizeof(sbc_data), 2, 2, FALSE)
                 == OI_STATUS_SUCCESS;
 }
 
 bool phone_codec_configuration_valid(phone_codec_t codec, const phone_sbc_config_t *config) {
+    // Startup exercises LHDC before its endpoint becomes available to a phone.
+    if (codec == PHONE_CODEC_LHDCV5) return true;
     if (!phone_codec_available(codec)) return false;
     if (codec == PHONE_CODEC_SBC) {
         if (config == NULL || (config->blocks != 4 && config->blocks != 8 &&
@@ -45,11 +52,13 @@ bool phone_codec_configure(phone_codec_t codec, const phone_sbc_config_t *config
 }
 
 bool phone_codec_prepare(void) {
+    if (selected != PHONE_CODEC_LHDCV5 && lhdc48_ready()) lhdc48_close();
     if (selected != PHONE_CODEC_APTX && aptx != NULL) {
         aptx_finish(aptx);
         aptx = NULL;
     }
     if (selected == PHONE_CODEC_APTX && aptx == NULL) aptx = aptx_init(0);
+    if (selected == PHONE_CODEC_LHDCV5 && !lhdc48_ready()) return lhdc48_prepare(24);
     return phone_codec_ready();
 }
 
@@ -61,7 +70,8 @@ void phone_codec_close(void) {
 
 bool phone_codec_ready(void) {
     return (selected == PHONE_CODEC_SBC && sbc_ready) ||
-           (selected == PHONE_CODEC_APTX && aptx != NULL);
+           (selected == PHONE_CODEC_APTX && aptx != NULL) ||
+           (selected == PHONE_CODEC_LHDCV5 && lhdc48_ready());
 }
 
 static uint8_t crc_bit(uint8_t crc, unsigned bit) {
@@ -149,6 +159,7 @@ bool phone_codec_decode(const uint8_t *payload, size_t length, uint8_t frames,
     if (!phone_codec_ready() || payload == NULL || callback == NULL ||
         length == 0 || length > PHONE_CODEC_MAX_PAYLOAD) return false;
     bool ok = selected == PHONE_CODEC_SBC ? decode_sbc(payload, length, frames, callback, context) :
+              selected == PHONE_CODEC_LHDCV5 ? lhdc48_decode(payload, length, frames, callback, context) :
               frames == 0 && decode_aptx(payload, length, callback, context);
     if (!ok) phone_codec_reset();
     return ok;

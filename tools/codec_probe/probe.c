@@ -4,12 +4,23 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "aacenc_lib.h"
 #include "aacdecoder_lib.h"
+#include "lhdc48.h"
+#include "lhdc48_bench_fixture.h"
+#include "lhdc_quality.h"
 
 #ifndef PROBE_HEAP_BYTES
 #error "Pass the firmware's linked heap capacity as PROBE_HEAP_BYTES"
+#endif
+#ifndef PROBE_PHONE_WORKER_BYTES
+#error "Pass the linked firmware's retained phone worker storage size"
+#endif
+#ifndef PROBE_PHONE_MODE
+#define PROBE_PHONE_MODE 0
 #endif
 
 extern void probe_emit(const char *text);
@@ -121,19 +132,8 @@ static unsigned char packets[16][1024];
 static unsigned packet_lengths[16];
 static unsigned checksum = 2166136261u;
 
-static void encode_frame(HANDLE_AACENCODER handle, unsigned channels, unsigned frame,
-                         unsigned char *packet, unsigned *length) {
-    AACENC_InfoStruct info = {0};
-    ENC_OK(aacEncInfo(handle, &info));
-    unsigned samples = info.frameLength;
-    if (channels != info.inputChannels || samples == 0 || samples > 1024 || channels > 2)
-        fail("encoder input format", samples);
-    for (unsigned sample = 0; sample < samples; ++sample) {
-        int value = (sample + frame * samples) % 96;
-        value = (value < 48 ? value : 96 - value) - 24;
-        for (unsigned channel = 0; channel < channels; ++channel)
-            pcm[sample * channels + channel] = (INT_PCM)(value * 100);
-    }
+static void encode_pcm(HANDLE_AACENCODER handle, unsigned channels, unsigned samples,
+                        unsigned char *packet, unsigned *length) {
     void *input_buffers[] = {pcm}, *output_buffers[] = {packet};
     INT input_ids[] = {IN_AUDIO_DATA}, output_ids[] = {OUT_BITSTREAM_DATA};
     INT input_sizes[] = {samples * channels * sizeof(INT_PCM)}, output_sizes[] = {1024};
@@ -149,6 +149,99 @@ static void encode_frame(HANDLE_AACENCODER handle, unsigned channels, unsigned f
     *length = result.numOutBytes;
     for (unsigned i = 0; i < *length; ++i)
         checksum = (checksum ^ packet[i]) * 16777619u;
+}
+
+static void encode_frame(HANDLE_AACENCODER handle, unsigned channels, unsigned frame,
+                         unsigned char *packet, unsigned *length) {
+    AACENC_InfoStruct info = {0};
+    ENC_OK(aacEncInfo(handle, &info));
+    unsigned samples = info.frameLength;
+    if (channels != info.inputChannels || samples == 0 || samples > 1024 || channels > 2)
+        fail("encoder input format", samples);
+    for (unsigned sample = 0; sample < samples; ++sample) {
+        int value = (sample + frame * samples) % 96;
+        value = (value < 48 ? value : 96 - value) - 24;
+        for (unsigned channel = 0; channel < channels; ++channel)
+            pcm[sample * channels + channel] = (INT_PCM)(value * 100);
+    }
+    encode_pcm(handle, channels, samples, packet, length);
+}
+
+typedef struct {
+    HANDLE_AACENCODER encoder;
+    unsigned filled, frames, encodes;
+    uint32_t checksum;
+    lhdc_quality_t quality;
+} phone_probe_t;
+
+static void phone_pcm(const int16_t *stereo, uint16_t frames, void *context) {
+    phone_probe_t *phone = context;
+    if (stereo == NULL || frames != 240 || phone->filled + frames > 480)
+        fail("LHDC decoded format", frames);
+    lhdc_quality_collect(&phone->quality, stereo, frames);
+    memcpy(pcm + phone->filled * 2u, stereo, frames * 2u * sizeof(*stereo));
+    for (unsigned n = 0; n < frames * 2u; ++n) {
+        uint16_t value = (uint16_t)stereo[n];
+        phone->checksum = (phone->checksum ^ (value & 255u)) * 16777619u;
+        phone->checksum = (phone->checksum ^ (value >> 8)) * 16777619u;
+    }
+    phone->filled += frames;
+    phone->frames++;
+    if (phone->filled == 480) {
+        unsigned char packet[1024];
+        unsigned length;
+        encode_pcm(phone->encoder, 2, 480, packet, &length);
+        if (length == 0) fail("LHDC playback output", -1);
+        phone->filled = 0;
+        phone->encodes++;
+    }
+}
+
+static void check_phone_lhdc(void) {
+    phone_probe_t phone = {.checksum = 2166136261u};
+    for (unsigned cycle = 0; cycle < 2; ++cycle) {
+        phone.quality = (lhdc_quality_t){0};
+        if (cycle != 0) phone.encoder = encoder(2, 256000);
+        // The layout value comes from the exact firmware ELF, including its padding.
+        volatile uint8_t *worker = calloc(1, PROBE_PHONE_WORKER_BYTES);
+        if (worker == NULL) fail("phone worker allocation", PROBE_PHONE_WORKER_BYTES);
+        worker[0] = worker[PROBE_PHONE_WORKER_BYTES - 1u] = 0x5a;
+        watermark_start();
+        if (!lhdc48_prepare(24) || !lhdc48_ready()) fail("LHDC preparation", -1);
+        report_stack("phone_lhdc_prepare", watermark_depth());
+        if (cycle == 0) phone.encoder = encoder(2, 256000);
+        unsigned maximum_depth = 0;
+        for (unsigned frame = 0; frame < LHDC48_BENCH_FRAME_COUNT; ++frame) {
+            watermark_start();
+            if (!lhdc48_decode(lhdc48_bench_data + frame * LHDC48_BENCH_FRAME_BYTES,
+                               LHDC48_BENCH_FRAME_BYTES, 1, phone_pcm, &phone))
+                fail("LHDC frame", frame);
+            unsigned depth = watermark_depth();
+            if (depth > maximum_depth) maximum_depth = depth;
+        }
+        report_stack("phone_lhdc_and_eld_frame_max", maximum_depth);
+        if (!lhdc_quality_passed(&phone.quality)) fail("LHDC PCM quality", cycle);
+        char quality[160];
+        snprintf(quality, sizeof(quality),
+                 "PHONE_QUALITY cycle=%u reference_samples=%u gain_ppm=%ld/%ld snr_above_30db=1\n",
+                 cycle, phone.quality.compared,
+                 (long)(phone.quality.cross[0] * 1000000 / phone.quality.signal[0]),
+                 (long)(phone.quality.cross[1] * 1000000 / phone.quality.signal[1]));
+        probe_emit(quality);
+        report_heap(cycle == 0 ? "phone_lhdc_eld_live" : "eld_retained_lhdc_live");
+        if (worker[0] != 0x5a || worker[PROBE_PHONE_WORKER_BYTES - 1u] != 0x5a)
+            fail("phone worker storage", -1);
+        ENC_OK(aacEncClose(&phone.encoder));
+        lhdc48_close();
+        free((void *)worker);
+        if (phone.filled != 0 || mallinfo().uordblks != 0) fail("LHDC lifecycle cleanup", cycle);
+    }
+    if (phone.frames != 64 || phone.encodes != 32 || phone.checksum == 2166136261u)
+        fail("LHDC frame accounting", phone.frames);
+    char text[160];
+    snprintf(text, sizeof(text), "PHONE_LHDC frames=%u encodes=%u worker_bytes=%u checksum=%08x\n",
+             phone.frames, phone.encodes, (unsigned)PROBE_PHONE_WORKER_BYTES, (unsigned)phone.checksum);
+    probe_emit(text);
 }
 
 #include "profile_checks.h"
@@ -291,6 +384,14 @@ static void check_variable_encoder(void) {
 
 int main(void) {
     report_heap("baseline");
+    if (PROBE_PHONE_MODE) {
+        check_phone_lhdc();
+        char text[100];
+        snprintf(text, sizeof(text), "HEAP_PEAK bytes=%u\n", (unsigned)peak_heap_break);
+        probe_emit(text);
+        probe_emit("CHECKS complete\n");
+        return 0;
+    }
     HANDLE_AACENCODER mono = encoder(1, 64000);
     AACENC_InfoStruct info = {0};
     ENC_OK(aacEncInfo(mono, &info));

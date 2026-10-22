@@ -31,6 +31,14 @@
       "windows/daemon/src/battery_ble.rs": "9558693266aa298e6392e412ddd1803f3d8ae3d5b8e2b63495075063a6181582"
     }
   },
+  "lhdcv5": {
+    "repository": "https://github.com/WillyBilly06/LHDC-V5-Decoder",
+    "revision": "cf857ce1a1429965e161e54adbc3f293fd9ce273",
+    "license": "Apache-2.0 (upstream README grant)",
+    "original_hashes": "3rd-party/lhdcv5/SOURCE.json",
+    "local_changes": "3rd-party/lhdcv5/local-changes.patch",
+    "encoder_fixtures": "tests/lhdc/fixture.json"
+  },
   "libfreeaptx": {
     "repository": "https://github.com/regularhunter/libfreeaptx",
     "revision": "476e2d56b0374c643c50bc37ab5cfee3012e2144",

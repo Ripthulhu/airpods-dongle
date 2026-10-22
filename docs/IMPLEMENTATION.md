@@ -26,7 +26,9 @@ reference file hashes used for these changes.
 | PCM queues | Racy cursor resets and repeated queue allocations | Use bounded storage, generation-tagged microphone frames and acquire/release publication |
 | USB controls | Invalid channel/format requests and repeated mute alter state | Reject unsupported requests; apply idempotent mute to PCM and preserve volume |
 | Stem controls | Play/Pause mutes the dongle instead of controlling the player | Send explicit USB Consumer Control commands, with bounded queues and ordered key releases |
-| Phone bridge | No A2DP receiver or independent phone ownership | Negotiate 48 kHz classic aptX/SBC, decode into bounded PCM and route AVRCP by peer |
+| Phone bridge | No A2DP receiver or independent phone ownership | Negotiate guarded 48 kHz LHDC v5 with classic aptX/SBC fallback, decode into bounded PCM and route AVRCP by peer |
+| LHDC validation | Upstream decoder has approximate gain and unchecked malformed-data arithmetic | Correct the 48 kHz transform scale, bound arithmetic, check original PCM against the linked archive and require a core 1 startup timing check before advertising LHDC |
+| Phone fallback | Rejected Open or repeated decoder failures can leave an unusable codec selected | Bound active Open attempts and reconnect with aptX/SBC after rejecting the failed vendor codec |
 | Phone startup | Input could accumulate behind AirPods priming | Open and prime the AirPods output before accepting phone Start; use one ELD frame per phone-output packet |
 | Phone memory | A retained idle microphone decoder competes with the phone decoder | Let core 1 detach it, then free on core 0; close the phone codec before USB microphone takeover |
 | Phone CPU use | Phone decode and AirPods encode share core 0 while core 1 waits | Decode complete phone packets on core 1; publish bounded, generation-checked PCM on core 0 |
@@ -39,10 +41,10 @@ reference file hashes used for these changes.
 
 Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
 
-| Linked layout | 0.1.8 |
+| Linked layout | 0.1.9 |
 | --- | ---: |
-| Main-heap capacity before codec allocations | 386,792 bytes |
-| Flash image | 1,644,696 bytes |
+| Main-heap capacity before codec allocations | 385,184 bytes |
+| Flash image | 1,704,456 bytes |
 | Full BLE cache copy for aggregate logs | 28 bytes |
 
 The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
@@ -77,9 +79,9 @@ their original dimensions.
 
 The real-codec probe keeps stereo ELD at 48 kHz/256 kbps and the microphone
 decoder open together. Live allocator use is 186,872 bytes, down from 379,864.
-The tested allocator peak is 188,040 bytes, leaving 198,752 bytes before other
+The tested allocator peak is 188,040 bytes, leaving 197,144 bytes before other
 application allocations. Heap alignment and allocation order affect arena use.
-Every firmware link verifies its exact codec archive fingerprint, derives capacity
+Every firmware link verifies its exact FDK/LHDC archive fingerprints, derives capacity
 from the ELF and reserves 64 KiB for other runtime use. The reserve is a build
 policy, not a measured bound on the application. Tests cover malformed input,
 limiter operation, playback recreation with the microphone retained and bit-exact
@@ -110,7 +112,7 @@ The hearing/diagnostic transport uses bounded static storage and one additional
 L2CAP channel. It uses the existing ACL and allocates no heap;
 fragment assembly, ATT and cached AACP reports stay on core 0.
 It allocates and configures the microphone decoder in thread context under the
-Bluetooth async lock, then publishes the handle. Core 1 owns phone aptX/SBC decode
+Bluetooth async lock, then publishes the handle. Core 1 owns phone LHDC/aptX/SBC decode
 or microphone decode, codec reset and decoder statistics. These inputs are
 mutually exclusive. It never calls Bluetooth, USB or logging APIs.
 
@@ -135,8 +137,16 @@ it. No core 1 allocation/free occurs. USB microphone takeover waits for the phon
 worker to detach, then frees its codec and queue before initializing a fresh
 microphone decoder. Stale output remains generation-tagged. The aptX context adds
 4,404 bytes while selected, and SBC uses 1,636 bytes of static decoder state/workspace.
-The phone-only worker allocation is 9,772 bytes: two bounded compressed packet
+The phone-only worker allocation is 9,776 bytes: two bounded compressed packet
 slots and one complete-packet PCM mailbox. Malformed partial output is discarded.
+The LHDC adapter requests 11,264 live heap bytes on ARM32 and prewarms transform
+tables on core 0. No decode allocation or second decoder worker is introduced.
+LHDC plus AAC-ELD and the phone worker peak at 90,816 allocator bytes in the linked
+memory probe. Fixed-profile entropy histories and scratch buffers remove 4,740
+bytes of retained decoder RAM before allocator rounding; decoder static state is
+1,241 bytes. Compiling out disabled tracing reduces the channel decoder's ARM
+stack frame from 752 to 144 bytes. Actual core 1 deadlines and full runtime memory
+remain hardware checks.
 
 The diagnostics ring is 2 KiB instead of 8 KiB. Overflow retains a dropped-byte
 count, and each USB service tick still drains at most 64 bytes. The saved 6 KiB
@@ -172,10 +182,10 @@ and 480 samples per frame. USB still presents the inherited 64 kHz clock.
 Calibrated duration/pitch and long-run drift checks must resolve that distinction
 before changing the rate or claiming calibrated measurements.
 
-The phone sink advertises only 48 kHz stereo classic aptX and SBC. Discovery
-prefers aptX; a phone may initiate either supported configuration. Raw aptX
-codewords and SBC's RTP framing have separate bounded parsers. SBC validates the
-entire packet before decoding a valid prefix. Phone Start waits for successful
+The phone sink advertises 48 kHz stereo LHDC v5 only after its startup check,
+alongside classic aptX and SBC. Discovery prefers LHDC, then aptX; a phone may
+initiate any available configuration. Each codec has a bounded parser, and
+malformed packets cannot publish partial PCM. Phone Start waits for successful
 AirPods silence transmission, with a three-second deadline. See
 [phone bridge](PHONE-TRANSPORT.md) for buffering, pairing and hardware checks.
 

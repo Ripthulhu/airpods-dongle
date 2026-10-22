@@ -1,10 +1,10 @@
 # Phone bridge
 
-Firmware 0.1.8 provides wireless stereo audio and a separate app control service.
+Firmware 0.1.9 provides wireless stereo audio and a separate app control service.
 Both paths remain untested on Pico hardware.
 
 ```text
-Phone -- aptX or SBC --> Pico 2 W -- AAC-ELD / AAC / SBC --> AirPods
+Phone -- LHDC v5 / aptX / SBC --> Pico 2 W -- AAC-ELD / AAC / SBC --> AirPods
 ```
 
 The phone pairs with **AirPods Dongle** as an ordinary Bluetooth audio output.
@@ -40,14 +40,31 @@ revokes that ownership. Stored device ear detection is a separate AirPods settin
 
 ## Codec and buffering
 
-- Input is 48 kHz stereo classic aptX where negotiated, with SBC fallback. The
-  dongle prefers aptX during its own discovery; a phone initiating configuration
-  can select either supported codec. aptX LL, HD, Adaptive, AAC and LDAC input
-  are not advertised. Unavailable aptX allocation withdraws that endpoint so a
-  subsequent connection can use SBC.
+- Input is 48 kHz stereo. Discovery prefers LHDC v5, then classic aptX, then SBC;
+  a phone initiating configuration can choose an available codec. LHDC is limited
+  to 24-bit input, 5 ms lossy frames and 256–400 kbps. The bridge retains its existing
+  16-bit PCM path. No LHDC lossless/LL, aptX LL/HD/Adaptive, AAC or LDAC input is
+  advertised. Rejected vendor-codec setup or failed allocation withdraws that
+  endpoint and makes one reconnect attempt with the remaining codecs.
+  A rejected Open or failed media-channel setup uses the same recovery. Three
+  consecutive completed LHDC decode failures also withdraw LHDC; successful PCM
+  clears the count. Packet gaps, malformed RTP and input backpressure keep their
+  existing reset behavior and do not mark a codec unsupported.
+  Actual Open attempts have a three-second deadline. A peer that configures audio
+  and waits before requesting Open remains connected.
+- Before Bluetooth starts, core 1 silently decodes 32 synthetic LHDC music frames
+  through the actual worker. LHDC is offered only if every frame completes in
+  under 4 ms, produces 240 stereo samples, both channels produce nonzero output
+  across the fixture, and the worker detaches cleanly. Missing
+  timing, decode errors or timeouts leave aptX/SBC available. USB is serviced while
+  waiting; no decoded audio is played. An unacknowledged worker detach aborts
+  Bluetooth startup instead of freeing memory still used by core 1. This is a
+  startup sample at the configured clock, not a guarantee under radio/USB load.
 - Classic aptX contains raw four-byte codewords, without RTP. SBC has RTP and its
   SBC media header. The receiver validates framing and configuration, rejects
-  fragmented SBC, and resets on SBC sequence gaps instead of playing stale PCM.
+  fragmented SBC, and resets on sequence gaps instead of playing stale PCM.
+  LHDC uses RTP plus `[frame_count << 2, packet_sequence]`; fragmented packets,
+  unsupported frame formats, mismatched frame counts and truncated tails are rejected.
 - Core 1 decodes into a 64 ms maximum PCM queue via a single completed-packet
   mailbox. Two compressed packet slots bound the cross-core handoff; they have
   no playout timer. Initial prefill is 30 ms
@@ -80,8 +97,10 @@ to AAC-ELD is still a lossy transcode.
 ## Memory and ownership
 
 Bluetooth, USB, playback encoding and PCM publication run on core 0. Core 1 owns
-phone aptX/SBC decoding or USB microphone decoding; the two inputs are mutually
-exclusive. The phone worker allocates 9,772 bytes only during phone sessions.
+phone LHDC/aptX/SBC decoding or USB microphone decoding; the two inputs are mutually
+exclusive. The phone worker allocates 9,776 bytes only during phone sessions or the
+silent startup check. The LHDC decoder's ARM32 preparation requests 11,264 bytes
+live and peaks at 13,792 bytes; its static state is included in the linked heap budget.
 An idle microphone decoder is detached by core 1
 before core 0 releases its heap for a phone session. USB recording can initialize
 it again after the phone worker acknowledges detachment and core 0 frees its memory.
@@ -100,7 +119,14 @@ Native sanitizer tests cover negotiation, framing, stale events, pairing-window
 ownership, startup gating, bounded queues, controls and decoder release. Eighteen
 ten-minute clock simulations cover the three output frame sizes at ±300 ppm,
 including fixed-packet arrival drift. Real
-aptX/SBC codec tests run natively and in ARM32 emulation. Firmware cross-compilation
+LHDC/aptX/SBC codec tests run natively and in ARM32 emulation. The startup gate is
+tested with synthetic clocks, including real decoder/worker integration; those
+clocks are never used for performance claims. LHDC quality fixtures use original
+synthetic PCM encoded identically by pinned C and official AOSP Rust encoders.
+Gain, channel separation, malformed data and allocation cleanup are checked.
+The firmware build repeats the original-PCM gain/error checks against its exact
+linked LHDC archive. Silent, scaled or swapped output cannot pass that gate.
+Firmware cross-compilation
 checks the pinned SDK API and RAM layout. These checks do not establish radio
 reliability, CPU headroom or acoustic latency on the Pico.
 
@@ -115,8 +141,15 @@ clean stereo. Measure first sound and steady delay separately, queue occupancy,
 drift and heap/stack use. Then test long playback, pause/resume, phone radio loss,
 AirPods case return, AVRCP/volume, USB takeover and microphone recovery. Compare
 aptX with an SBC-only phone and check passive BLE reception alongside both links.
+Also read the boot log's LHDC `frames`, `max_us`, enable and cleanup results. A phone
+without an LHDC encoder will use aptX/SBC regardless of the Pico result. Measure
+core 0 encoding load and both stack high-water marks during sustained LHDC playback.
 
 Sources: [pinned BTstack AVDTP](https://github.com/bluekitchen/btstack/blob/501e6d2b86e6c92bfb9c390bcf55709938e25ac1/src/classic/avdtp.c),
 [pinned sink example](https://github.com/bluekitchen/btstack/blob/501e6d2b86e6c92bfb9c390bcf55709938e25ac1/example/a2dp_sink_demo.c),
 [AOSP classic aptX transport](https://android.googlesource.com/platform/packages/modules/Bluetooth/+/refs/heads/main/system/stack/a2dp/a2dp_vendor_aptx.cc),
 [pinned aptX decoder](https://github.com/regularhunter/libfreeaptx/tree/476e2d56b0374c643c50bc37ab5cfee3012e2144).
+
+LHDC sources: [pinned AOSP framing and configuration](https://android.googlesource.com/platform/packages/modules/Bluetooth/+/c77db469de80f86660bc053bec4dee0c5d4b947c/system/stack/a2dp/a2dp_vendor_lhdcv5.cc),
+[decoder provenance and local fixes](../3rd-party/lhdcv5/README.dongle.md),
+[synthetic fixture provenance](../tests/lhdc/fixture.json).

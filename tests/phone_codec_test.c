@@ -6,13 +6,22 @@
 #include <string.h>
 #include "../src/btstack/phone_codec.h"
 #include "../src/btstack/phone_worker.h"
+#include "../src/btstack/phone_benchmark.h"
 #include "freeaptx.h"
 #include "sbc_encoder.h"
+#include "lhdc48_bench_fixture.h"
 
 static int16_t captured[4096];
 static unsigned samples, calls;
 static bool reject_allocations;
 static unsigned allocations;
+static uint32_t synthetic_clock = 1;
+uint32_t phone_test_time_us(void) { return synthetic_clock += 100u; }
+static bool benchmark_idle(void) {
+    phone_worker_step();
+    synthetic_clock += 100u;
+    return true;
+}
 void phone_worker_wake(void) {}
 extern void test_phone_resampler(void);
 extern void *__real_malloc(size_t size);
@@ -206,11 +215,61 @@ static void test_sbc(void) {
     assert(phone_worker_close());
 }
 
+static void test_lhdc(void) {
+    assert(!phone_codec_available(PHONE_CODEC_LHDCV5));
+    assert(phone_codec_available(PHONE_CODEC_APTX) && phone_codec_available(PHONE_CODEC_SBC));
+
+    phone_benchmark_result_t result;
+    assert(phone_benchmark_lhdc(phone_test_time_us, benchmark_idle, &result));
+    assert(result.cleanup && result.frames == LHDC48_BENCH_FRAME_COUNT);
+    assert(phone_codec_available(PHONE_CODEC_LHDCV5));
+    assert(phone_worker_released() && !phone_codec_ready());
+    phone_codec_enable_lhdc(false);
+    // Startup uses the same worker before exposing this endpoint to a phone.
+    assert(phone_worker_configure(PHONE_CODEC_LHDCV5, NULL));
+    assert(phone_worker_prepare() == PHONE_WORKER_READY);
+    unsigned prepared_allocations = allocations;
+    for (unsigned i = 0; i < LHDC48_BENCH_FRAME_COUNT; ++i) {
+        samples = calls = 0;
+        assert(phone_worker_submit(lhdc48_bench_data + i * LHDC48_BENCH_FRAME_BYTES,
+                                   LHDC48_BENCH_FRAME_BYTES, 1));
+        assert(phone_worker_step());
+        assert(phone_worker_poll(collect, &samples));
+        assert(samples == 480 && calls == 1);
+        assert(allocations == prepared_allocations);
+    }
+    phone_worker_reset();
+    samples = calls = 0;
+    assert(phone_worker_submit(lhdc48_bench_data, LHDC48_BENCH_FRAME_BYTES - 1, 1));
+    assert(phone_worker_step());
+    assert(!phone_worker_poll(collect, &samples));
+    assert(samples == 0 && calls == 0);
+    assert(!phone_worker_close());
+    assert(phone_worker_step());
+    assert(phone_worker_close());
+    assert(!phone_codec_ready());
+    phone_codec_enable_lhdc(true);
+    assert(phone_codec_available(PHONE_CODEC_LHDCV5));
+    phone_codec_enable_lhdc(false);
+    assert(!phone_codec_available(PHONE_CODEC_LHDCV5));
+    assert(phone_codec_available(PHONE_CODEC_APTX) && phone_codec_available(PHONE_CODEC_SBC));
+
+    assert(phone_codec_configure(PHONE_CODEC_LHDCV5, NULL));
+    reject_allocations = true;
+    assert(!phone_codec_prepare() && !phone_codec_ready());
+    phone_codec_close();
+    reject_allocations = false;
+    assert(phone_codec_configure(PHONE_CODEC_APTX, NULL));
+    assert(phone_codec_prepare());
+    phone_codec_close();
+}
+
 int main(void) {
     test_phone_resampler();
     test_aptx();
     test_allocation_failure_falls_back();
     test_sbc();
+    test_lhdc();
     assert(!phone_codec_prepare());
-    puts("phone aptX/SBC real codecs, PCM conversion, bounds and reset: passed");
+    puts("phone LHDC/aptX/SBC real codecs, PCM conversion, bounds and reset: passed");
 }

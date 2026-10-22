@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "sample_rate": 48000,
+  "channels": 2,
+  "samples_per_frame_per_channel": 240,
+  "frame_duration_ms": 5,
+  "pcm_license": "CC0-1.0 (original deterministic signals, no recorded audio)",
+  "encoder_c": {
+    "repository": "https://github.com/WillyBilly06/LHDC-V5-Encoder",
+    "commit": "3f9d1980fa9c57cdfb78792f9455a7dbac50edda",
+    "license": "Apache-2.0; KISS FFT BSD-3-Clause notice retained"
+  },
+  "encoder_rust": {
+    "repository": "https://android.googlesource.com/platform/packages/modules/Bluetooth",
+    "commit": "c77db469de80f86660bc053bec4dee0c5d4b947c",
+    "path": "system/audio/codecs/lhdcv5",
+    "tree": "ae18507b0f80d4bc4eea55edb7e1b2a27ebd211a",
+    "license": "Apache-2.0; KISS FFT notice retained"
+  },
+  "case": "music_complex-48k-s24-400k",
+  "source_pcm_sha256": "1a3546ed8a9ec69eda267d0e61b46407148c7421568ffa34b4284be1f0608593",
+  "source_all_1024_aus_sha256": "ce17473b8729928f98d4d6ea9363198c7c078d7514684df76eccd7f2d0b4220e",
+  "fixture_frames": 32,
+  "fixture_bytes": 8064,
+  "fixture_sha256": "11cf3b00c7dc10371ce432b89ce6f62261b79d04f6c42dca807f22bfe0ea7311",
+  "source_first_frame": 0,
+  "pcm_reference_first_sample": 960,
+  "pcm_reference_stride": 8,
+  "decoder_delay_samples": 168,
+  "reference_pcm_sha256": "fcc930820f6eb58b778b30221805a6e91f7983c1aeaf01bab124508109b99a2c",
+  "limitations": [
+    "Synthetic encoder corpus, not a captured Bluetooth session.",
+    "Original PCM comparison checks lossy fidelity and gain; no independent decoder oracle."
+  ]
+}

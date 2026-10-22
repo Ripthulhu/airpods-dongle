@@ -45,73 +45,189 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def verify_library(firmware, codec_sha256):
-    stamps = set(re.findall(rb"APDG_FDK_SHA256:([0-9a-f]{64})\x00", firmware))
+def verify_library(firmware, codec_sha256, label="FDK"):
+    stamps = set(re.findall(rb"APDG_" + label.encode("ascii") + rb"_SHA256:([0-9a-f]{64})\x00", firmware))
     if stamps != {codec_sha256.encode("ascii")}:
-        raise ValueError("Codec archive does not match the fingerprint linked into this firmware")
+        raise ValueError(f"{label} codec archive does not match the fingerprint linked into this firmware")
+
+
+def phone_worker_bytes(firmware, symbols):
+    """Read sizeof(worker_t) retained by this firmware, never the current source layout."""
+    firmware_heap(firmware[:52], symbols)
+    addresses = re.findall(r"^([0-9a-fA-F]+)\s+[RrDd]\s+airpods_phone_worker_storage_bytes$",
+                           symbols, re.MULTILINE)
+    if len(addresses) != 1 or int(addresses[0], 16) & 3:
+        raise ValueError("Firmware must retain one aligned phone worker storage size")
+    address = int(addresses[0], 16)
+    offset = struct.unpack_from("<I", firmware, 28)[0]
+    entry_size, count = struct.unpack_from("<HH", firmware, 42)
+    if entry_size != 32 or not 0 < count <= 128 or offset < 52 or offset + entry_size * count > len(firmware):
+        raise ValueError("Unsupported or truncated firmware program headers")
+    values = []
+    for entry in range(count):
+        kind, file_offset, virtual, _, size, memory_size, _, _ = struct.unpack_from(
+            "<IIIIIIII", firmware, offset + entry * entry_size)
+        if kind != 1:
+            continue
+        if size > memory_size or file_offset + size > len(firmware) or virtual + size > 1 << 32:
+            raise ValueError("Invalid firmware load segment")
+        if virtual <= address and address + 4 <= virtual + size:
+            values.append(struct.unpack_from("<I", firmware, file_offset + address - virtual)[0])
+    if len(values) != 1 or not 4096 <= values[0] <= 65536 or values[0] & 3:
+        raise ValueError("Invalid or unmapped phone worker storage size")
+    return values[0]
+
+
+def invalidate_outputs(firmware):
+    # Only this ELF's named flash artifacts; never recurse or follow an output symlink.
+    for suffix in (".uf2", ".bin", ".hex", ".uf2.pending"):
+        firmware.with_suffix(suffix).unlink(missing_ok=True)
+
+
+def convert_uf2(picotool, firmware, pending, family, abs_block):
+    command = [picotool, "uf2", "convert", "--quiet", str(firmware), str(pending),
+               "-t", "uf2", "--family", family]
+    if abs_block:
+        command.append("--abs-block")
+    converted = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    if converted.returncode or not pending.is_file() or pending.stat().st_size == 0:
+        raise ValueError("UF2 conversion failed:\n" + converted.stdout + converted.stderr)
+
+
+def input_hashes(firmware, library, lhdc_library):
+    directory = pathlib.Path(__file__).resolve().parent
+    root = directory.parents[1]
+    checks = [directory / name for name in ("run.py", "probe.c", "lhdc_quality.h",
+                                           "profile_checks.h", "startup.c", "probe.ld")]
+    checks += [root / "3rd-party/lhdcv5/lhdc48_bench_fixture.h", root / "tests/lhdc/music_reference.h"]
+    return {"firmware_sha256": digest(firmware), "codec_sha256": digest(library),
+            "lhdc_sha256": digest(lhdc_library),
+            "validation_sha256": hashlib.sha256(b"\0".join(path.read_bytes() for path in checks)).hexdigest()}
+
+
+def current_output(args, firmware, receipt):
+    try:
+        saved = json.loads(receipt.read_text())
+        return isinstance(saved, dict) and saved.get("passed") is True and all(saved.get(key) == value for key, value in
+            input_hashes(firmware, args.library.resolve(), args.lhdc_library.resolve()).items()) and \
+            saved.get("uf2_sha256") == digest(firmware.with_suffix(".uf2"))
+    except (ValueError, OSError):
+        return False
 
 
 def run(args):
     directory = pathlib.Path(__file__).resolve().parent
     root = directory.parents[1]
     output = (args.output or root / "build" / "codec-probe").resolve()
-    output.mkdir(parents=True, exist_ok=True)
     receipt = output / "memory-check.json"
-    # A failed or interrupted recheck cannot leave a stale passing receipt.
-    receipt.unlink(missing_ok=True)
-    firmware, library = args.firmware.resolve(), args.library.resolve()
-    if not firmware.is_file() or not library.is_file():
-        raise ValueError("The built firmware ELF and codec archive are required")
+    firmware = args.firmware.resolve()
+    if firmware.suffix != ".elf":
+        raise ValueError("Expected the linked firmware .elf path")
+    # Only the CMake missing-output recovery rule may reuse an unchanged receipt.
+    # Explicit rechecks always invalidate and repeat every check.
+    if getattr(args, "if_current", False) and current_output(args, firmware, receipt):
+        return
+    invalidate_outputs(firmware)
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        # A failed or interrupted recheck cannot leave a stale passing receipt.
+        receipt.unlink(missing_ok=True)
+        validate(args, directory, root, output, receipt, firmware)
+    except BaseException:
+        try:
+            receipt.unlink(missing_ok=True)
+        finally:
+            invalidate_outputs(firmware)
+        raise
+
+
+def validate(args, directory, root, output, receipt, firmware):
+    library, lhdc_library = args.library.resolve(), args.lhdc_library.resolve()
+    if not firmware.is_file() or not library.is_file() or not lhdc_library.is_file():
+        raise ValueError("The built firmware ELF, FDK archive and LHDC archive are required")
     compiler = shutil.which(args.compiler)
     nm = shutil.which(args.nm)
     emulator = shutil.which("qemu-system-arm")
-    if compiler is None or nm is None or emulator is None:
-        raise ValueError("The ARM compiler, matching nm and qemu-system-arm are required")
-    before = {"firmware_sha256": digest(firmware), "codec_sha256": digest(library)}
-    verify_library(firmware.read_bytes(), before["codec_sha256"])
+    picotool = shutil.which(args.picotool)
+    if compiler is None or nm is None or emulator is None or picotool is None:
+        raise ValueError("The ARM compiler, matching nm, qemu-system-arm and picotool are required")
+    before = input_hashes(firmware, library, lhdc_library)
+    firmware_data = firmware.read_bytes()
+    verify_library(firmware_data, before["codec_sha256"])
+    verify_library(firmware_data, before["lhdc_sha256"], "LHDC")
     symbols = subprocess.run([nm, "--defined-only", str(firmware)], capture_output=True,
                              text=True, timeout=10, check=True).stdout
-    capacity = firmware_heap(firmware.read_bytes()[:52], symbols)
+    capacity = firmware_heap(firmware_data[:52], symbols)
+    worker_bytes = phone_worker_bytes(firmware_data, symbols)
     budget = capacity - RUNTIME_RESERVE_BYTES
-    elf = output / "codec-probe.elf"
     fdk = root / "3rd-party" / "fdk-aac"
     command = [compiler, "-mcpu=cortex-m33", "-mthumb", "-march=armv8-m.main+fp+dsp",
                "-mfloat-abi=softfp", "-mcmse", "-O2", "-g", "-ffreestanding",
                "-Wall", "-Wextra", "-Werror", "-DFDK_AIRPODS_PROFILE=1",
-               f"-DPROBE_HEAP_BYTES={budget}"]
+               f"-DPROBE_HEAP_BYTES={budget}", f"-DPROBE_PHONE_WORKER_BYTES={worker_bytes}",
+               "-I", str(root / "3rd-party" / "lhdcv5")]
     for module in ("libAACenc", "libAACdec", "libSYS"):
         command += ["-isystem", str(fdk / module / "include")]
     command += ["-nostartfiles", f"-Wl,-T,{directory / 'probe.ld'}",
-                str(directory / "startup.c"), str(directory / "probe.c"), str(library),
-                "-Wl,--start-group", "-lc", "-lm", "-lnosys", "-Wl,--end-group",
-                "-o", str(elf)]
-    compiled = subprocess.run(command, capture_output=True, text=True, timeout=60)
-    (output / "build.log").write_text(compiled.stdout + compiled.stderr)
-    if compiled.returncode:
-        raise ValueError("Codec probe compilation failed:\n" + compiled.stdout + compiled.stderr)
-    result = subprocess.run([emulator, "-M", "mps2-an500", "-nographic",
-                             "-semihosting-config", "enable=on,target=native",
-                             "-kernel", str(elf)],
-                            capture_output=True, text=True, timeout=60)
-    transcript = result.stdout + result.stderr
-    (output / "result.log").write_text(transcript)
-    if result.returncode:
-        raise ValueError("Codec memory check failed:\n" + transcript)
-    if "SUCCESS frames=16 checksum=4105af5d" not in transcript or "CHECKS complete" not in transcript:
-        raise ValueError("Codec probe did not complete every required check")
-    peak = re.search(r"^HEAP_PEAK bytes=(\d+)$", transcript, re.MULTILINE)
-    if peak is None or not 0 < int(peak[1]) <= budget:
-        raise ValueError("Codec probe returned an invalid heap high-water mark")
-    if before != {"firmware_sha256": digest(firmware), "codec_sha256": digest(library)}:
+                str(directory / "startup.c"), str(directory / "probe.c"), str(library), str(lhdc_library),
+                "-Wl,--start-group", "-lc", "-lm", "-lnosys", "-Wl,--end-group"]
+    modes, builds, transcripts = {}, [], []
+    for mode in ("usb_mic", "phone_lhdc"):
+        elf = output / f"codec-probe-{mode}.elf"
+        compiled = subprocess.run(command + [f"-DPROBE_PHONE_MODE={int(mode == 'phone_lhdc')}",
+                                             "-o", str(elf)],
+                                  capture_output=True, text=True, timeout=60)
+        builds.append(f"MODE {mode}\n" + compiled.stdout + compiled.stderr)
+        (output / "build.log").write_text("".join(builds))
+        if compiled.returncode:
+            raise ValueError("Codec probe compilation failed:\n" + builds[-1])
+        result = subprocess.run([emulator, "-M", "mps2-an500", "-nographic",
+                                 "-semihosting-config", "enable=on,target=native",
+                                 "-kernel", str(elf)],
+                                capture_output=True, text=True, timeout=60)
+        transcript = result.stdout + result.stderr
+        transcripts.append(f"MODE {mode}\n" + transcript)
+        (output / "result.log").write_text("".join(transcripts))
+        if result.returncode:
+            raise ValueError("Codec memory check failed:\n" + transcript)
+        if mode == "usb_mic":
+            complete = "SUCCESS frames=16 checksum=4105af5d" in transcript
+        else:
+            complete = re.search(rf"^PHONE_LHDC frames=64 encodes=32 worker_bytes={worker_bytes} checksum=[0-9a-f]{{8}}$",
+                                 transcript, re.MULTILINE) is not None
+            quality = re.findall(r"^PHONE_QUALITY cycle=([01]) reference_samples=819 "
+                                 r"gain_ppm=(\d+)/(\d+) snr_above_30db=1$", transcript, re.MULTILINE)
+            complete = complete and [entry[0] for entry in quality] == ["0", "1"] and all(
+                995000 <= int(gain) <= 1005000 for entry in quality for gain in entry[1:])
+        if not complete or "CHECKS complete" not in transcript:
+            raise ValueError("Codec probe did not complete every required check")
+        peaks = re.findall(r"^HEAP_PEAK bytes=(\d+)$", transcript, re.MULTILINE)
+        if len(peaks) != 1 or not 0 < int(peaks[0]) <= budget:
+            raise ValueError("Codec probe returned an invalid heap high-water mark")
+        modes[mode] = {"peak_codec_heap_break_bytes": int(peaks[0]),
+                       "remaining_after_peak_bytes": capacity - int(peaks[0])}
+        if mode == "phone_lhdc":
+            modes[mode]["quality"] = [{"reference_pairs": 819, "gain_ppm": [int(entry[1]), int(entry[2])],
+                                        "snr_above_30db": True} for entry in quality]
+    peak = max(mode["peak_codec_heap_break_bytes"] for mode in modes.values())
+    if before != input_hashes(firmware, library, lhdc_library):
         raise ValueError("Firmware or codec archive changed during validation")
-    summary = {**before, "heap_capacity_bytes": capacity,
+    # Convert to a non-flashable sibling first. A failed/interrupted conversion cannot
+    # expose a partial UF2 under the documented flash filename.
+    pending = firmware.with_suffix(".uf2.pending")
+    convert_uf2(picotool, firmware, pending, args.uf2_family, args.uf2_abs_block)
+    if before != input_hashes(firmware, library, lhdc_library):
+        raise ValueError("Firmware or codec archive changed during UF2 conversion")
+    summary = {**before, "uf2_sha256": digest(pending), "heap_capacity_bytes": capacity,
                "runtime_reserve_bytes": RUNTIME_RESERVE_BYTES, "probe_budget_bytes": budget,
-               "peak_codec_heap_break_bytes": int(peak[1]),
-               "remaining_after_peak_bytes": capacity - int(peak[1]),
+               "phone_worker_storage_bytes": worker_bytes, "modes": modes,
+               "peak_codec_heap_break_bytes": peak,
+               "remaining_after_peak_bytes": capacity - peak,
                "passed": True, "hardware_tested": False}
     receipt.write_text(json.dumps(summary, indent=2) + "\n")
-    print(transcript, end="")
-    print(f"Codec memory check passed: {capacity - int(peak[1])} bytes remain at the emulated peak; "
+    pending.replace(firmware.with_suffix(".uf2"))
+    print("".join(transcripts), end="")
+    print(f"Codec memory check passed: {capacity - peak} bytes remain at the emulated peak; "
           f"{RUNTIME_RESERVE_BYTES} bytes were reserved for other runtime use.")
 
 
@@ -121,8 +237,14 @@ def main():
                         help="exact linked airpods_dongle.elf")
     parser.add_argument("--library", required=True, type=pathlib.Path,
                         help="codec archive linked into that firmware")
+    parser.add_argument("--lhdc-library", required=True, type=pathlib.Path,
+                        help="exact LHDC archive linked into that firmware")
     parser.add_argument("--compiler", default="arm-none-eabi-gcc")
     parser.add_argument("--nm", default="arm-none-eabi-nm")
+    parser.add_argument("--picotool", default="picotool", help="matching Pico SDK picotool executable")
+    parser.add_argument("--uf2-family", default="rp2350-arm-s")
+    parser.add_argument("--uf2-abs-block", action="store_true", help="Pico SDK RP2350 A2 compatibility flag")
+    parser.add_argument("--if-current", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     try:

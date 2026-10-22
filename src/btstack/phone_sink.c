@@ -16,32 +16,39 @@
 #endif
 
 #define PHONE_START_TIMEOUT_MS 3000u
+#define PHONE_OPEN_TIMEOUT_MS 3000u
+#define PHONE_LHDC_DECODE_FAILURE_LIMIT 3u
 #define PHONE_CONTROL_TIMEOUT_MS 2000u
 #define PHONE_CONTROL_QUEUE 4u
 
-// 48 kHz stereo only; prefer aptX during discovery, accept either codec from the phone.
+// 48 kHz stereo only. LHDC uses 24-bit, 5 ms lossy frames at 256–400 kbit/s.
+static const uint8_t lhdc_capabilities[] = {0x3a, 5, 0, 0, 0x35, 0x4c, 0x10, 0x92, 0x11, 0, 0};
 static const uint8_t aptx_capabilities[] = {0x4f, 0, 0, 0, 1, 0, 0x12};
 static const uint8_t sbc_capabilities[] = {0x13, 0x17, 2, 53};
+static uint8_t lhdc_configuration[sizeof(lhdc_capabilities)];
 static uint8_t aptx_configuration[sizeof(aptx_capabilities)];
 static uint8_t sbc_configuration[sizeof(sbc_capabilities)];
-static avdtp_stream_endpoint_t *aptx_endpoint, *sbc_endpoint;
-static uint8_t aptx_seid, sbc_seid;
+static avdtp_stream_endpoint_t *lhdc_endpoint, *aptx_endpoint, *sbc_endpoint;
+static uint8_t lhdc_seid, aptx_seid, sbc_seid;
 static uint8_t sink_sdp[150];
-static bool initialized, aptx_disabled;
-static bool retry_sbc;
+static bool initialized, lhdc_disabled, aptx_disabled;
+static bool retry_codec;
 
 static struct {
     bd_addr_t address;
     uint16_t cid, avrcp_cid;
     uint8_t seid;
-    uint8_t remote_aptx_seid, remote_sbc_seid;
+    uint8_t remote_lhdc_seid, remote_aptx_seid, remote_sbc_seid;
+    uint8_t remote_lhdc_configuration[sizeof(lhdc_capabilities)];
     avdtp_configuration_sbc_t remote_sbc;
     phone_codec_t codec;
     phone_codec_t requested_codec;
     bool select_codec;
-    bool configured, opened, started, start_pending, start_accepted, disconnecting, controls_owned;
+    bool configured, opening, opened, started, start_pending, start_accepted, disconnecting, controls_owned;
     bool sequence_valid, volume_valid;
     uint16_t last_sequence;
+    uint8_t last_codec_sequence;
+    uint8_t decode_failures;
     uint32_t ssrc, pending_since_ms;
     uint32_t packets, malformed, sequence_gaps;
     uint8_t volume;
@@ -84,7 +91,9 @@ static uint32_t read_be32(const uint8_t *p) {
 
 static void audio_stop(void) {
     phone.started = phone.start_pending = phone.start_accepted = false;
+    phone.opening = false;
     phone.sequence_valid = false;
+    phone.decode_failures = 0;
     phone_worker_reset();
     bridge_phone_stop();
 }
@@ -108,11 +117,36 @@ static void disconnect_phone(void) {
     }
 }
 
-static void disable_failed_aptx_endpoint(void) {
-    if (!aptx_disabled || phone.cid != 0 || aptx_endpoint == NULL) return;
-    a2dp_sink_finalize_stream_endpoint(aptx_endpoint);
-    aptx_endpoint = NULL;
-    aptx_seid = 0;
+static void disable_failed_vendor_endpoints(void) {
+    if (phone.cid != 0) return;
+    if (lhdc_disabled && lhdc_endpoint != NULL) {
+        a2dp_sink_finalize_stream_endpoint(lhdc_endpoint);
+        lhdc_endpoint = NULL;
+        lhdc_seid = 0;
+    }
+    if (aptx_disabled && aptx_endpoint != NULL) {
+        a2dp_sink_finalize_stream_endpoint(aptx_endpoint);
+        aptx_endpoint = NULL;
+        aptx_seid = 0;
+    }
+}
+
+static void vendor_codec_failed(phone_codec_t codec) {
+    if (codec == PHONE_CODEC_LHDCV5) lhdc_disabled = retry_codec = true;
+    if (codec == PHONE_CODEC_APTX) aptx_disabled = retry_codec = true;
+}
+
+static void configured_codec_failed(void) {
+    vendor_codec_failed(phone.codec);
+    reject_start();
+    disconnect_phone();
+}
+
+static bool lhdc_configuration_valid(const uint8_t *configuration, unsigned length) {
+    return length == sizeof(lhdc_capabilities) &&
+        memcmp(configuration, lhdc_capabilities, 7) == 0 &&
+        (configuration[7] == 0x92 || configuration[7] == 0xd2) &&
+        configuration[8] == 0x11 && configuration[9] == 0 && configuration[10] == 0;
 }
 
 static bool parse_configuration(const uint8_t *event, uint16_t size,
@@ -137,6 +171,13 @@ static bool parse_configuration(const uint8_t *event, uint16_t size,
         return phone_codec_available(*codec);
     }
     if (event[2] == A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION) {
+        if (size == 24 && event[5] == lhdc_seid && lhdc_seid != 0 && !lhdc_disabled &&
+            little_endian_read_16(event, 9) == AVDTP_CODEC_NON_A2DP &&
+            little_endian_read_16(event, 11) == sizeof(lhdc_capabilities) &&
+            lhdc_configuration_valid(event + 13, size - 13u)) {
+            *codec = PHONE_CODEC_LHDCV5;
+            return phone_codec_available(*codec);
+        }
         if (size != 20 || event[5] != aptx_seid || aptx_seid == 0 || aptx_disabled ||
             little_endian_read_16(event, 9) != AVDTP_CODEC_NON_A2DP ||
             little_endian_read_16(event, 11) != sizeof(aptx_capabilities) ||
@@ -152,7 +193,7 @@ static uint8_t validate_configuration(const avdtp_stream_endpoint_t *endpoint,
                                       const uint8_t *event, uint16_t size) {
     phone_codec_t codec;
     phone_sbc_config_t sbc;
-    if (endpoint != aptx_endpoint && endpoint != sbc_endpoint)
+    if (endpoint == NULL || (endpoint != lhdc_endpoint && endpoint != aptx_endpoint && endpoint != sbc_endpoint))
         return AVDTP_ERROR_CODE_BAD_ACP_SEID;
     if (phone.started || phone.start_pending || phone.start_accepted)
         return AVDTP_ERROR_CODE_SEP_IN_USE;
@@ -182,7 +223,7 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
         memcpy(phone.address, address, sizeof(address));
         phone.cid = cid;
         phone.disconnecting = false;
-        phone.remote_aptx_seid = phone.remote_sbc_seid = 0;
+        phone.remote_lhdc_seid = phone.remote_aptx_seid = phone.remote_sbc_seid = 0;
         phone.select_codec = false;
         phone.requested_codec = PHONE_CODEC_NONE;
         return;
@@ -191,6 +232,17 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
     if (phone.disconnecting && packet[2] != A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED) return;
     switch (packet[2]) {
         case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CAPABILITY:
+            if (size == 22 && packet[6] == AVDTP_AUDIO && lhdc_seid != 0 && !lhdc_disabled &&
+                little_endian_read_16(packet, 7) == AVDTP_CODEC_NON_A2DP &&
+                little_endian_read_16(packet, 9) == sizeof(lhdc_capabilities) &&
+                memcmp(packet + 11, lhdc_capabilities, 6) == 0 &&
+                (packet[17] & 0x10u) && (packet[18] & 2u) && (packet[19] & 0x11u) == 0x11u &&
+                packet[5] != 0 && packet[5] <= 0x3e) {
+                phone.remote_lhdc_seid = packet[5];
+                memcpy(phone.remote_lhdc_configuration, lhdc_capabilities, sizeof(lhdc_capabilities));
+                // A source may require 400 kbit/s; intersect that with our 256–400 range.
+                if ((packet[18] & 0xc0u) == 0xc0u) phone.remote_lhdc_configuration[7] = 0xd2;
+            }
             if (size == 18 && packet[6] == AVDTP_AUDIO && aptx_seid != 0 && !aptx_disabled &&
                 little_endian_read_16(packet, 7) == AVDTP_CODEC_NON_A2DP &&
                 little_endian_read_16(packet, 9) == sizeof(aptx_capabilities) &&
@@ -222,16 +274,22 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
             break;
         case A2DP_SUBEVENT_COMMAND_REJECTED:
             if (size == 8 && packet[6] != 0 && packet[7] == AVDTP_SI_SET_CONFIGURATION &&
-                phone.requested_codec == PHONE_CODEC_APTX && packet[5] == aptx_seid) {
-                aptx_disabled = retry_sbc = true;
+                ((phone.requested_codec == PHONE_CODEC_LHDCV5 && packet[5] == lhdc_seid) ||
+                 (phone.requested_codec == PHONE_CODEC_APTX && packet[5] == aptx_seid))) {
+                vendor_codec_failed(phone.requested_codec);
                 disconnect_phone();
             }
+            if (size == 8 && packet[6] != 0 && packet[7] == AVDTP_SI_OPEN &&
+                phone.configured && !phone.opened && packet[5] == phone.seid)
+                configured_codec_failed();
             break;
         case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION:
         case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION: {
             phone_codec_t codec;
             phone_sbc_config_t sbc;
             if (!parse_configuration(packet, size, &codec, &sbc)) return;
+            bool already_open = packet[7] != 0 && phone.opened && phone.seid == packet[5];
+            bool local_configuration = packet[7] == 0 && phone.requested_codec == codec;
             audio_stop();
             phone.controls_owned = false;
             if (!phone_worker_configure(codec, codec == PHONE_CODEC_SBC ? &sbc : NULL)) {
@@ -241,21 +299,31 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
             phone.codec = codec;
             phone.seid = packet[5];
             phone.configured = true;
+            phone.opened = already_open;
+            // The SDK automatically Opens our outgoing configuration; a peer may idle configured.
+            phone.opening = !already_open && local_configuration;
+            phone.pending_since_ms = btstack_run_loop_get_time_ms();
+            phone.requested_codec = PHONE_CODEC_NONE;
             break;
         }
         case A2DP_SUBEVENT_STREAM_ESTABLISHED: {
-            if (size != 14 || !phone.configured || packet[11] != phone.seid) return;
+            if (size != 14 || !phone.configured || phone.opened || packet[11] != phone.seid) return;
             bd_addr_t address;
             a2dp_subevent_stream_established_get_bd_addr(packet, address);
-            if (packet[13] != ERROR_CODE_SUCCESS ||
-                memcmp(address, phone.address, sizeof(address)) != 0 ||
-                !bt_hci_phone_peer_connected(address)) {
+            if (memcmp(address, phone.address, sizeof(address)) != 0) return;
+            if (packet[13] != ERROR_CODE_SUCCESS) {
+                configured_codec_failed();
+                return;
+            }
+            if (!bt_hci_phone_peer_connected(address)) {
                 disconnect_phone();
                 return;
             }
             phone.opened = true;
+            phone.opening = false;
             (void)bridge_phone_open();
-            printf("[PHONE] open: %s stereo/48000\n", phone.codec == PHONE_CODEC_APTX ? "aptX" : "SBC");
+            printf("[PHONE] open: %s stereo/48000\n", phone.codec == PHONE_CODEC_LHDCV5 ? "LHDCv5" :
+                phone.codec == PHONE_CODEC_APTX ? "aptX" : "SBC");
             break;
         }
         case A2DP_SUBEVENT_START_STREAM_REQUESTED:
@@ -321,13 +389,22 @@ static void phone_avdtp_handler(uint8_t type, uint16_t channel, uint8_t *packet,
     } else if (size < 5 || phone.cid == 0 || little_endian_read_16(packet, 3) != phone.cid) {
         return;
     }
+    if (!phone.disconnecting && phone.configured && !phone.opened && !phone.opening &&
+        packet[2] == AVDTP_SUBEVENT_SIGNALING_ACCEPT && packet[5] == phone.seid &&
+        packet[6] <= 1 && packet[7] == AVDTP_SI_OPEN) {
+        phone.opening = true;
+        phone.pending_since_ms = btstack_run_loop_get_time_ms();
+    }
     // The shared framework otherwise discovers the AirPods in both A2DP roles.
     a2dp_config_process_avdtp_event_handler(AVDTP_ROLE_SINK, packet, size);
 }
 
 static void decoded_pcm(const int16_t *stereo, uint16_t frames, void *context) {
     (void)context;
-    if (phone.started && bridge_phone_ready()) bridge_phone_pcm_push(stereo, frames);
+    if (phone.started && frames != 0 && bridge_phone_ready()) {
+        phone.decode_failures = 0;
+        bridge_phone_pcm_push(stereo, frames);
+    }
 }
 
 static void bad_packet(void) {
@@ -367,13 +444,25 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
         if (padding == 0 || padding > length) { bad_packet(); return; }
         length -= padding;
     }
-    if (length == 0 || length > PHONE_CODEC_MAX_PAYLOAD + 1u) { bad_packet(); return; }
+    if (length == 0 || length > PHONE_CODEC_MAX_PAYLOAD + 2u) { bad_packet(); return; }
     uint8_t frames = 0;
+    uint8_t codec_sequence = 0;
     if (phone.codec == PHONE_CODEC_SBC) {
         uint8_t header = packet[offset++];
         if ((header & 0xf0u) != 0 || (header & 15u) == 0) { bad_packet(); return; }
         frames = header & 15u;
         --length;
+    } else if (phone.codec == PHONE_CODEC_LHDCV5) {
+        // Android/Savitech send [frame_count << 2, sequence], without fragmentation.
+        if (length < 2u || (packet[offset] & 3u) != 0) { bad_packet(); return; }
+        frames = packet[offset] >> 2;
+        if (frames == 0 || frames > 8) { bad_packet(); return; }
+        codec_sequence = packet[offset + 1u];
+        offset += 2u;
+        length -= 2u;
+    } else {
+        bad_packet();
+        return;
     }
     if (length == 0 || length > PHONE_CODEC_MAX_PAYLOAD) { bad_packet(); return; }
     uint16_t sequence = ((uint16_t)packet[2] << 8) | packet[3];
@@ -381,7 +470,8 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
     if (phone.sequence_valid && ssrc == phone.ssrc) {
         uint16_t advance = (uint16_t)(sequence - phone.last_sequence);
         if (advance == 0 || advance >= 0x8000u) return; // duplicate or late packet
-        if (advance != 1u) {
+        if (advance != 1u || (phone.codec == PHONE_CODEC_LHDCV5 &&
+            codec_sequence != (uint8_t)(phone.last_codec_sequence + 1u))) {
             phone.sequence_gaps++;
             phone_worker_reset();
             bridge_phone_drop_pcm();
@@ -393,6 +483,7 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
     phone.sequence_valid = true;
     phone.last_sequence = sequence;
     phone.ssrc = ssrc;
+    phone.last_codec_sequence = codec_sequence;
     if (!phone_worker_submit(packet + offset, length, frames)) {
         bad_packet();
         return;
@@ -408,6 +499,11 @@ bool phone_sink_init(void) {
     avdtp_sink_register_packet_handler(phone_avdtp_handler);
     a2dp_sink_register_media_handler(phone_media_handler);
     a2dp_sink_register_media_config_validator(validate_configuration);
+    if (phone_codec_available(PHONE_CODEC_LHDCV5)) {
+        lhdc_endpoint = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_NON_A2DP,
+            lhdc_capabilities, sizeof(lhdc_capabilities), lhdc_configuration, sizeof(lhdc_configuration));
+        if (lhdc_endpoint != NULL) lhdc_seid = avdtp_local_seid(lhdc_endpoint);
+    }
     if (phone_codec_available(PHONE_CODEC_APTX)) {
         aptx_endpoint = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_NON_A2DP,
             aptx_capabilities, sizeof(aptx_capabilities), aptx_configuration, sizeof(aptx_configuration));
@@ -416,7 +512,10 @@ bool phone_sink_init(void) {
     sbc_endpoint = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_SBC,
         sbc_capabilities, sizeof(sbc_capabilities), sbc_configuration, sizeof(sbc_configuration));
     if (sbc_endpoint == NULL) {
+        if (lhdc_endpoint != NULL) a2dp_sink_finalize_stream_endpoint(lhdc_endpoint);
         if (aptx_endpoint != NULL) a2dp_sink_finalize_stream_endpoint(aptx_endpoint);
+        lhdc_endpoint = NULL;
+        lhdc_seid = 0;
         aptx_endpoint = NULL;
         aptx_seid = 0;
         return false;
@@ -442,11 +541,21 @@ static uint8_t send_control(uint8_t operation) {
 }
 
 void phone_sink_poll(void) {
-    if (!phone_worker_poll(decoded_pcm, NULL)) bad_packet();
+    if (!phone_worker_poll(decoded_pcm, NULL)) {
+        bad_packet();
+        if (phone.started && phone.codec == PHONE_CODEC_LHDCV5 &&
+            ++phone.decode_failures >= PHONE_LHDC_DECODE_FAILURE_LIMIT)
+            configured_codec_failed();
+    }
     if (phone.select_codec && phone.cid != 0 && !phone.configured) {
         phone.select_codec = false;
         uint8_t status = ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE;
-        if (phone.remote_aptx_seid != 0 && aptx_seid != 0 && !aptx_disabled) {
+        if (phone.remote_lhdc_seid != 0 && lhdc_seid != 0 && !lhdc_disabled) {
+            status = a2dp_sink_set_config_other(phone.cid, lhdc_seid, phone.remote_lhdc_seid,
+                phone.remote_lhdc_configuration, sizeof(phone.remote_lhdc_configuration));
+            if (status == ERROR_CODE_SUCCESS) phone.requested_codec = PHONE_CODEC_LHDCV5;
+        }
+        if (status != ERROR_CODE_SUCCESS && phone.remote_aptx_seid != 0 && aptx_seid != 0 && !aptx_disabled) {
             status = a2dp_sink_set_config_other(phone.cid, aptx_seid, phone.remote_aptx_seid,
                                                 aptx_capabilities, sizeof(aptx_capabilities));
             if (status == ERROR_CODE_SUCCESS) phone.requested_codec = PHONE_CODEC_APTX;
@@ -458,19 +567,20 @@ void phone_sink_poll(void) {
         if (status != ERROR_CODE_SUCCESS) disconnect_phone();
     }
     if (phone.configured && !phone_worker_ready() && phone_worker_prepare() == PHONE_WORKER_FAILED) {
-        if (phone.codec == PHONE_CODEC_APTX) aptx_disabled = retry_sbc = true;
-        printf("[PHONE] decoder unavailable; reconnect with SBC\n");
-        reject_start();
-        disconnect_phone();
+        printf("[PHONE] decoder unavailable; reconnect with a fallback codec\n");
+        configured_codec_failed();
     }
+    if (phone.opening &&
+        (uint32_t)(btstack_run_loop_get_time_ms() - phone.pending_since_ms) >= PHONE_OPEN_TIMEOUT_MS)
+        configured_codec_failed();
     if (!phone.configured) phone_worker_close();
-    disable_failed_aptx_endpoint();
-    if (retry_sbc && phone.cid == 0) {
-        retry_sbc = false;
+    disable_failed_vendor_endpoints();
+    if (retry_codec && phone.cid == 0) {
+        retry_codec = false;
         uint16_t cid = 0;
         if (bt_hci_phone_peer_allowed(phone.address) &&
             a2dp_sink_establish_stream(phone.address, &cid) != ERROR_CODE_SUCCESS)
-            printf("[PHONE] SBC reconnect failed\n");
+            printf("[PHONE] fallback reconnect failed\n");
     }
     if ((phone.started || phone.start_accepted) && !bridge_phone_ready()) {
         printf("[PHONE] output lost or USB took ownership\n");
@@ -516,7 +626,7 @@ void phone_sink_poll(void) {
 }
 
 void phone_sink_yield(void) {
-    retry_sbc = false;
+    retry_codec = false;
     if (!phone.disconnecting) disconnect_phone();
     phone_worker_close();
 }

@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <assert.h>
 #include <stdio.h>
+#define AVDTP_SI_OPEN 6 // Pinned BTstack signal identifier, absent from the minimal stub.
 #include "../src/btstack/phone_sink.c"
 
 static btstack_packet_handler_t sink_handler, raw_handler;
 static void (*media_handler)(uint8_t,uint8_t*,uint16_t);
 static uint8_t (*validator)(const avdtp_stream_endpoint_t*,const uint8_t*,uint16_t);
-static avdtp_stream_endpoint_t endpoints[2];
+static avdtp_stream_endpoint_t endpoints[3];
 static unsigned endpoint_count, finalized, framework_calls, accepted, rejected, disconnected;
 static unsigned opens, claims, stops, pcm_frames, pcm_drops, codec_resets, decode_calls;
 static unsigned prepares, closes, controls_sent, volume_updates;
-static unsigned aptx_selections, sbc_selections, reconnects;
+static unsigned lhdc_selections, aptx_selections, sbc_selections, reconnects;
 static uint8_t selected_remote;
-static bool aptx_select_ok;
+static bool lhdc_select_ok, aptx_select_ok, lhdc_create_ok;
 static uint8_t last_control, last_volume;
 static uint32_t now;
 static bool output_ready, open_allowed, claim_allowed, secure_peer;
-static bool aptx_available, prepare_ok, codec_ready, decode_ok, control_busy;
+static bool lhdc_available, aptx_available, prepare_ok, codec_ready, decode_ok, control_busy;
 static bool prefix_before_failure;
 static bool prepare_waiting, close_waiting;
+static bool async_worker, worker_pending, submit_ok;
 static phone_codec_t desired;
 static uint8_t received_payload[PHONE_CODEC_MAX_PAYLOAD];
 static size_t received_length;
@@ -32,8 +34,12 @@ void avdtp_sink_register_packet_handler(btstack_packet_handler_t handler) {raw_h
 void a2dp_sink_register_media_handler(void (*handler)(uint8_t,uint8_t*,uint16_t)) {media_handler=handler;}
 void a2dp_sink_register_media_config_validator(uint8_t (*callback)(const avdtp_stream_endpoint_t*,const uint8_t*,uint16_t)) {validator=callback;}
 avdtp_stream_endpoint_t *a2dp_sink_create_stream_endpoint(int media,int codec,const uint8_t*caps,uint16_t caplen,uint8_t*config,uint16_t configlen) {
-    assert(media==AVDTP_AUDIO && configlen==caplen && config && caps && endpoint_count<2);
-    if (codec==AVDTP_CODEC_NON_A2DP) assert(endpoint_count==0 && caplen==7 && caps[6]==0x12);
+    assert(media==AVDTP_AUDIO && configlen==caplen && config && caps && endpoint_count<3);
+    if (codec==AVDTP_CODEC_NON_A2DP && caplen==11) {
+        const uint8_t expected[]={0x3a,5,0,0,0x35,0x4c,0x10,0x92,0x11,0,0};
+        assert(endpoint_count==0 && memcmp(caps,expected,sizeof(expected))==0);
+        if (!lhdc_create_ok) return NULL;
+    } else if (codec==AVDTP_CODEC_NON_A2DP) assert(caplen==7 && caps[6]==0x12);
     else assert(codec==AVDTP_CODEC_SBC && caplen==4 && caps[0]==0x13);
     endpoints[endpoint_count].seid=(uint8_t)(endpoint_count+4);
     return &endpoints[endpoint_count++];
@@ -50,6 +56,10 @@ uint8_t a2dp_sink_establish_stream(bd_addr_t address,uint16_t *cid) {
     assert(memcmp(address,phone_address,6)==0);*cid=0x41;reconnects++;return 0;
 }
 uint8_t a2dp_sink_set_config_other(uint16_t cid,uint8_t local,uint8_t remote,const uint8_t *config,uint8_t length) {
+    if (local==lhdc_seid) {
+        assert(cid==phone.cid && local && remote && lhdc_configuration_valid(config,length));
+        lhdc_selections++;selected_remote=remote;return lhdc_select_ok ? 0 : 0x11;
+    }
     assert(cid==phone.cid && local==aptx_seid && remote && length==7 && memcmp(config,aptx_capabilities,7)==0);
     aptx_selections++;selected_remote=remote;return aptx_select_ok ? 0 : 0x11;
 }
@@ -62,17 +72,30 @@ uint8_t a2dp_sink_set_config_sbc(uint16_t cid,uint8_t local,uint8_t remote,const
 uint32_t btstack_run_loop_get_time_ms(void) {return now;}
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]) {return memcmp(address,phone_address,6)==0;}
 bool bt_hci_phone_peer_connected(const uint8_t address[6]) {return secure_peer && bt_hci_phone_peer_allowed(address);}
-bool phone_codec_available(phone_codec_t codec) {return codec==PHONE_CODEC_SBC || (codec==PHONE_CODEC_APTX && aptx_available);}
+bool phone_codec_available(phone_codec_t codec) {return codec==PHONE_CODEC_SBC ||
+    (codec==PHONE_CODEC_APTX && aptx_available) || (codec==PHONE_CODEC_LHDCV5 && lhdc_available);}
 bool phone_worker_configure(phone_codec_t codec,const phone_sbc_config_t*sbc) {desired=codec;codec_ready=false;if(codec==PHONE_CODEC_SBC)assert(sbc&&sbc->blocks==16&&sbc->subbands==8&&sbc->channel_mode==2);return true;}
 phone_worker_status_t phone_worker_prepare(void) {prepares++;if(prepare_waiting)return PHONE_WORKER_WAITING;codec_ready=prepare_ok;return prepare_ok ? PHONE_WORKER_READY : PHONE_WORKER_FAILED;}
-bool phone_worker_close(void) {desired=PHONE_CODEC_NONE;codec_ready=false;closes++;return !close_waiting;}
+bool phone_worker_close(void) {desired=PHONE_CODEC_NONE;codec_ready=false;worker_pending=false;closes++;return !close_waiting;}
 bool phone_worker_released(void) {return !codec_ready && !close_waiting;}
-bool phone_worker_poll(phone_codec_pcm_callback callback,void*context) {(void)callback;(void)context;return true;}
+bool phone_worker_poll(phone_codec_pcm_callback callback,void*context) {
+    if (!async_worker || !worker_pending || !codec_ready) return true;
+    worker_pending=false;
+    if (!decode_ok) return false;
+    static const int16_t pcm[480]={1,2,3,4};
+    callback(pcm,240,context);
+    return true;
+}
 bool phone_worker_ready(void) {return codec_ready;}
-void phone_worker_reset(void) {codec_resets++;}
+void phone_worker_reset(void) {codec_resets++;worker_pending=false;}
 bool phone_worker_submit(const uint8_t*payload,size_t length,uint8_t count) {
     decode_calls++;received_length=length;received_frames=count;
     assert(length<=sizeof(received_payload));memcpy(received_payload,payload,length);
+    if (async_worker) {
+        if (!submit_ok || worker_pending) return false;
+        worker_pending=true;
+        return true;
+    }
     static int16_t pcm[8]={1,2,3,4,5,6,7,8};
     if(decode_ok || prefix_before_failure)decoded_pcm(pcm,4,NULL);
     return decode_ok;
@@ -104,17 +127,21 @@ void a2dp_config_process_avdtp_event_handler(avdtp_role_t role,uint8_t*packet,ui
     }
 }
 
-static void fixture(bool aptx) {
+static void fixture_codecs(bool lhdc,bool aptx,bool create_lhdc) {
     memset(&phone,0,sizeof(phone));memset(endpoints,0,sizeof(endpoints));
-    initialized=aptx_disabled=retry_sbc=false;aptx_endpoint=sbc_endpoint=NULL;aptx_seid=sbc_seid=0;
+    initialized=lhdc_disabled=aptx_disabled=retry_codec=false;lhdc_endpoint=aptx_endpoint=sbc_endpoint=NULL;
+    lhdc_seid=aptx_seid=sbc_seid=0;
     endpoint_count=finalized=framework_calls=accepted=rejected=disconnected=0;
     opens=claims=stops=pcm_frames=pcm_drops=codec_resets=decode_calls=prepares=closes=controls_sent=volume_updates=0;
     now=0;output_ready=false;open_allowed=claim_allowed=secure_peer=prepare_ok=decode_ok=true;
-    codec_ready=control_busy=prefix_before_failure=false;aptx_available=aptx;desired=PHONE_CODEC_NONE;
+    codec_ready=control_busy=prefix_before_failure=false;lhdc_available=lhdc;aptx_available=aptx;desired=PHONE_CODEC_NONE;
     prepare_waiting=close_waiting=false;
-    aptx_selections=sbc_selections=reconnects=0;selected_remote=0;aptx_select_ok=true;
+    async_worker=worker_pending=false;submit_ok=true;
+    lhdc_selections=aptx_selections=sbc_selections=reconnects=0;selected_remote=0;lhdc_select_ok=aptx_select_ok=true;
+    lhdc_create_ok=create_lhdc;
     assert(phone_sink_init());
 }
+static void fixture(bool aptx) {fixture_codecs(false,aptx,true);}
 static void address_event(uint8_t*p,unsigned offset,const bd_addr_t address) {for(unsigned i=0;i<6;i++)p[offset+i]=address[5-i];}
 static void signaling(uint16_t cid,const bd_addr_t address) {
     uint8_t p[14]={HCI_EVENT_AVDTP_META,12,AVDTP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED,(uint8_t)cid,(uint8_t)(cid>>8)};
@@ -141,6 +168,16 @@ static void configure(bool aptx) {
     }
     assert(phone.configured);phone_sink_poll();assert(codec_ready);
 }
+static void lhdc_event(uint8_t*p) {
+    uint8_t event[24]={HCI_EVENT_A2DP_META,22,A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION,
+        (uint8_t)phone.cid,(uint8_t)(phone.cid>>8),lhdc_seid,1,0,AVDTP_AUDIO,0xff,0,11,0};
+    memcpy(p,event,sizeof(event));memcpy(p+13,lhdc_capabilities,sizeof(lhdc_capabilities));
+}
+static void configure_lhdc(void) {
+    uint8_t p[24];lhdc_event(p);assert(validator(lhdc_endpoint,p,sizeof(p))==0);
+    sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));phone_sink_poll();
+    assert(phone.configured && codec_ready && desired==PHONE_CODEC_LHDCV5);
+}
 static void remote_sbc(uint8_t rate) {
     uint8_t p[14]={HCI_EVENT_A2DP_META,12,A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CAPABILITY,
         (uint8_t)phone.cid,(uint8_t)(phone.cid>>8),11,AVDTP_AUDIO,rate,3,1,1,3,2,53};
@@ -152,20 +189,26 @@ static void remote_aptx(uint8_t rate_and_channels) {
     memcpy(p+11,aptx_capabilities,7);p[17]=rate_and_channels;
     sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
 }
+static void remote_lhdc(const uint8_t*caps) {
+    uint8_t p[22]={HCI_EVENT_A2DP_META,20,A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CAPABILITY,
+        (uint8_t)phone.cid,(uint8_t)(phone.cid>>8),13,AVDTP_AUDIO,0xff,0,11,0};
+    memcpy(p+11,caps,sizeof(lhdc_capabilities));sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
 static void capabilities_complete(void) {
     uint8_t p[6]={HCI_EVENT_A2DP_META,4,A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE,
         (uint8_t)phone.cid,(uint8_t)(phone.cid>>8),0xa5};
     sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
     // Configuration must wait until the framework finishes this callback.
-    assert(aptx_selections==0 && sbc_selections==0);
+    assert(lhdc_selections==0 && aptx_selections==0 && sbc_selections==0);
     phone_sink_poll();
 }
-static void opened(void) {
+static void open_result(uint16_t cid,uint8_t seid,uint8_t status,const bd_addr_t address) {
     uint8_t p[14]={HCI_EVENT_A2DP_META,12,A2DP_SUBEVENT_STREAM_ESTABLISHED,
-        (uint8_t)phone.cid,(uint8_t)(phone.cid>>8)};
-    address_event(p,5,phone_address);p[11]=phone.seid;p[12]=1;
+        (uint8_t)cid,(uint8_t)(cid>>8)};
+    address_event(p,5,address);p[11]=seid;p[12]=1;p[13]=status;
     sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
 }
+static void opened(void) {open_result(phone.cid,phone.seid,0,phone_address);}
 static void playing(bool aptx) {
     signaling(0x40,phone_address);configure(aptx);opened();
     stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
@@ -232,7 +275,7 @@ static void test_codec_selection(void) {
     remote_sbc(1);remote_aptx(0x12);capabilities_complete();
     uint8_t reject[8]={HCI_EVENT_A2DP_META,6,A2DP_SUBEVENT_COMMAND_REJECTED,0x40,0,aptx_seid,1,AVDTP_SI_SET_CONFIGURATION};
     sink_handler(HCI_EVENT_PACKET,0,reject,8);
-    assert(disconnected==1 && aptx_disabled && retry_sbc && phone.disconnecting);
+    assert(disconnected==1 && aptx_disabled && retry_codec && phone.disconnecting);
     uint8_t release[5]={HCI_EVENT_A2DP_META,3,A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED,0x40,0};
     sink_handler(HCI_EVENT_PACKET,0,release,5);phone_sink_poll();
     assert(reconnects==1 && finalized==1 && aptx_seid==0);
@@ -268,6 +311,269 @@ static void test_aptx_raw_and_fallback(void) {
     uint8_t release[5]={HCI_EVENT_A2DP_META,3,A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED,0x40,0};
     sink_handler(HCI_EVENT_PACKET,0,release,5);phone_sink_poll();assert(finalized==1 && aptx_seid==0);
     assert(reconnects==1);phone_sink_poll();assert(reconnects==1);
+}
+static void discover_all(void) {
+    lhdc_selections=aptx_selections=sbc_selections=0;
+    remote_sbc(1);remote_aptx(0x12);remote_lhdc(lhdc_capabilities);capabilities_complete();
+}
+static void release_signaling(void) {
+    uint8_t p[5]={HCI_EVENT_A2DP_META,3,A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED,
+        (uint8_t)phone.cid,(uint8_t)(phone.cid>>8)};
+    sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));phone_sink_poll();
+}
+static void reject_configuration(uint8_t seid) {
+    uint8_t p[8]={HCI_EVENT_A2DP_META,6,A2DP_SUBEVENT_COMMAND_REJECTED,
+        (uint8_t)phone.cid,(uint8_t)(phone.cid>>8),seid,1,AVDTP_SI_SET_CONFIGURATION};
+    sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void test_lhdc_availability_and_configuration(void) {
+    fixture(true);assert(lhdc_endpoint==NULL && lhdc_seid==0);
+    signaling(0x40,phone_address);discover_all();
+    assert(lhdc_selections==0 && aptx_selections==1);
+    fixture_codecs(true,true,false);assert(lhdc_endpoint==NULL && endpoint_count==2);
+    signaling(0x40,phone_address);discover_all();assert(aptx_selections==1);
+
+    fixture_codecs(true,true,true);assert(endpoint_count==3 && lhdc_seid<aptx_seid && aptx_seid<sbc_seid);
+    signaling(0x40,phone_address);uint8_t p[24];lhdc_event(p);
+    assert(validator(lhdc_endpoint,p,sizeof(p))==0);
+    for(unsigned n=0;n<sizeof(p);n++)assert(validator(lhdc_endpoint,p,n)!=0);
+    const unsigned exact[]={3,5,9,11,13,14,17,18,19,21};
+    for(unsigned i=0;i<sizeof(exact)/sizeof(*exact);i++){
+        uint8_t saved=p[exact[i]];p[exact[i]]^=1;
+        assert(validator(lhdc_endpoint,p,sizeof(p))!=0);p[exact[i]]=saved;
+    }
+    const uint8_t rates[]={0,0x20,4,1,0x35};
+    for(unsigned i=0;i<sizeof(rates);i++){p[19]=rates[i];assert(validator(lhdc_endpoint,p,sizeof(p))!=0);}
+    p[19]=0x10;
+    const uint8_t formats[]={0x94,0x96,0x91,0x82,0xa2,0xb2,0x12,0x52};
+    for(unsigned i=0;i<sizeof(formats);i++){p[20]=formats[i];assert(validator(lhdc_endpoint,p,sizeof(p))!=0);}
+    p[20]=0xd2;assert(validator(lhdc_endpoint,p,sizeof(p))==0);p[20]=0x92;
+    const uint8_t versions[]={0,1,0x10,0x12,0x31};
+    for(unsigned i=0;i<sizeof(versions);i++){p[21]=versions[i];assert(validator(lhdc_endpoint,p,sizeof(p))!=0);}
+    p[21]=0x11;
+    for(unsigned at=22;at<24;at++)for(unsigned bit=0;bit<8;bit++){
+        p[at]=(uint8_t)(1u<<bit);assert(validator(lhdc_endpoint,p,sizeof(p))!=0);p[at]=0;
+    }
+    lhdc_available=false;assert(validator(lhdc_endpoint,p,sizeof(p))!=0);lhdc_available=true;
+    p[0]=HCI_EVENT_AVDTP_META;p[2]=AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION;
+    unsigned before=framework_calls;
+    for(unsigned n=3;n<sizeof(p);n++){p[1]=(uint8_t)(n-2);raw_handler(HCI_EVENT_PACKET,0,p,n);}
+    assert(framework_calls==before);
+    p[1]=22;raw_handler(HCI_EVENT_PACKET,0,p,sizeof(p));assert(framework_calls==before+1);
+    p[11]=12;raw_handler(HCI_EVENT_PACKET,0,p,sizeof(p));assert(framework_calls==before+1);
+    configure_lhdc();assert(phone.codec==PHONE_CODEC_LHDCV5);
+}
+static void test_lhdc_preference_and_classic_fallbacks(void) {
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);discover_all();
+    assert(lhdc_selections==1 && aptx_selections==0 && sbc_selections==0 && selected_remote==13);
+    assert(phone.requested_codec==PHONE_CODEC_LHDCV5);
+    configure(true);assert(phone.codec==PHONE_CODEC_APTX); // inbound source choice is independent
+    reject_configuration(lhdc_seid);assert(phone.configured && !phone.disconnecting && !lhdc_disabled);
+
+    uint8_t caps[sizeof(lhdc_capabilities)];memcpy(caps,lhdc_capabilities,sizeof(caps));
+    caps[6]=0x35;caps[7]=0xc7;caps[9]=caps[10]=0xff;
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);remote_lhdc(caps);capabilities_complete();
+    assert(lhdc_selections==1 && phone.remote_lhdc_configuration[7]==0xd2);
+    assert(phone.remote_lhdc_configuration[9]==0 && phone.remote_lhdc_configuration[10]==0);
+    const unsigned required[]={0,4,6,7,8};
+    for(unsigned i=0;i<sizeof(required)/sizeof(*required);i++){
+        fixture_codecs(true,true,true);signaling(0x40,phone_address);
+        memcpy(caps,lhdc_capabilities,sizeof(caps));caps[required[i]]=0;
+        remote_lhdc(caps);remote_aptx(0x12);capabilities_complete();
+        assert(lhdc_selections==0 && aptx_selections==1);
+    }
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);lhdc_select_ok=false;discover_all();
+    assert(lhdc_selections==1 && aptx_selections==1 && phone.requested_codec==PHONE_CODEC_APTX);
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);lhdc_select_ok=aptx_select_ok=false;discover_all();
+    assert(lhdc_selections==1 && aptx_selections==1 && sbc_selections==1 && phone.requested_codec==PHONE_CODEC_SBC);
+    fixture_codecs(true,false,true);signaling(0x40,phone_address);lhdc_select_ok=false;discover_all();
+    assert(lhdc_selections==1 && aptx_selections==0 && sbc_selections==1);
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);discover_all();
+    reject_configuration(lhdc_seid);
+    assert(lhdc_disabled && !aptx_disabled && retry_codec && finalized==0 && phone.disconnecting);
+    release_signaling();assert(lhdc_seid==0 && aptx_seid!=0 && finalized==1 && reconnects==1);
+    signaling(0x41,phone_address);discover_all();assert(lhdc_selections==0 && aptx_selections==1);
+    reject_configuration(aptx_seid);release_signaling();
+    assert(aptx_seid==0 && finalized==2 && reconnects==2);
+    signaling(0x42,phone_address);discover_all();assert(lhdc_selections==0 && aptx_selections==0 && sbc_selections==1);
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc();
+    codec_ready=false;prepare_ok=false;phone_sink_poll();
+    assert(lhdc_disabled && !aptx_disabled && phone.disconnecting && finalized==0);
+    release_signaling();assert(lhdc_seid==0 && aptx_seid!=0 && reconnects==1);
+    prepare_ok=true;signaling(0x41,phone_address);discover_all();configure(true);
+    assert(desired==PHONE_CODEC_APTX);
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);discover_all();
+    reject_configuration(lhdc_seid);phone_sink_yield();release_signaling();
+    assert(reconnects==0 && !retry_codec); // USB takeover also cancels queued fallback
+}
+static unsigned lhdc_rtp(uint8_t*p,uint16_t sequence,uint8_t codec_sequence,uint8_t frames,unsigned length) {
+    rtp(p,sequence);p[12]=(uint8_t)(frames<<2);p[13]=codec_sequence;
+    memset(p+14,0xa5,length);return 14+length;
+}
+static void reject_open(uint16_t cid,uint8_t seid,bool initiator) {
+    uint8_t p[8]={HCI_EVENT_A2DP_META,6,A2DP_SUBEVENT_COMMAND_REJECTED,
+        (uint8_t)cid,(uint8_t)(cid>>8),seid,initiator,AVDTP_SI_OPEN};
+    sink_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void accept_open(uint16_t cid,uint8_t seid) {
+    uint8_t p[8]={HCI_EVENT_AVDTP_META,6,AVDTP_SUBEVENT_SIGNALING_ACCEPT,
+        (uint8_t)cid,(uint8_t)(cid>>8),seid,0,AVDTP_SI_OPEN};
+    raw_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void configure_lhdc_outgoing(void) {discover_all();configure_lhdc();assert(phone.opening);}
+static void test_open_failure_fallbacks(void) {
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc_outgoing();
+    reject_open(0x41,phone.seid,true);reject_open(phone.cid,aptx_seid,true);
+    reject_open(phone.cid,phone.seid,false);
+    open_result(0x41,phone.seid,0x0c,phone_address);
+    open_result(phone.cid,aptx_seid,0x0c,phone_address);
+    open_result(phone.cid,phone.seid,0x0c,airpods_address);
+    assert(!disconnected && phone.configured && !phone.opened && !lhdc_disabled);
+    reject_open(phone.cid,phone.seid,true);
+    assert(disconnected==1 && lhdc_disabled && !aptx_disabled && retry_codec && !phone.configured);
+    opened();reject_open(phone.cid,lhdc_seid,true);phone_sink_poll();
+    assert(disconnected==1 && !phone.opened && !codec_ready);
+    release_signaling();assert(reconnects==1 && lhdc_seid==0 && aptx_seid!=0);
+    signaling(0x41,phone_address);discover_all();configure(true);
+    reject_open(0x40,phone.seid,true);assert(!phone.disconnecting);
+    reject_open(phone.cid,phone.seid,true);release_signaling();
+    assert(aptx_seid==0 && reconnects==2);
+    signaling(0x42,phone_address);discover_all();configure(false);
+    open_result(phone.cid,phone.seid,0x0c,phone_address);release_signaling();
+    assert(reconnects==2 && sbc_seid!=0); // SBC still disconnects without another codec retry.
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc();
+    open_result(phone.cid,phone.seid,0x0c,phone_address);phone_sink_poll();
+    assert(lhdc_disabled && !aptx_disabled && disconnected==1 && !codec_ready);
+    release_signaling();assert(reconnects==1 && lhdc_seid==0);
+}
+static void test_open_deadline_and_cancellation(void) {
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);
+    now=UINT32_MAX-999u;configure_lhdc_outgoing();
+    now=1999;phone_sink_poll();assert(!disconnected && phone.configured);
+    now=2000;phone_sink_poll();assert(disconnected==1 && lhdc_disabled && !codec_ready);
+    phone_sink_poll();release_signaling();phone_sink_poll();assert(reconnects==1);
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc();
+    now=10000;phone_sink_poll();assert(!disconnected && !phone.opening && codec_ready);
+    accept_open(0x41,phone.seid);accept_open(phone.cid,aptx_seid);
+    assert(!phone.opening); // An incoming configured phone may legitimately wait to play.
+    accept_open(phone.cid,phone.seid);assert(phone.opening);
+    now=12999;phone_sink_poll();assert(!disconnected);
+    now=13000;phone_sink_poll();assert(disconnected==1 && lhdc_disabled);
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc_outgoing();
+    now=2999;configure_lhdc(); // A replacement peer configuration cancels the old local Open deadline.
+    now=10000;phone_sink_poll();assert(!disconnected && !phone.opening);
+    accept_open(phone.cid,phone.seid);now=12999;phone_sink_poll();assert(!disconnected);
+    now=13000;phone_sink_poll();assert(disconnected==1);
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc_outgoing();
+    now=2999;opened();now=6000;phone_sink_poll();
+    reject_open(phone.cid,phone.seid,true);open_result(phone.cid,phone.seid,0x0c,phone_address);
+    assert(!disconnected && phone.opened && !lhdc_disabled);
+    uint8_t reconfigure[24];lhdc_event(reconfigure);reconfigure[7]=1;
+    sink_handler(HCI_EVENT_PACKET,0,reconfigure,sizeof(reconfigure));
+    now=10000;phone_sink_poll();assert(phone.opened && !disconnected);
+
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc_outgoing();
+    now=2999;phone_sink_yield();now=10000;phone_sink_poll();
+    reject_open(phone.cid,phone.seid,true);opened();release_signaling();
+    assert(!lhdc_disabled && !retry_codec && !reconnects && !phone.configured && !phone.opened);
+    signaling(0x41,phone_address);configure_lhdc_outgoing();now=12999;phone_sink_poll();
+    assert(!phone.disconnecting && !lhdc_disabled);
+    opened();now=20000;phone_sink_poll();assert(!phone.disconnecting && phone.opened);
+}
+
+static void lhdc_playing_async(void) {
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc();opened();
+    output_ready=true;stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);
+    async_worker=true;
+}
+static void lhdc_decode_result(uint16_t sequence,bool success) {
+    uint8_t p[32];unsigned length=lhdc_rtp(p,sequence,(uint8_t)sequence,1,4);
+    decode_ok=success;media_handler(phone.seid,p,length);
+    assert(worker_pending); // Submission itself is not a decoded success/failure.
+    phone_sink_poll();assert(!worker_pending);
+}
+static void test_lhdc_runtime_failure_recovery(void) {
+    lhdc_playing_async();lhdc_decode_result(0,false);
+    assert(phone.decode_failures==1 && phone.started && !lhdc_disabled && !disconnected);
+    for(unsigned i=0;i<20;i++)phone_sink_poll();
+    assert(phone.decode_failures==1); // Empty successful polls cannot erase failed completions.
+    lhdc_decode_result(1,true);assert(phone.decode_failures==0 && pcm_frames==240);
+    lhdc_decode_result(2,false);lhdc_decode_result(3,false);
+    assert(phone.decode_failures==2 && !disconnected);
+    uint8_t p[32];unsigned size=lhdc_rtp(p,5,5,1,4);
+    submit_ok=false;media_handler(phone.seid,p,size);phone_sink_poll();
+    assert(phone.decode_failures==2 && !lhdc_disabled); // Backpressure and sequence gap do not count.
+    media_handler(phone.seid,p,size);assert(phone.decode_failures==2); // Duplicate ignored.
+    media_handler(phone.seid,p,3);assert(phone.decode_failures==2); // Malformed RTP does not count.
+    submit_ok=true;lhdc_decode_result(6,true);assert(phone.decode_failures==0);
+    lhdc_decode_result(7,false);lhdc_decode_result(8,false);lhdc_decode_result(9,false);
+    assert(lhdc_disabled && !aptx_disabled && disconnected==1 && !phone.started && !codec_ready);
+    phone_sink_poll();release_signaling();phone_sink_poll();assert(reconnects==1 && lhdc_seid==0);
+    signaling(0x41,phone_address);discover_all();assert(phone.requested_codec==PHONE_CODEC_APTX);
+    configure(true);open_result(phone.cid,phone.seid,0x0c,phone_address);release_signaling();
+    assert(aptx_disabled && reconnects==2 && aptx_seid==0);
+    signaling(0x42,phone_address);discover_all();configure(false);opened();
+    output_ready=true;stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);assert(phone.started && phone.codec==PHONE_CODEC_SBC);
+
+    lhdc_playing_async();lhdc_decode_result(0,false);lhdc_decode_result(1,false);
+    stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
+    assert(phone.decode_failures==0);
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);lhdc_decode_result(0,false);
+    assert(phone.decode_failures==1 && !lhdc_disabled);
+    phone_sink_yield();phone_sink_poll();release_signaling();
+    assert(!lhdc_disabled && !retry_codec && !reconnects && !worker_pending);
+}
+static void test_lhdc_media_bounds_sequence_and_cancellation(void) {
+    fixture_codecs(true,true,true);signaling(0x40,phone_address);configure_lhdc();opened();
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);output_ready=true;phone_sink_poll();
+    uint8_t p[PHONE_CODEC_MAX_PAYLOAD+32];unsigned size=lhdc_rtp(p,65535,255,1,4);
+    media_handler(phone.seid,p,size);assert(decode_calls==0);
+    stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);
+    media_handler(phone.seid,p,size);assert(decode_calls==1 && received_frames==1 && received_length==4 && received_payload[0]==0xa5);
+    lhdc_rtp(p,0,0,8,PHONE_CODEC_MAX_PAYLOAD);media_handler(phone.seid,p,14+PHONE_CODEC_MAX_PAYLOAD);
+    assert(decode_calls==2 && received_frames==8 && phone.sequence_gaps==0);
+    unsigned before=codec_resets;
+    size=lhdc_rtp(p,1,2,1,4);media_handler(phone.seid,p,size);
+    assert(decode_calls==3 && phone.sequence_gaps==1 && codec_resets==before+1);
+    media_handler(phone.seid,p,size);assert(decode_calls==3 && codec_resets==before+1);
+    size=lhdc_rtp(p,0,1,1,4);media_handler(phone.seid,p,size);assert(decode_calls==3);
+    size=lhdc_rtp(p,3,4,1,4);media_handler(phone.seid,p,size);
+    assert(decode_calls==4 && phone.sequence_gaps==2 && codec_resets==before+2);
+    size=lhdc_rtp(p,4,80,1,4);p[11]=2;media_handler(phone.seid,p,size);
+    assert(decode_calls==5 && codec_resets==before+3); // new SSRC starts a new codec sequence
+
+    for(unsigned n=0;n<=14;n++)media_handler(phone.seid,p,n);
+    const uint8_t headers[]={0,1,2,3,5,6,7,9u<<2,0x80};
+    for(unsigned i=0;i<sizeof(headers);i++){
+        size=lhdc_rtp(p,5,81,1,4);p[12]=headers[i];media_handler(phone.seid,p,size);
+    }
+    size=lhdc_rtp(p,5,81,1,PHONE_CODEC_MAX_PAYLOAD+1);media_handler(phone.seid,p,size);
+    assert(decode_calls==5);
+    size=lhdc_rtp(p,5,81,1,4);decode_ok=false;prefix_before_failure=true;
+    media_handler(phone.seid,p,size);assert(decode_calls==6 && pcm_frames==0);
+    decode_ok=true;prefix_before_failure=false;
+    memset(p,0,34);p[0]=0xb2;p[1]=96;p[3]=6;p[11]=1;p[23]=1;
+    p[28]=4;p[29]=82;p[30]=0xa5;p[31]=0x5a;p[33]=2;
+    media_handler(phone.seid,p,34);assert(decode_calls==7 && received_length==2 && received_frames==1);
+    assert(received_payload[0]==0xa5 && received_payload[1]==0x5a);
+    media_handler((uint8_t)(phone.seid+1),p,34);assert(decode_calls==7);
+    uint8_t config[24];lhdc_event(config);assert(validator(lhdc_endpoint,config,sizeof(config))==AVDTP_ERROR_CODE_SEP_IN_USE);
+    uint8_t stale[6]={HCI_EVENT_A2DP_META,4,A2DP_SUBEVENT_STREAM_SUSPENDED,0x41,0,phone.seid};
+    sink_handler(HCI_EVENT_PACKET,0,stale,sizeof(stale));assert(phone.started);
+    phone_sink_yield();media_handler(phone.seid,p,34);assert(decode_calls==7 && !phone.started);
+    assert(validator(lhdc_endpoint,config,sizeof(config))!=0);
+    sink_handler(HCI_EVENT_PACKET,0,config,sizeof(config));phone_sink_poll();assert(!phone.configured);
 }
 static void test_worker_wait_and_release(void) {
     fixture(true);signaling(0x40,phone_address);configure(true);opened();
@@ -348,5 +654,8 @@ int main(void) {
     test_roles_and_start_priming();test_configuration_and_security();test_aptx_raw_and_fallback();
     test_codec_selection();test_raw_boundaries_and_yield();test_worker_wait_and_release();
     test_rtp_bounds_sequence_and_faults();test_timeouts_and_stale_events();test_avrcp_ownership_controls_and_volume();
-    puts("phone sink: role isolation, aptX/SBC, primed Start, packet bounds, loss, cancellation and AVRCP passed");
+    test_lhdc_availability_and_configuration();test_lhdc_preference_and_classic_fallbacks();
+    test_lhdc_media_bounds_sequence_and_cancellation();
+    test_open_failure_fallbacks();test_open_deadline_and_cancellation();test_lhdc_runtime_failure_recovery();
+    puts("phone sink: role isolation, LHDCv5/aptX/SBC, primed Start, packet bounds, loss, cancellation and AVRCP passed");
 }

@@ -66,6 +66,7 @@ def main():
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
         "phone_worker": ["tests/phone_worker_test.c", "-pthread"],
+        "phone_benchmark": ["tests/phone_benchmark_test.c"],
         "phone_control_protocol": ["tests/phone_control_protocol_test.c"],
         "phone_control": ["-Itests/phone_control_stubs", "tests/phone_control_test.c"],
         "ble_scan": ["-Itests/ble_scan_stubs", "tests/ble_scan_test.c"],
