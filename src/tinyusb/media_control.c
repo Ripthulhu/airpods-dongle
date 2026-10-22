@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "media_control.h"
+#include "dongle_control.h"
+#include "dongle_rpc.h"
 
 #include <stdatomic.h>
 #include <stddef.h>
@@ -40,6 +42,8 @@ bool usb_media_enqueue(enum usb_media_command command) {
 }
 
 void usb_media_set_available(bool available) {
+    dongle_control_available(available);
+    dongle_rpc_available(available);
     uint32_t old = atomic_load_explicit(&host_state, memory_order_relaxed);
     uint32_t next = ((old + 2u) & ~1u) | (uint32_t)available;
     atomic_store_explicit(&host_state, next, memory_order_release);
@@ -52,7 +56,7 @@ void usb_media_set_available(bool available) {
 
 static bool send_usage(uint16_t usage) {
     const uint8_t report[] = {(uint8_t)usage, (uint8_t)(usage >> 8)};
-    if (!tud_hid_report(0, report, sizeof(report))) return false;
+    if (!tud_hid_report(1, report, sizeof(report))) return false;
     last_usage = usage;
     return true;
 }
@@ -85,7 +89,11 @@ void usb_media_task(void) {
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type, uint8_t *buffer,
                                uint16_t requested) {
-    if (instance != 0 || report_id != 0 || report_type != HID_REPORT_TYPE_INPUT ||
+    if (instance == 0 && report_id == 2 && report_type == HID_REPORT_TYPE_FEATURE)
+        return dongle_control_get(buffer, requested);
+    if (instance == 0 && report_id == 3 && report_type == HID_REPORT_TYPE_FEATURE)
+        return dongle_rpc_get(buffer, requested);
+    if (instance != 0 || report_id != 1 || report_type != HID_REPORT_TYPE_INPUT ||
         buffer == NULL || requested < 2) return 0;
     buffer[0] = (uint8_t)last_usage;
     buffer[1] = (uint8_t)(last_usage >> 8);
@@ -95,9 +103,8 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type, uint8_t const *buffer,
                            uint16_t size) {
-    (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)size;
+    if (instance == 0 && report_id == 2 && report_type == HID_REPORT_TYPE_FEATURE)
+        dongle_control_set(buffer, size);
+    if (instance == 0 && report_id == 3 && report_type == HID_REPORT_TYPE_FEATURE)
+        dongle_rpc_set(buffer, size);
 }

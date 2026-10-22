@@ -7,7 +7,9 @@
 #include "btstack/btstack_ble_scan.h"
 #include "btstack/btstack_aacp.h"
 #include "btstack/aacp_mic_dec.h"
+#include "btstack/mic_decoder_lifecycle.h"
 #include "btstack/phone_sink.h"
+#include "btstack/phone_worker.h"
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -30,6 +32,8 @@
 
 #include "tinyusb/uac.h"
 #include "tinyusb/debug_cdc.h"
+#include "tinyusb/dongle_control.h"
+#include "tinyusb/dongle_rpc.h"
 #include "pico_w_led.h"
 #include "slot_storage.h"
 #include "button_gesture.h"
@@ -44,12 +48,14 @@ void aacp_mic_dec_wake_worker(void) {
     __sev();
 }
 
+void phone_worker_wake(void) { __sev(); }
+
 static void codec_core_entry(void) {
     bool safe = flash_safe_execute_core_init();
     atomic_store_explicit(&codec_core_state, safe ? 1u : 2u, memory_order_release);
     __sev();
     for (;;) {
-        if (!safe || !aacp_mic_dec_worker_step()) __wfe();
+        if (!safe || (!phone_worker_step() && !aacp_mic_dec_worker_step())) __wfe();
     }
 }
 
@@ -316,12 +322,10 @@ int main() {
     }
 
     // Enable watchdog — auto-resets if the main loop stops feeding it.
-    // 8s (upstream used 2s): the mic decoder init below allocates ~258KB in
-    // many chunks from this loop, and long-term testing was done at this value.
+    // Allow bounded codec initialization and flash operations to finish.
     watchdog_enable(8000, true);
 
-    bool dec_init_done = false;
-    bool dec_release_pending = false;
+    mic_decoder_lifecycle_t decoder = {0};
     uint32_t button_sample_ms = to_ms_since_boot(get_absolute_time());
     while (1) {
         watchdog_update();  // feed the watchdog
@@ -336,36 +340,35 @@ int main() {
         async_context_t *ctx = cyw43_arch_async_context();
         async_context_acquire_lock_blocking(ctx);
         bt_hci_phone_poll();
+        if (usb_mic_take_request(&mic_wanted)) {
+            // A fresh open also clears an earlier AACP failure before retrying.
+            aacp_mic_stop();
+            mic_decoder_lifecycle_request(&decoder, mic_wanted, aacp_mic_dec_ready());
+        }
         // The idle microphone decoder is too large to retain during a phone
         // session. Core 1 detaches it before core 0 frees its allocations.
-        if (dec_release_pending ||
-            (dec_init_done && phone_sink_connected() &&
-             !usb_mic_requested() && !aacp_mic_active())) {
-            dec_release_pending = !aacp_mic_dec_release();
-            if (!dec_release_pending) dec_init_done = false;
-        }
-        if ((usb_mic_requested() || get_usb_streaming()) && phone_sink_connected())
+        mic_decoder_lifecycle_release(&decoder,
+            phone_sink_connected() && !usb_mic_requested() && !aacp_mic_active());
+        if ((usb_mic_requested() || aacp_mic_active() || get_usb_streaming()) && phone_sink_connected())
             phone_sink_yield();
-        if (!dec_release_pending) phone_sink_poll();
+        if (!decoder.releasing) phone_sink_poll();
         ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND,
                             !usb_host_active() && !phone_sink_connected());
         ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, usb_mic_requested() || aacp_mic_active());
         // Keep decoder allocation in thread context and serialize malloc with
         // Bluetooth encoder callbacks. The USB service timer remains active.
-        if (!dec_init_done && !dec_release_pending && usb_mic_requested()) {
-            dec_init_done = true;
-            if (!aacp_mic_dec_init()) printf("Microphone decoder unavailable\n");
-        }
+        mic_decoder_prepare_t prepared = mic_decoder_lifecycle_prepare(&decoder,
+            usb_mic_requested(), phone_sink_decoder_released());
+        if (prepared == MIC_DECODER_FAILED) printf("Microphone decoder unavailable; reopen recording to retry\n");
         aacp_mic_dec_poll();
         tinyusb_control_task();
-        if (usb_mic_take_request(&mic_wanted)) {
-            if (mic_wanted) {
-                ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, true);
-                aacp_mic_start();
-            }
-            else aacp_mic_stop();
+        if (prepared == MIC_DECODER_READY && usb_mic_requested()) {
+            ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, true);
+            aacp_mic_start();
         }
         aacp_poll();
+        dongle_control_poll();
+        dongle_rpc_poll();
         ble_diagnostics_task();
         async_context_release_lock(ctx);
         sleep_ms(1);

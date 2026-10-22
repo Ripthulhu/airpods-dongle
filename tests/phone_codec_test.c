@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../src/btstack/phone_codec.h"
+#include "../src/btstack/phone_worker.h"
 #include "freeaptx.h"
 #include "sbc_encoder.h"
 
@@ -12,6 +13,7 @@ static int16_t captured[4096];
 static unsigned samples, calls;
 static bool reject_allocations;
 static unsigned allocations;
+void phone_worker_wake(void) {}
 extern void test_phone_resampler(void);
 extern void *__real_malloc(size_t size);
 extern void *__real_calloc(size_t count, size_t size);
@@ -91,6 +93,22 @@ static void test_aptx(void) {
     aptx_finish(reference);
     phone_codec_close();
     assert(!phone_codec_ready());
+    assert(phone_worker_configure(PHONE_CODEC_APTX, NULL));
+    assert(phone_worker_prepare() == PHONE_WORKER_READY);
+    prepared_allocations = allocations;
+    samples = calls = 0;
+    assert(phone_worker_submit(encoded, sizeof(encoded), 0));
+    assert(phone_worker_step());
+    assert(calls == 0); // Core1 never calls the Bluetooth-side PCM consumer.
+    assert(phone_worker_poll(collect, &samples));
+    assert(calls == 1 && samples == 1868);
+    checksum = 2166136261u;
+    for (unsigned i = 0; i < samples; ++i)
+        checksum = (checksum ^ (uint16_t)captured[i]) * 16777619u;
+    assert(checksum == 0xd9974350u && allocations == prepared_allocations);
+    assert(!phone_worker_close());
+    assert(phone_worker_step());
+    assert(phone_worker_close());
 }
 
 static void test_allocation_failure_falls_back(void) {
@@ -119,7 +137,7 @@ static void test_sbc(void) {
     encoder.u8NumPacketToEncode = 1;
     SBC_Encoder_Init(&encoder);
     int16_t pcm[256];
-    uint8_t packet[512];
+    uint8_t packet[1024];
     for (unsigned i = 0; i < 256; ++i) pcm[i] = (int16_t)(((int)i % 48 - 24) * 600);
     encoder.ps16PcmBuffer = pcm;
     encoder.pu8Packet = packet;
@@ -153,6 +171,39 @@ static void test_sbc(void) {
     assert(phone_codec_decode(packet, frame_bytes, 1, collect, &samples));
     assert(calls == 1 && samples == 256);
     phone_codec_close();
+
+    assert(phone_worker_configure(PHONE_CODEC_SBC, &config));
+    assert(phone_worker_prepare() == PHONE_WORKER_READY);
+    unsigned prepared_allocations = allocations;
+    samples = calls = 0;
+    packet[frame_bytes + 3] ^= 1;
+    assert(phone_worker_submit(packet, frame_bytes * 2, 2));
+    assert(phone_worker_step());
+    assert(!phone_worker_poll(collect, &samples));
+    assert(calls == 0); // Bad tail cannot publish a valid prefix.
+    packet[frame_bytes + 3] ^= 1;
+    phone_worker_reset();
+    assert(phone_worker_submit(packet, frame_bytes * 2, 2));
+    assert(phone_worker_step());
+    phone_worker_reset();
+    assert(phone_worker_poll(collect, &samples));
+    assert(calls == 0); // Completed PCM from an old stream is discarded.
+    encoder.s16BitPool = 2;
+    SBC_Encoder_Init(&encoder);
+    encoder.ps16PcmBuffer = pcm;
+    encoder.pu8Packet = packet;
+    SBC_Encoder(&encoder);
+    frame_bytes = encoder.u16PacketLength;
+    assert(frame_bytes * 15 <= sizeof(packet));
+    for (unsigned frame = 1; frame < 15; ++frame)
+        memcpy(packet + frame * frame_bytes, packet, frame_bytes);
+    assert(phone_worker_submit(packet, frame_bytes * 15, 15));
+    assert(phone_worker_step());
+    assert(phone_worker_poll(collect, &samples));
+    assert(samples == 3840 && calls == 1 && allocations == prepared_allocations);
+    assert(!phone_worker_close());
+    assert(phone_worker_step());
+    assert(phone_worker_close());
 }
 
 int main(void) {

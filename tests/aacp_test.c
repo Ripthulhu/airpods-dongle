@@ -6,6 +6,7 @@ static uint32_t now;
 static uint16_t next_cid, last_disconnected;
 static unsigned connects, disconnects, sends, starts, stops, decoded, resets;
 static uint8_t create_result, send_result;
+static uint16_t remote_mtu = 512;
 static bool decoder_ready = true, decode_ok = true;
 static bool decoder_reset_done = true, complete_on_submit = true;
 static uint32_t completed;
@@ -30,6 +31,7 @@ uint8_t l2cap_create_channel(btstack_packet_handler_t handler, bd_addr_t addr,
 }
 void l2cap_disconnect(uint16_t cid) { disconnects++; last_disconnected = cid; }
 void l2cap_request_can_send_now_event(uint16_t cid) { assert(cid != 0); }
+uint16_t l2cap_get_remote_mtu_for_local_cid(uint16_t cid) { assert(cid != 0); return remote_mtu; }
 uint8_t l2cap_send(uint16_t cid, uint8_t *data, uint16_t len) {
     assert(cid == aacp_cid && len != 0);
     if (send_result != 0) return send_result;
@@ -85,6 +87,8 @@ static void quiet_after_stop(void) {
 }
 static void fixture(void) {
     aacp_init();
+    aacp_research_cancel();
+    remote_mtu = 512;
     now = 0;
     next_cid = 0x40;
     last_disconnected = 0;
@@ -472,6 +476,97 @@ static void test_worker_fault_and_reset_after_start_queued(void) {
     assert(starts == 0 && aacp_mic_failed && !aacp_mic_start_queued());
 }
 
+static void test_host_controls_preserve_mic_capacity_and_readback(void) {
+    fixture();
+    assert(!aacp_control_ready() && !aacp_control_anc(2));
+    ready();
+    assert(aacp_control_ready() && aacp_control_readback()->anc == 3);
+    uint8_t report[] = {4,0,4,0,9,0,0x0d,3,0,0,0};
+    audio(report, aacp_cid, sizeof(report));
+    assert(aacp_control_readback()->anc == 3);
+    assert(!aacp_control_anc(4));
+    assert(aacp_control_anc(2));
+    assert(!aacp_control_anc(3)); // bounded host queue leaves STOP room
+    assert(aacp_control_readback()->anc == 3); // acceptance is not confirmation
+    drain();
+    assert(aacp_control_readback()->anc == 3);
+    report[7] = 2; audio(report, aacp_cid, sizeof(report));
+    assert(aacp_control_readback()->anc == 2);
+    uint32_t session = aacp_control_session();
+    aacp_disconnect();
+    assert(aacp_control_session() != session && !aacp_control_readback()->anc);
+    assert(!aacp_control_anc(3));
+}
+
+static void test_research_lifecycle_and_cache(void) {
+    fixture();
+    uint8_t hearing[] = {4,0,4,0,9,0,0x2c,1,1,0,0};
+    uint8_t output[512];
+    assert(!aacp_research_send(hearing, sizeof(hearing)));
+    ready();
+    bd_addr_t address;
+    assert(aacp_control_address(address) && memcmp(address, peer, 6) == 0);
+    assert(aacp_research_send(hearing, sizeof(hearing)));
+    assert(!aacp_research_send(hearing, sizeof(hearing)));
+    assert(aacp_research_take() == 0);
+    aacp_research_cancel();
+    assert(aacp_tx_count == 0);
+    assert(aacp_research_send(hearing, sizeof(hearing)));
+    drain();
+    assert(aacp_research_take() == 1 && aacp_research_take() == 0);
+    assert(aacp_research_cached(2, output, sizeof(output)) == 0);
+    audio(hearing, aacp_cid, sizeof(hearing));
+    now = 123;
+    assert(aacp_research_cached(2, output, sizeof(output)) == 19);
+    assert(dongle_u32(output) == 123 && dongle_u32(output + 4) == 1 &&
+           memcmp(output + 8, hearing, sizeof(hearing)) == 0);
+    audio(hearing, aacp_cid, sizeof(hearing));
+    assert(aacp_research_cached(2, output, sizeof(output)) == 19);
+    assert(dongle_u32(output) == 0 && dongle_u32(output + 4) == 2);
+    uint8_t oversized[12] = {4,0,4,0,9,0,0x2c};
+    audio(oversized, aacp_cid, sizeof(oversized));
+    assert(aacp_research_cached(2, output, sizeof(output)) == 0);
+    assert(reports[1].revision == 3);
+    audio(hearing, aacp_cid, sizeof(hearing));
+    assert(aacp_research_cached(2, output, sizeof(output)) == 19 && dongle_u32(output + 4) == 4);
+    reports[1].revision = UINT32_MAX;
+    audio(hearing, aacp_cid, sizeof(hearing));
+    assert(aacp_research_cached(2, output, sizeof(output)) == 19 && dongle_u32(output + 4) == 1);
+    assert(!aacp_research_send(aacp_mic_start_bytes, sizeof(aacp_mic_start_bytes)));
+    remote_mtu = 10;
+    assert(!aacp_research_send(hearing, sizeof(hearing)));
+    remote_mtu = 512;
+    for (unsigned i = 0; i < 6; ++i) assert(aacp_tx_enqueue(control_anc, sizeof(control_anc)));
+    assert(!aacp_research_send(hearing, sizeof(hearing)));
+    drain();
+    assert(aacp_research_send(hearing, sizeof(hearing)));
+    now += 3000;
+    aacp_poll();
+    assert(aacp_research_take() == 2 && aacp_tx_count == 0 && aacp_control_ready());
+    assert(aacp_research_send(hearing, sizeof(hearing)));
+    aacp_disconnect();
+    assert(aacp_research_take() == 2);
+    assert(aacp_research_cached(2, output, sizeof(output)) == 0);
+    assert(reports[1].revision == 0);
+}
+static void test_research_allowed_packets(void) {
+    fixture(); ready();
+    uint8_t pme[140] = {4,0,4,0,0x53,0,0x84,0,2,1,1,2};
+    assert(aacp_research_send(pme, sizeof(pme)));
+    drain(); assert(aacp_research_take() == 1);
+    pme[8] = 1;
+    assert(!aacp_research_send(pme, sizeof(pme)));
+    uint8_t clock[41] = {4,0,4,0,0x1b,0};
+    clock[14] = 25;
+    memcpy(clock + 16, "2026-10-22T15:34:02+00:00", 25);
+    assert(aacp_research_send(clock, sizeof(clock)));
+    drain(); assert(aacp_research_take() == 1);
+    clock[36] = '1';
+    assert(!aacp_research_send(clock, sizeof(clock)));
+    assert(aacp_research_send(aacp_request_notifications, sizeof(aacp_request_notifications)));
+    drain(); assert(aacp_research_take() == 1);
+}
+
 int main(void) {
     test_handshake_and_decoder_gate();
     test_usb_cancel_and_stop_are_not_lost();
@@ -487,6 +582,9 @@ int main(void) {
     test_worker_reset_ack_and_timeout();
     test_queued_frames_do_not_feed_decode_watchdog();
     test_worker_fault_and_reset_after_start_queued();
-    puts("AACP lifecycle and packet validation: 14 groups passed");
+    test_host_controls_preserve_mic_capacity_and_readback();
+    test_research_lifecycle_and_cache();
+    test_research_allowed_packets();
+    puts("AACP lifecycle and packet validation: 17 groups passed");
     return 0;
 }

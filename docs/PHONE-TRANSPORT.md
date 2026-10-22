@@ -33,9 +33,11 @@ SCO and a BLE settings interface are not implemented.
 - Classic aptX contains raw four-byte codewords, without RTP. SBC has RTP and its
   SBC media header. The receiver validates framing and configuration, rejects
   fragmented SBC, and resets on SBC sequence gaps instead of playing stale PCM.
-- Decode goes straight into a 64 ms maximum PCM queue. Initial prefill is 30 ms
+- Core 1 decodes into a 64 ms maximum PCM queue via a single completed-packet
+  mailbox. Two compressed packet slots bound the cross-core handoff; they have
+  no playout timer. Initial prefill is 30 ms
   for AAC-ELD/SBC output and about 41 ms for AAC; it leaves a small reserve for
-  packet arrival phase and clock drift. There is no compressed playout queue.
+  packet arrival phase and clock drift.
   A bounded resampling correction follows queue fill to compensate for independent
   clocks. Saturation discards the oldest complete PCM frames. These are buffer
   thresholds, not measured acoustic delay.
@@ -54,10 +56,14 @@ to AAC-ELD is still a lossy transcode.
 
 ## Memory and ownership
 
-Bluetooth, USB, playback encoding and phone decoding run on core 0. Core 1 owns
-the USB microphone decoder. An idle microphone decoder is detached by core 1
+Bluetooth, USB, playback encoding and PCM publication run on core 0. Core 1 owns
+phone aptX/SBC decoding or USB microphone decoding; the two inputs are mutually
+exclusive. The phone worker allocates 9,772 bytes only during phone sessions.
+An idle microphone decoder is detached by core 1
 before core 0 releases its heap for a phone session. USB recording can initialize
-it again after the phone stops. Codec allocation/free stays in thread context
+it again after the phone worker acknowledges detachment and core 0 frees its memory.
+Both worker inputs and completed output carry a cancellation generation. A
+partial or stale decode cannot enter playback. Codec allocation/free stays in thread context
 under the Bluetooth lock; no packet callback allocates memory.
 
 The phone and AirPods use independent AVDTP and AVRCP connection IDs. Shared

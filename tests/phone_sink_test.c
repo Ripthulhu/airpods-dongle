@@ -18,6 +18,7 @@ static uint32_t now;
 static bool output_ready, open_allowed, claim_allowed, secure_peer;
 static bool aptx_available, prepare_ok, codec_ready, decode_ok, control_busy;
 static bool prefix_before_failure;
+static bool prepare_waiting, close_waiting;
 static phone_codec_t desired;
 static uint8_t received_payload[PHONE_CODEC_MAX_PAYLOAD];
 static size_t received_length;
@@ -62,16 +63,18 @@ uint32_t btstack_run_loop_get_time_ms(void) {return now;}
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]) {return memcmp(address,phone_address,6)==0;}
 bool bt_hci_phone_peer_connected(const uint8_t address[6]) {return secure_peer && bt_hci_phone_peer_allowed(address);}
 bool phone_codec_available(phone_codec_t codec) {return codec==PHONE_CODEC_SBC || (codec==PHONE_CODEC_APTX && aptx_available);}
-bool phone_codec_configure(phone_codec_t codec,const phone_sbc_config_t*sbc) {desired=codec;codec_ready=false;if(codec==PHONE_CODEC_SBC)assert(sbc&&sbc->blocks==16&&sbc->subbands==8&&sbc->channel_mode==2);return true;}
-bool phone_codec_prepare(void) {prepares++;codec_ready=prepare_ok;return prepare_ok;}
-void phone_codec_close(void) {desired=PHONE_CODEC_NONE;codec_ready=false;closes++;}
-bool phone_codec_ready(void) {return codec_ready;}
-void phone_codec_reset(void) {codec_resets++;}
-bool phone_codec_decode(const uint8_t*payload,size_t length,uint8_t count,phone_codec_pcm_callback callback,void*context) {
+bool phone_worker_configure(phone_codec_t codec,const phone_sbc_config_t*sbc) {desired=codec;codec_ready=false;if(codec==PHONE_CODEC_SBC)assert(sbc&&sbc->blocks==16&&sbc->subbands==8&&sbc->channel_mode==2);return true;}
+phone_worker_status_t phone_worker_prepare(void) {prepares++;if(prepare_waiting)return PHONE_WORKER_WAITING;codec_ready=prepare_ok;return prepare_ok ? PHONE_WORKER_READY : PHONE_WORKER_FAILED;}
+bool phone_worker_close(void) {desired=PHONE_CODEC_NONE;codec_ready=false;closes++;return !close_waiting;}
+bool phone_worker_released(void) {return !codec_ready && !close_waiting;}
+bool phone_worker_poll(phone_codec_pcm_callback callback,void*context) {(void)callback;(void)context;return true;}
+bool phone_worker_ready(void) {return codec_ready;}
+void phone_worker_reset(void) {codec_resets++;}
+bool phone_worker_submit(const uint8_t*payload,size_t length,uint8_t count) {
     decode_calls++;received_length=length;received_frames=count;
     assert(length<=sizeof(received_payload));memcpy(received_payload,payload,length);
     static int16_t pcm[8]={1,2,3,4,5,6,7,8};
-    if(decode_ok || prefix_before_failure)callback(pcm,4,context);
+    if(decode_ok || prefix_before_failure)decoded_pcm(pcm,4,NULL);
     return decode_ok;
 }
 bool bridge_phone_open(void) {opens++;return open_allowed;}
@@ -108,6 +111,7 @@ static void fixture(bool aptx) {
     opens=claims=stops=pcm_frames=pcm_drops=codec_resets=decode_calls=prepares=closes=controls_sent=volume_updates=0;
     now=0;output_ready=false;open_allowed=claim_allowed=secure_peer=prepare_ok=decode_ok=true;
     codec_ready=control_busy=prefix_before_failure=false;aptx_available=aptx;desired=PHONE_CODEC_NONE;
+    prepare_waiting=close_waiting=false;
     aptx_selections=sbc_selections=reconnects=0;selected_remote=0;aptx_select_ok=true;
     assert(phone_sink_init());
 }
@@ -265,6 +269,19 @@ static void test_aptx_raw_and_fallback(void) {
     sink_handler(HCI_EVENT_PACKET,0,release,5);phone_sink_poll();assert(finalized==1 && aptx_seid==0);
     assert(reconnects==1);phone_sink_poll();assert(reconnects==1);
 }
+static void test_worker_wait_and_release(void) {
+    fixture(true);signaling(0x40,phone_address);configure(true);opened();
+    codec_ready=false;prepare_waiting=true;output_ready=true;
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
+    phone_sink_poll();
+    assert(phone.configured && phone.start_pending && !aptx_disabled);
+    assert(accepted==0 && rejected==0 && disconnected==0);
+    prepare_waiting=false;phone_sink_poll();assert(accepted==1);
+    close_waiting=true;phone_sink_yield();
+    assert(!phone_sink_decoder_released() && !phone_sink_active());
+    phone_sink_poll();assert(!phone_sink_decoder_released() && disconnected==1);
+    close_waiting=false;phone_sink_poll();assert(phone_sink_decoder_released());
+}
 static void test_rtp_bounds_sequence_and_faults(void) {
     fixture(true);playing(false);uint8_t p[64];unsigned size=rtp(p,65535);
     for(unsigned n=0;n<12;n++)media_handler(phone.seid,p,n);
@@ -329,7 +346,7 @@ static void test_avrcp_ownership_controls_and_volume(void) {
 }
 int main(void) {
     test_roles_and_start_priming();test_configuration_and_security();test_aptx_raw_and_fallback();
-    test_codec_selection();test_raw_boundaries_and_yield();
+    test_codec_selection();test_raw_boundaries_and_yield();test_worker_wait_and_release();
     test_rtp_bounds_sequence_and_faults();test_timeouts_and_stale_events();test_avrcp_ownership_controls_and_volume();
     puts("phone sink: role isolation, aptX/SBC, primed Start, packet bounds, loss, cancellation and AVRCP passed");
 }

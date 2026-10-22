@@ -16,6 +16,7 @@ extern void probe_emit(const char *text);
 extern void _exit(int code) __attribute__((noreturn));
 extern char _end;
 static char *heap_break;
+static size_t peak_heap_break;
 
 void *_sbrk(ptrdiff_t increment) {
     if (heap_break == NULL) heap_break = &_end;
@@ -27,6 +28,8 @@ void *_sbrk(ptrdiff_t increment) {
         return (void *)-1;
     }
     heap_break += increment;
+    size_t used = (size_t)(heap_break - &_end);
+    if (used > peak_heap_break) peak_heap_break = used;
     return previous;
 }
 
@@ -97,34 +100,141 @@ static HANDLE_AACENCODER encoder(unsigned channels, unsigned bitrate) {
     return handle;
 }
 
-static INT_PCM pcm[960];
+static HANDLE_AACENCODER playback_encoder(unsigned aot, unsigned bitrate) {
+    if (aot == 39) return encoder(2, bitrate);
+    HANDLE_AACENCODER handle = NULL;
+    ENC_OK(aacEncOpen(&handle, 1, 2));
+    const struct { AACENC_PARAM key; UINT value; } parameters[] = {
+        {AACENC_AOT, aot}, {AACENC_BITRATE, bitrate}, {AACENC_SAMPLERATE, 48000},
+        {AACENC_CHANNELMODE, MODE_2}, {AACENC_BITRATEMODE, 0}, {AACENC_AFTERBURNER, 0},
+        {AACENC_TRANSMUX, TT_MP4_LATM_MCP1}, {AACENC_HEADER_PERIOD, 1},
+        {AACENC_AUDIOMUXVER, 1},
+    };
+    for (unsigned i = 0; i < sizeof(parameters) / sizeof(*parameters); ++i)
+        ENC_OK(aacEncoder_SetParam(handle, parameters[i].key, parameters[i].value));
+    ENC_OK(aacEncEncode(handle, NULL, NULL, NULL, NULL));
+    return handle;
+}
+
+static INT_PCM pcm[2048];
 static unsigned char packets[16][1024];
 static unsigned packet_lengths[16];
 static unsigned checksum = 2166136261u;
 
 static void encode_frame(HANDLE_AACENCODER handle, unsigned channels, unsigned frame,
                          unsigned char *packet, unsigned *length) {
-    for (unsigned sample = 0; sample < 480; ++sample) {
-        int value = (sample + frame * 480) % 96;
+    AACENC_InfoStruct info = {0};
+    ENC_OK(aacEncInfo(handle, &info));
+    unsigned samples = info.frameLength;
+    if (channels != info.inputChannels || samples == 0 || samples > 1024 || channels > 2)
+        fail("encoder input format", samples);
+    for (unsigned sample = 0; sample < samples; ++sample) {
+        int value = (sample + frame * samples) % 96;
         value = (value < 48 ? value : 96 - value) - 24;
         for (unsigned channel = 0; channel < channels; ++channel)
             pcm[sample * channels + channel] = (INT_PCM)(value * 100);
     }
     void *input_buffers[] = {pcm}, *output_buffers[] = {packet};
     INT input_ids[] = {IN_AUDIO_DATA}, output_ids[] = {OUT_BITSTREAM_DATA};
-    INT input_sizes[] = {480 * channels * sizeof(INT_PCM)}, output_sizes[] = {1024};
+    INT input_sizes[] = {samples * channels * sizeof(INT_PCM)}, output_sizes[] = {1024};
     INT input_elements[] = {sizeof(INT_PCM)}, output_elements[] = {1};
     AACENC_BufDesc input = {1, input_buffers, input_ids, input_sizes, input_elements};
     AACENC_BufDesc output = {1, output_buffers, output_ids, output_sizes, output_elements};
     AACENC_InArgs arguments = {0};
     AACENC_OutArgs result = {0};
-    arguments.numInSamples = 480 * channels;
+    arguments.numInSamples = samples * channels;
     ENC_OK(aacEncEncode(handle, &input, &output, &arguments, &result));
-    if (result.numInSamples != (INT)(480 * channels) || result.numOutBytes < 0 ||
+    if (result.numInSamples != (INT)(samples * channels) || result.numOutBytes < 0 ||
         result.numOutBytes > 1024) fail("encode bounds", result.numOutBytes);
     *length = result.numOutBytes;
     for (unsigned i = 0; i < *length; ++i)
         checksum = (checksum ^ packet[i]) * 16777619u;
+}
+
+#include "profile_checks.h"
+
+static void check_encoder_matrix(void) {
+    static const struct { unsigned aot, bitrate, bytes, hash; } cases[] = {
+        {2, 96000, 25154, 0x4b593030}, {2, 128000, 33372, 0x6695ac06},
+        {2, 174000, 45093, 0xf31b3f32}, {2, 192000, 49653, 0xcf081c13},
+        {2, 220000, 56734, 0x17f98789}, {39, 128000, 15361, 0xdfce004b},
+        {39, 174000, 20881, 0x02d55c6e}, {39, 192000, 23041, 0x7099ba4b},
+        {39, 220000, 26400, 0x88655cac}, {39, 256000, 30720, 0x7d41fe7c},
+    };
+    static INT_PCM input_pcm[2048];
+    static unsigned char encoded[1024];
+    for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
+        unsigned aot = cases[c].aot, rate = cases[c].bitrate;
+        unsigned frames = aot == 39 ? 480 : 1024;
+        HANDLE_AACENCODER handle = playback_encoder(aot, rate);
+        unsigned hash = 2166136261u, random = 12345, bytes_total = 0;
+        for (unsigned frame = 0; frame < 96; ++frame) {
+            for (unsigned n = 0; n < frames * 2; ++n) {
+                random = random * 1664525u + 1013904223u;
+                int value = (int)((random >> 16) & 65535) - 32768;
+                switch ((frame / 8) % 4) {
+                    case 0: value = 0; break;
+                    case 1: value = (n % 96 < 48 ? (int)(n % 48) : 48 - (int)(n % 48)) * 500 - 12000; break;
+                    case 2: if (n % 80) value = 0; break;
+                    default: break;
+                }
+                input_pcm[n] = (INT_PCM)value;
+            }
+            void *input_ptrs[] = {input_pcm}, *output_ptrs[] = {encoded};
+            INT input_ids[] = {IN_AUDIO_DATA}, output_ids[] = {OUT_BITSTREAM_DATA};
+            INT input_sizes[] = {frames * 2 * sizeof(INT_PCM)}, output_sizes[] = {sizeof(encoded)};
+            INT input_elements[] = {sizeof(INT_PCM)}, output_elements[] = {1};
+            AACENC_BufDesc in = {1, input_ptrs, input_ids, input_sizes, input_elements};
+            AACENC_BufDesc out = {1, output_ptrs, output_ids, output_sizes, output_elements};
+            AACENC_InArgs args = {0};
+            AACENC_OutArgs result = {0};
+            args.numInSamples = frames * 2;
+            ENC_OK(aacEncEncode(handle, &in, &out, &args, &result));
+            if (result.numInSamples != (INT)(frames * 2) || result.numOutBytes < 0 ||
+                result.numOutBytes > (INT)sizeof(encoded)) fail("matrix output bounds", result.numOutBytes);
+            bytes_total += result.numOutBytes;
+            hash = (hash ^ (unsigned)result.numOutBytes) * 16777619u;
+            for (INT n = 0; n < result.numOutBytes; ++n) hash = (hash ^ encoded[n]) * 16777619u;
+        }
+        if (hash != cases[c].hash || bytes_total != cases[c].bytes) fail("encoder matrix checksum", c);
+        ENC_OK(aacEncClose(&handle));
+        if (mallinfo().uordblks != 0) fail("encoder matrix cleanup", c);
+    }
+    probe_emit("MATRIX 960 frames across ten AAC/AAC-ELD configurations match baseline hashes\n");
+}
+
+static void check_lifecycle(void) {
+    static const struct { unsigned aot, bitrate; const char *name; } modes[] = {
+        {39, 256000, "lifecycle_ELD_256"},
+        {2, 128000, "lifecycle_LC_128"},
+        {2, 220000, "lifecycle_LC_220"},
+    };
+    for (unsigned mode = 0; mode < sizeof(modes) / sizeof(*modes); ++mode) {
+        for (unsigned cycle = 0; cycle < 8; ++cycle) {
+            HANDLE_AACDECODER decoder = NULL;
+            HANDLE_AACENCODER stereo = NULL;
+            if (cycle & 1) stereo = playback_encoder(modes[mode].aot, modes[mode].bitrate);
+            decoder = aacDecoder_Open(TT_MP4_RAW, 1);
+            if (decoder == NULL) fail("lifecycle decoder open", cycle);
+            profile_configure(decoder);
+            if (stereo == NULL) stereo = playback_encoder(modes[mode].aot, modes[mode].bitrate);
+            unsigned char packet[1024];
+            unsigned length;
+            encode_frame(stereo, 2, 0, packet, &length);
+            DEC_OK(profile_decode(decoder, packets[0], packet_lengths[0], AACDEC_CLRHIST));
+            if (cycle == 0) report_heap(modes[mode].name);
+            ENC_OK(aacEncClose(&stereo));
+            // Recreate playback while recording retains its allocations.
+            stereo = playback_encoder(modes[mode].aot, modes[mode].bitrate);
+            encode_frame(stereo, 2, 1, packet, &length);
+            DEC_OK(aacDecoder_SetParam(decoder, AAC_TPDEC_CLEAR_BUFFER, 1));
+            DEC_OK(profile_decode(decoder, packets[0], packet_lengths[0], AACDEC_CLRHIST));
+            aacDecoder_Close(decoder);
+            ENC_OK(aacEncClose(&stereo));
+            if (mallinfo().uordblks != 0) fail("lifecycle cleanup", cycle);
+        }
+    }
+    probe_emit("LIFECYCLE ELD-256/LC-128/LC-220 alternating allocation order and retained-microphone playback recreation passed\n");
 }
 
 int main(void) {
@@ -197,5 +307,12 @@ int main(void) {
     aacDecoder_Close(decoder);
     ENC_OK(aacEncClose(&stereo));
     report_heap("closed");
-    return successful == 16 && checksum == 0x4105af5du ? 0 : 1;
+    if (successful != 16 || checksum != 0x4105af5du || mallinfo().uordblks != 0) return 1;
+    profile_checks(packets, packet_lengths);
+    check_encoder_matrix();
+    check_lifecycle();
+    snprintf(text, sizeof(text), "HEAP_PEAK bytes=%u\n", (unsigned)peak_heap_break);
+    probe_emit(text);
+    probe_emit("CHECKS complete\n");
+    return 0;
 }

@@ -19,12 +19,17 @@ reference file hashes used for these changes.
 | Microphone parsing | A valid prefix can be decoded before a malformed tail | Validate the whole SDU before any decode; reject zero-length/truncated AUs |
 | Decoder | Codec work blocks the Bluetooth callback | Copy bounded AUs to core 1, acknowledge resets before Start and validate completed mono/480-sample output |
 | Codec allocation | Bluetooth encoder callbacks can interrupt decoder allocation and deadlock the heap mutex | Allocate the decoder in thread context while holding the Bluetooth async lock; USB servicing remains active |
+| Codec memory | Generic eight-channel workspaces consume nearly the entire heap | Use a guarded stereo-encoder/mono-microphone profile; validate the linked firmware's budget on every build |
+| Microphone initialization | One failed allocation prevents later recording opens from retrying | Make one attempt per request; detach failed workers before a fresh open can retry |
 | PCM queues | Racy cursor resets and repeated queue allocations | Use bounded storage, generation-tagged microphone frames and acquire/release publication |
 | USB controls | Invalid channel/format requests and repeated mute alter state | Reject unsupported requests; apply idempotent mute to PCM and preserve volume |
 | Stem controls | Play/Pause mutes the dongle instead of controlling the player | Send explicit USB Consumer Control commands, with bounded queues and ordered key releases |
 | Phone bridge | No A2DP receiver or independent phone ownership | Negotiate 48 kHz classic aptX/SBC, decode into bounded PCM and route AVRCP by peer |
 | Phone startup | Input could accumulate behind AirPods priming | Open and prime the AirPods output before accepting phone Start; use one ELD frame per phone-output packet |
 | Phone memory | A retained idle microphone decoder competes with the phone decoder | Let core 1 detach it, then free on core 0; close the phone codec before USB microphone takeover |
+| Phone CPU use | Phone decode and AirPods encode share core 0 while core 1 waits | Decode complete phone packets on core 1; publish bounded, generation-checked PCM on core 0 |
+| NTPods controls | Host-specific Bluetooth drivers are required for app controls | Use standard USB HID for pairing, reconnect, reported batteries and ANC/transparency |
+| Hearing and diagnostics | USB controls cannot carry full settings records | Stage bounded HID fragments, commit once, use ATT on the existing Classic link and validate complete profile readback in NTPods |
 | BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity without a phone connection |
 | Build | Missing SDK patches can still produce a crashing or incompatible binary | Pin revisions and verify complete patched-file hashes before compilation |
 
@@ -32,11 +37,11 @@ reference file hashes used for these changes.
 
 Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
 
-| Linked layout | `bde77fb` | 0.1.2 | 0.1.3 | 0.1.4 |
-| --- | ---: | ---: | ---: | ---: |
-| Main-heap capacity before codec allocations | 413,920 bytes | 423,696 bytes | 392,512 bytes | 387,036 bytes |
-| Flash image | 1,549,032 bytes | 1,551,824 bytes | 1,558,360 bytes | 1,595,344 bytes |
-| Full BLE cache copy for aggregate logs | 700 bytes | 28 bytes | 28 bytes | 28 bytes |
+| Linked layout | 0.1.7 |
+| --- | ---: |
+| Main-heap capacity before codec allocations | 389,736 bytes |
+| Flash image | 1,604,680 bytes |
+| Full BLE cache copy for aggregate logs | 28 bytes |
 
 The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
 decode PCM use 3 KiB of scratch-Y. Core 1 has an explicit 16 KiB stack in ordinary
@@ -54,12 +59,30 @@ stack writes and 7.4 KiB for stereo ELD encoding, including the probe's margin.
 These measurements support the 16 KiB reservations but do not establish hardware
 stack high-water marks under USB/Bluetooth interrupts.
 
-The real-codec probe initializes stereo ELD at 48 kHz/256 kbps plus the microphone
-decoder with ASC `F8 E6 30 00`. Live allocator use is 379,864 bytes, leaving 7,172
-bytes of the current heap region before other application allocations. Allocator
-arena use also depends on heap alignment. Sixteen generated mono frames
-decode identically before and after the stack change. See
-[`tools/codec_probe`](../tools/codec_probe/) for reproduction and emulator limits.
+The target-specific `FDK_AIRPODS_PROFILE` keeps stereo AAC/AAC-ELD encoding and
+raw mono ELD decoding at 48 kHz, 480 samples, with ASC `F8 E6 30 00`. Unsupported
+channel counts, transports and configurations are rejected before using smaller
+workspaces. The limiter remains available; non-profile FDK builds keep
+their original dimensions.
+
+| Allocation change | Bytes saved |
+| --- | ---: |
+| Encoder scratch: eight channels to two | 57,312 |
+| Limiter capacity: eight channels/96 kHz to mono/48 kHz | 46,080 |
+| Raw transport: 32 KiB to 512 bytes, with a 255-byte input limit | 32,256 |
+| Decoder time workspace: 64 KiB to 8 KiB | 57,344 |
+| Total | 192,992 |
+
+The real-codec probe keeps stereo ELD at 48 kHz/256 kbps and the microphone
+decoder open together. Live allocator use is 186,872 bytes, down from 379,864.
+The tested allocator peak is 188,040 bytes, leaving 201,696 bytes before other
+application allocations. Heap alignment and allocation order affect arena use.
+Every firmware link verifies its exact codec archive fingerprint, derives capacity
+from the ELF and reserves 64 KiB for other runtime use. The reserve is a build
+policy, not a measured bound on the application. Tests cover malformed input,
+limiter operation, playback recreation with the microphone retained and bit-exact
+encoding across ten AAC/AAC-ELD configurations. See
+[`tools/codec_probe`](../tools/codec_probe/README.md) for reproduction and limits.
 
 Unused Bluetooth HFP, HID, network and serial profile pools are disabled. The
 implemented audio/control profiles, two HCI connections, GATT client capacity
@@ -78,12 +101,16 @@ still require the board.
 
 ## Core ownership
 
-Core 0 retains Bluetooth, USB, playback encoding, phone decoding and control state.
+Core 0 retains Bluetooth, USB, playback encoding, PCM publication and control state.
+The hearing/diagnostic transport adds 3,084 bytes of static storage, including
+one additional L2CAP channel. It uses the existing ACL and allocates no heap;
+fragment assembly, ATT and cached AACP reports stay on core 0.
 It allocates and configures the microphone decoder in thread context under the
-Bluetooth async lock, then publishes the handle. Core 1 owns microphone decode, codec
-reset and decoder statistics. It never calls Bluetooth, USB or logging APIs.
+Bluetooth async lock, then publishes the handle. Core 1 owns phone aptX/SBC decode
+or microphone decode, codec reset and decoder statistics. These inputs are
+mutually exclusive. It never calls Bluetooth, USB or logging APIs.
 
-Eight copied compressed frames and sixteen tagged PCM frames bound worker memory.
+Eight copied compressed frames and sixteen tagged PCM frames bound microphone worker memory.
 Stop, reset, disconnect and queue saturation invalidate the generation. The USB
 consumer discards stale output, including an in-flight decode completed after
 cancellation. Start waits for reset acknowledgement; a stopped worker cannot feed
@@ -93,10 +120,16 @@ after one second, and the existing valid-frame watchdog bounds capture recovery.
 Before phone codec preparation, core 0 requests release of an idle microphone
 decoder and waits for core 1's acknowledgement. Core 1 discards compressed work
 and atomically detaches the handle after any in-flight decode. Core 0 then closes
-it. No core 1 allocation/free occurs. USB microphone takeover closes the phone
-decoder first and can initialize a fresh microphone decoder; stale output remains
-generation-tagged. The aptX context adds 4,404 bytes while selected, and SBC uses
-1,636 bytes of static decoder state/workspace.
+it. No core 1 allocation/free occurs. USB microphone takeover waits for the phone
+worker to detach, then frees its codec and queue before initializing a fresh
+microphone decoder. Stale output remains generation-tagged. The aptX context adds
+4,404 bytes while selected, and SBC uses 1,636 bytes of static decoder state/workspace.
+The phone-only worker allocation is 9,772 bytes: two bounded compressed packet
+slots and one complete-packet PCM mailbox. Malformed partial output is discarded.
+
+The diagnostics ring is 2 KiB instead of 8 KiB. Overflow retains a dropped-byte
+count, and each USB service tick still drains at most 64 bytes. The saved 6 KiB
+is available to the codec heap rather than reserved for old log messages.
 
 Both cores register for SDK flash lockout before pairing/storage can write flash.
 The worker uses atomic queues and wake events, leaving the multicore FIFO to the

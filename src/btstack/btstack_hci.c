@@ -80,16 +80,17 @@ void bt_hci_phone_poll(void) {
     gap_discoverable_control(0);
 }
 
-void bt_hci_phone_pairing_start(void) {
+bool bt_hci_phone_pairing_start(void) {
     if (!phone_storage_supported) {
         printf("Phone identity storage unavailable or unsupported\n");
-        return;
+        return false;
     }
     memset(phone_candidate, 0, sizeof(phone_candidate));
     phone_pairing_since = btstack_run_loop_get_time_ms();
     phone_pairing = true;
     gap_discoverable_control(1);
     printf("Phone pairing available for 120 seconds\n");
+    return true;
 }
 
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]) {
@@ -152,14 +153,15 @@ bd_addr_t * get_device_addr_from_list(uint8_t i){
     return i < 2 ? &device_addr_list[i] : NULL;
 }
 
-void gap_start_scanning(void){
-    if (scan_active) return;
+bool gap_start_scanning(void){
+    if (scan_active) return true;
     printf("Start scanning...\n");
     ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, true);
     scan_active = gap_inquiry_start(A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS) == ERROR_CODE_SUCCESS;
     if (!scan_active) ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
     set_led_mode_off();
     set_led_mode_pairing();
+    return scan_active;
 }
 
 

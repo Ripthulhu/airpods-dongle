@@ -10,7 +10,7 @@
 
 char __StackLimit[1];
 static CStreamInfo info = {48000, 480, 1, 39};
-static bool fill_error, partial_fill, decode_error, no_info, config_error, reset_error;
+static bool fill_error, partial_fill, decode_error, no_info, allocation_error, config_error, reset_error;
 static unsigned core, opened, closed, decoded, reset_count, wakes, logs;
 static UINT last_flags;
 static uint8_t expected_au;
@@ -31,6 +31,7 @@ void aacp_mic_dec_wake_worker(void) { ++wakes; }
 HANDLE_AACDECODER aacDecoder_Open(int transport, UINT layers) {
     assert(core == 0 && transport == TT_MP4_RAW && layers == 1);
     assert(!decoder_live);
+    if (allocation_error) return NULL;
     decoder_live = true;
     ++opened;
     return &info;
@@ -115,6 +116,9 @@ int main(void) {
     int16_t pcm[960];
     assert(!step() && !aacp_mic_dec_ready());
     assert(!aacp_mic_dec_reset_done());
+    allocation_error = true;
+    assert(!aacp_mic_dec_init() && !aacp_mic_dec_ready() && closed == 0 && !decoder_live);
+    allocation_error = false;
     config_error = true;
     assert(!aacp_mic_dec_init() && !aacp_mic_dec_ready() && closed == 1);
     config_error = false;

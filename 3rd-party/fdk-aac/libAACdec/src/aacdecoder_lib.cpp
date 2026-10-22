@@ -101,6 +101,7 @@ amm-info@iis.fraunhofer.de
 *******************************************************************************/
 
 #include "aacdecoder_lib.h"
+#include "FDK_dongle_profile.h"
 
 #include "aac_ram.h"
 #include "aacdecoder.h"
@@ -192,6 +193,15 @@ static LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_Config(
 LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_ConfigRaw(HANDLE_AACDECODER self,
                                                     UCHAR *conf[],
                                                     const UINT length[]) {
+#ifdef FDK_AIRPODS_PROFILE
+  static const UCHAR microphoneConfig[] = {0xf8, 0xe6, 0x30, 0};
+  if (self == NULL) return AAC_DEC_INVALID_HANDLE;
+  if (conf == NULL || length == NULL || conf[0] == NULL ||
+      length[0] != sizeof(microphoneConfig) ||
+      FDKmemcmp(conf[0], microphoneConfig, sizeof(microphoneConfig)) != 0) {
+    return AAC_DEC_UNSUPPORTED_FORMAT;
+  }
+#endif
   AAC_DECODER_ERROR err = AAC_DEC_OK;
   TRANSPORTDEC_ERROR errTp;
   UINT layer, nrOfLayers = self->nrOfLayers;
@@ -698,14 +708,14 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_SetParam(
   /* configure the subsystems */
   switch (param) {
     case AAC_PCM_MIN_OUTPUT_CHANNELS:
-      if (value < -1 || value > (8)) {
+      if (value < -1 || value > FDK_DECODER_LIMITER_CHANNELS) {
         return AAC_DEC_SET_PARAM_FAIL;
       }
       dmxErr = pcmDmx_SetParam(hPcmDmx, MIN_NUMBER_OF_OUTPUT_CHANNELS, value);
       break;
 
     case AAC_PCM_MAX_OUTPUT_CHANNELS:
-      if (value < -1 || value > (8)) {
+      if (value < -1 || value > FDK_DECODER_LIMITER_CHANNELS) {
         return AAC_DEC_SET_PARAM_FAIL;
       }
       dmxErr = pcmDmx_SetParam(hPcmDmx, MAX_NUMBER_OF_OUTPUT_CHANNELS, value);
@@ -955,6 +965,9 @@ bail:
 }
 LINKSPEC_CPP HANDLE_AACDECODER aacDecoder_Open(TRANSPORT_TYPE transportFmt,
                                                UINT nrOfLayers) {
+#ifdef FDK_AIRPODS_PROFILE
+  if (transportFmt != TT_MP4_RAW || nrOfLayers != 1) return NULL;
+#endif
   AAC_DECODER_INSTANCE *aacDec = NULL;
   HANDLE_TRANSPORTDEC pIn;
   int err = 0;
@@ -1039,7 +1052,8 @@ LINKSPEC_CPP HANDLE_AACDECODER aacDecoder_Open(TRANSPORT_TYPE transportFmt,
 
   aacDec->hLimiter =
       pcmLimiter_Create(TDL_ATTACK_DEFAULT_MS, TDL_RELEASE_DEFAULT_MS,
-                        (FIXP_DBL)MAXVAL_DBL, (8), 96000);
+                        (FIXP_DBL)MAXVAL_DBL, FDK_DECODER_LIMITER_CHANNELS,
+                        FDK_DECODER_LIMITER_RATE);
   if (NULL == aacDec->hLimiter) {
     err = -1;
     goto bail;
@@ -1066,6 +1080,12 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_Fill(HANDLE_AACDECODER self,
                                                UCHAR *pBuffer[],
                                                const UINT bufferSize[],
                                                UINT *pBytesValid) {
+#ifdef FDK_AIRPODS_PROFILE
+  if (self == NULL) return AAC_DEC_INVALID_HANDLE;
+  if (pBuffer == NULL || bufferSize == NULL || pBytesValid == NULL ||
+      pBuffer[0] == NULL || pBytesValid[0] > FDK_MIC_ACCESS_UNIT_BYTES ||
+      pBytesValid[0] > bufferSize[0]) return AAC_DEC_UNKNOWN;
+#endif
   TRANSPORTDEC_ERROR tpErr;
   /* loop counter for layers; if not TT_MP4_RAWPACKETS used as index for only
      available layer */

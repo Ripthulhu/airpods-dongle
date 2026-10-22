@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "btstack.h"
+#include "../tinyusb/dongle_protocol.h"
 
 // One-time setup. Call once from btstack_main() after l2cap_init().
 void aacp_init(void);
@@ -44,5 +45,21 @@ void aacp_mic_stop(void);
 
 // True after START is sent or unsolicited audio arrives, until quiet after STOP/close.
 bool aacp_mic_active(void);
+
+// Bounded host controls; readback is separate from command acceptance.
+uint32_t aacp_control_session(void);
+bool aacp_control_ready(void);
+const dongle_readback_t *aacp_control_readback(void);
+bool aacp_control_anc(uint8_t mode);
+bool aacp_control_address(bd_addr_t address);
+
+// Bounded settings transport; completion means sent locally, not device readback.
+bool aacp_research_send(const uint8_t *packet, uint16_t length);
+int aacp_research_take(void); // 0 waiting/idle, 1 sent, 2 failed
+void aacp_research_cancel(void);
+// Slots: model, hearing gate, assist gate, PME configuration, ear status.
+// Returns little-endian u32 age (ms), u32 receipt revision, then the raw report.
+// Revision changes even for identical reports and resets with the AACP session.
+uint16_t aacp_research_cached(uint8_t slot, uint8_t *out, uint16_t capacity);
 
 #endif // BTSTACK_AACP_H

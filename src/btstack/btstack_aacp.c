@@ -89,6 +89,34 @@ typedef struct {
 #define AACP_MIC_PREPARE_TIMEOUT_MS 1000
 static aacp_pkt_t aacp_tx_queue[AACP_TX_QUEUE_LEN];
 static uint8_t aacp_tx_head, aacp_tx_count;
+static uint8_t research_tx[512];
+static uint32_t research_since;
+static bool research_pending;
+static int research_result;
+static uint8_t model_report[384], hearing_report[11], assist_report[11], pme_report[140], ear_report[32];
+typedef struct { uint8_t *packet; uint16_t capacity, length; uint32_t updated, revision; } cached_report_t;
+static cached_report_t reports[] = {
+    {model_report, sizeof(model_report), 0, 0, 0}, {hearing_report, sizeof(hearing_report), 0, 0, 0},
+    {assist_report, sizeof(assist_report), 0, 0, 0}, {pme_report, sizeof(pme_report), 0, 0, 0},
+    {ear_report, sizeof(ear_report), 0, 0, 0}
+};
+static dongle_readback_t control_readback;
+static uint32_t control_session;
+// Static entries stay valid until their queued transmission completes.
+static const uint8_t control_anc[] = {4,0,4,0,9,0,0x0d,2,0,0,0};
+static const uint8_t control_transparency[] = {4,0,4,0,9,0,0x0d,3,0,0,0};
+static void control_reset(void) {
+    ++control_session;
+    dongle_readback_clear(&control_readback);
+    for (unsigned i = 0; i < sizeof(reports) / sizeof(reports[0]); ++i) {
+        reports[i].length = 0;
+        reports[i].revision = 0;
+    }
+    if (research_pending || research_result) {
+        aacp_research_cancel();
+        research_result = 2;
+    }
+}
 static uint16_t aacp_cid;
 static bool aacp_session, aacp_connected, aacp_got_control, aacp_init_sent;
 static bd_addr_t aacp_addr;
@@ -128,6 +156,7 @@ static void aacp_mic_teardown(void) {
 
 // Clear ownership before disconnect: a late event must not revive this channel.
 void aacp_disconnect(void) {
+    control_reset();
     uint16_t cid = aacp_cid;
     aacp_session = false;
     aacp_cid = 0;
@@ -193,6 +222,99 @@ static bool aacp_tx_enqueue(const uint8_t *data, uint16_t len) {
     return true;
 }
 
+uint32_t aacp_control_session(void) { return control_session; }
+bool aacp_control_ready(void) { return aacp_connected && aacp_got_control && aacp_init_sent; }
+bool aacp_control_address(bd_addr_t address) {
+    if (!address || !aacp_control_ready()) return false;
+    memcpy(address, aacp_addr, sizeof(bd_addr_t));
+    return true;
+}
+const dongle_readback_t *aacp_control_readback(void) { return &control_readback; }
+bool aacp_control_anc(uint8_t mode) {
+    if (!aacp_control_ready() || !control_readback.anc || (mode != 2 && mode != 3)) return false;
+    // Keep capacity for microphone STOP and recovery even if a host floods controls.
+    for (unsigned i = 0; i < aacp_tx_count; ++i) {
+        const uint8_t *p = aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN].data;
+        if (p == control_anc || p == control_transparency) return false;
+    }
+    if (aacp_tx_count >= AACP_TX_QUEUE_LEN - 2) return false;
+    return aacp_tx_enqueue(mode == 2 ? control_anc : control_transparency, sizeof(control_anc));
+}
+
+void aacp_research_cancel(void) {
+    unsigned kept = 0;
+    for (unsigned i = 0; i < aacp_tx_count; ++i) {
+        aacp_pkt_t packet = aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN];
+        if (packet.data == research_tx) continue;
+        aacp_tx_queue[(aacp_tx_head + kept++) % AACP_TX_QUEUE_LEN] = packet;
+    }
+    aacp_tx_count = (uint8_t)kept;
+    research_pending = false;
+    research_result = 0;
+}
+static bool research_valid(const uint8_t *p, uint16_t n) {
+    static const uint8_t header[] = {4,0,4,0};
+    if (!p || n < 6 || n > sizeof(research_tx) || memcmp(p, header, sizeof(header)) || p[5]) return false;
+    if (p[4] == 9 && n == 11 && p[9] == 0 && p[10] == 0) {
+        if (p[6] == 0x2c) return p[7] <= 2 && (p[8] == 1 || p[8] == 2);
+        if (p[6] == 0x33) return (p[7] == 1 || p[7] == 2) && p[8] == 0;
+        if (p[6] == 0x0d) return (p[7] == 2 || p[7] == 3) && p[8] == 0;
+    }
+    if (p[4] == 0x53) return n == 140 && p[6] == 0x84 && p[7] == 0 && p[8] == 2 &&
+        p[9] <= 2 && (p[10] == 1 || p[10] == 2) && (p[11] == 1 || p[11] == 2);
+    if (p[4] == 0x0f) return n == sizeof(aacp_request_notifications) &&
+        memcmp(p, aacp_request_notifications, n) == 0;
+    if (p[4] != 0x1b || n != 41 || little_endian_read_16(p, 14) != 25 ||
+        dongle_u32(p + 10) >= 1000000 || memcmp(p + 35, "+00:00", 6)) return false;
+    for (unsigned i = 16; i < 35; ++i) {
+        uint8_t separator = i == 20 || i == 23 ? '-' : i == 26 ? 'T' : i == 29 || i == 32 ? ':' : 0;
+        if (separator ? p[i] != separator : (p[i] < '0' || p[i] > '9')) return false;
+    }
+    return true;
+}
+bool aacp_research_send(const uint8_t *packet, uint16_t length) {
+    if (!aacp_control_ready() || research_pending || research_result || !research_valid(packet, length) ||
+        aacp_tx_count >= AACP_TX_QUEUE_LEN - 2 || length > l2cap_get_remote_mtu_for_local_cid(aacp_cid)) return false;
+    memcpy(research_tx, packet, length);
+    research_since = btstack_run_loop_get_time_ms();
+    research_pending = true;
+    if (aacp_tx_enqueue(research_tx, length)) return true;
+    research_pending = false;
+    return false;
+}
+int aacp_research_take(void) {
+    int result = research_result;
+    research_result = 0;
+    return result;
+}
+uint16_t aacp_research_cached(uint8_t slot, uint8_t *out, uint16_t capacity) {
+    if (!aacp_control_ready() || slot < 1 || slot > sizeof(reports) / sizeof(reports[0]) || !out) return 0;
+    cached_report_t *report = &reports[slot - 1];
+    if (!report->length || capacity < report->length + 8u) return 0;
+    dongle_put32(out, btstack_run_loop_get_time_ms() - report->updated);
+    dongle_put32(out + 4, report->revision);
+    memcpy(out + 8, report->packet, report->length);
+    return report->length + 8;
+}
+static void research_cache(const uint8_t *p, uint16_t n) {
+    int slot = -1;
+    if (p[4] == 0x1d) slot = 0;
+    else if (p[4] == 9 && n >= 7 && p[6] == 0x2c) slot = 1;
+    else if (p[4] == 9 && n >= 7 && p[6] == 0x33) slot = 2;
+    else if (p[4] == 0x53) {
+        if (n == 10 && p[6] == 2 && p[7] == 0 && p[8] == 1) return;
+        slot = 3;
+    } else if (p[4] == 6) slot = 4;
+    if (slot < 0) return;
+    cached_report_t *report = &reports[slot];
+    if (++report->revision == 0) ++report->revision;
+    report->length = 0;
+    if (n > report->capacity) return;
+    memcpy(report->packet, p, n);
+    report->length = n;
+    report->updated = btstack_run_loop_get_time_ms();
+}
+
 static bool aacp_mic_start_queued(void) {
     for (unsigned i = 0; i < aacp_tx_count; ++i) {
         if (aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN].data == aacp_mic_start_bytes)
@@ -214,6 +336,7 @@ static void aacp_drop_mic_commands(void) {
 }
 
 static void aacp_channel_failed(void) {
+    control_reset();
     uint16_t cid = aacp_cid;
     aacp_cid = 0;
     aacp_connected = aacp_got_control = aacp_init_sent = false;
@@ -351,6 +474,7 @@ static void aacp_handle_can_send_now(void) {
     aacp_tx_head = (uint8_t)((aacp_tx_head + 1) % AACP_TX_QUEUE_LEN);
     aacp_tx_count--;
     aacp_tx_since_ms = btstack_run_loop_get_time_ms();
+    if (p.data == research_tx) { research_pending = false; research_result = 1; }
     if (p.data == aacp_request_notifications) aacp_init_sent = true;
     if (p.data == aacp_mic_start_bytes) {
         aacp_mic_preparing = false;
@@ -382,6 +506,10 @@ void aacp_poll(void) {
             l2cap_request_can_send_now_event(aacp_cid);
     }
     uint32_t now = btstack_run_loop_get_time_ms();
+    if (research_pending && (uint32_t)(now - research_since) >= 3000u) {
+        aacp_research_cancel();
+        research_result = 2;
+    }
     if (aacp_cid != 0 &&
         ((!aacp_connected || !aacp_got_control || !aacp_init_sent) &&
          (uint32_t)(now - aacp_channel_since_ms) >= AACP_CHANNEL_TIMEOUT_MS)) {
@@ -473,6 +601,8 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
         if (little_endian_read_16(packet, 4) == 0x58) {
             aacp_handle_audio_sdu(packet, size);
         } else {
+            research_cache(packet, size);
+            dongle_readback_packet(&control_readback, packet, size, btstack_run_loop_get_time_ms());
             aacp_got_control = true;
             aacp_try_mic_start();
         }

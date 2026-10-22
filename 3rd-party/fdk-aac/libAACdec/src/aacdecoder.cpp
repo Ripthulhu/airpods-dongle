@@ -157,6 +157,7 @@ amm-info@iis.fraunhofer.de
 */
 
 #include "aacdecoder.h"
+#include "FDK_dongle_profile.h"
 
 #include "aac_rom.h"
 #include "aac_ram.h"
@@ -1565,6 +1566,15 @@ CAacDecoder_Init(HANDLE_AACDECODER self, const CSAudioSpecificConfig *asc,
   UCHAR mpsEnableCurr = self->mpsEnableCurr;
 
   if (!self) return AAC_DEC_INVALID_HANDLE;
+
+#ifdef FDK_AIRPODS_PROFILE
+  if (asc == NULL || asc->m_aot != AOT_ER_AAC_ELD ||
+      asc->m_channelConfiguration != 1 || asc->m_samplingFrequency != 48000 ||
+      asc->m_samplesPerFrame != 480 || asc->m_sbrPresentFlag > 0 ||
+      asc->m_psPresentFlag > 0 || asc->m_sc.m_eldSpecificConfig.m_sbrPresentFlag) {
+    return AAC_DEC_UNSUPPORTED_FORMAT;
+  }
+#endif
 
   UCHAR downscaleFactor = self->downscaleFactor;
   UCHAR downscaleFactorInBS = self->downscaleFactorInBS;

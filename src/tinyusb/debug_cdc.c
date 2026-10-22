@@ -19,7 +19,8 @@
 
 #include "debug_cdc.h"
 
-#define DBG_BUF_SIZE 8192u                 // must be a power of two
+// Diagnostic history is expendable; reserve scarce SRAM for live duplex audio.
+#define DBG_BUF_SIZE 2048u                 // must be a power of two
 #define DBG_BUF_MASK (DBG_BUF_SIZE - 1u)
 
 static uint8_t           dbg_buf[DBG_BUF_SIZE];
@@ -65,7 +66,7 @@ void debug_cdc_init(void) {
 void debug_cdc_task(void) {
     if (dbg_tail == dbg_head && dbg_dropped == 0) return;
     // Drain only while a terminal is actually attached (DTR asserted). Until
-    // then, output accumulates in the 8KB ring, so boot/pairing logs are still
+    // then, output accumulates in the 2KB ring, so recent boot/pairing logs are still
     // delivered when the user opens the terminal late.
     if (!tud_cdc_connected()) return;
 

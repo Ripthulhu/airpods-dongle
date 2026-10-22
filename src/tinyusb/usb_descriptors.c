@@ -120,8 +120,20 @@ uint8_t const * tud_descriptor_device_cb(void)
 #define EPNUM_CDC_IN      0x84
 #define EPNUM_HID_IN      0x85
 
-// Standard Consumer Control collection; no vendor feature reports.
-static const uint8_t desc_hid_report[] = { TUD_HID_REPORT_DESC_CONSUMER() };
+// Separate top-level collections: Windows media keys and NTPods controls.
+static const uint8_t desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(1)),
+    0x06, 0x31, 0xff, // Usage Page (vendor FF31)
+    0x09, 0x01,       // Usage 1
+    0xa1, 0x01,       // Application collection
+    0x85, 0x02,       // Report ID 2
+    0x15, 0x00, 0x26, 0xff, 0x00, // Logical 0..255
+    0x75, 0x08, 0x95, 0x3f,       // 63 bytes + report ID
+    0x09, 0x01, 0xb1, 0x02,       // Feature (Data, Variable, Absolute)
+    0x85, 0x03,                   // Report ID 3: bounded settings transactions
+    0x09, 0x02, 0xb1, 0x02,
+    0xc0
+};
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
     return instance == 0 ? desc_hid_report : NULL;

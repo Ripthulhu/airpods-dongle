@@ -21,8 +21,7 @@ void phone_codec_reset(void) {
                 == OI_STATUS_SUCCESS;
 }
 
-bool phone_codec_configure(phone_codec_t codec, const phone_sbc_config_t *config) {
-    selected = PHONE_CODEC_NONE;
+bool phone_codec_configuration_valid(phone_codec_t codec, const phone_sbc_config_t *config) {
     if (!phone_codec_available(codec)) return false;
     if (codec == PHONE_CODEC_SBC) {
         if (config == NULL || (config->blocks != 4 && config->blocks != 8 &&
@@ -32,8 +31,14 @@ bool phone_codec_configure(phone_codec_t codec, const phone_sbc_config_t *config
             config->allocation > 1 || config->min_bitpool < 2 ||
             config->max_bitpool > 53 || config->min_bitpool > config->max_bitpool)
             return false;
-        configuration = *config;
     }
+    return true;
+}
+
+bool phone_codec_configure(phone_codec_t codec, const phone_sbc_config_t *config) {
+    selected = PHONE_CODEC_NONE;
+    if (!phone_codec_configuration_valid(codec, config)) return false;
+    if (codec == PHONE_CODEC_SBC) configuration = *config;
     selected = codec;
     phone_codec_reset();
     return true;

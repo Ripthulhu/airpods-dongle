@@ -102,6 +102,7 @@ amm-info@iis.fraunhofer.de
 
 #include "aac_ram.h"
 #include "aac_rom.h"
+#include "FDK_dongle_profile.h"
 
 #define WORKBUFFER1_TAG 0
 #define WORKBUFFER2_TAG 1
@@ -177,6 +178,6 @@ C_ALLOC_MEM_OVERLAY(WorkBufferCore1, CWorkBufferCore1, 1, SECT_DATA_L1,
                     WORKBUFFER1_TAG)
 
 /* double buffer size needed for de-/interleaving */
-/* USBPods: (8) -> (2) channels, see WorkBufferCore2 note above. */
-C_ALLOC_MEM_OVERLAY(WorkBufferCore5, PCM_DEC, (2) * (1024 * 4) * 2,
+/* The profile rejects non-mono/non-ELD input before using this workspace. */
+C_ALLOC_MEM_OVERLAY(WorkBufferCore5, PCM_DEC, FDK_DECODER_TIME_SAMPLES,
                     SECT_DATA_EXTERN, WORKBUFFER5_TAG)

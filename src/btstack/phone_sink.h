@@ -11,6 +11,7 @@ bool phone_sink_init(void);
 void phone_sink_poll(void);
 // Thread context, under the Bluetooth lock: release phone decoder before USB mic allocation.
 void phone_sink_yield(void);
+bool phone_sink_decoder_released(void);
 bool phone_sink_connected(void);
 bool phone_sink_active(void);
 bool phone_sink_owns_controls(void);

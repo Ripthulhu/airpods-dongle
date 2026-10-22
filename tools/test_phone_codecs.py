@@ -64,6 +64,7 @@ def main():
                 "-I", str(codec / "decoder/include"), "-I", str(codec / "encoder/include")]
     sources = [ROOT / "tests/phone_codec_test.c", ROOT / "tests/phone_resample_test.c",
                sdk / "lib/btstack/src/btstack_resample.c", ROOT / "src/btstack/phone_codec.c",
+               ROOT / "src/btstack/phone_worker.c",
                ROOT / "3rd-party/libfreeaptx/freeaptx.c"]
     sources += sorted((codec / "decoder/srce").glob("*.c"))
     sources += sorted((codec / "encoder/srce").glob("*.c"))
@@ -76,6 +77,13 @@ def main():
         for index, source in enumerate(sources):
             obj = Path(temporary) / f"{index}.o"
             flags = command.copy()
+            if args.arm and source.name == "phone_worker.c":
+                # The installed QEMU M33 model has no FPU, so this harness uses
+                # M7. Compile its C11 atomics as equivalent DMB/load/store ops;
+                # ARMv8 LDA/STL instructions cannot execute on that M7 model.
+                # The firmware build still compiles this file for Cortex-M33.
+                flags = [flag for flag in flags if not flag.startswith(("-mcpu=", "-march="))]
+                flags += ["-mcpu=cortex-m7"]
             # Pinned SBC fixed-point code uses signed/zero-bit shifts intentionally.
             # Retain address/bounds checks there and full UB checks in our wrapper.
             if args.sanitize and source.is_relative_to(codec):

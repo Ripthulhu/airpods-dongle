@@ -17,15 +17,18 @@ Pro 3 testing; that does not validate these changes.
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
 - Phone Bluetooth input with classic aptX where negotiated and SBC fallback.
 - Simultaneous AACP microphone, opened only by a USB recording request.
-- Microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
+- Phone or microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
 - 100 ms encoded startup silence for AAC-ELD, sent before accepting phone playback.
 - Stem media controls and volume routed to the active phone or USB input.
 - Two saved headset slots; reconnect uses the selected address and its bond.
 - Bounded recovery, packet validation and USB suspend/disconnect cleanup.
 
-The serial port currently carries diagnostics. NTPods settings, hearing controls,
-battery display and LibrePods switching are not connected to this firmware yet.
+NTPods can use the [USB control interface](docs/USB-CONTROL.md) for pairing,
+reconnect, reported batteries, ANC/transparency, hearing assistance and hardware
+checks. It uses Windows' built-in HID driver; USB audio and microphone also work
+independently of the app. Sensors and LibrePods switching are not ported yet.
+The serial port remains a diagnostic console.
 LDAC is unsupported: the inherited encoder path could exceed the negotiated packet
 limit, and AirPods do not need that codec.
 
@@ -37,8 +40,8 @@ The firmware links both Classic and BLE through one BTstack controller. The
 | Communication | Transport | Current implementation |
 | --- | --- | --- |
 | Playback and stem media controls | Classic AVDTP / AVRCP | Implemented |
-| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Microphone implemented; settings still need a host interface |
-| Hearing profiles and saved diagnostics | ATT over Classic, PSM `0x001F` | Not ported yet |
+| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Microphone, batteries, ANC/transparency and hearing modes through USB HID |
+| Hearing profiles and saved diagnostics | ATT over Classic, PSM `0x001F` | Complete profile edits, saved checks, read-only hearing metadata and guarded in-case self-checks |
 | Proximity and offline advertisements | BLE | Passive reception, RSSI, reception time and raw records |
 | Case DULT / Find My service | BLE GATT | Not ported yet |
 
@@ -57,8 +60,9 @@ both during wireless playback. Passive scanning uses no connection slot.
 
 ## Build
 
-Requires Python 3, Git, CMake 3.17+, Ninja and a complete Arm GNU embedded C/C++
-toolchain with newlib. Development builds use GCC 13.2.1 under Ubuntu 24.04/WSL.
+Requires Python 3, Git, CMake 3.17+, Ninja, `qemu-system-arm` and a complete Arm GNU
+embedded C/C++ toolchain with newlib. Development builds use GCC 13.2.1 under
+Ubuntu 24.04/WSL.
 
 ```sh
 python3 tools/prepare_sdk.py --sdk .sdk/pico-sdk
@@ -73,6 +77,9 @@ The SDK helper pins Pico SDK 2.1.1 and its submodules, checks original file hash
 applies the reviewed patches, and verifies readback. Configuration and builds
 reject missing patches or unknown patch states. The UF2 tool is pinned to
 picotool 2.1.1. Use a separate SDK checkout rather than modifying a shared one.
+Every firmware link runs the [real-codec memory check](tools/codec_probe/README.md)
+against that ELF and its fingerprinted codec archive. The build fails if the
+tested allocations cannot leave a 64 KiB runtime reserve.
 
 ## Use
 
@@ -88,6 +95,11 @@ and connects it. During playback, those presses adjust volume instead.
 Opening the USB microphone starts capture; closing it, suspending USB or losing
 the USB configuration cancels capture. **AirPods Dongle Console** exposes bounded diagnostic logs.
 
+Install NTPods with its default app-only setup for dongle controls. The optional
+Direct Bluetooth driver feature is only for a PC Bluetooth adapter; the dongle
+needs no test-signed driver, Test Mode or host vendor-ID override. Opening NTPods'
+dongle controls does not acquire audio. Select **AirPods Dongle** in Windows Sound.
+
 ## Tests and hardware checks
 
 Run native C and Python tests on Linux/WSL:
@@ -102,7 +114,9 @@ Use `--arm` instead of `--sanitize` for the ARM32 codec check; it requires QEMU.
 
 The tests cover malformed packets, phone codec negotiation and controls,
 early startup priming, stale connections, cancelled recording,
-decoder failures, PCM ordering, media-key release/retry, BLE pause/resume and
+decoder failures, cross-core cancellation/teardown, USB control identity and
+command receipts, fragmented settings transfers, interrupted writes, stale
+profile readback, PCM ordering, media-key release/retry, BLE pause/resume and
 advertisement bounds, and SDK patch validation.
 They do not measure radio behavior or acoustic latency. Slot migration, failed
 storage, partial console writes and button timing boundaries also have regression tests.
@@ -118,12 +132,17 @@ heap margin and microphone clock drift remain unmeasured. The microphone uses
 the inherited 64 kHz USB presentation clock with a 48 kHz AAC coding configuration;
 this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
-Both cores have guarded 16 KiB stacks. The current build leaves 378 KiB of heap
-before codec allocations. A real-codec ARM emulation check leaves about 7 KiB
-after encoder/decoder initialization, before other runtime allocations. Hardware
-heap and stack measurements are still required.
+Both cores have guarded 16 KiB stacks. The current build leaves 389,736 bytes of
+heap before codec allocations. Buffers sized for stereo encoding and the fixed
+mono microphone save 192,992 bytes without reducing audio queues. ARM emulation
+leaves 201,696 bytes at the tested codec allocation peak, before other runtime
+use. Hardware heap and stack measurements are still required.
 Phone playback releases the idle microphone decoder before preparing its input
-codec; USB recording releases the phone decoder before allocating the microphone.
+codec and 9,772-byte worker queue; USB recording waits for worker detachment and
+frees both before allocating the microphone. Diagnostic history is limited to
+2 KiB, with dropped-byte counts, to leave more memory for audio.
+If microphone initialization fails, reopening recording makes one fresh attempt
+after any failed worker has detached.
 
 USB audio on Android needs an OTG/power and enumeration check. Wireless stereo
 bridging also needs dual-link radio and latency checks. Phone calls are not

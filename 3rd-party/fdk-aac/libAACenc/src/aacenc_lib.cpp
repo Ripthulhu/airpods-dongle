@@ -1484,6 +1484,14 @@ AACENC_ERROR aacEncOpen(HANDLE_AACENCODER *phAacEncoder, const UINT encModules,
     goto bail;
   }
 
+#ifdef FDK_AIRPODS_PROFILE
+  if (encModules != ENC_MODE_FLAG_AAC || maxChannels == 0 ||
+      (maxChannels & 0x00ff) > FDK_ENCODER_WORK_CHANNELS ||
+      (maxChannels >> 8) != 0) {
+    return AACENC_INVALID_CONFIG;
+  }
+#endif
+
   /* allocate memory */
   hAacEncoder = Get_AacEncoder();
 

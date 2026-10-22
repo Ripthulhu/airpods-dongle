@@ -7,6 +7,13 @@
 #include "tusb.h"
 #include "../src/tinyusb/media_control.h"
 
+void dongle_control_available(bool available) { (void)available; }
+void dongle_rpc_available(bool available) { (void)available; }
+uint16_t dongle_rpc_get(uint8_t *buffer, uint16_t size) { (void)buffer; (void)size; return 0; }
+void dongle_rpc_set(const uint8_t *buffer, uint16_t size) { (void)buffer; (void)size; }
+uint16_t dongle_control_get(uint8_t *buffer, uint16_t size) { (void)buffer; (void)size; return 0; }
+void dongle_control_set(const uint8_t *buffer, uint16_t size) { (void)buffer; (void)size; }
+
 static bool ready = true;
 static bool reject_report;
 static uint16_t reports[128];
@@ -15,7 +22,7 @@ static unsigned ready_queries;
 
 bool tud_hid_ready(void) { ready_queries++; return ready; }
 bool tud_hid_report(uint8_t report_id, const void *report, uint16_t length) {
-    assert(report_id == 0 && length == 2 && ready);
+    assert(report_id == 1 && length == 2 && ready);
     if (reject_report) return false;
     const uint8_t *bytes = report;
     assert(count < sizeof(reports) / sizeof(reports[0]));
@@ -73,7 +80,7 @@ int main(void) {
     tick();
     assert(reports[count - 1] == 0xb6); // rejected transfer retained the event
     uint8_t report[2];
-    assert(tud_hid_get_report_cb(0, 0, HID_REPORT_TYPE_INPUT, report, 2) == 2);
+    assert(tud_hid_get_report_cb(0, 1, HID_REPORT_TYPE_INPUT, report, 2) == 2);
     assert(report[0] == 0xb6 && report[1] == 0);
     assert(tud_hid_get_report_cb(1, 0, HID_REPORT_TYPE_INPUT, report, 2) == 0);
     assert(tud_hid_get_report_cb(0, 0, HID_REPORT_TYPE_OUTPUT, report, 2) == 0);

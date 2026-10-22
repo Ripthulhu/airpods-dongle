@@ -5,6 +5,7 @@
 #include "classic/a2dp.h"
 #include "btstack_hci.h"
 #include "phone_codec.h"
+#include "phone_worker.h"
 #include "phone_sink.h"
 
 #ifndef ENABLE_AVDTP_ACCEPTOR_EXPLICIT_START_STREAM_CONFIRMATION
@@ -84,7 +85,7 @@ static uint32_t read_be32(const uint8_t *p) {
 static void audio_stop(void) {
     phone.started = phone.start_pending = phone.start_accepted = false;
     phone.sequence_valid = false;
-    phone_codec_reset();
+    phone_worker_reset();
     bridge_phone_stop();
 }
 
@@ -233,7 +234,7 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
             if (!parse_configuration(packet, size, &codec, &sbc)) return;
             audio_stop();
             phone.controls_owned = false;
-            if (!phone_codec_configure(codec, codec == PHONE_CODEC_SBC ? &sbc : NULL)) {
+            if (!phone_worker_configure(codec, codec == PHONE_CODEC_SBC ? &sbc : NULL)) {
                 disconnect_phone();
                 return;
             }
@@ -331,7 +332,7 @@ static void decoded_pcm(const int16_t *stereo, uint16_t frames, void *context) {
 
 static void bad_packet(void) {
     phone.malformed++;
-    phone_codec_reset();
+    phone_worker_reset();
     bridge_phone_drop_pcm();
 }
 
@@ -340,7 +341,7 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
     // Classic aptX on Android has raw codewords, without RTP or a media header.
     if (phone.codec == PHONE_CODEC_APTX) {
         if (packet == NULL || size == 0 || size > PHONE_CODEC_MAX_PAYLOAD || size % 4u != 0 ||
-            !phone_codec_decode(packet, size, 0, decoded_pcm, NULL)) {
+            !phone_worker_submit(packet, size, 0)) {
             bad_packet();
             return;
         }
@@ -382,17 +383,17 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
         if (advance == 0 || advance >= 0x8000u) return; // duplicate or late packet
         if (advance != 1u) {
             phone.sequence_gaps++;
-            phone_codec_reset();
+            phone_worker_reset();
             bridge_phone_drop_pcm();
         }
     } else if (phone.sequence_valid) {
-        phone_codec_reset();
+        phone_worker_reset();
         bridge_phone_drop_pcm();
     }
     phone.sequence_valid = true;
     phone.last_sequence = sequence;
     phone.ssrc = ssrc;
-    if (!phone_codec_decode(packet + offset, length, frames, decoded_pcm, NULL)) {
+    if (!phone_worker_submit(packet + offset, length, frames)) {
         bad_packet();
         return;
     }
@@ -441,6 +442,7 @@ static uint8_t send_control(uint8_t operation) {
 }
 
 void phone_sink_poll(void) {
+    if (!phone_worker_poll(decoded_pcm, NULL)) bad_packet();
     if (phone.select_codec && phone.cid != 0 && !phone.configured) {
         phone.select_codec = false;
         uint8_t status = ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE;
@@ -455,13 +457,13 @@ void phone_sink_poll(void) {
         }
         if (status != ERROR_CODE_SUCCESS) disconnect_phone();
     }
-    if (phone.configured && !phone_codec_ready() && !phone_codec_prepare()) {
+    if (phone.configured && !phone_worker_ready() && phone_worker_prepare() == PHONE_WORKER_FAILED) {
         if (phone.codec == PHONE_CODEC_APTX) aptx_disabled = retry_sbc = true;
         printf("[PHONE] decoder unavailable; reconnect with SBC\n");
         reject_start();
         disconnect_phone();
     }
-    if (!phone.configured) phone_codec_close();
+    if (!phone.configured) phone_worker_close();
     disable_failed_aptx_endpoint();
     if (retry_sbc && phone.cid == 0) {
         retry_sbc = false;
@@ -483,14 +485,14 @@ void phone_sink_poll(void) {
         if ((uint32_t)(now - phone.pending_since_ms) >= PHONE_START_TIMEOUT_MS) {
             printf("[PHONE] AirPods priming timed out\n");
             reject_start();
-        } else if (phone_codec_ready() && bridge_phone_open() && bridge_phone_ready()) {
+        } else if (phone_worker_ready() && bridge_phone_open() && bridge_phone_ready()) {
             if (!bridge_phone_start()) {
                 reject_start();
             } else {
                 phone.start_pending = false;
                 phone.start_accepted = true;
                 phone.pending_since_ms = now;
-                phone_codec_reset();
+                phone_worker_reset();
                 if (phone.volume_valid) bridge_phone_volume(phone.volume);
                 if (a2dp_sink_start_stream_accept(phone.cid, phone.seid) != ERROR_CODE_SUCCESS) {
                     audio_stop();
@@ -516,8 +518,10 @@ void phone_sink_poll(void) {
 void phone_sink_yield(void) {
     retry_sbc = false;
     if (!phone.disconnecting) disconnect_phone();
-    phone_codec_close();
+    phone_worker_close();
 }
+
+bool phone_sink_decoder_released(void) { return phone_worker_released(); }
 
 bool phone_sink_connected(void) { return phone.cid != 0; }
 bool phone_sink_active(void) { return phone.started || phone.start_accepted; }

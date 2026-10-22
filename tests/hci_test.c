@@ -471,12 +471,12 @@ static void test_phone_storage_rejects_unknown_and_failed_writes(void) {
     memcpy(stored_phone.address, nearby, 6);
     stored_phone_length = sizeof(stored_phone);
     bt_hci_init();
-    bt_hci_phone_pairing_start();
+    assert(!bt_hci_phone_pairing_start());
     assert(!bt_hci_phone_pairing_active() && discoverable == 0 && !allow(nearby, HCI_LINK_TYPE_ACL));
     fixture();
     tlv_missing = true;
     bt_hci_init();
-    bt_hci_phone_pairing_start();
+    assert(!bt_hci_phone_pairing_start());
     assert(!bt_hci_phone_pairing_active());
 
     for (unsigned fault = 0; fault < 2; ++fault) {

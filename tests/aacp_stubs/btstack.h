@@ -29,6 +29,7 @@ uint8_t l2cap_create_channel(btstack_packet_handler_t handler, bd_addr_t addr,
 void l2cap_disconnect(uint16_t cid);
 void l2cap_request_can_send_now_event(uint16_t cid);
 uint8_t l2cap_send(uint16_t cid, uint8_t *data, uint16_t len);
+uint16_t l2cap_get_remote_mtu_for_local_cid(uint16_t cid);
 static inline uint16_t little_endian_read_16(const uint8_t *p, unsigned off) {
     return (uint16_t)(p[off] | (uint16_t)p[off + 1] << 8);
 }

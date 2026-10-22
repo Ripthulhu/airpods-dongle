@@ -163,6 +163,10 @@ static btstack_resample_t phone_resampler;
 static void playback_media_sent(void);
 static uint8_t cur_codec = 0;
 
+uint8_t dongle_output_codec(void) {
+    return get_a2dp_connected_flag() ? (cur_codec == 4 ? 3 : cur_codec <= 2 ? cur_codec : 0) : 0;
+}
+
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
@@ -1822,7 +1826,7 @@ static int setup_aaceld_configuration(){
 }
 
 
-void avdtp_disconnect_and_scan(){
+bool avdtp_disconnect_and_scan(void){
     a2dp_accept_incoming = false;
     a2dp_demo_timer_stop(&media_tracker);
     aacp_disconnect();
@@ -1842,11 +1846,11 @@ void avdtp_disconnect_and_scan(){
     if (!cleared) {
         printf("Pairing slot could not be cleared\n");
         set_led_mode_off();
-        return;
+        return false;
     }
     gap_drop_link_key_for_bd_addr((uint8_t *) get_device_addr());
     //gap_delete_all_link_keys();
-    gap_start_scanning();
+    return gap_start_scanning();
 }
 
 void avdtp_source_establish_stream(void) {

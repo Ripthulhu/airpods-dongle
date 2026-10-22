@@ -32,11 +32,12 @@ bool * get_is_bt_sink_volume_changed_ptr();
 
 int btstack_main(int argc, const char * argv[]);
 
-void avdtp_disconnect_and_scan(void);
+bool avdtp_disconnect_and_scan(void);
 
-void gap_start_scanning(void);
+bool gap_start_scanning(void);
 
 bool get_a2dp_connected_flag();
+uint8_t dongle_output_codec(void);
 
 void a2dp_source_reconnect();
 

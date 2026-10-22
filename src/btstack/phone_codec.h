@@ -16,6 +16,7 @@ typedef void (*phone_codec_pcm_callback)(const int16_t *stereo, uint16_t frames,
 
 // Capability only; prepare() must succeed before accepting a stream Start.
 bool phone_codec_available(phone_codec_t codec);
+bool phone_codec_configuration_valid(phone_codec_t codec, const phone_sbc_config_t *sbc);
 bool phone_codec_configure(phone_codec_t codec, const phone_sbc_config_t *sbc);
 // Thread context under the Bluetooth lock: allocates/frees aptX only here.
 bool phone_codec_prepare(void);

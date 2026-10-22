@@ -1,42 +1,49 @@
-# ARM codec probe
+# ARM codec memory check
 
-Runs the built FDK codec with 32-bit ARM pointers and newlib allocation. It checks
-real stereo AAC-ELD encoding, mono microphone-shaped decoding, codec heap use and
-stack writes. No Pico, Bluetooth or USB device is emulated.
+Every firmware link runs the built FDK codec with ARM32 pointers and newlib
+allocation. It derives heap capacity from that ELF's `end` and `__StackLimit`,
+then subtracts a required 64 KiB allowance for other runtime use. An archive hash
+retained in flash binds the tested library to the firmware. Missing tools,
+unsupported layouts, mismatched inputs, failed checks or timeouts fail the build.
 
-Requires the build toolchain and `qemu-system-arm`. Run on Linux/WSL after building:
+Requires the ARM build toolchain and `qemu-system-arm`. To repeat the check:
 
 ```sh
-arm-none-eabi-nm build/airpods_dongle.elf | rg ' (__StackLimit|end)$'
 python3 tools/codec_probe/run.py \
-  --library build/3rd-party/fdk-aac/libfdk-aac.a \
-  --heap-bytes 392512
+  --firmware build/airpods_dongle.elf \
+  --library build/3rd-party/fdk-aac/libfdk-aac.a
 ```
 
-Calculate `--heap-bytes` as `__StackLimit - end` from that exact firmware ELF;
-392512 is an example build value. Generated files stay in ignored `build/codec-probe`.
-The runner bounds compilation to 60 seconds and emulation to 40 seconds.
+The CMake target `check_codec_memory` also repeats it. Generated files stay in
+ignored `build/codec-probe`. Symbol inspection is bounded to ten seconds;
+compilation and emulation each have a 60-second timeout. A failed or interrupted
+recheck removes any previous passing receipt. `memory-check.json` records input
+hashes, capacity, reserve, allocator peak and remaining space.
 
-The fixture generates 16 mono 480-sample AAC-ELD frames at 48 kHz, 64 kbps, with
-ASC `F8 E6 30 00`. It closes that fixture encoder, keeps the production-style
-stereo 256 kbps encoder open and decodes all 16 mono frames. The encoded data and
-decoded samples must retain checksum `4105af5d`. The fixture's preparation encoder
-is not part of the measured simultaneous encoder/decoder heap use.
+The check covers:
 
-With GCC 13.2.1 and the pinned library, before and after the coupling-element
-parser stack fix, live codec allocations total 379864 bytes: 121696 for the stereo
-encoder and 258168 more for the configured mono decoder. Allocator bookkeeping
-and fragmentation use additional space; this is not total firmware memory use.
+- Stereo ELD at 48 kHz/256 kbps together with mono microphone decoding. Sixteen
+  generated 480-sample frames with ASC `F8 E6 30 00` retain checksum `4105af5d`.
+- 960 encoded frames across ten AAC/AAC-ELD bitrate configurations, compared with
+  fixed hashes from the original library.
+- Unsupported configurations, truncated/malformed input, reset recovery, limiter
+  operation and output canaries.
+- Eight allocation lifecycles each for ELD-256, LC-128 and LC-220, including both
+  allocation orders and recreating playback while retaining the microphone decoder.
 
-The stack marker starts 128 bytes below the probe helper's stack pointer. Reported
-depths exclude that gap, the caller's existing frame and firmware interrupt nesting.
-The tested decoder path changed from 41972 bytes below the marker to 7420 bytes;
-the stereo encoder path touches 7228 bytes. These observations do not
-prove a bound for every input or replace firmware stack guards.
+With GCC 13.2.1 and firmware 0.1.7, live stereo/microphone allocations total
+186,872 bytes; the tested allocator peak is 188,040 bytes. The linked heap is
+389,736 bytes, leaving 201,696 bytes at that peak before other runtime allocations.
+The 64 KiB reserve is a policy allowance, not a measured application requirement.
 
-The installed QEMU 8.2 Cortex-M33 model does not expose an FPU. The harness runs
-the same Cortex-M33-compiled fixed-point codec on its Cortex-M7 model, which can
-execute these instructions and newlib's FP register transfers. Pointer sizes and
-allocation layouts remain ARM32. This is a functional and memory check, never an
-RP2350 timing, concurrency, power or radio measurement. The generated fixture is
-not a captured AirPods microphone stream.
+Stack markers start 128 bytes below the helper's stack pointer. Tested decoder
+and stereo encoder depths are 7,420 and 7,332 bytes below the marker. These exclude
+the caller's existing frame and firmware interrupt nesting; they do not prove
+a bound for every input or replace firmware stack guards.
+
+QEMU 8.2's Cortex-M33 model lacks an FPU. The harness runs the same M33-compiled
+fixed-point library on its Cortex-M7 model, which supports these instructions and
+newlib's FP register transfers. Allocation layouts remain ARM32. No Pico,
+Bluetooth or USB device is emulated, and the generated microphone fixture is not
+an AirPods capture. This does not measure board timing, concurrency, power,
+radio behavior or actual runtime memory use.
