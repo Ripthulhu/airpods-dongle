@@ -5,7 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.7 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.8 LANGUAGES C CXX ASM)
 pico_sdk_init()
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
@@ -48,6 +48,8 @@ add_executable(airpods_dongle
     src/btstack/btstack_att.c
     src/btstack/aacp_mic_dec.c
     src/btstack/phone_sink.c
+    src/btstack/phone_control.c
+    src/btstack/dongle_finder.c
     src/btstack/phone_codec.c
     src/btstack/phone_worker.c
     3rd-party/libfreeaptx/freeaptx.c
@@ -57,6 +59,7 @@ add_executable(airpods_dongle
     src/tinyusb/media_control.c
     src/tinyusb/dongle_control.c
     src/tinyusb/dongle_rpc.c
+    src/tinyusb/dongle_features.c
 )
 target_include_directories(airpods_dongle PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}"

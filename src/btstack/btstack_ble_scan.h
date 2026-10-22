@@ -46,6 +46,8 @@ void ble_scan_controller_ready(bool ready);
 void ble_scan_set_paused(uint32_t reason, bool paused);
 void ble_scan_get_stats(ble_scan_stats_t *stats);
 void ble_scan_snapshot(ble_scan_snapshot_t *snapshot);
+// Borrow each cache entry under the Bluetooth lock; avoid copying the whole cache.
+void ble_scan_visit(void (*visit)(const ble_scan_report_t *,unsigned,void *),void *context);
 bool ble_scan_report_has_type(const ble_scan_report_t *report, uint8_t type);
 
 #endif

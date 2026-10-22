@@ -14,6 +14,8 @@ import make_linker
 SOURCE = b"""/* Original SDK notice. */
 MEMORY { RAM(rwx) : ORIGIN = 0x20000000, LENGTH = 512k }
     .heap (NOLOAD): {
+        __end__ = .;
+        end = __end__;
         KEEP(*(.heap*))
     } > RAM
     __HeapLimit = ORIGIN(RAM) + LENGTH(RAM);
@@ -40,6 +42,7 @@ class LinkerTests(unittest.TestCase):
         with self.fixture_hash():
             generated = make_linker.generate(SOURCE).decode()
         self.assertIn("__HeapLimit = ORIGIN(RAM) + LENGTH(RAM) - 16384;", generated)
+        self.assertIn(". = ALIGN(8);\n        __end__ = .;\n        end = __end__;", generated)
         self.assertIn(".stack_dummy __HeapLimit (NOLOAD)", generated)
         self.assertIn("KEEP(*(.stack*))\n    } > RAM", generated)
         self.assertIn("__StackLimit = __HeapLimit;", generated)

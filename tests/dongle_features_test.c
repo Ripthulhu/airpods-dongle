@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: GPL-3.0-only
+#include <assert.h>
+#include <stdio.h>
+#include "../src/tinyusb/dongle_features.c"
+
+static unsigned setting_writes, profile_writes, game_writes, starts, stops, polls;
+static uint8_t result=DONGLE_ACCEPTED;
+uint8_t aacp_setting_write(uint8_t id,uint32_t value) {
+    assert(id==0x28 && value==UINT32_C(0x89abcdef));setting_writes++;return result;
+}
+uint16_t aacp_settings_snapshot(uint8_t *out,uint16_t cap) {
+    if(cap<2)return 0;
+    out[0]=1;out[1]=0;return 2;
+}
+uint8_t dongle_playback_configure(uint8_t codec,uint8_t mode,uint32_t bitrate) {
+    assert(codec==3 && mode==1 && bitrate==174000);profile_writes++;return result;
+}
+uint8_t dongle_playback_game_mode(bool enabled) {assert(enabled);game_writes++;return result;}
+uint16_t dongle_playback_status(uint8_t *out,uint16_t cap) {
+    if(cap<20)return 0;
+    memset(out,0,20);out[0]=1;return 20;
+}
+uint16_t dongle_playback_diagnostics(uint8_t *out,uint16_t cap) {
+    if(cap<64)return 0;
+    memset(out,0,64);out[0]=1;return 64;
+}
+uint8_t dongle_finder_start(uint8_t client) {assert(client==1);starts++;return result;}
+uint8_t dongle_finder_stop(uint8_t client) {assert(client==1);stops++;return result;}
+uint16_t dongle_finder_snapshot(uint8_t client,uint8_t *out,uint16_t cap) {
+    assert(client==1);if(cap<24)return 0;memset(out,0,24);out[0]=1;return 24;
+}
+void dongle_playback_poll(void) {polls++;}
+void dongle_finder_poll(void) {polls++;}
+void dongle_finder_disconnect(uint8_t client) {assert(client==1);stops++;}
+
+int main(void) {
+    uint8_t out[64],p[64]={1,0x28,0xef,0xcd,0xab,0x89};uint16_t n=99;
+    assert(dongle_features_request(1,NULL,1,out,64,&n)==1);
+    assert(dongle_features_request(1,p,0,out,64,&n)==1);
+    assert(dongle_features_request(1,p,6,out,64,NULL)==1);
+    for(unsigned size=1;size<6;size++)assert(dongle_features_request(1,p,size,out,64,&n)==1);
+    assert(!setting_writes);
+    assert(dongle_features_request(1,p,6,p,64,&n)==0 && n==0 && setting_writes==1);
+    const uint8_t results[]={DONGLE_BUSY,DONGLE_STALE,DONGLE_DISCONNECTED,DONGLE_UNSUPPORTED,DONGLE_MALFORMED};
+    const uint8_t errors[]={2,3,4,7,1};
+    for(unsigned i=0;i<sizeof(results);i++){
+        result=results[i];assert(dongle_features_request(1,p,6,out,64,&n)==errors[i] && n==0);
+    }
+    result=DONGLE_ACCEPTED;
+    uint8_t profile[]={3,3,1,0xb0,0xa7,2,0};
+    assert(dongle_features_request(1,profile,7,out,19,&n)==1 && !profile_writes);
+    assert(dongle_features_request(1,profile,7,out,64,&n)==0 && n==20 && profile_writes==1);
+    uint8_t game[]={4,1};
+    assert(dongle_features_request(1,game,2,out,19,&n)==1 && !game_writes);
+    game[1]=2;assert(dongle_features_request(1,game,2,out,64,&n)==1 && !game_writes);
+    game[1]=1;assert(dongle_features_request(1,game,2,out,64,&n)==0 && n==20 && game_writes==1);
+    p[0]=6;assert(dongle_features_request(1,p,1,out,23,&n)==1 && !starts);
+    assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==24 && starts==1);
+    p[0]=7;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==24 && starts==1);
+    p[0]=8;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==0 && stops==1);
+    p[0]=2;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==2 && out[0]==1);
+    p[0]=5;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==64);
+    p[0]=9;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==20);
+    p[0]=0;assert(dongle_features_request(1,p,1,out,64,&n)==7 && n==0);
+    dongle_features_poll();dongle_features_disconnect(1);assert(polls==2 && stops==2);
+    puts("typed features: validation, exact integer values, aliased buffers, bounded responses and result mapping passed");
+}

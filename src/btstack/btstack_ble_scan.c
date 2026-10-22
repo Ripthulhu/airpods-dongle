@@ -45,6 +45,10 @@ void ble_scan_set_paused(uint32_t reason, bool paused) {
 void ble_scan_snapshot(ble_scan_snapshot_t *snapshot) {
     if (snapshot != NULL) *snapshot = scan_state;
 }
+void ble_scan_visit(void (*visit)(const ble_scan_report_t *,unsigned,void *),void *context) {
+    if (!visit) return;
+    for (unsigned i=0;i<scan_state.stats.cache_count;i++) visit(&scan_state.reports[i],i,context);
+}
 
 void ble_scan_get_stats(ble_scan_stats_t *stats) {
     if (stats != NULL) *stats = scan_state.stats;

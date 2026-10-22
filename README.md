@@ -10,7 +10,8 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Experimental. The firmware cross-compiles and the host regression tests pass.
+Experimental firmware **0.1.8**. The firmware cross-compiles and the host
+regression tests pass.
 This version has not been tested on a Pico or AirPods. The source fork reports
 Pro 3 testing; that does not validate these changes.
 
@@ -21,13 +22,18 @@ Pro 3 testing; that does not validate these changes.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
 - 100 ms encoded startup silence for AAC-ELD, sent before accepting phone playback.
 - Stem media controls and volume routed to the active phone or USB input.
+- NTPods USB controls and LibrePods controls over an encrypted, bonded phone connection.
+- Model-gated AirPods settings, hearing profiles, saved hardware checks and app-owned ear detection.
+- Selectable output codecs and supported bitrates, guarded Game Mode and performance readings.
+- Nearby signal readings resolved against the selected pair's identity key.
 - Two saved headset slots; reconnect uses the selected address and its bond.
 - Bounded recovery, packet validation and USB suspend/disconnect cleanup.
 
-NTPods can use the [USB control interface](docs/USB-CONTROL.md) for pairing,
-reconnect, reported batteries, ANC/transparency, hearing assistance and hardware
-checks. It uses Windows' built-in HID driver; USB audio and microphone also work
-independently of the app. Sensors and LibrePods switching are not ported yet.
+NTPods uses the [USB control interface](docs/USB-CONTROL.md); LibrePods uses the
+[phone control service](docs/CONTROL-EXTENSIONS.md). Both expose device settings
+and readback without acquiring audio. USB uses Windows' built-in HID driver;
+USB audio and microphone also work independently of the app. There are no
+PC/phone handoff commands. Sensor streaming and case ringing are not implemented.
 The serial port remains a diagnostic console.
 LDAC is unsupported: the inherited encoder path could exceed the negotiated packet
 limit, and AirPods do not need that codec.
@@ -40,22 +46,28 @@ The firmware links both Classic and BLE through one BTstack controller. The
 | Communication | Transport | Current implementation |
 | --- | --- | --- |
 | Playback and stem media controls | Classic AVDTP / AVRCP | Implemented |
-| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Microphone, batteries, ANC/transparency and hearing modes through USB HID |
+| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Model-gated settings and readback; HQ microphone opened only by USB recording |
 | Hearing profiles and saved diagnostics | ATT over Classic, PSM `0x001F` | Complete profile edits, saved checks, read-only hearing metadata and guarded in-case self-checks |
-| Proximity and offline advertisements | BLE | Passive reception, RSSI, reception time and raw records |
+| Proximity and offline advertisements | BLE | Passive cache; selected-pair nearby finder for verified proximity reports |
+| Phone app controls | Encrypted, bonded Classic RFCOMM | Same basic and settings reports as USB, with separate client transactions |
 | Case DULT / Find My service | BLE GATT | Not ported yet |
 
 BLE uses a provisional 30 ms scan window every 300 ms during stereo playback.
 It pauses for Classic pairing searches, microphone startup/capture/drain and USB
-suspension without a phone connection, then restores the scan policy. The CDC console reports aggregate
+suspension without a phone connection or active finder, then restores the scan policy. The CDC console reports aggregate
 counts at most once per five seconds; `requested` means a scan command was queued,
 not that controller acceptance was verified.
 
-The eight-entry advertisement cache is an unassociated inventory. It does not
-identify the selected earbuds or case. Verified battery/finder data needs the
-selected pair's proximity keys and address resolution; case GATT also needs an
-explicit identity check. Scanning never pairs, opens an audio path or sends case
-commands. The current connection pool supports two links: phone and AirPods occupy
+The eight-entry raw advertisement cache remains unassociated. The nearby finder
+separately verifies resolvable private addresses with the selected pair's IRK
+before using proximity RSSI. It shows smoothed signal, trend and last-heard age,
+without metres, direction or an anonymous-device fallback. Identity remains in RAM
+across the same pair's AACP disconnect, and is cleared for another pair or an
+invalid key replacement. An old reading after 90 seconds does not prove absence.
+The finder stops when its view/client closes, its 30-second polling lease expires
+or the selected pair changes. HQ microphone use pauses scanning.
+Neither path identifies a separate case transmitter or sends locator commands.
+The current connection pool supports two links: phone and AirPods occupy
 both during wireless playback. Passive scanning uses no connection slot.
 
 ## Build
@@ -115,9 +127,10 @@ Use `--arm` instead of `--sanitize` for the ARM32 codec check; it requires QEMU.
 The tests cover malformed packets, phone codec negotiation and controls,
 early startup priming, stale connections, cancelled recording,
 decoder failures, cross-core cancellation/teardown, USB control identity and
-command receipts, fragmented settings transfers, interrupted writes, stale
-profile readback, PCM ordering, media-key release/retry, BLE pause/resume and
-advertisement bounds, and SDK patch validation.
+command receipts, isolated USB/phone transactions, fragmented settings transfers,
+interrupted writes, model/value guards, stale profile readback, codec preflight,
+Game Mode restoration, PCM ordering, media-key release/retry, BLE pause/resume,
+selected-pair address rotation, finder cancellation and SDK patch validation.
 They do not measure radio behavior or acoustic latency. Slot migration, failed
 storage, partial console writes and button timing boundaries also have regression tests.
 
@@ -132,11 +145,14 @@ heap margin and microphone clock drift remain unmeasured. The microphone uses
 the inherited 64 kHz USB presentation clock with a 48 kHz AAC coding configuration;
 this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
-Both cores have guarded 16 KiB stacks. The current build leaves 389,736 bytes of
-heap before codec allocations. Buffers sized for stereo encoding and the fixed
-mono microphone save 192,992 bytes without reducing audio queues. ARM emulation
-leaves 201,696 bytes at the tested codec allocation peak, before other runtime
-use. Hardware heap and stack measurements are still required.
+Both cores have guarded 16 KiB stacks. The build measures codec allocation peaks
+against the linked heap and requires at least 64 KiB left for runtime use.
+The 0.1.8 link leaves 386,800 bytes of heap; the ARM codec probe peaks at
+188,040 bytes, leaving 198,760 bytes before other runtime allocations.
+The [codec probe](tools/codec_probe/README.md) covers the real encoders, VBR frame
+bounds and decoder lifecycles; emulation does not measure full runtime heap or
+stack use. Performance readings expose queue fill, dropped/underflow frames,
+encode time and allocator use for hardware checks.
 Phone playback releases the idle microphone decoder before preparing its input
 codec and 9,772-byte worker queue; USB recording waits for worker detachment and
 frees both before allocating the microphone. Diagnostic history is limited to

@@ -38,6 +38,11 @@ bool gap_start_scanning(void);
 
 bool get_a2dp_connected_flag();
 uint8_t dongle_output_codec(void);
+uint8_t dongle_playback_configure(uint8_t codec, uint8_t rate_mode, uint32_t bitrate);
+uint8_t dongle_playback_game_mode(bool enabled);
+uint16_t dongle_playback_status(uint8_t *out, uint16_t capacity);
+uint16_t dongle_playback_diagnostics(uint8_t *out, uint16_t capacity);
+void dongle_playback_poll(void);
 
 void a2dp_source_reconnect();
 

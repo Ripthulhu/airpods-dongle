@@ -1,5 +1,8 @@
 # Phone bridge
 
+Firmware 0.1.8 provides wireless stereo audio and a separate app control service.
+Both paths remain untested on Pico hardware.
+
 ```text
 Phone -- aptX or SBC --> Pico 2 W -- AAC-ELD / AAC / SBC --> AirPods
 ```
@@ -22,6 +25,18 @@ before its identity is retained.
 AirPods stem media commands and absolute volume go to the phone during phone
 playback. USB media commands stay on the USB path. Music only: phone calls, HFP,
 SCO and a BLE settings interface are not implemented.
+
+LibrePods connects to the saved phone's encrypted, bonded RFCOMM service for
+device settings, hearing profiles, saved checks, audio profiles, performance
+readings and nearby finding. See [control extensions](CONTROL-EXTENSIONS.md) for
+the UUID and wire format. These controls do not need a PC, a phone vendor-ID
+override or an audio stream. The microphone path still requires USB recording.
+Opening settings never takes audio; no PC/phone handoff commands are added.
+
+Automatic pause belongs to the app using the active input. It consumes fresh
+ear-state reports and resumes only the player it paused, while it still owns
+that pause. Disconnect, stale reports, another input or a manual playback change
+revokes that ownership. Stored device ear detection is a separate AirPods setting.
 
 ## Codec and buffering
 
@@ -46,8 +61,11 @@ SCO and a BLE settings interface are not implemented.
   so phone audio cannot accumulate behind startup priming. Readiness has a
   three-second deadline; failure rejects Start rather than claiming playback.
 - Phone AAC-ELD output uses one 10 ms frame per packet. USB retains its existing
-  packet grouping. Codec bitrate, output timestamps and controller flush policy
-  are unchanged.
+  packet grouping. Output profiles offer discrete supported AAC/ELD bitrates;
+  an explicit unsupported choice never falls back silently. Profile changes
+  require idle audio and reopen AVDTP for negotiation. Timestamps, startup
+  priming and controller flush policy remain fixed. The
+  [profile contract](CONTROL-EXTENSIONS.md#output-profiles) lists valid choices.
 
 The SBC demo's 60–80-frame buffer would hold 160–213 ms at 48 kHz. It is not used.
 Small codec frames alone do not establish end-to-end delay: Android's batching,
@@ -80,6 +98,12 @@ including fixed-packet arrival drift. Real
 aptX/SBC codec tests run natively and in ARM32 emulation. Firmware cross-compilation
 checks the pinned SDK API and RAM layout. These checks do not establish radio
 reliability, CPU headroom or acoustic latency on the Pico.
+
+Control tests cover fragmented/coalesced RFCOMM frames, encrypted saved-peer
+checks, per-client RPC ownership, replay protection, blocked writers and cleanup.
+Finder tests resolve the selected pair's IRK against rotating addresses, reject
+other nearby pairs, preserve old-reading ages, and exercise lease/microphone
+pause behavior. These are protocol regressions, not live radio verification.
 
 On hardware, first verify simultaneous phone/AirPods links, negotiated codec and
 clean stereo. Measure first sound and steady delay separately, queue occupancy,

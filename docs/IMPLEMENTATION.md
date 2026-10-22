@@ -37,10 +37,10 @@ reference file hashes used for these changes.
 
 Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
 
-| Linked layout | 0.1.7 |
+| Linked layout | 0.1.8 |
 | --- | ---: |
-| Main-heap capacity before codec allocations | 389,736 bytes |
-| Flash image | 1,604,680 bytes |
+| Main-heap capacity before codec allocations | 386,800 bytes |
+| Flash image | 1,643,528 bytes |
 | Full BLE cache copy for aggregate logs | 28 bytes |
 
 The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
@@ -75,16 +75,16 @@ their original dimensions.
 
 The real-codec probe keeps stereo ELD at 48 kHz/256 kbps and the microphone
 decoder open together. Live allocator use is 186,872 bytes, down from 379,864.
-The tested allocator peak is 188,040 bytes, leaving 201,696 bytes before other
+The tested allocator peak is 188,040 bytes, leaving 198,760 bytes before other
 application allocations. Heap alignment and allocation order affect arena use.
 Every firmware link verifies its exact codec archive fingerprint, derives capacity
 from the ELF and reserves 64 KiB for other runtime use. The reserve is a build
 policy, not a measured bound on the application. Tests cover malformed input,
 limiter operation, playback recreation with the microphone retained and bit-exact
-encoding across ten AAC/AAC-ELD configurations. See
+encoding across ten AAC/AAC-ELD configurations and five ELD VBR frame ceilings. See
 [`tools/codec_probe`](../tools/codec_probe/README.md) for reproduction and limits.
 
-Unused Bluetooth HFP, HID, network and serial profile pools are disabled. The
+Unused Bluetooth HFP, HID and network profile pools are disabled. The
 implemented audio/control profiles, two HCI connections, GATT client capacity
 and security tables remain allocated. HFP is not implemented by this firmware.
 
@@ -101,14 +101,23 @@ still require the board.
 
 ## Core ownership
 
-Core 0 retains Bluetooth, USB, playback encoding, PCM publication and control state.
-The hearing/diagnostic transport adds 3,084 bytes of static storage, including
-one additional L2CAP channel. It uses the existing ACL and allocates no heap;
+Both Cortex-M33 cores run: core 0 retains Bluetooth, USB, playback encoding,
+PCM publication and control state. RP2350's Hazard3 RISC-V cores are alternative
+processors selected at boot; only two cores can run at once.
+The hearing/diagnostic transport uses bounded static storage and one additional
+L2CAP channel. It uses the existing ACL and allocates no heap;
 fragment assembly, ATT and cached AACP reports stay on core 0.
 It allocates and configures the microphone decoder in thread context under the
 Bluetooth async lock, then publishes the handle. Core 1 owns phone aptX/SBC decode
 or microphone decode, codec reset and decoder statistics. These inputs are
 mutually exclusive. It never calls Bluetooth, USB or logging APIs.
+
+USB and the bonded phone's encrypted RFCOMM control service have independent
+receipts and bounded request buffers. They share one exclusive ATT/AACP request
+owner; a competing client cannot cancel or inspect its transaction. Settings,
+codec/Game Mode policy and finder work stay on core 0, without per-packet heap
+allocation. The selected-pair finder borrows the eight-entry BLE cache and
+resolves private addresses with an AACP-derived IRK retained only in RAM.
 
 Eight copied compressed frames and sixteen tagged PCM frames bound microphone worker memory.
 Stop, reset, disconnect and queue saturation invalidate the generation. The USB
@@ -171,7 +180,9 @@ The BLE receiver validates the complete legacy event, AD structures and Apple
 type/length records before caching any prefix. It retains at most eight reports
 with exact address/type, RSSI validity and monotonic reception time. Address
 rotation creates a separate entry; neither model fields nor signal strength
-establish ownership. Type `0x12` is retained as an opaque offline record, with no
+establish ownership. The finder separately requires the selected pair's complete
+IRK response, successful private-address resolution and a valid proximity record
+before using RSSI. Type `0x12` is retained as an opaque offline record, with no
 Find My key derivation or assumption that it belongs to the paired AirPods.
 
 ## Validation limits

@@ -567,6 +567,143 @@ static void test_research_allowed_packets(void) {
     drain(); assert(aacp_research_take() == 1);
 }
 
+static void setting_report(uint8_t id, uint32_t value) {
+    uint8_t packet[]={4,0,4,0,9,0,id,0,0,0,0}; dongle_put32(packet+7,value);
+    audio(packet,aacp_cid,sizeof(packet));
+}
+static void model_report_for(const char *model, const char *firmware) {
+    const char *fields[]={"AirPods",model,"Apple Inc.","EXAMPLE",firmware,"","1","com.apple.accessory.updater","LEFT","RIGHT",""};
+    uint8_t packet[384]={4,0,4,0,0x1d,0,2,0,0,4,0}; unsigned n=11;
+    for (unsigned i=0;i<11;++i) {
+        unsigned count=(unsigned)strlen(fields[i])+1; memcpy(packet+n,fields[i],count); n+=count;
+    }
+    audio(packet,aacp_cid,n);
+}
+static void test_typed_settings_and_confirmation(void) {
+    fixture();
+    assert(aacp_setting_write(0x28,1)==DONGLE_DISCONNECTED);
+    ready();
+    uint8_t out[512];
+    assert(aacp_setting_write(0xff,1)==DONGLE_UNSUPPORTED);
+    assert(aacp_setting_write(0x28,0x0101)==DONGLE_MALFORMED);
+    assert(aacp_setting_write(0x28,1)==DONGLE_UNSUPPORTED);
+    assert(aacp_setting_write(0x0d,4)==DONGLE_UNSUPPORTED);
+    assert(aacp_setting_write(0x0d,2)==DONGLE_ACCEPTED);
+    assert(aacp_setting_write(0x0d,3)==DONGLE_BUSY);
+    assert(aacp_control_readback()->anc==3);
+    assert(aacp_research_cached(6,out,sizeof(out))==15 && out[2]==0x0d && dongle_u32(out+11)==3);
+    drain();
+    assert(aacp_control_readback()->anc==3);
+    model_report_for("A3063","9A348");
+    assert(aacp_setting_write(1,0)==DONGLE_ACCEPTED); // Explicit unreported preference.
+    assert(!settings.reports[setting_index(1)].known);
+    drain();
+    assert(aacp_setting_write(0x28,1)==DONGLE_UNSUPPORTED);
+    setting_report(0x28,2);
+    assert(aacp_setting_write(0x28,1)==DONGLE_ACCEPTED);
+    drain();
+    assert(setting_report_is(&settings,0x28,2)); // Sending is not device confirmation.
+    setting_report(0x28,1);
+    assert(setting_report_is(&settings,0x28,1));
+    assert(aacp_setting_write(0x0d,1)==DONGLE_UNSUPPORTED);
+    assert(aacp_setting_write(0x34,1)==DONGLE_ACCEPTED);
+    assert(!settings.reports[setting_index(0x34)].known);
+    assert(settings.allow_off_requested==-1);
+    drain();
+    assert(settings.allow_off_requested==1);
+    assert(aacp_setting_write(0x0d,1)==DONGLE_ACCEPTED);
+    drain();
+    assert(aacp_control_readback()->anc==3);
+    assert(aacp_setting_write(0x0d,4)==DONGLE_ACCEPTED);
+    drain();
+    assert(aacp_setting_write(0x16,0x0501)==DONGLE_ACCEPTED);
+    assert(setting_tx[7]==1 && setting_tx[8]==5 && !setting_tx[9] && !setting_tx[10]);
+    drain();
+    assert(aacp_setting_write(0x16,0x01050501)==DONGLE_MALFORMED);
+    usb_capture_wanted=true;
+    assert(aacp_setting_write(1,1)==DONGLE_BUSY);
+    usb_capture_wanted=false;
+    for (unsigned i=0;i<6;++i) assert(aacp_tx_enqueue(control_anc,sizeof(control_anc)));
+    assert(aacp_setting_write(1,1)==DONGLE_BUSY);
+    drain();
+    remote_mtu=10;
+    assert(aacp_setting_write(1,1)==DONGLE_UNSUPPORTED);
+    remote_mtu=512;
+    assert(aacp_setting_write(1,1)==DONGLE_ACCEPTED);
+    aacp_disconnect();
+    assert(!aacp_tx_count && !aacp_settings_snapshot(out,sizeof(out)) && !settings.profile);
+}
+static void test_settings_invalid_replacement_and_stale_ear_events(void) {
+    fixture(); ready(); uint8_t out[512];
+    uint8_t bad_anc[]={4,0,4,0,9,0,0x0d,0};
+    audio(bad_anc,aacp_cid,sizeof(bad_anc));
+    assert(!aacp_control_readback()->anc);
+    assert(aacp_settings_snapshot(out,sizeof(out))==2 && !out[1]);
+    setting_report(0x0d,3);
+    uint8_t ears[]={4,0,4,0,6,0,0,1};
+    audio(ears,aacp_cid+1,sizeof(ears));
+    assert(!aacp_research_cached(5,out,sizeof(out)));
+    audio(ears,aacp_cid,sizeof(ears));
+    now=25;
+    assert(aacp_research_cached(5,out,sizeof(out))==16 && dongle_u32(out)==25 && dongle_u32(out+4)==1);
+    audio(ears,aacp_cid,sizeof(ears));
+    assert(aacp_research_cached(5,out,sizeof(out))==16 && dongle_u32(out)==0 && dongle_u32(out+4)==2);
+    uint8_t oversized[33]={4,0,4,0,6,0,0,1};
+    audio(oversized,aacp_cid,sizeof(oversized));
+    assert(!aacp_research_cached(5,out,sizeof(out)) && reports[4].revision==3);
+    audio(ears,aacp_cid,sizeof(ears));
+    assert(aacp_research_cached(5,out,sizeof(out))==16 && dongle_u32(out+4)==4);
+    aacp_disconnect();
+    assert(!aacp_research_cached(5,out,sizeof(out)) && !reports[4].revision);
+}
+static void keys_report(uint8_t packet[48]) {
+    const uint8_t prefix[]={4,0,4,0,0x31,0,2,1,0,16,0};
+    memset(packet,0,48); memcpy(packet,prefix,sizeof(prefix));
+    for (unsigned i=0;i<16;++i) packet[11+i]=(uint8_t)(i+1);
+    packet[27]=4; packet[29]=16;
+    for (unsigned i=0;i<16;++i) packet[31+i]=(uint8_t)(i+33);
+}
+static void test_pair_keys_and_receive_buffer_policy(void) {
+    fixture(); ready();
+    uint8_t address[6], key[16], packet[48];
+    assert(!aacp_pair_irk(address,key)); keys_report(packet);
+    audio(packet,aacp_cid,47);
+    assert(aacp_pair_irk(address,key) && memcmp(address,peer,6)==0 && memcmp(key,packet+11,16)==0);
+    assert(!aacp_pair_irk(NULL,key) && !aacp_pair_irk(address,NULL));
+    aacp_disconnect(); assert(aacp_pair_irk(address,key));
+    ready(); assert(aacp_pair_irk(address,key));
+    for (unsigned n=6;n<47;++n) {
+        keys_report(packet); audio(packet,aacp_cid,47);
+        audio(packet,aacp_cid,n); assert(!aacp_pair_irk(address,key));
+    }
+    const unsigned corrupt[]={5,6,7,8,9,10,27,28,29,30};
+    for (unsigned i=0;i<sizeof(corrupt)/sizeof(*corrupt);++i) {
+        keys_report(packet); audio(packet,aacp_cid,47);
+        packet[corrupt[i]]^=0xff; audio(packet,aacp_cid,47);
+        assert(!aacp_pair_irk(address,key));
+    }
+    keys_report(packet); packet[27]=1; audio(packet,aacp_cid,47); assert(!aacp_pair_irk(address,key));
+    keys_report(packet); memset(packet+31,0,16); audio(packet,aacp_cid,47); assert(!aacp_pair_irk(address,key));
+    keys_report(packet); memset(packet+11,0,16); audio(packet,aacp_cid,47); assert(!aacp_pair_irk(address,key));
+    keys_report(packet); audio(packet,aacp_cid,48); assert(!aacp_pair_irk(address,key));
+    keys_report(packet);
+    uint8_t first[20]; memcpy(first,packet+7,20); memcpy(packet+7,packet+27,20); memcpy(packet+27,first,20);
+    audio(packet,aacp_cid,47); assert(aacp_pair_irk(address,key) && memcmp(key,packet+31,16)==0);
+    bd_addr_t next={7,8,9,10,11,12}; aacp_connect(next);
+    assert(!aacp_pair_irk(address,key));
+    fixture(); ready();
+    assert(!aacp_model_game_supported() && aacp_receive_buffer(60)==DONGLE_UNSUPPORTED);
+    model_report_for("A3063","9A348"); assert(aacp_model_game_supported());
+    assert(aacp_receive_buffer(61)==DONGLE_MALFORMED);
+    uint32_t serial=aacp_receive_buffer_serial();
+    assert(aacp_receive_buffer(60)==DONGLE_ACCEPTED && aacp_receive_buffer_serial()==serial);
+    assert(aacp_receive_buffer(150)==DONGLE_BUSY);
+    drain(); assert(aacp_receive_buffer_serial()!=serial && aacp_receive_buffer_last()==60);
+    usb_capture_wanted=true;
+    assert(aacp_receive_buffer(60)==DONGLE_BUSY && aacp_receive_buffer(150)==DONGLE_ACCEPTED);
+    drain(); assert(aacp_receive_buffer_last()==150);
+}
+
 int main(void) {
     test_handshake_and_decoder_gate();
     test_usb_cancel_and_stop_are_not_lost();
@@ -585,6 +722,9 @@ int main(void) {
     test_host_controls_preserve_mic_capacity_and_readback();
     test_research_lifecycle_and_cache();
     test_research_allowed_packets();
-    puts("AACP lifecycle and packet validation: 17 groups passed");
+    test_typed_settings_and_confirmation();
+    test_settings_invalid_replacement_and_stale_ear_events();
+    test_pair_keys_and_receive_buffer_policy();
+    puts("AACP lifecycle and packet validation: 20 groups passed");
     return 0;
 }

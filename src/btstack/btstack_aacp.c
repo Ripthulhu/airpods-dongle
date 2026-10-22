@@ -24,6 +24,7 @@
 #include "btstack.h"
 #include "btstack_aacp.h"
 #include "aacp_mic_dec.h"
+#include "dongle_settings.h"
 #include "../tinyusb/uac.h"
 
 #define AACP_PSM              0x1001
@@ -62,6 +63,7 @@ static const uint8_t aacp_request_notifications[] = {
     0x04, 0x00, 0x04, 0x00, 0x0F, 0x00,
     0xFF, 0xFF, 0xFF, 0xFF
 };
+static const uint8_t aacp_request_keys[] = {4,0,4,0,0x30,0,5,0};
 
 // --- Mic stream control byte sequences (verbatim from librepods) ---
 
@@ -101,6 +103,13 @@ static cached_report_t reports[] = {
     {ear_report, sizeof(ear_report), 0, 0, 0}
 };
 static dongle_readback_t control_readback;
+static dongle_settings_t settings;
+static uint8_t setting_tx[11];
+static uint8_t receive_buffer_tx[11];
+static uint32_t receive_buffer_serial;
+static uint16_t receive_buffer_last;
+static uint8_t pair_irk[16], pair_key_address[6];
+static bool pair_irk_known;
 static uint32_t control_session;
 // Static entries stay valid until their queued transmission completes.
 static const uint8_t control_anc[] = {4,0,4,0,9,0,0x0d,2,0,0,0};
@@ -108,6 +117,7 @@ static const uint8_t control_transparency[] = {4,0,4,0,9,0,0x0d,3,0,0,0};
 static void control_reset(void) {
     ++control_session;
     dongle_readback_clear(&control_readback);
+    settings_reset(&settings);
     for (unsigned i = 0; i < sizeof(reports) / sizeof(reports[0]); ++i) {
         reports[i].length = 0;
         reports[i].revision = 0;
@@ -170,6 +180,9 @@ void aacp_disconnect(void) {
 }
 
 void aacp_init(void) {
+    pair_irk_known=false;
+    memset(pair_irk,0,sizeof(pair_irk));
+    memset(pair_key_address,0,sizeof(pair_key_address));
     aacp_disconnect();
     aacp_mic_want = aacp_mic_failed = false;
     aacp_mic_restarts = 0;
@@ -201,6 +214,11 @@ static void aacp_schedule_retry(void) {
 void aacp_connect(bd_addr_t addr) {
     if (aacp_session && memcmp(aacp_addr, addr, sizeof(bd_addr_t)) == 0) return;
     aacp_disconnect();
+    if (memcmp(pair_key_address,addr,sizeof(pair_key_address))) {
+        pair_irk_known=false;
+        memset(pair_irk,0,sizeof(pair_irk));
+        memcpy(pair_key_address,addr,sizeof(pair_key_address));
+    }
     memcpy(aacp_addr, addr, sizeof(bd_addr_t));
     aacp_session = true;
     aacp_attempts = 0;
@@ -230,6 +248,65 @@ bool aacp_control_address(bd_addr_t address) {
     return true;
 }
 const dongle_readback_t *aacp_control_readback(void) { return &control_readback; }
+bool aacp_model_game_supported(void) {
+    return settings.profile && settings.profile->silent_allow_off && settings.firmware_major>=8;
+}
+uint32_t aacp_receive_buffer_serial(void) { return receive_buffer_serial; }
+uint16_t aacp_receive_buffer_last(void) { return receive_buffer_last; }
+uint8_t aacp_receive_buffer(uint16_t milliseconds) {
+    if (milliseconds!=60 && milliseconds!=150) return DONGLE_MALFORMED;
+    if (!aacp_control_ready()) return DONGLE_DISCONNECTED;
+    if (!aacp_model_game_supported()) return DONGLE_UNSUPPORTED;
+    if ((milliseconds==60 && (usb_mic_requested() || aacp_mic_active())) ||
+        aacp_tx_count>=AACP_TX_QUEUE_LEN-2) return DONGLE_BUSY;
+    for (unsigned i=0;i<aacp_tx_count;++i)
+        if (aacp_tx_queue[(aacp_tx_head+i)%AACP_TX_QUEUE_LEN].data==receive_buffer_tx) return DONGLE_BUSY;
+    if (l2cap_get_remote_mtu_for_local_cid(aacp_cid)<sizeof(receive_buffer_tx)) return DONGLE_UNSUPPORTED;
+    memcpy(receive_buffer_tx,"\x04\0\x04\0\x09\0\x0b",7);
+    dongle_put32(receive_buffer_tx+7,milliseconds);
+    return aacp_tx_enqueue(receive_buffer_tx,sizeof(receive_buffer_tx)) ? DONGLE_ACCEPTED : DONGLE_BUSY;
+}
+bool aacp_pair_irk(uint8_t address[6], uint8_t key[16]) {
+    if (!pair_irk_known || !address || !key) return false;
+    memcpy(address,pair_key_address,6); memcpy(key,pair_irk,16); return true;
+}
+static void pair_keys_report(const uint8_t *p, uint16_t n) {
+    pair_irk_known=false;
+    memset(pair_irk,0,sizeof(pair_irk));
+    if (n!=47 || p[5] || p[6]!=2) return;
+    const uint8_t *identity=NULL;
+    unsigned kinds=0;
+    for (unsigned off=7;off<n;off+=20) {
+        uint8_t id=p[off];
+        if ((id!=1 && id!=4) || (kinds&(1u<<id)) || p[off+1] || p[off+2]!=16 || p[off+3]) return;
+        bool nonzero=false;
+        for (unsigned i=0;i<16;++i) nonzero|=p[off+4+i]!=0;
+        if (!nonzero) return;
+        kinds|=1u<<id;
+        if (id==1) identity=p+off+4;
+    }
+    if (!identity || kinds!=((1u<<1)|(1u<<4))) return;
+    memcpy(pair_irk,identity,16); memcpy(pair_key_address,aacp_addr,6); pair_irk_known=true;
+}
+uint8_t aacp_setting_write(uint8_t id, uint32_t value) {
+    if (setting_index(id)<0) return DONGLE_UNSUPPORTED;
+    if (!setting_value_valid(id,value)) return DONGLE_MALFORMED;
+    if (!aacp_control_ready()) return DONGLE_DISCONNECTED;
+    if (!settings_supported(&settings,id,value)) return DONGLE_UNSUPPORTED;
+    if (usb_mic_requested() || aacp_mic_active() || aacp_tx_count>=AACP_TX_QUEUE_LEN-2)
+        return DONGLE_BUSY;
+    for (unsigned i=0;i<aacp_tx_count;++i)
+        if (aacp_tx_queue[(aacp_tx_head+i)%AACP_TX_QUEUE_LEN].data==setting_tx) return DONGLE_BUSY;
+    if (l2cap_get_remote_mtu_for_local_cid(aacp_cid)<sizeof(setting_tx)) return DONGLE_UNSUPPORTED;
+    memcpy(setting_tx,"\x04\0\x04\0\x09\0",6);
+    setting_tx[6]=id; dongle_put32(setting_tx+7,value);
+    if (!aacp_tx_enqueue(setting_tx,sizeof(setting_tx))) return DONGLE_BUSY;
+    return DONGLE_ACCEPTED;
+}
+uint16_t aacp_settings_snapshot(uint8_t *out, uint16_t capacity) {
+    if (!aacp_control_ready()) return 0;
+    return settings_snapshot(&settings,btstack_run_loop_get_time_ms(),out,capacity);
+}
 bool aacp_control_anc(uint8_t mode) {
     if (!aacp_control_ready() || !control_readback.anc || (mode != 2 && mode != 3)) return false;
     // Keep capacity for microphone STOP and recovery even if a host floods controls.
@@ -288,6 +365,7 @@ int aacp_research_take(void) {
     return result;
 }
 uint16_t aacp_research_cached(uint8_t slot, uint8_t *out, uint16_t capacity) {
+    if (slot==6) return aacp_settings_snapshot(out,capacity);
     if (!aacp_control_ready() || slot < 1 || slot > sizeof(reports) / sizeof(reports[0]) || !out) return 0;
     cached_report_t *report = &reports[slot - 1];
     if (!report->length || capacity < report->length + 8u) return 0;
@@ -473,6 +551,13 @@ static void aacp_handle_can_send_now(void) {
     }
     aacp_tx_head = (uint8_t)((aacp_tx_head + 1) % AACP_TX_QUEUE_LEN);
     aacp_tx_count--;
+    // Pro 3 can leave Allow Off unreported; a sent choice is not a device report.
+    if (p.data==setting_tx && setting_tx[6]==0x34 && settings.profile && settings.profile->silent_allow_off)
+        settings.allow_off_requested=dongle_u32(setting_tx+7)==1;
+    if (p.data==receive_buffer_tx) {
+        receive_buffer_last=(uint16_t)dongle_u32(p.data+7);
+        if (++receive_buffer_serial==0) ++receive_buffer_serial;
+    }
     aacp_tx_since_ms = btstack_run_loop_get_time_ms();
     if (p.data == research_tx) { research_pending = false; research_result = 1; }
     if (p.data == aacp_request_notifications) aacp_init_sent = true;
@@ -601,6 +686,12 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
         if (little_endian_read_16(packet, 4) == 0x58) {
             aacp_handle_audio_sdu(packet, size);
         } else {
+            settings_packet(&settings,packet,size,btstack_run_loop_get_time_ms());
+            if (packet[4]==0x31) pair_keys_report(packet,size);
+            if (size>=7 && packet[4]==9 && packet[5]==0 && packet[6]==0x0d) {
+                const setting_report_t *anc=&settings.reports[setting_index(0x0d)];
+                control_readback.anc=anc->known ? (uint8_t)anc->value : 0;
+            }
             research_cache(packet, size);
             dongle_readback_packet(&control_readback, packet, size, btstack_run_loop_get_time_ms());
             aacp_got_control = true;
@@ -631,6 +722,7 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
             aacp_tx_enqueue(aacp_handshake, sizeof(aacp_handshake));
             aacp_tx_enqueue(aacp_set_feature_flags, sizeof(aacp_set_feature_flags));
             aacp_tx_enqueue(aacp_request_notifications, sizeof(aacp_request_notifications));
+            aacp_tx_enqueue(aacp_request_keys, sizeof(aacp_request_keys));
             break;
         }
         case L2CAP_EVENT_CAN_SEND_NOW:

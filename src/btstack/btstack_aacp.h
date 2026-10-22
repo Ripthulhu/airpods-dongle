@@ -53,11 +53,23 @@ const dongle_readback_t *aacp_control_readback(void);
 bool aacp_control_anc(uint8_t mode);
 bool aacp_control_address(bd_addr_t address);
 
+// Typed model/value-checked controls. Acceptance is local, never a device report.
+uint8_t aacp_setting_write(uint8_t id, uint32_t value);
+// Version 1, count, then {id:u8, age_ms:u32, revision:u32, value:u32} records.
+uint16_t aacp_settings_snapshot(uint8_t *out, uint16_t capacity);
+bool aacp_model_game_supported(void);
+// Only the stream-owned 60/150 ms policy is allowed; not a general buffer knob.
+uint8_t aacp_receive_buffer(uint16_t milliseconds);
+uint32_t aacp_receive_buffer_serial(void);
+uint16_t aacp_receive_buffer_last(void);
+// Pair-bound key retained through same-peer radio loss, never a host-supplied key.
+bool aacp_pair_irk(uint8_t address[6], uint8_t key[16]);
+
 // Bounded settings transport; completion means sent locally, not device readback.
 bool aacp_research_send(const uint8_t *packet, uint16_t length);
 int aacp_research_take(void); // 0 waiting/idle, 1 sent, 2 failed
 void aacp_research_cancel(void);
-// Slots: model, hearing gate, assist gate, PME configuration, ear status.
+// Slots: model, hearing gate, assist gate, PME configuration, ear status, settings.
 // Returns little-endian u32 age (ms), u32 receipt revision, then the raw report.
 // Revision changes even for identical reports and resets with the AACP session.
 uint16_t aacp_research_cached(uint8_t slot, uint8_t *out, uint16_t capacity);

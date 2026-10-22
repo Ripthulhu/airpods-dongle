@@ -11,6 +11,22 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+def playback_lifecycle_sources(directory):
+    source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    functions = []
+    for signature in ["bool avdtp_disconnect_and_scan(void)",
+                      "void avdtp_source_establish_stream(void)",
+                      "uint8_t dongle_playback_configure(", "void dongle_playback_poll(void)"]:
+        start = source.index("\n" + signature) + 1
+        end = source.index("\n}", start) + 2
+        functions.append(source[start:end])
+    (directory / "playback_lifecycle.inc").write_text("\n".join(functions))
+    start = source.index("        case AVDTP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:")
+    start = source.index("\n", start) + 1
+    end = source.index("        default:", start)
+    (directory / "playback_release.inc").write_text(source[start:end])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
@@ -23,14 +39,21 @@ def main():
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
         "phone_worker": ["tests/phone_worker_test.c", "-pthread"],
+        "phone_control_protocol": ["tests/phone_control_protocol_test.c"],
+        "phone_control": ["-Itests/phone_control_stubs", "tests/phone_control_test.c"],
         "ble_scan": ["-Itests/ble_scan_stubs", "tests/ble_scan_test.c"],
+        "dongle_finder": ["-Itests/finder_stubs", "tests/dongle_finder_test.c"],
         "playback": ["tests/playback_test.c"],
+        "playback_options": ["tests/playback_options_test.c"],
+        "playback_lifecycle": ["tests/playback_lifecycle_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],
+        "dongle_settings": ["tests/dongle_settings_test.c"],
         "att": ["-Itests/aacp_stubs", "-Wno-unused-function", "tests/att_test.c"],
         "usb_control": ["tests/usb_control_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],
         "dongle_rpc": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_rpc_test.c"],
+        "dongle_features": ["-Itests/aacp_stubs", "-Wno-unused-function", "tests/dongle_features_test.c"],
         "mic_decoder": ["-Itests/mic_stubs", "-Wno-deprecated-declarations",
                         "tests/mic_decoder_test.c", "-lm"],
         "mic_lifecycle": ["tests/mic_lifecycle_test.c"],
@@ -41,12 +64,13 @@ def main():
         "debug_cdc": ["-Itests/cdc_stubs", "tests/debug_cdc_test.c"],
     }
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:
+        playback_lifecycle_sources(pathlib.Path(tmp))
         for name, sources in tests.items():
             binary = pathlib.Path(tmp) / name
             command = [args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-g", "-O1"]
             if args.sanitize:
                 command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-no-pie"]
-            subprocess.run([*command, *sources, "-o", str(binary)], cwd=ROOT, check=True)
+            subprocess.run([*command, "-I", tmp, *sources, "-o", str(binary)], cwd=ROOT, check=True)
             subprocess.run([str(binary)], cwd=ROOT, check=True)
             print(f"PASS {name}", flush=True)
     subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],

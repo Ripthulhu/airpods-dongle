@@ -3,6 +3,11 @@
 #define DONGLE_CONTROL_H
 #include <stdbool.h>
 #include <stdint.h>
+#include "dongle_client.h"
+bool dongle_control_client_get(uint8_t client, uint8_t report[64]);
+bool dongle_control_client_set(uint8_t client, const uint8_t report[64]);
+void dongle_control_client_available(uint8_t client, bool available);
+uint32_t dongle_control_client_generation(uint8_t client);
 // USB IRQ context: reports exclude the ID already handled by TinyUSB.
 uint16_t dongle_control_get(uint8_t *buffer, uint16_t requested);
 void dongle_control_set(const uint8_t *buffer, uint16_t size);

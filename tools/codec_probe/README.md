@@ -30,10 +30,12 @@ The check covers:
   operation and output canaries.
 - Eight allocation lifecycles each for ELD-256, LC-128 and LC-220, including both
   allocation orders and recreating playback while retaining the microphone decoder.
+- 480 ELD VBR frames across five bitrate ceilings with the microphone retained;
+  every access unit stays within its negotiated byte limit.
 
-With GCC 13.2.1 and firmware 0.1.7, live stereo/microphone allocations total
+With GCC 13.2.1 and firmware 0.1.8, live stereo/microphone allocations total
 186,872 bytes; the tested allocator peak is 188,040 bytes. The linked heap is
-389,736 bytes, leaving 201,696 bytes at that peak before other runtime allocations.
+386,800 bytes, leaving 198,760 bytes at that peak before other runtime allocations.
 The 64 KiB reserve is a policy allowance, not a measured application requirement.
 
 Stack markers start 128 bytes below the helper's stack pointer. Tested decoder

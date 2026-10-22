@@ -10,6 +10,9 @@
 #include "btstack/mic_decoder_lifecycle.h"
 #include "btstack/phone_sink.h"
 #include "btstack/phone_worker.h"
+#include "btstack/phone_control.h"
+#include "btstack/dongle_finder.h"
+#include "tinyusb/dongle_features.h"
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -309,6 +312,14 @@ int main() {
         printf("Bluetooth audio services unavailable\n");
         return 1;
     }
+    async_context_t *startup_context = cyw43_arch_async_context();
+    async_context_acquire_lock_blocking(startup_context);
+    bool controls_ready = phone_control_init();
+    async_context_release_lock(startup_context);
+    if (!controls_ready) {
+        printf("Phone controls unavailable\n");
+        return 1;
+    }
     sleep_ms(200);
 
     static repeating_timer_t usb_timer;
@@ -353,7 +364,7 @@ int main() {
             phone_sink_yield();
         if (!decoder.releasing) phone_sink_poll();
         ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND,
-                            !usb_host_active() && !phone_sink_connected());
+                            !usb_host_active() && !phone_sink_connected() && !dongle_finder_active());
         ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, usb_mic_requested() || aacp_mic_active());
         // Keep decoder allocation in thread context and serialize malloc with
         // Bluetooth encoder callbacks. The USB service timer remains active.
@@ -369,6 +380,8 @@ int main() {
         aacp_poll();
         dongle_control_poll();
         dongle_rpc_poll();
+        dongle_features_poll();
+        phone_control_poll();
         ble_diagnostics_task();
         async_context_release_lock(ctx);
         sleep_ms(1);

@@ -66,7 +66,7 @@ All six findings below are fixed.
 - Verify hearing-mode reports, complete profile preservation and diagnostic
   readback through USB. Mode requests remain unconfirmed if the AirPods do not
   send a fresh report; they may require a reconnect. The firmware's remaining
-  201,696 bytes at the emulated codec peak still need a hardware peak measurement
+  198,760 bytes at the emulated codec peak still need a hardware peak measurement
   before release.
 
 ## Memory fixes
@@ -113,8 +113,8 @@ defect was found in that baseline. Follow-up regression coverage includes malfor
 commands, stale targets, replayed sequences, USB loss, queue bounds, partial
 decode failures and concurrent worker teardown.
 
-Offline checks passed: 19 native C test programs with ASan/UBSan, 23 Python tests,
-real aptX/SBC codec and resampler checks on host and ARM emulation, and the ARM
+Offline firmware checks passed: 26 native C test programs with ASan/UBSan, 23 Python tests,
+real aptX/SBC codec, resampler and selected-pair AES checks on host and ARM emulation, and the ARM
 Release firmware build with its linked-memory check. The profiled FDK library
 also passed native ASan/UBSan/leak checks; signed-shift checks are excluded for
 its fixed-point arithmetic. A non-profile smoke test retains eight-channel

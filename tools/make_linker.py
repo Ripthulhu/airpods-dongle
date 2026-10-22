@@ -16,6 +16,7 @@ def generate(source):
         raise ValueError("Unsupported SDK linker script; expected the original Pico SDK 2.1.1 RP2350 map")
     text = source.decode("utf-8")
     replacements = (
+        ("        __end__ = .;\n", "        . = ALIGN(8);\n        __end__ = .;\n"),
         ("        KEEP(*(.heap*))\n", "        KEEP(*(.heap*))\n        __heap_min_end = .;\n"),
         ("    __HeapLimit = ORIGIN(RAM) + LENGTH(RAM);",
          f"    __HeapLimit = ORIGIN(RAM) + LENGTH(RAM) - {STACK_BYTES};"),

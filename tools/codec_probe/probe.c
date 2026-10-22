@@ -237,6 +237,58 @@ static void check_lifecycle(void) {
     probe_emit("LIFECYCLE ELD-256/LC-128/LC-220 alternating allocation order and retained-microphone playback recreation passed\n");
 }
 
+static void check_variable_encoder(void) {
+    static const unsigned rates[]={128000,174000,192000,220000,256000};
+    for (unsigned mode=0;mode<sizeof(rates)/sizeof(*rates);++mode) {
+        unsigned peak=rates[mode]/800*800;
+        unsigned bandwidth=peak<=128000 ? 15500 : peak<=160000 ? 17500 : 20000;
+        HANDLE_AACDECODER decoder=aacDecoder_Open(TT_MP4_RAW,1);
+        if (decoder==NULL) fail("VBR simultaneous microphone",mode);
+        profile_configure(decoder);
+        HANDLE_AACENCODER handle=NULL;
+        ENC_OK(aacEncOpen(&handle,1,2));
+        const struct { AACENC_PARAM key; UINT value; } parameters[]={
+            {AACENC_AOT,39},{AACENC_SAMPLERATE,48000},{AACENC_CHANNELMODE,MODE_2},
+            {AACENC_GRANULE_LENGTH,480},{AACENC_SBR_MODE,0},{AACENC_BITRATE,peak},
+            {AACENC_BITRATEMODE,5},{AACENC_PEAK_BITRATE,peak},{AACENC_AFTERBURNER,0},
+            {AACENC_TRANSMUX,TT_MP4_RAW},{AACENC_BANDWIDTH,bandwidth},
+        };
+        for (unsigned i=0;i<sizeof(parameters)/sizeof(*parameters);++i)
+            ENC_OK(aacEncoder_SetParam(handle,parameters[i].key,parameters[i].value));
+        ENC_OK(aacEncEncode(handle,NULL,NULL,NULL,NULL));
+        AACENC_InfoStruct info={0}; ENC_OK(aacEncInfo(handle,&info));
+        if (info.frameLength!=480 || info.inputChannels!=2 ||
+            aacEncoder_GetParam(handle,AACENC_PEAK_BITRATE)!=peak ||
+            aacEncoder_GetParam(handle,AACENC_BITRATEMODE)!=(peak<192000 ? 4u : 5u)) fail("VBR configuration",mode);
+        unsigned maximum=0;
+        for (unsigned frame=0;frame<96;++frame) {
+            for (unsigned n=0;n<960;++n) {
+                unsigned value=(n+frame*960)*1103515245u+12345u;
+                pcm[n]=(INT_PCM)((frame%24<8) ? 0 : (frame%24<16) ? (int)((n%96)*500)-24000 : (int)(value>>16)-32768);
+            }
+            unsigned char output[1024];
+            void *in_ptrs[]={pcm}, *out_ptrs[]={output};
+            INT in_ids[]={IN_AUDIO_DATA},out_ids[]={OUT_BITSTREAM_DATA};
+            INT in_sizes[]={960*sizeof(INT_PCM)},out_sizes[]={sizeof(output)};
+            INT in_elements[]={sizeof(INT_PCM)},out_elements[]={1};
+            AACENC_BufDesc in={1,in_ptrs,in_ids,in_sizes,in_elements};
+            AACENC_BufDesc out={1,out_ptrs,out_ids,out_sizes,out_elements};
+            AACENC_InArgs args={960,0}; AACENC_OutArgs result={0};
+            ENC_OK(aacEncEncode(handle,&in,&out,&args,&result));
+            if (result.numInSamples!=960 || result.numOutBytes<0 || (unsigned)result.numOutBytes>peak/800)
+                fail("VBR frame ceiling",result.numOutBytes);
+            if ((unsigned)result.numOutBytes>maximum) maximum=(unsigned)result.numOutBytes;
+            DEC_OK(profile_decode(decoder,packets[frame%16],packet_lengths[frame%16],AACDEC_CLRHIST));
+        }
+        char line[120];
+        snprintf(line,sizeof(line),"VBR requested=%u peak=%u frames=96 max_au=%u limit=%u\n",rates[mode],peak,maximum,peak/800);
+        probe_emit(line);
+        aacDecoder_Close(decoder); ENC_OK(aacEncClose(&handle));
+        if (mallinfo().uordblks!=0) fail("VBR lifecycle cleanup",mode);
+    }
+    probe_emit("VBR 480 frames with retained microphone respect five negotiated frame ceilings\n");
+}
+
 int main(void) {
     report_heap("baseline");
     HANDLE_AACENCODER mono = encoder(1, 64000);
@@ -311,6 +363,7 @@ int main(void) {
     profile_checks(packets, packet_lengths);
     check_encoder_matrix();
     check_lifecycle();
+    check_variable_encoder();
     snprintf(text, sizeof(text), "HEAP_PEAK bytes=%u\n", (unsigned)peak_heap_break);
     probe_emit(text);
     probe_emit("CHECKS complete\n");

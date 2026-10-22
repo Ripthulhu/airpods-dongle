@@ -102,6 +102,22 @@ def main():
                "enable=on,target=native", "-kernel", str(binary)] if args.arm else [str(binary)]
         subprocess.run(run, check=True, timeout=30)
 
+        # Exercise the selected-pair resolver with the pinned AES implementation.
+        finder = Path(temporary) / "finder"
+        aes = sdk / "lib/btstack/3rd-party/rijndael"
+        finder_command = [command[0], "-I", str(ROOT / "tests/finder_stubs"),
+                          *command[1:], "-DFINDER_REAL_AES", "-I", str(aes)]
+        finder_link = []
+        finder_sources = [ROOT / "tests/dongle_finder_test.c", aes / "rijndael.c"]
+        if args.arm:
+            finder_link = ["-nostartfiles", "-Wl,--gc-sections", "-Wl,--wrap=printf",
+                           "-Wl,--wrap=puts", "-T", str(ROOT / "tools/codec_probe/probe.ld")]
+            finder_sources += [support, ROOT / "tools/codec_probe/startup.c"]
+        subprocess.run(finder_command + finder_link + [str(p) for p in finder_sources] +
+                       libraries + ["-o", str(finder)], check=True, timeout=60)
+        finder_run = [*run[:-1], str(finder)] if args.arm else [str(finder)]
+        subprocess.run(finder_run, check=True, timeout=30)
+
 
 if __name__ == "__main__":
     main()
