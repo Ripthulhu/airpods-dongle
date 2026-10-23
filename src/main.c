@@ -390,6 +390,7 @@ int main() {
         if (prepared == MIC_DECODER_FAILED) printf("Microphone decoder unavailable; reopen recording to retry\n");
         aacp_mic_dec_poll();
         tinyusb_control_task();
+        bt_volume_poll();
         if (prepared == MIC_DECODER_READY && usb_mic_requested()) {
             ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, true);
             aacp_mic_start();

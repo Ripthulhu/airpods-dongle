@@ -3,6 +3,7 @@
 #include "../src/btstack/btstack_att.c"
 static uint32_t now, peer_session = 1;
 static bool ready = true;
+static bool transport_current = true;
 static uint8_t create_error, send_error;
 static uint16_t next_cid = 0x40, remote_mtu = 512, last_closed;
 static unsigned connects, closes, sends;
@@ -18,6 +19,7 @@ bool check_is_streaming(void) { return (busy_routes & 2) != 0; }
 bool dongle_playback_transitioning(void) { return (busy_routes & 32) != 0; }
 bool usb_mic_requested(void) { return (busy_routes & 4) != 0; }
 bool aacp_mic_active(void) { return (busy_routes & 8) != 0; }
+bool dongle_rpc_transport_current(void) { return transport_current; }
 bool phone_sink_connected(void) { return (busy_routes & 16) != 0; }
 uint16_t aacp_research_cached(uint8_t slot, uint8_t *out, uint16_t capacity) {
     assert(slot == 5 && capacity >= 16);
@@ -57,6 +59,7 @@ static void fixture(void) {
     connects = closes = sends = 0; create_error = send_error = 0; remote_mtu = 512;
     memcpy(ear_packet, (uint8_t[]){4,0,4,0,6,0,2,2}, sizeof(ear_packet));
     ear_length = sizeof(ear_packet); ear_age = 0; busy_routes = 0;
+    transport_current = true;
 }
 static void begin(void) {
     const uint8_t read[] = {0x0a, 0x14, 0};
@@ -121,6 +124,15 @@ int main(void) {
     uint8_t large[513] = {0x0b}; reply(large,sizeof(large));
     assert(dongle_att_take(out,sizeof(out),&length) == DONGLE_ATT_FAILED);
     puts("ATT transport: bounded replies, cancellation, stale peers and failures passed");
+    for(unsigned i=0;i<4;++i){
+        fixture();assert(dongle_att_request(read,sizeof(read)));open_event(att_cid,0,true);
+        if(i==0)transport_current=false;
+        if(i==1)busy_routes=4;
+        if(i==2)busy_routes=8;
+        if(i==3)now=ATT_TIMEOUT_MS;
+        event(L2CAP_EVENT_CAN_SEND_NOW,att_cid);
+        assert(!sends && dongle_att_take(out,sizeof(out),&length)==DONGLE_ATT_FAILED);
+    }
 
     const uint8_t self_check[] = {0x12,0x14,0,'1'};
     fixture();
@@ -156,7 +168,7 @@ int main(void) {
     assert(sends == 1); send_error = 0; ear_packet[7] = 1;
     event(L2CAP_EVENT_CAN_SEND_NOW, att_cid);
     assert(sends == 1 && dongle_att_take(out,sizeof(out),&length) == DONGLE_ATT_FAILED);
-    fixture(); busy_routes = 31; ear_length = 0;
+    fixture(); busy_routes = 19; ear_length = 0;
     assert(dongle_att_request((uint8_t[]){0x12,0x14,0,'1',0}, 5));
     open_event(att_cid, 0, true); event(L2CAP_EVENT_CAN_SEND_NOW, att_cid);
     assert(sends == 1); reply((uint8_t[]){0x13}, 1);

@@ -5,12 +5,14 @@
 static uint32_t now;
 static uint16_t next_cid, last_disconnected;
 static unsigned connects, disconnects, sends, starts, stops, decoded, resets;
+static unsigned setting_sends;
 static uint8_t create_result, send_result;
 static uint16_t remote_mtu = 512;
 static bool decoder_ready = true, decode_ok = true;
 static bool decoder_reset_done = true, complete_on_submit = true;
 static uint32_t completed;
 static bool usb_capture_wanted;
+static bool transport_current;
 static bd_addr_t peer = {1, 2, 3, 4, 5, 6};
 
 void btstack_run_loop_remove_timer(btstack_timer_source_t *timer) { timer->active = false; }
@@ -38,10 +40,14 @@ uint8_t l2cap_send(uint16_t cid, uint8_t *data, uint16_t len) {
     sends++;
     if (data == aacp_mic_start_bytes) starts++;
     if (data == aacp_mic_stop_bytes) stops++;
+    if (data == setting_tx) setting_sends++;
     return 0;
 }
 bool aacp_mic_dec_ready(void) { return decoder_ready; }
 bool usb_mic_requested(void) { return usb_capture_wanted; }
+#ifndef AACP_RPC_INTEGRATION_TEST
+bool dongle_rpc_transport_current(void) { return transport_current; }
+#endif
 bool aacp_mic_dec_reset(void) { resets++; return decoder_ready; }
 bool aacp_mic_dec_reset_done(void) { return decoder_reset_done; }
 uint32_t aacp_mic_dec_completed(void) { return completed; }
@@ -88,16 +94,19 @@ static void quiet_after_stop(void) {
 static void fixture(void) {
     aacp_init();
     aacp_research_cancel();
+    aacp_setting_cancel();
     remote_mtu = 512;
     now = 0;
     next_cid = 0x40;
     last_disconnected = 0;
     connects = disconnects = sends = starts = stops = decoded = resets = 0;
+    setting_sends = 0;
     create_result = send_result = 0;
     decoder_ready = decode_ok = true;
     decoder_reset_done = complete_on_submit = true;
     completed = 0;
     usb_capture_wanted = false;
+    transport_current = true;
 }
 static void request_capture(void) {
     usb_capture_wanted = true;
@@ -593,15 +602,18 @@ static void test_typed_settings_and_confirmation(void) {
     assert(aacp_control_readback()->anc==3);
     assert(aacp_research_cached(6,out,sizeof(out))==15 && out[2]==0x0d && dongle_u32(out+11)==3);
     drain();
+    assert(aacp_setting_take()==1 && aacp_setting_take()==0);
     assert(aacp_control_readback()->anc==3);
     model_report_for("A3063","9A348");
     assert(aacp_setting_write(1,0)==DONGLE_ACCEPTED); // Explicit unreported preference.
     assert(!settings.reports[setting_index(1)].known);
     drain();
+    assert(aacp_setting_take()==1);
     assert(aacp_setting_write(0x28,1)==DONGLE_UNSUPPORTED);
     setting_report(0x28,2);
     assert(aacp_setting_write(0x28,1)==DONGLE_ACCEPTED);
     drain();
+    assert(aacp_setting_take()==1);
     assert(setting_report_is(&settings,0x28,2)); // Sending is not device confirmation.
     setting_report(0x28,1);
     assert(setting_report_is(&settings,0x28,1));
@@ -610,15 +622,19 @@ static void test_typed_settings_and_confirmation(void) {
     assert(!settings.reports[setting_index(0x34)].known);
     assert(settings.allow_off_requested==-1);
     drain();
+    assert(aacp_setting_take()==1);
     assert(settings.allow_off_requested==1);
     assert(aacp_setting_write(0x0d,1)==DONGLE_ACCEPTED);
     drain();
+    assert(aacp_setting_take()==1);
     assert(aacp_control_readback()->anc==3);
     assert(aacp_setting_write(0x0d,4)==DONGLE_ACCEPTED);
     drain();
+    assert(aacp_setting_take()==1);
     assert(aacp_setting_write(0x16,0x0501)==DONGLE_ACCEPTED);
     assert(setting_tx[7]==1 && setting_tx[8]==5 && !setting_tx[9] && !setting_tx[10]);
     drain();
+    assert(aacp_setting_take()==1);
     assert(aacp_setting_write(0x16,0x01050501)==DONGLE_MALFORMED);
     usb_capture_wanted=true;
     assert(aacp_setting_write(1,1)==DONGLE_BUSY);
@@ -631,7 +647,110 @@ static void test_typed_settings_and_confirmation(void) {
     remote_mtu=512;
     assert(aacp_setting_write(1,1)==DONGLE_ACCEPTED);
     aacp_disconnect();
+    assert(aacp_setting_take()==2 && aacp_setting_take()==0);
     assert(!aacp_tx_count && !aacp_settings_snapshot(out,sizeof(out)) && !settings.profile);
+}
+static void test_typed_setting_owner_lifecycle(void) {
+    fixture();ready();
+    assert(aacp_setting_take()==0);
+    assert(aacp_setting_write(0x0d,2)==DONGLE_ACCEPTED);
+    assert(aacp_setting_take()==0 && !setting_sends);
+    assert(aacp_setting_write(0x0d,3)==DONGLE_BUSY && dongle_u32(setting_tx+7)==2);
+    aacp_setting_cancel(); // RPC owner disconnected/cancelled before CAN_SEND.
+    assert(!aacp_tx_count && aacp_setting_take()==0);
+    event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(!setting_sends && aacp_control_readback()->anc==3);
+
+    assert(aacp_setting_write(0x0d,2)==DONGLE_ACCEPTED);
+    event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(setting_sends==1 && !setting_pending && !aacp_tx_count);
+    assert(aacp_control_readback()->anc==3); // Local send remains separate from readback.
+    assert(aacp_setting_write(0x0d,3)==DONGLE_BUSY); // Receipt still belongs to its original owner.
+    assert(aacp_setting_take()==1 && aacp_setting_take()==0);
+    assert(aacp_setting_write(0x0d,3)==DONGLE_ACCEPTED);
+    aacp_setting_cancel();
+    assert(setting_sends==1 && aacp_setting_take()==0);
+
+    // Removing a wrapped middle entry must retain unrelated control and MIC Stop ordering.
+    aacp_tx_head=AACP_TX_QUEUE_LEN-1;
+    assert(aacp_tx_enqueue(control_anc,sizeof(control_anc)));
+    assert(aacp_setting_write(0x0d,2)==DONGLE_ACCEPTED);
+    assert(aacp_tx_enqueue(aacp_mic_stop_bytes,sizeof(aacp_mic_stop_bytes)));
+    assert(aacp_tx_enqueue(aacp_request_notifications,sizeof(aacp_request_notifications)));
+    aacp_setting_cancel();
+    assert(aacp_tx_count==3 && aacp_tx_queue[aacp_tx_head].data==control_anc);
+    assert(aacp_tx_queue[0].data==aacp_mic_stop_bytes && aacp_tx_queue[1].data==aacp_request_notifications);
+    drain();assert(setting_sends==1 && stops==1);
+}
+static void test_host_writes_recheck_owner_and_microphone(void) {
+    for(unsigned route=0;route<4;++route) {
+        fixture();ready();model_report_for("A3063","9A348");
+        assert(aacp_setting_write(0x34,1)==DONGLE_ACCEPTED);
+        if(route==0)transport_current=false;
+        if(route==1)usb_capture_wanted=true;
+        if(route==2)aacp_mic_remote_active=true;
+        if(route==3)now+=3000u;
+        assert(aacp_tx_enqueue(aacp_mic_stop_bytes,sizeof(aacp_mic_stop_bytes)));
+        event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+        assert(!setting_sends && aacp_setting_take()==2 && aacp_setting_take()==0);
+        assert(settings.allow_off_requested==-1 && aacp_tx_count==1);
+        event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+        assert(stops==1 && !aacp_tx_count); // MIC Stop is never removed by a host cancellation.
+    }
+    fixture();ready();model_report_for("A3063","9A348");
+    assert(aacp_setting_write(0x34,1)==DONGLE_ACCEPTED);
+    send_result=1;event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(!setting_sends && aacp_setting_take()==0 && setting_pending);
+    send_result=0;usb_capture_wanted=true;
+    event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(!setting_sends && aacp_setting_take()==2 && settings.allow_off_requested==-1);
+
+    const uint8_t hearing[]={4,0,4,0,9,0,0x2c,1,1,0,0};
+    for(unsigned route=0;route<4;++route) {
+        fixture();ready();
+        unsigned before=sends;
+        assert(aacp_research_send(hearing,sizeof(hearing)));
+        if(route==0)transport_current=false;
+        if(route==1)usb_capture_wanted=true;
+        if(route==2)aacp_mic_remote_active=true;
+        if(route==3)now+=3000u;
+        event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+        assert(sends==before && !aacp_tx_count && aacp_research_take()==2);
+    }
+    fixture();ready();assert(aacp_research_send(hearing,sizeof(hearing)));
+    unsigned before=sends;send_result=1;
+    event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);assert(aacp_research_take()==0);
+    send_result=0;transport_current=false;
+    event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(sends==before && aacp_research_take()==2);
+}
+static void test_typed_setting_timeout_reset_and_retry(void) {
+    fixture();ready();now=UINT32_MAX-10u;
+    assert(aacp_setting_write(0x0d,2)==DONGLE_ACCEPTED);
+    assert(aacp_tx_enqueue(control_transparency,sizeof(control_transparency)));
+    now+=2999u;aacp_poll();
+    assert(setting_pending && aacp_setting_take()==0 && aacp_tx_count==2);
+    ++now;aacp_poll();
+    assert(!setting_pending && aacp_setting_take()==2 && aacp_tx_count==1 && aacp_control_ready());
+    drain();assert(!setting_sends);
+
+    fixture();ready();assert(aacp_setting_write(0x0d,2)==DONGLE_ACCEPTED);
+    send_result=1;event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(aacp_setting_take()==0 && setting_pending);
+    send_result=0;event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(setting_sends==1 && aacp_setting_take()==1);
+    assert(aacp_setting_write(0x0d,2)==DONGLE_ACCEPTED);
+    uint16_t old_cid=aacp_cid;
+    event(L2CAP_EVENT_CHANNEL_CLOSED,old_cid);
+    assert(!setting_pending && !aacp_tx_count);
+    fire(&aacp_connect_timer);opened(aacp_cid,0,peer);drain();control(aacp_cid);
+    assert(aacp_setting_write(0x0d,3)==DONGLE_BUSY); // A failed old-session receipt cannot be overwritten.
+    assert(aacp_setting_take()==2 && aacp_setting_take()==0);
+    assert(aacp_setting_write(0x0d,3)==DONGLE_ACCEPTED);
+    event(L2CAP_EVENT_CAN_SEND_NOW,old_cid);assert(setting_sends==1 && setting_pending);
+    drain();assert(setting_sends==2);
+    aacp_disconnect();assert(aacp_setting_take()==2); // Reset invalidates an unconsumed sent receipt too.
+    aacp_setting_cancel();assert(aacp_setting_take()==0);
 }
 static void test_settings_invalid_replacement_and_stale_ear_events(void) {
     fixture(); ready(); uint8_t out[512];
@@ -723,8 +842,11 @@ int main(void) {
     test_research_lifecycle_and_cache();
     test_research_allowed_packets();
     test_typed_settings_and_confirmation();
+    test_typed_setting_owner_lifecycle();
+    test_host_writes_recheck_owner_and_microphone();
+    test_typed_setting_timeout_reset_and_retry();
     test_settings_invalid_replacement_and_stale_ear_events();
     test_pair_keys_and_receive_buffer_policy();
-    puts("AACP lifecycle and packet validation: 20 groups passed");
+    puts("AACP lifecycle and packet validation: 23 groups passed");
     return 0;
 }

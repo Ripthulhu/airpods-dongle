@@ -25,6 +25,7 @@ reference file hashes used for these changes.
 | Microphone initialization | One failed allocation prevents later recording opens from retrying | Make one attempt per request; detach failed workers before a fresh open can retry |
 | PCM queues | Racy cursor resets and repeated queue allocations | Use bounded storage, generation-tagged microphone frames and acquire/release publication |
 | USB controls | Invalid channel/format requests and repeated mute alter state | Reject unsupported requests; apply idempotent mute to PCM and preserve volume |
+| USB playback | Receive callback reads before TinyUSB copies the current packet | Consume PCM after OUT is rearmed; use a monotonic 50 ms idle deadline and publish ownership only on transitions |
 | Stem controls | Play/Pause mutes the dongle instead of controlling the player | Send explicit USB Consumer Control commands, with bounded queues and ordered key releases |
 | Phone bridge | No A2DP receiver or independent phone ownership | Negotiate guarded 48 kHz LHDC v5 with classic aptX/SBC fallback, decode into bounded PCM and route AVRCP by peer |
 | LHDC validation | Upstream decoder has approximate gain and unchecked malformed-data arithmetic | Correct the 48 kHz transform scale, bound arithmetic, check original PCM against the linked archive and require a core 1 startup timing check before advertising LHDC |
@@ -43,8 +44,8 @@ Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
 
 | Linked layout | 0.1.9 |
 | --- | ---: |
-| Main-heap capacity before codec allocations | 385,184 bytes |
-| Flash image | 1,704,456 bytes |
+| Main-heap capacity before codec allocations | 385,752 bytes |
+| Flash image | 1,708,080 bytes |
 | Full BLE cache copy for aggregate logs | 28 bytes |
 
 The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
@@ -79,7 +80,7 @@ their original dimensions.
 
 The real-codec probe keeps stereo ELD at 48 kHz/256 kbps and the microphone
 decoder open together. Live allocator use is 186,872 bytes, down from 379,864.
-The tested allocator peak is 188,040 bytes, leaving 197,144 bytes before other
+The tested allocator peak is 188,040 bytes, leaving 197,712 bytes before other
 application allocations. Heap alignment and allocation order affect arena use.
 Every firmware link verifies its exact FDK/LHDC archive fingerprints, derives capacity
 from the ELF and reserves 64 KiB for other runtime use. The reserve is a build
@@ -93,8 +94,12 @@ implemented audio/control profiles, two HCI connections, GATT client capacity
 and security tables remain allocated. HFP is not implemented by this firmware.
 
 Playback and microphone queues use bounded contiguous copies instead of
-per-sample division/copy loops. CDC drains directly into TinyUSB and retains
-bytes on partial writes. Idle CDC/HID avoid up to 4,000 endpoint-state queries
+per-sample division/copy loops. Malformed USB playback packets clear the FIFO,
+so a leftover tail cannot enter the next packet. USB audio notifications are
+coalesced, retried on backpressure and written only by the USB service context.
+CDC drains directly into TinyUSB and retains bytes on partial writes. Its RX
+and TX FIFOs each hold one 64-byte packet, saving 640 bytes; endpoint buffers and
+the 2 KiB diagnostic history remain separate. Idle CDC/HID avoid up to 4,000 endpoint-state queries
 per second at the existing USB service rate. Advertisement type queries derive
 their result from retained raw data rather than a duplicate bitmap.
 
@@ -122,6 +127,20 @@ owner; a competing client cannot cancel or inspect its transaction. Settings,
 codec/Game Mode policy and finder work stay on core 0, without per-packet heap
 allocation. The selected-pair finder borrows the eight-entry BLE cache and
 resolves private addresses with an AACP-derived IRK retained only in RAM.
+RPC replies are rebuilt only when their contents change; transport progress and
+timeouts still run on every poll. Live control-status refresh remains independent.
+Hearing workflows hold a client/session lease across baseline reads, edits,
+verification and mode cleanup. Typed setting writes retain their RPC owner until
+sent; cancellation removes unsent work. Radio callbacks recheck the live owner,
+microphone restrictions and deadlines. See [control extensions](CONTROL-EXTENSIONS.md).
+
+Volume requests and confirmed AirPods levels are separate. The latest request is
+coalesced while AVRCP is busy; accepted replies and notifications supply readback.
+Requests are bound to the selected peer, and connection changes invalidate old
+confirmation. Both hosts receive confirmed changes, so input takeover keeps the
+current AirPods loudness instead of replaying a cached level. USB's fixed-point
+scale preserves all 128 AVRCP levels on a round trip; it is a compatibility mapping,
+not a calibrated acoustic gain. USB mute affects PCM and preserves that level.
 
 Eight copied compressed frames and sixteen tagged PCM frames bound microphone worker memory.
 Stop, reset, disconnect and queue saturation invalidate the generation. The USB

@@ -36,7 +36,10 @@
 
  #include "../btstack/btstack_avdtp_source.h"
  #include "../btstack/aacp_mic_dec.h"
+ #include "../btstack/volume_scale.h"
  #include "pico/flash.h"
+ #include "pico/time.h"
+ #include "hardware/sync.h"
 
 
 
@@ -83,9 +86,6 @@
    VOLUME_CTRL_SILENCE = 0x8000,
  };
 
- #define BT_VOL_MAX   127
- #define USB_ATT_MAX  25600
-
  static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
 
  // Audio controls
@@ -98,6 +98,17 @@
  static bool usb_suspended;
  static _Atomic bool usb_host_available;
  static bool mic_interface_open;
+ static bool speaker_active;
+ static uint32_t speaker_last_packet_us;
+ static _Atomic bool volume_notification_pending;
+
+ #define USB_PLAYBACK_IDLE_US 50000u
+
+ static void usb_speaker_stop(void) {
+   if (!speaker_active) return;
+   speaker_active = false;
+   set_usb_streaming(false);
+ }
 
  static void usb_mic_update_request(void) {
    atomic_store_explicit(&usb_host_available, usb_mounted && !usb_suspended, memory_order_release);
@@ -118,19 +129,10 @@
    return atomic_load_explicit(&usb_host_available, memory_order_acquire);
  }
 
- // Buffer for microphone data
- //int32_t mic_buf[CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ / 4];
-
  // Buffer for speaker data
  // One receive callback carries at most one descriptor-sized USB packet.
- static int32_t spk_buf[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(int32_t)];
- // Speaker data size received in the last frame
- int spk_data_size;
- // Resolution per format
- const uint8_t resolutions_per_format[CFG_TUD_AUDIO_FUNC_1_N_FORMATS] = {CFG_TUD_AUDIO_FUNC_1_FORMAT_1_RESOLUTION_RX,
-                                                                         CFG_TUD_AUDIO_FUNC_1_FORMAT_2_RESOLUTION_RX};
- // Current resolution, update on format change
- uint8_t current_resolution;
+ static int16_t spk_buf[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(int16_t)];
+ static bool speaker_interface_open;
 
  //void led_blinking_task(void);
  void audio_task(void);
@@ -160,9 +162,9 @@
     tud_task(); // TinyUSB device task
     // A bus reset clears TinyUSB configuration without an unmount callback.
     if (usb_mounted && !tud_mounted()) tud_umount_cb();
-    debug_cdc_task(); // drain buffered stdout to the CDC console (same context as tud_task)
-    usb_media_task();
     audio_task();
+    usb_media_task();
+    debug_cdc_task(); // diagnostics follow audio and media work
  }
 
 
@@ -177,6 +179,8 @@ void tinyusb_control_task(void){
  // Invoked when device is mounted
  void tud_mount_cb(void)
  {
+   usb_speaker_stop();
+   speaker_interface_open = false;
    usb_media_set_available(true);
    usb_mounted = true;
    usb_suspended = false;
@@ -189,9 +193,10 @@ void tinyusb_control_task(void){
  {
    usb_media_set_available(false);
    usb_mounted = false;
+   speaker_interface_open = false;
    mic_interface_open = false;
    usb_mic_update_request();
-   set_usb_streaming(false);
+   usb_speaker_stop();
  }
 
  // Invoked when usb bus is suspended
@@ -203,7 +208,7 @@ void tinyusb_control_task(void){
    usb_media_set_available(false);
    usb_suspended = true;
    usb_mic_update_request();
-   set_usb_streaming(false);
+   usb_speaker_stop();
  }
 
  // Invoked when usb bus is resumed
@@ -338,7 +343,7 @@ void tinyusb_control_task(void){
      {
        audio_control_range_2_n_t(1) range_vol = {
          .wNumSubRanges = tu_htole16(1),
-         .subrange[0] = { .bMin = tu_htole16(-VOLUME_CTRL_50_DB), tu_htole16(VOLUME_CTRL_0_DB), tu_htole16(256) }
+         .subrange[0] = { .bMin = tu_htole16(-VOLUME_CTRL_50_DB), tu_htole16(VOLUME_CTRL_0_DB), tu_htole16(1) }
        };
        TU_LOG1("Get channel %u volume range (%d, %d, %u) dB\r\n", request->bChannelNumber,
                range_vol.subrange[0].bMin / 256, range_vol.subrange[0].bMax / 256, range_vol.subrange[0].bRes / 256);
@@ -373,10 +378,6 @@ void tinyusb_control_task(void){
      TU_VERIFY(buf != NULL && buf[0] <= 1);
      mute[request->bChannelNumber] = (int8_t)buf[0];
 
-     if(request->bChannelNumber == 0){
-      need_change_bt_volume = true;
-     }
-
      TU_LOG1("Set channel %d Mute: %d\r\n", request->bChannelNumber, mute[request->bChannelNumber]);
 
      return true;
@@ -387,13 +388,12 @@ void tinyusb_control_task(void){
 
      int16_t requested_volume;
      TU_VERIFY(usb_audio_volume_value(buf, request->wLength, &requested_volume));
-     volume[request->bChannelNumber] = requested_volume;
+     atomic_store_explicit(&volume[request->bChannelNumber], requested_volume, memory_order_release);
 
      TU_LOG1("Set channel %d volume: %d dB\r\n", request->bChannelNumber, volume[request->bChannelNumber]/256);
 
-     if(request->bChannelNumber == 0){
-      need_change_bt_volume = true;
-     }
+     // A same-value SET is still explicit intent after a peer/source change.
+     atomic_store_explicit(&need_change_bt_volume, true, memory_order_release);
 
      return true;
    }
@@ -459,7 +459,8 @@ void tinyusb_control_task(void){
    if (itf == ITF_NUM_AUDIO_STREAMING_SPK) {
      if (alt == 0) {
        blink_interval_ms = BLINK_MOUNTED;
-       set_usb_streaming(false);
+       speaker_interface_open = false;
+       usb_speaker_stop();
      }
      return true;
    }
@@ -483,48 +484,43 @@ void tinyusb_control_task(void){
      return true;
    }
    if (itf != ITF_NUM_AUDIO_STREAMING_SPK) return false;
-   spk_data_size = 0;
-   current_resolution = alt == 1 ? resolutions_per_format[0] : 0;
+   speaker_interface_open = alt == 1;
    blink_interval_ms = alt == 1 ? BLINK_STREAMING : BLINK_MOUNTED;
-   if (alt == 0) set_usb_streaming(false);
+   if (alt == 0) usb_speaker_stop();
    return true;
  }
 
- uint16_t usb_stop_delay = 0;
- bool is_usb_audio_running = false;
-
- bool tud_audio_rx_done_pre_read_cb(uint8_t rhport, uint16_t n_bytes_received, uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting)
+ // TinyUSB has copied this packet and rearmed OUT before calling post_read.
+ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received, uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting)
  {
    (void)rhport;
    (void)func_id;
    (void)ep_out;
 
-   if (n_bytes_received > sizeof(spk_buf)) {
-     (void)tud_audio_read(spk_buf, sizeof(spk_buf));
+   if (n_bytes_received > sizeof(spk_buf) || n_bytes_received % (2u * sizeof(int16_t)) != 0) {
+     (void)tud_audio_clear_ep_out_ff();
      return false;
    }
-   spk_data_size = tud_audio_read(spk_buf, n_bytes_received);
-   TU_VERIFY(spk_data_size % (2 * sizeof(int16_t)) == 0);
-   if (cur_alt_setting != 1 || current_resolution != 16 ||
+   uint16_t spk_data_size = tud_audio_read(spk_buf, n_bytes_received);
+   if (spk_data_size != n_bytes_received) {
+     (void)tud_audio_clear_ep_out_ff();
+     return false;
+   }
+   if (cur_alt_setting != 1 || !speaker_interface_open ||
        !usb_mounted || usb_suspended) return true;
 
    if (spk_data_size)
    {
-    usb_stop_delay = 0;
-    set_usb_streaming(true);
-    if (current_resolution == 16)
-    {
-      int16_t *src = (int16_t *)spk_buf;
-      uint16_t sample_count = spk_data_size / (2u * sizeof(*src));
-
-      // USB mute must preserve the AirPods volume for a later unmute.
-      if (atomic_load_explicit(&mute[0], memory_order_acquire))
-        memset(src, 0, sample_count * 2u * sizeof(*src));
-      audio_slot_push_samples(src, sample_count);
-
-      is_usb_audio_running = true;
-      spk_data_size = 0;
+    speaker_last_packet_us = time_us_32();
+    if (!speaker_active) {
+      speaker_active = true;
+      set_usb_streaming(true);
     }
+    uint16_t sample_count = spk_data_size / (2u * sizeof(*spk_buf));
+    // USB mute must preserve the AirPods volume for a later unmute.
+    if (atomic_load_explicit(&mute[0], memory_order_acquire))
+      memset(spk_buf, 0, spk_data_size);
+    audio_slot_push_samples(spk_buf, sample_count);
    }
 
    return true;
@@ -543,7 +539,7 @@ void tinyusb_control_task(void){
    uint32_t got = 0;
    if (cur_alt_setting == 1 && usb_mic_requested())
      got = aacp_mic_pcm_read(buf, TU_ARRAY_SIZE(buf));
-   for (uint32_t i = got; i < TU_ARRAY_SIZE(buf); i++) buf[i] = 0;
+   memset(buf + got, 0, sizeof(buf) - got * sizeof(*buf));
 
    tud_audio_write(buf, sizeof(buf));
    return true;
@@ -556,15 +552,19 @@ void tinyusb_control_task(void){
 
  void audio_task(void)
  {
-  if (is_usb_audio_running){
-    usb_stop_delay = 0;
-  }else{
-    usb_stop_delay++;
-    if (usb_stop_delay > 100){
-      set_usb_streaming(false);
-    }
-  }
-  is_usb_audio_running = false;
+   if (speaker_active && (uint32_t)(time_us_32() - speaker_last_packet_us) >= USB_PLAYBACK_IDLE_US)
+     usb_speaker_stop();
+   // Only the USB service context writes TinyUSB endpoint FIFOs.
+   if (!atomic_load_explicit(&volume_notification_pending, memory_order_acquire) ||
+       !atomic_exchange_explicit(&volume_notification_pending, false, memory_order_acq_rel)) return;
+   if (!usb_host_active()) return;
+   const audio_interrupt_data_t data = {
+     .bInfo = 0, .bAttribute = AUDIO_CS_REQ_CUR,
+     .wValue_cn_or_mcn = 0, .wValue_cs = AUDIO_FU_CTRL_VOLUME,
+     .wIndex_ep_or_int = 0, .wIndex_entity_id = UAC2_ENTITY_SPK_FEATURE_UNIT,
+   };
+   if (!tud_audio_int_write(&data))
+     atomic_store_explicit(&volume_notification_pending, true, memory_order_release);
  }
 
 
@@ -574,52 +574,27 @@ void audio_control_task(void)
        !atomic_load_explicit(&need_change_bt_volume, memory_order_acquire))
    {
 
-    uint8_t bt_level = get_bt_volume();
+    uint8_t bt_level;
+    bool confirmed = get_bt_volume(&bt_level);
 
-
-    // 2) invert & scale into 0…25600
-    //    (BT_VOL_MAX - bt_level) maps 127→0, 0→127
-    //    multiply then divide with rounding
-    uint16_t usb_level = (bt_level > BT_VOL_MAX)
-                       ? USB_ATT_MAX
-                       : (uint16_t)(( (uint32_t)(BT_VOL_MAX - bt_level)
-                                     * USB_ATT_MAX
-                                     + (BT_VOL_MAX/2) )
-                                   / BT_VOL_MAX);
-
-    // 3) store into USB-Audio’s volume (attenuation) field
-    volume[0] = -1 * usb_level / 2;
-
-     // 6.1 Interrupt Data Message
-     const audio_interrupt_data_t data = {
-       .bInfo = 0,                                       // Class-specific interrupt, originated from an interface
-       .bAttribute = AUDIO_CS_REQ_CUR,                   // Caused by current settings
-       .wValue_cn_or_mcn = 0,                            // CH0: master volume
-       .wValue_cs = AUDIO_FU_CTRL_VOLUME,                // Volume change
-       .wIndex_ep_or_int = 0,                            // From the interface itself
-       .wIndex_entity_id = UAC2_ENTITY_SPK_FEATURE_UNIT, // From feature unit
-     };
-
-     tud_audio_int_write(&data);
-     *get_is_bt_sink_volume_changed_ptr() = false;
+    // A USB Set Volume may interrupt the Bluetooth readback above.
+    uint32_t saved = save_and_disable_interrupts();
+    if (!atomic_load_explicit(&need_change_bt_volume, memory_order_acquire)) {
+      if (confirmed) {
+        volume[0] = bt_volume_to_usb(bt_level);
+        atomic_store_explicit(&volume_notification_pending, true, memory_order_release);
+      }
+      *get_is_bt_sink_volume_changed_ptr() = false;
+    }
+    restore_interrupts(saved);
    }
 
    if (atomic_exchange_explicit(&need_change_bt_volume, false, memory_order_acq_rel)){
 
     // Mute is applied to PCM; AVRCP zero would erase the level on readback.
-    set_bt_volume(atomic_load_explicit(&volume[0], memory_order_acquire) / 256);
+    set_bt_volume(atomic_load_explicit(&volume[0], memory_order_acquire));
 
-    const audio_interrupt_data_t data = {
-      .bInfo = 0,                                       // Class-specific interrupt, originated from an interface
-      .bAttribute = AUDIO_CS_REQ_CUR,                   // Caused by current settings
-      .wValue_cn_or_mcn = 0,                            // CH0: master volume
-      .wValue_cs = AUDIO_FU_CTRL_VOLUME,                // Volume change
-      .wIndex_ep_or_int = 0,                            // From the interface itself
-      .wIndex_entity_id = UAC2_ENTITY_SPK_FEATURE_UNIT, // From feature unit
-    };
-
-    tud_audio_int_write(&data);
-    //*get_is_bt_sink_volume_changed_ptr() = false;
+    atomic_store_explicit(&volume_notification_pending, true, memory_order_release);
    }
 
   }

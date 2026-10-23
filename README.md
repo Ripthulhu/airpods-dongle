@@ -153,9 +153,9 @@ this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
 Both cores have guarded 16 KiB stacks. The build measures codec allocation peaks
 against the linked heap and requires at least 64 KiB left for runtime use.
-The 0.1.9 link leaves 385,184 bytes of heap. The ARM probe peaks at 90,816 bytes
+The 0.1.9 link leaves 385,752 bytes of heap. The ARM probe peaks at 90,816 bytes
 for LHDC plus AAC-ELD, or 188,040 bytes for playback plus USB microphone. The
-heavier case leaves 197,144 bytes before other runtime allocations.
+heavier case leaves 197,712 bytes before other runtime allocations.
 The [codec probe](tools/codec_probe/README.md) covers the real encoders, VBR frame
 bounds and decoder lifecycles; emulation does not measure full runtime heap or
 stack use. Performance readings expose queue fill, dropped/underflow frames,

@@ -42,6 +42,7 @@ int main(void) {
     dongle_control_available(true); dongle_control_poll();
     assert(dongle_control_get(out, 62) == 0 && dongle_control_get(out, 63) == 63);
     assert(!memcmp(out, "APDG", 4));
+    assert(controls[0].status[42] & 32); // Whole-workflow settings lease support.
     for (unsigned i = 0; i < 10; ++i) dongle_control_poll();
     assert(!reconnects && !pairs && !anc_writes); // discovery is read-only
     request(r, 1, 1); send(r); assert(reconnects == 1 && controls[0].last_result == DONGLE_ACCEPTED);

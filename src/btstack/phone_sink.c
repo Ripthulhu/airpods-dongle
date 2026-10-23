@@ -45,16 +45,38 @@ static struct {
     phone_codec_t requested_codec;
     bool select_codec;
     bool configured, opening, opened, started, start_pending, start_accepted, disconnecting, controls_owned;
-    bool sequence_valid, volume_valid;
+    bool sequence_valid, volume_valid, volume_notification_pending, volume_event_supported;
+    bool requested_volume_valid;
     uint16_t last_sequence;
     uint8_t last_codec_sequence;
     uint8_t decode_failures;
     uint32_t ssrc, pending_since_ms;
     uint32_t packets, malformed, sequence_gaps;
-    uint8_t volume;
+    uint8_t volume, requested_volume;
     uint8_t controls[PHONE_CONTROL_QUEUE], control_head, control_count;
     uint32_t control_since_ms;
 } phone;
+
+static void notify_phone_volume(void) {
+    if (phone.avrcp_cid == 0) return;
+    if (!phone.volume_event_supported) {
+        if (avrcp_target_support_event(phone.avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED)
+                != ERROR_CODE_SUCCESS) return;
+        phone.volume_event_supported = true;
+    }
+    if (!phone.volume_valid || !phone.volume_notification_pending) return;
+    if (avrcp_target_volume_changed(phone.avrcp_cid, phone.volume) != ERROR_CODE_SUCCESS) return;
+    phone.volume_notification_pending = false;
+}
+
+static void apply_phone_volume_intent(void) {
+    if (!phone.requested_volume_valid || !phone.controls_owned || phone.disconnecting) return;
+    if (!bridge_phone_volume(phone.requested_volume)) return;
+    phone.requested_volume_valid = false;
+    phone.volume_valid = phone.volume_notification_pending = false;
+    uint8_t confirmed;
+    if (bridge_phone_get_volume(&confirmed)) phone_sink_volume_changed(confirmed);
+}
 
 static bool event_complete(const uint8_t *packet, uint16_t size) {
     return packet != NULL && size >= 3 && (unsigned)packet[1] + 2u == size;
@@ -103,11 +125,15 @@ static void reject_start(void) {
         a2dp_sink_start_stream_reject(phone.cid, phone.seid);
     audio_stop();
     phone.controls_owned = false;
+    phone.requested_volume_valid = false;
+    bt_volume_cancel_phone();
 }
 
 static void disconnect_phone(void) {
     audio_stop();
     phone.controls_owned = false;
+    phone.requested_volume_valid = false;
+    bt_volume_cancel_phone();
     phone.opened = phone.configured = phone.select_codec = false;
     phone.control_head = phone.control_count = 0;
     phone.requested_codec = PHONE_CODEC_NONE;
@@ -291,7 +317,9 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
             bool already_open = packet[7] != 0 && phone.opened && phone.seid == packet[5];
             bool local_configuration = packet[7] == 0 && phone.requested_codec == codec;
             audio_stop();
+            if (phone.controls_owned) phone.requested_volume_valid = false;
             phone.controls_owned = false;
+            bt_volume_cancel_phone();
             if (!phone_worker_configure(codec, codec == PHONE_CODEC_SBC ? &sbc : NULL)) {
                 disconnect_phone();
                 return;
@@ -348,7 +376,11 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
         case A2DP_SUBEVENT_STREAM_RELEASED:
             if (size != 6 || packet[5] != phone.seid) return;
             audio_stop();
-            if (packet[2] != A2DP_SUBEVENT_STREAM_SUSPENDED) phone.controls_owned = false;
+            if (packet[2] != A2DP_SUBEVENT_STREAM_SUSPENDED) {
+                phone.controls_owned = false;
+                phone.requested_volume_valid = false;
+                bt_volume_cancel_phone();
+            }
             if (packet[2] == A2DP_SUBEVENT_STREAM_RELEASED) {
                 phone.opened = phone.configured = false;
                 phone.codec = PHONE_CODEC_NONE;
@@ -358,6 +390,8 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
             if (size != 5) return;
             audio_stop();
             phone.controls_owned = false;
+            phone.requested_volume_valid = false;
+            bt_volume_cancel_phone();
             phone.control_head = phone.control_count = 0;
             phone.cid = 0;
             phone.disconnecting = false;
@@ -603,10 +637,11 @@ void phone_sink_poll(void) {
                 phone.start_accepted = true;
                 phone.pending_since_ms = now;
                 phone_worker_reset();
-                if (phone.volume_valid) bridge_phone_volume(phone.volume);
                 if (a2dp_sink_start_stream_accept(phone.cid, phone.seid) != ERROR_CODE_SUCCESS) {
                     audio_stop();
                     phone.controls_owned = false;
+                    phone.requested_volume_valid = false;
+                    bt_volume_cancel_phone();
                 } else {
                     phone.controls_owned = true;
                 }
@@ -623,6 +658,8 @@ void phone_sink_poll(void) {
             phone.control_since_ms = now;
         }
     }
+    apply_phone_volume_intent();
+    notify_phone_volume();
 }
 
 void phone_sink_yield(void) {
@@ -652,18 +689,21 @@ bool phone_sink_handle_avrcp(uint8_t type, uint16_t channel, uint8_t *packet, ui
         if (phone.avrcp_cid != 0 && phone.avrcp_cid != cid) return true;
         memcpy(phone.address, address, sizeof(address));
         phone.avrcp_cid = cid;
-        phone.volume = bridge_phone_get_volume();
-        phone.volume_valid = true;
-        avrcp_target_support_event(cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-        avrcp_target_volume_changed(cid, phone.volume);
+        phone_sink_volume_invalidated();
+        // shortcut: BTstack can answer unsolicited early REGISTER from its default;
+        // defer it if Android captures require it. That value never becomes intent.
+        uint8_t confirmed;
+        if (bridge_phone_get_volume(&confirmed)) phone_sink_volume_changed(confirmed);
+        else notify_phone_volume();
         return true;
     }
     if (size < 5 || phone.avrcp_cid == 0 || little_endian_read_16(packet, 3) != phone.avrcp_cid)
         return false;
     if (packet[2] == AVRCP_SUBEVENT_CONNECTION_RELEASED && size == 5) {
+        bt_volume_cancel_phone();
         phone.avrcp_cid = 0;
         phone.control_head = phone.control_count = 0;
-        phone.volume_valid = false;
+        phone_sink_volume_invalidated();
     }
     return true;
 }
@@ -678,9 +718,11 @@ bool phone_sink_handle_controller(uint8_t type, uint16_t channel, uint8_t *packe
 bool phone_sink_handle_target(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {
     if (!phone_sink_handle_controller(type, channel, packet, size)) return false;
     if (packet[2] == AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED && size == 7 && packet[6] <= 127) {
-        phone.volume = packet[6];
-        phone.volume_valid = true;
-        if (phone_sink_owns_controls()) bridge_phone_volume(phone.volume);
+        if (phone.disconnecting) return true;
+        // This target event represents an explicit phone SET_ABSOLUTE_VOLUME.
+        phone.requested_volume = packet[6];
+        phone.requested_volume_valid = true;
+        apply_phone_volume_intent();
     }
     return true;
 }
@@ -701,8 +743,14 @@ bool phone_sink_media_control(uint8_t operation) {
 }
 
 void phone_sink_volume_changed(uint8_t volume) {
-    if (volume > 127 || phone.avrcp_cid == 0 || (phone.volume_valid && phone.volume == volume)) return;
+    if (volume > 127) return;
     phone.volume = volume;
     phone.volume_valid = true;
-    avrcp_target_volume_changed(phone.avrcp_cid, volume);
+    phone.volume_notification_pending = true;
+    notify_phone_volume();
+}
+
+void phone_sink_volume_invalidated(void) {
+    phone.volume_valid = phone.volume_notification_pending = phone.volume_event_supported = false;
+    phone.requested_volume_valid = false;
 }

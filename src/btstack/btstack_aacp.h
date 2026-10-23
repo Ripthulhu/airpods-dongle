@@ -55,6 +55,9 @@ bool aacp_control_address(bd_addr_t address);
 
 // Typed model/value-checked controls. Acceptance is local, never a device report.
 uint8_t aacp_setting_write(uint8_t id, uint32_t value);
+// The RPC owner retains the operation until sent/failed, then consumes its receipt.
+int aacp_setting_take(void); // 0 pending/idle, 1 sent locally, 2 failed
+void aacp_setting_cancel(void); // Remove only its unsent queue entry and clear receipt.
 // Version 1, count, then {id:u8, age_ms:u32, revision:u32, value:u32} records.
 uint16_t aacp_settings_snapshot(uint8_t *out, uint16_t capacity);
 bool aacp_model_game_supported(void);

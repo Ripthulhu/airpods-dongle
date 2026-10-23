@@ -1,7 +1,7 @@
 # USB controls, version 1
 
-Firmware 0.1.8 retains the version-1 reports and adds the typed features described
-in [control extensions](CONTROL-EXTENSIONS.md).
+Version-1 reports include the typed features described in
+[control extensions](CONTROL-EXTENSIONS.md).
 
 Audio and the microphone use the Windows USB Audio 2 driver. Media keys use HID.
 NTPods uses a separate vendor HID collection on the same interface; opening it
@@ -35,7 +35,7 @@ command. Bluetooth work runs on core 0, outside the USB interrupt.
 | 36–39 | Last command sequence |
 | 40 | Result: 0 none, 1 accepted, 2 busy, 3 stale target, 4 unsupported, 5 disconnected, 6 malformed |
 | 41 | Last command opcode; 0 for an invalid opcode |
-| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16) |
+| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16), settings workflow lease (32) |
 | 44–63 | Reserved zero |
 
 Acceptance means queued/performed locally, not device readback. In particular,
@@ -96,14 +96,25 @@ disconnected (4), timeout (5), transport failure (6), unsupported (7) or cancell
 Malformed new requests may be ignored; hosts must bound their waits.
 
 Cancel uses the same sequence and generation with zero total, offset and payload.
-It discards pending work and closes ATT; it cannot undo a write already sent or
-stop a physical self-check. USB loss or a generation change clears the transaction.
+It discards pending work, including an unsent typed setting write, and closes ATT;
+it cannot undo a write already sent or stop a physical self-check. A valid workflow
+lease remains available for mode-restoration cleanup; the app releases it when
+the whole action ends. USB loss or a generation change clears both.
 USB and the bonded phone have separate assembly buffers, sequences, receipts and
 completed responses. Shared ATT/AACP execution has one owner; a competing commit
 returns busy while it runs. One client cannot page or cancel another's response.
-Assembly and execution have a 3.5-second firmware watchdog. ATT has a three-second
-deadline and closes its channel on failure so a late response cannot satisfy a
-later request. NTPods never retries a write after an uncertain result.
+Assembly and execution have a 3.5-second firmware watchdog. ATT, raw AACP and
+typed setting sends have three-second deadlines. Typed writes remain running
+until sent locally, then require separate device readback. Client/session ownership,
+microphone restrictions and deadlines are rechecked before every radio send,
+including retries. ATT closes its channel on failure so a late response cannot
+satisfy a later request. NTPods never retries a write after an uncertain result.
+
+Raw ATT/AACP transactions require a settings workflow lease. Acquire it before
+reading an edit's baseline and retain it through writes, readback and mode cleanup.
+Capability 32 and [typed subcommand 10](CONTROL-EXTENSIONS.md#settings-workflow-lease)
+define the handshake. Cached reports remain readable without a lease. Apps must
+fail closed if firmware lacks this capability; an unlocked edit is not a fallback.
 
 Cached report requests contain one slot byte: model/firmware (1), Hearing Aid
 `09/2C` (2), assistance gate `09/33` (3), PME `53` subtype 2 (4), ear state `06` (5).

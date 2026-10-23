@@ -56,7 +56,7 @@ The check covers:
 With GCC 13.2.1 and firmware 0.1.9, live stereo/microphone allocations total
 186,872 bytes; the tested allocator peak is 188,040 bytes. LHDC/ELD/worker live
 allocations total 85,512 bytes and peak at 90,816 bytes. The linked heap is
-385,184 bytes, leaving 197,144 bytes at the heavier peak before other runtime allocations.
+385,752 bytes, leaving 197,712 bytes at the heavier peak before other runtime allocations.
 The 64 KiB reserve is a policy allowance, not a measured application requirement.
 
 Stack markers start 128 bytes below the helper's stack pointer. Tested decoder

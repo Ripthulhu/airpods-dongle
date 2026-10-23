@@ -22,6 +22,7 @@ bool phone_sink_handle_controller(uint8_t type, uint16_t channel, uint8_t *packe
 bool phone_sink_handle_target(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size);
 bool phone_sink_media_control(uint8_t operation);
 void phone_sink_volume_changed(uint8_t absolute_volume);
+void phone_sink_volume_invalidated(void);
 
 // AirPods/USB ownership boundary; only the selected phone input can publish PCM.
 bool bridge_phone_open(void);
@@ -30,7 +31,8 @@ bool bridge_phone_start(void);
 void bridge_phone_stop(void);
 void bridge_phone_pcm_push(const int16_t *stereo, uint16_t frames);
 void bridge_phone_drop_pcm(void);
-void bridge_phone_volume(uint8_t absolute_volume);
-uint8_t bridge_phone_get_volume(void);
+bool bridge_phone_volume(uint8_t absolute_volume);
+bool bridge_phone_get_volume(uint8_t *absolute_volume);
+void bt_volume_cancel_phone(void);
 
 #endif

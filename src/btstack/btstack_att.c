@@ -4,6 +4,7 @@
 #include "btstack_avdtp_source.h"
 #include "phone_sink.h"
 #include "../tinyusb/uac.h"
+#include "../tinyusb/dongle_rpc.h"
 #include "btstack.h"
 #include <string.h>
 
@@ -144,7 +145,9 @@ static void packet_handler(uint8_t type, uint16_t channel, uint8_t *p, uint16_t 
         case L2CAP_EVENT_CAN_SEND_NOW:
             if (n < 4 || !pending || !opened || sent ||
                 l2cap_event_can_send_now_get_local_cid(p) != att_cid) return;
-            if (!same_peer() || tx_length > l2cap_get_remote_mtu_for_local_cid(att_cid) ||
+            if (!same_peer() || !dongle_rpc_transport_current() || usb_mic_requested() || aacp_mic_active() ||
+                (uint32_t)(btstack_run_loop_get_time_ms()-started)>=ATT_TIMEOUT_MS ||
+                tx_length > l2cap_get_remote_mtu_for_local_cid(att_cid) ||
                 !guarded_write_ready()) { fail(); return; }
             if (l2cap_send(att_cid, tx, tx_length) != ERROR_CODE_SUCCESS) {
                 l2cap_request_can_send_now_event(att_cid);

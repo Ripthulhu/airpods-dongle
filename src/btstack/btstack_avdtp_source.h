@@ -22,9 +22,10 @@ void audio_slot_push_samples(const int16_t *src, uint16_t stereo_pair_count);
 bool check_is_streaming();
 bool dongle_playback_transitioning(void);
 
-void set_bt_volume(int16_t);
-
-uint8_t get_bt_volume();
+void set_bt_volume(int16_t db256);
+bool get_bt_volume(uint8_t *level);
+void bt_volume_poll(void);
+void bt_volume_cancel_phone(void);
 
 void set_usb_streaming(bool flag);
 bool get_usb_streaming(void);

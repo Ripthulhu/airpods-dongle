@@ -12,4 +12,6 @@ void dongle_rpc_set(const uint8_t *buffer, uint16_t length);
 void dongle_rpc_available(bool available);
 void dongle_rpc_poll(void);
 bool dongle_rpc_busy(void);
+// Recheck client/session ownership at the radio send boundary, after IRQ revocation.
+bool dongle_rpc_transport_current(void);
 #endif

@@ -4,11 +4,43 @@
 import argparse
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def uac_sources(directory):
+    source = (ROOT / "src/tinyusb/uac.c").read_text()
+    start = source.index(" const uint32_t sample_rates[]")
+    end = source.index(" static void usb_speaker_stop(void)")
+    declarations = source[start:end]
+    start = source.index(" static int16_t spk_buf[")
+    end = source.index(" //void led_blinking_task", start)
+    declarations += source[start:end]
+    functions = []
+    for name in ["usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
+                 "usb_mic_requested", "usb_host_active", "tinyusb_task", "tinyusb_control_task",
+                 "tud_mount_cb", "tud_umount_cb", "tud_suspend_cb", "tud_resume_cb",
+                 "tud_audio_mic_clock_get_request", "tud_audio_clock_get_request",
+                 "tud_audio_clock_set_request", "tud_audio_feature_unit_get_request",
+                 "tud_audio_feature_unit_set_request", "tud_audio_get_req_entity_cb",
+                 "tud_audio_set_req_entity_cb", "tud_audio_set_itf_close_EP_cb",
+                 "tud_audio_set_itf_cb", "tud_audio_rx_done_post_read_cb",
+                 "tud_audio_tx_done_pre_load_cb", "audio_task", "audio_control_task"]:
+        match = re.search(r"(?m)^\s*(?:static )?(?:void|bool) " + name + r"\([^;]*?\)\s*\{", source)
+        if match is None:
+            raise ValueError(f"Missing UAC function: {name}")
+        start = match.start()
+        end = source.index("{", start) + 1
+        depth = 1
+        while depth:
+            depth += (source[end] == "{") - (source[end] == "}")
+            end += 1
+        functions.append(source[start:end])
+    (directory / "uac.inc").write_text(declarations + "\n".join(functions))
 
 
 def playback_lifecycle_sources(directory):
@@ -80,9 +112,13 @@ def main():
         "dongle_settings": ["tests/dongle_settings_test.c"],
         "att": ["-Itests/aacp_stubs", "-Wno-unused-function", "tests/att_test.c"],
         "usb_control": ["tests/usb_control_test.c"],
+        "uac": ["tests/uac_test.c"],
+        "volume_sync": ["tests/volume_sync_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],
         "dongle_rpc": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_rpc_test.c"],
+        "dongle_lease": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_lease_test.c"],
+        "dongle_setting_lifecycle": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_setting_lifecycle_test.c"],
         "dongle_features": ["-Itests/aacp_stubs", "-Wno-unused-function", "tests/dongle_features_test.c"],
         "mic_decoder": ["-Itests/mic_stubs", "-Wno-deprecated-declarations",
                         "tests/mic_decoder_test.c", "-lm"],
@@ -95,6 +131,7 @@ def main():
     }
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:
         playback_lifecycle_sources(pathlib.Path(tmp))
+        uac_sources(pathlib.Path(tmp))
         for name, sources in tests.items():
             binary = pathlib.Path(tmp) / name
             command = [args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-g", "-O1"]

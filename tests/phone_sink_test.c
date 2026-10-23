@@ -21,6 +21,12 @@ static bool lhdc_available, aptx_available, prepare_ok, codec_ready, decode_ok, 
 static bool prefix_before_failure;
 static bool prepare_waiting, close_waiting;
 static bool async_worker, worker_pending, submit_ok;
+static bool confirmed_volume_known, volume_request_ok, target_volume_busy, target_support_busy;
+static uint8_t confirmed_volume, last_bridge_volume, target_volume;
+static unsigned bridge_volume_attempts, bridge_volume_requests, target_volume_attempts, target_support_attempts;
+static bool target_volume_initialized;
+static unsigned volume_cancels;
+static bool accept_ok;
 static phone_codec_t desired;
 static uint8_t received_payload[PHONE_CODEC_MAX_PAYLOAD];
 static size_t received_length;
@@ -49,7 +55,7 @@ uint8_t avdtp_local_seid(avdtp_stream_endpoint_t*endpoint) {return endpoint->sei
 void a2dp_sink_create_sdp_record(uint8_t*buffer,uint32_t handle,uint16_t features,const char*name,const char*provider) {(void)handle;(void)features;(void)name;(void)provider;buffer[0]=1;}
 uint32_t sdp_create_service_record_handle(void) {return 0x10001;}
 void sdp_register_service(const uint8_t*service) {assert(service[0]==1);}
-uint8_t a2dp_sink_start_stream_accept(uint16_t cid,uint8_t seid) {assert(cid==phone.cid && seid==phone.seid);accepted++;return 0;}
+uint8_t a2dp_sink_start_stream_accept(uint16_t cid,uint8_t seid) {assert(cid==phone.cid && seid==phone.seid);accepted++;return accept_ok ? 0 : 0x0c;}
 uint8_t a2dp_sink_start_stream_reject(uint16_t cid,uint8_t seid) {assert(cid==phone.cid && seid==phone.seid);rejected++;return 0;}
 void a2dp_sink_disconnect(uint16_t cid) {assert(cid);disconnected++;}
 uint8_t a2dp_sink_establish_stream(bd_addr_t address,uint16_t *cid) {
@@ -106,8 +112,20 @@ bool bridge_phone_start(void) {claims++;return claim_allowed;}
 void bridge_phone_stop(void) {stops++;}
 void bridge_phone_pcm_push(const int16_t*pcm,uint16_t frames) {assert(pcm);pcm_frames+=frames;}
 void bridge_phone_drop_pcm(void) {pcm_frames=0;pcm_drops++;}
-void bridge_phone_volume(uint8_t volume) {last_volume=volume;volume_updates++;}
-uint8_t bridge_phone_get_volume(void) {return 53;}
+bool bridge_phone_volume(uint8_t volume) {
+    ++bridge_volume_attempts;
+    if (!volume_request_ok) return false;
+    if (confirmed_volume_known && confirmed_volume==volume) return true;
+    assert(phone.controls_owned && !phone.disconnecting);
+    last_bridge_volume=last_volume=volume;bridge_volume_requests++;volume_updates++;
+    confirmed_volume_known=false;
+    return true;
+}
+bool bridge_phone_get_volume(uint8_t *volume) {
+    if (!confirmed_volume_known || volume==NULL) return false;
+    *volume=confirmed_volume;return true;
+}
+void bt_volume_cancel_phone(void) {volume_cancels++;}
 static uint8_t send(uint16_t cid,uint8_t operation) {assert(cid==phone.avrcp_cid);if(control_busy)return 0x0c;controls_sent++;last_control=operation;return 0;}
 uint8_t avrcp_controller_play(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_PLAY);}
 uint8_t avrcp_controller_pause(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_PAUSE);}
@@ -116,8 +134,17 @@ uint8_t avrcp_controller_forward(uint16_t cid) {return send(cid,AVRCP_OPERATION_
 uint8_t avrcp_controller_backward(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_BACKWARD);}
 uint8_t avrcp_controller_volume_up(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_VOLUME_UP);}
 uint8_t avrcp_controller_volume_down(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_VOLUME_DOWN);}
-uint8_t avrcp_target_support_event(uint16_t cid,uint8_t event) {assert(cid==phone.avrcp_cid&&event==AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);return 0;}
-uint8_t avrcp_target_volume_changed(uint16_t cid,uint8_t volume) {assert(cid==phone.avrcp_cid);last_volume=volume;volume_updates++;return 0;}
+uint8_t avrcp_target_support_event(uint16_t cid,uint8_t event) {
+    assert(cid==phone.avrcp_cid&&event==AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+    target_support_attempts++;return target_support_busy ? 0x0c : 0;
+}
+uint8_t avrcp_target_volume_changed(uint16_t cid,uint8_t volume) {
+    assert(cid==phone.avrcp_cid&&volume<=127);target_volume_attempts++;
+    if (target_volume_busy) return 0x0c;
+    target_volume_initialized=true;
+    if (target_volume!=volume) {target_volume=last_volume=volume;volume_updates++;}
+    return 0;
+}
 void a2dp_config_process_avdtp_event_handler(avdtp_role_t role,uint8_t*packet,uint16_t size) {
     assert(role==AVDTP_ROLE_SINK);framework_calls++;
     if(packet[2]==AVDTP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED){
@@ -137,12 +164,32 @@ static void fixture_codecs(bool lhdc,bool aptx,bool create_lhdc) {
     codec_ready=control_busy=prefix_before_failure=false;lhdc_available=lhdc;aptx_available=aptx;desired=PHONE_CODEC_NONE;
     prepare_waiting=close_waiting=false;
     async_worker=worker_pending=false;submit_ok=true;
+    confirmed_volume_known=volume_request_ok=true;confirmed_volume=53;
+    target_volume_busy=target_support_busy=target_volume_initialized=false;target_volume=0;
+    bridge_volume_attempts=bridge_volume_requests=target_volume_attempts=target_support_attempts=0;
+    volume_cancels=0;accept_ok=true;
     lhdc_selections=aptx_selections=sbc_selections=reconnects=0;selected_remote=0;lhdc_select_ok=aptx_select_ok=true;
     lhdc_create_ok=create_lhdc;
     assert(phone_sink_init());
 }
 static void fixture(bool aptx) {fixture_codecs(false,aptx,true);}
 static void address_event(uint8_t*p,unsigned offset,const bd_addr_t address) {for(unsigned i=0;i<6;i++)p[offset+i]=address[5-i];}
+static void phone_avrcp_connected(uint16_t cid) {
+    uint8_t p[14]={HCI_EVENT_AVRCP_META,12,AVRCP_SUBEVENT_CONNECTION_ESTABLISHED,0,(uint8_t)cid,(uint8_t)(cid>>8)};
+    address_event(p,6,phone_address);
+    target_volume=0;target_volume_initialized=false;
+    assert(phone_sink_handle_avrcp(HCI_EVENT_PACKET,0,p,sizeof(p)));
+}
+static bool phone_volume_set(uint16_t cid,uint8_t volume) {
+    uint8_t p[7]={HCI_EVENT_AVRCP_META,5,AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED,
+        (uint8_t)cid,(uint8_t)(cid>>8),0,volume};
+    // The pinned target updates its own value before emitting the SET event.
+    if (cid==phone.avrcp_cid && volume<=127) target_volume=volume;
+    return phone_sink_handle_target(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void confirm_volume(uint8_t volume) {
+    confirmed_volume_known=true;confirmed_volume=volume;phone_sink_volume_changed(volume);
+}
 static void signaling(uint16_t cid,const bd_addr_t address) {
     uint8_t p[14]={HCI_EVENT_AVDTP_META,12,AVDTP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED,(uint8_t)cid,(uint8_t)(cid>>8)};
     address_event(p,5,address);raw_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
@@ -635,22 +682,146 @@ static void test_avrcp_ownership_controls_and_volume(void) {
     stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
     assert(phone_sink_owns_controls() && phone_sink_media_control(AVRCP_OPERATION_ID_PLAY));phone_sink_poll();
     assert(controls_sent==2 && last_control==AVRCP_OPERATION_ID_PLAY);
-    uint8_t paused_volume[7]={HCI_EVENT_AVRCP_META,5,AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED,0x50,0,0,66};
-    assert(phone_sink_handle_target(HCI_EVENT_PACKET,0,paused_volume,7));assert(last_volume==66);
+    assert(phone_volume_set(0x50,66));assert(last_volume==66);
     stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
     stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);
     control_busy=true;
     for(unsigned i=0;i<8;i++)assert(phone_sink_media_control(AVRCP_OPERATION_ID_FORWARD));
     assert(phone.control_count==PHONE_CONTROL_QUEUE);phone_sink_poll();assert(controls_sent==2);
     control_busy=false;phone_sink_poll();assert(controls_sent==3);
-    uint8_t volume[7]={HCI_EVENT_AVRCP_META,5,AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED,0x50,0,0,88};
-    assert(phone_sink_handle_target(HCI_EVENT_PACKET,0,volume,7));assert(last_volume==88);
+    assert(phone_volume_set(0x50,88));assert(last_volume==88);
     unsigned before=volume_updates;phone_sink_volume_changed(88);assert(volume_updates==before);
-    volume[3]=0x51;assert(!phone_sink_handle_target(HCI_EVENT_PACKET,0,volume,7));
+    assert(!phone_volume_set(0x51,40));
     uint8_t release[5]={HCI_EVENT_AVRCP_META,3,AVRCP_SUBEVENT_CONNECTION_RELEASED,0x50,0};
     assert(phone_sink_handle_avrcp(HCI_EVENT_PACKET,0,release,5));assert(phone.control_count==0 && phone.avrcp_cid==0);
 }
+static void test_unknown_phone_volume_is_not_intent(void) {
+    fixture(true);confirmed_volume_known=false;
+    phone_avrcp_connected(0x50);
+    assert(!phone.volume_valid && !phone.requested_volume_valid && volume_updates==0);
+    assert(target_volume_attempts==0 && target_support_attempts==1 && phone.volume_event_supported);
+    assert(!target_volume_initialized); // Capability advertisement must not seed a guessed value.
+    assert(opens==0 && claims==0 && bridge_volume_attempts==0);
+    for(unsigned i=0;i<5;i++)phone_sink_poll();
+    assert(target_volume_attempts==0 && bridge_volume_attempts==0);
+    confirm_volume(42);
+    assert(phone.volume_valid && phone.volume==42 && !phone.requested_volume_valid);
+    assert(target_volume_initialized && target_volume==42 && target_support_attempts==1 && bridge_volume_attempts==0);
+    playing(false);
+    assert(bridge_volume_attempts==0); // A confirmed report is not a future Start request.
+    stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    assert(bridge_volume_attempts==0);
+
+    fixture(true);phone_avrcp_connected(0x50);
+    assert(phone.volume_valid && phone.volume==53 && bridge_volume_attempts==0);
+    assert(opens==0 && claims==0); // A controls-only connection never changes AirPods volume/audio.
+    fixture(true);confirmed_volume=0;phone_avrcp_connected(0x50);
+    assert(phone.volume_valid && phone.volume==0 && target_support_attempts==1);
+}
+static void test_explicit_phone_volume_survives_readback_until_start(void) {
+    fixture(true);confirmed_volume_known=false;phone_avrcp_connected(0x50);
+    assert(phone_volume_set(0x50,41) && phone.requested_volume_valid);
+    assert(!phone.volume_valid && bridge_volume_attempts==0);
+    confirm_volume(80); // PC confirmation cannot overwrite the separate phone intent.
+    assert(phone.volume==80 && phone.requested_volume==41 && phone.requested_volume_valid);
+    playing(false);
+    assert(bridge_volume_requests==1 && last_bridge_volume==41 && !phone.requested_volume_valid);
+    assert(!phone.volume_valid); // Queued intent is not confirmed readback.
+    confirm_volume(41);
+    unsigned attempts=bridge_volume_attempts;
+    stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    assert(bridge_volume_attempts==attempts); // No replay on resume.
+
+    fixture(true);phone_avrcp_connected(0x50);assert(phone_volume_set(0x50,0));
+    playing(false);assert(bridge_volume_requests==1 && last_bridge_volume==0);
+
+    fixture(true);phone_avrcp_connected(0x50);assert(phone_volume_set(0x50,53));
+    playing(false);assert(!phone.requested_volume_valid && phone.volume_valid);
+    assert(bridge_volume_requests==0); // A confirmed no-op stays known.
+}
+static void test_phone_notification_retry_and_invalidation(void) {
+    fixture(true);confirmed_volume_known=false;phone_avrcp_connected(0x50);
+    target_volume_busy=true;confirm_volume(44);
+    assert(phone.volume_notification_pending && target_volume_attempts==1 && target_support_attempts==1);
+    phone_sink_poll();assert(phone.volume_notification_pending && target_volume_attempts==2);
+    confirm_volume(55);assert(phone.volume_notification_pending);
+    target_volume_busy=false;phone_sink_poll();
+    assert(!phone.volume_notification_pending && target_volume==55 && target_support_attempts==1);
+    unsigned before=volume_updates;confirm_volume(55);assert(volume_updates==before);
+    assert(bridge_volume_requests==0);
+
+    fixture(true);confirmed_volume_known=false;target_support_busy=true;phone_avrcp_connected(0x50);
+    assert(!phone.volume_event_supported && target_support_attempts==1 && target_volume_attempts==0);
+    phone_sink_poll();assert(target_support_attempts==2 && target_volume_attempts==0);
+    confirm_volume(40);
+    assert(phone.volume_notification_pending && target_volume_attempts==0 && !phone.volume_event_supported);
+    confirm_volume(45);target_support_busy=false;phone_sink_poll();
+    assert(!phone.volume_notification_pending && phone.volume_event_supported && target_volume==45);
+
+    assert(phone_volume_set(0x50,90) && phone.requested_volume_valid);
+    target_volume_busy=true;confirm_volume(60);before=volume_updates;
+    confirmed_volume_known=false;phone_sink_volume_invalidated();
+    assert(!phone.volume_valid && !phone.volume_notification_pending && !phone.requested_volume_valid);
+    phone_sink_poll();assert(volume_updates==before && bridge_volume_requests==0);
+    playing(false);assert(bridge_volume_requests==0); // Pair/reset invalidation drops obsolete intent.
+}
+static void test_phone_volume_paused_retry_and_ownership_loss(void) {
+    fixture(true);playing(false);phone_avrcp_connected(0x50);
+    unsigned cancels=volume_cancels;
+    stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
+    assert(phone.controls_owned && volume_cancels==cancels);
+    volume_request_ok=false;assert(phone_volume_set(0x50,77));
+    assert(phone.requested_volume_valid && bridge_volume_requests==0);
+    phone_sink_poll();assert(phone.requested_volume_valid && bridge_volume_requests==0);
+    volume_request_ok=true;phone_sink_poll();
+    assert(!phone.requested_volume_valid && bridge_volume_requests==1 && last_bridge_volume==77);
+    confirm_volume(77);
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    assert(bridge_volume_requests==1 && volume_cancels==cancels);
+    stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);
+    volume_request_ok=false;assert(phone_volume_set(0x50,88) && phone.requested_volume_valid);
+    phone_sink_yield();
+    assert(!phone.requested_volume_valid && volume_cancels>cancels && !phone.controls_owned);
+    assert(phone_volume_set(0x50,89) && !phone.requested_volume_valid); // Ignore events during takeover.
+    volume_request_ok=true;phone_sink_poll();assert(bridge_volume_requests==1);
+
+    fixture(true);phone_avrcp_connected(0x50);assert(phone_volume_set(0x50,67));
+    signaling(0x40,phone_address);configure(false);opened();
+    accept_ok=false;output_ready=true;
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    assert(accepted==1 && !phone.start_accepted);
+    assert(!phone.controls_owned && !phone.requested_volume_valid && bridge_volume_requests==0);
+
+    fixture(true);playing(false);phone_avrcp_connected(0x50);
+    stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
+    volume_request_ok=false;assert(phone_volume_set(0x50,68) && phone.requested_volume_valid);
+    configure(false);
+    assert(!phone.controls_owned && !phone.requested_volume_valid && bridge_volume_requests==0);
+}
+static void test_phone_volume_disconnect_and_stale_cid(void) {
+    fixture(true);phone_avrcp_connected(0x50);
+    unsigned before=volume_updates;
+    assert(!phone_volume_set(0x51,90) && !phone.requested_volume_valid && volume_updates==before);
+    assert(phone_volume_set(0x50,60) && phone.requested_volume_valid);
+    uint8_t release[5]={HCI_EVENT_AVRCP_META,3,AVRCP_SUBEVENT_CONNECTION_RELEASED,0x51,0};
+    assert(!phone_sink_handle_avrcp(HCI_EVENT_PACKET,0,release,sizeof(release)) && phone.requested_volume_valid);
+    release[3]=0x50;
+    unsigned cancels=volume_cancels;
+    assert(phone_sink_handle_avrcp(HCI_EVENT_PACKET,0,release,sizeof(release)));
+    assert(!phone.volume_valid && !phone.requested_volume_valid && !phone.volume_notification_pending);
+    assert(phone.avrcp_cid==0 && volume_cancels==cancels+1);
+    confirmed_volume_known=false;phone_avrcp_connected(0x51);
+    assert(!phone.volume_valid && !phone.requested_volume_valid);
+    assert(!phone_volume_set(0x50,70) && !phone.requested_volume_valid);
+}
 int main(void) {
+    test_unknown_phone_volume_is_not_intent();
+    test_explicit_phone_volume_survives_readback_until_start();
+    test_phone_notification_retry_and_invalidation();
+    test_phone_volume_paused_retry_and_ownership_loss();
+    test_phone_volume_disconnect_and_stale_cid();
     test_roles_and_start_priming();test_configuration_and_security();test_aptx_raw_and_fallback();
     test_codec_selection();test_raw_boundaries_and_yield();test_worker_wait_and_release();
     test_rtp_bounds_sequence_and_faults();test_timeouts_and_stale_events();test_avrcp_ownership_controls_and_volume();

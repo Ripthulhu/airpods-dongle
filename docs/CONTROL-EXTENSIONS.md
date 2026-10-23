@@ -1,6 +1,6 @@
 # Dongle control extensions
 
-Firmware 0.1.8 extends the [version-1 USB reports](USB-CONTROL.md) with phone
+The [version-1 USB reports](USB-CONTROL.md) provide phone
 controls, device settings, output profiles, Game Mode, performance readings and
 nearby finding. The implementation and host tests are complete; Pico/AirPods
 hardware verification is pending. Audio ownership is unchanged. No PC/phone
@@ -39,7 +39,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 
 | Subcommand | Request after the subcommand byte | Successful response |
 | --- | --- | --- |
-| 1: device setting | control ID u8, value u32 little-endian | empty; readback is separate |
+| 1: device setting | control ID u8, value u32 little-endian | empty after local transmission; device readback is separate |
 | 2: settings snapshot | none | cached setting records below |
 | 3: audio profile | output codec u8 (0 auto, 1 SBC, 2 AAC, 3 ELD), rate mode u8 (0 CBR, 1 VBR), bitrate u32 in bits/s | profile status below |
 | 4: Game Mode | enabled u8 (0/1) | 20-byte profile status; device confirmation is separate |
@@ -48,6 +48,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 7: nearby status | none | finder snapshot |
 | 8: stop nearby finder | none | empty |
 | 9: audio profile status | none | profile status below |
+| 10: settings workflow lease | action u8, token u32 | acquire: version u8=1, token u32; renew/release: empty |
 
 Cached report slot 6 also returns the settings snapshot. Format: version u8=1,
 count u8, then count records of control ID u8, age milliseconds u32, report
@@ -71,6 +72,32 @@ ordinary toggles use 1 on/2 off. Microphone preference is 0 automatic, 1 right,
 2 left. Press/hold/swipe durations use 0–2; values are not shifted to match
 older UI indexes. Left/right actions are sent together, preserving the other
 side. Existing hearing/diagnostic RPCs and their restoration guards are unchanged.
+
+## Settings workflow lease
+
+Report-2 capability `0x20` signals this requirement. Subcommand 10 uses action
+0 to acquire with token zero, 1 to renew with the returned nonzero token, and 2
+to release that token. Acquisition returns five bytes: version 1 and the token.
+The token belongs to one client and connection generation; another client cannot
+renew or release it. Acquisition while any lease is held returns busy.
+
+Acquire before reading hearing-mode or profile baselines. Hold the lease for the
+complete read/compare/write/verify action, including mode restoration. All raw
+ATT/AACP commits require it. Other clients' device-setting, audio-profile and
+Game Mode writes return busy while it is held; cached reports and local read-only
+snapshots remain available between transport requests. Basic pairing/reconnect
+commands return busy until the workflow ends.
+
+The lease expires after five seconds without renewal or an owned raw commit,
+and after thirty seconds regardless of activity. Renew during cached mode polling.
+Disconnect, USB/session change or target change revokes it and cancels unsent work.
+Tokens that expire or lose their session must never be reacquired midway through
+an edit: start again with a fresh baseline. Apps reject older firmware without the
+capability instead of performing unlocked edits.
+
+Cancelling one RPC removes its unsent packet but preserves a valid workflow lease
+for mode cleanup. Release in the action's final cleanup, including cancellation;
+if release cannot be confirmed, end the action. Firmware expiry bounds abandoned leases.
 
 ## Output profiles
 

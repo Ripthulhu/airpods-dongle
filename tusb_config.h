@@ -116,12 +116,8 @@ extern "C" {
 
 #define CFG_TUD_AUDIO_FUNC_1_DESC_LEN                                TUD_AUDIO_HEADSET_STEREO_DESC_LEN
 
-// How many formats are used, need to adjust USB descriptor if changed
-#define CFG_TUD_AUDIO_FUNC_1_N_FORMATS                               2
-
 // Audio format type I specifications
-/* 24bit/48kHz is the best quality for headset or 24bit/96kHz for 2ch speaker,
-   high-speed is needed beyond this */
+// Each streaming interface exposes one 16-bit PCM alternate setting.
 // NOTE: MAX_SAMPLE_RATE sizes the speaker (RX/OUT) endpoint. The mic (TX/IN)
 // path runs at 64 kHz (USB_MIC_SAMPLE_RATE) and sizes its EP explicitly.
 #define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE                         48000
@@ -133,19 +129,6 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_RESOLUTION_TX                  16
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX          2
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_RESOLUTION_RX                  16
-
-#if defined(__RX__)
-// 8bit in 8bit slots
-//#define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_N_BYTES_PER_SAMPLE_TX          1
-//#define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_RESOLUTION_TX                  8
-#define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_N_BYTES_PER_SAMPLE_RX          1
-#define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_RESOLUTION_RX                  8
-#else
-// 24bit in 32bit slots
-#define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_N_BYTES_PER_SAMPLE_RX          2
-#define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_RESOLUTION_RX                  16
-#endif
-
 
 // EP and buffer size - for isochronous EP´s, the buffer and EP size are equal (different sizes would not make sense)
 // Mic (EP IN): 64 kHz mono 16-bit — (64+1) samples/ms * 2B = 130 bytes.
@@ -160,7 +143,6 @@ extern "C" {
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT               1
 
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT   TUD_AUDIO_EP_SIZE(CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
-//#define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_EP_SZ_OUT   TUD_AUDIO_EP_SIZE(CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_1_FORMAT_2_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
 
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ     (CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT)*2
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX        (CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT) // Maximum EP IN size for all AS alternate settings used
@@ -174,8 +156,10 @@ extern "C" {
 //--------------------------------------------------------------------
 // CDC (debug console) CONFIGURATION
 //--------------------------------------------------------------------
-#define CFG_TUD_CDC_RX_BUFSIZE    256
-#define CFG_TUD_CDC_TX_BUFSIZE    512
+// RX must hold one 64-byte OUT packet; unread console input then backpressures.
+#define CFG_TUD_CDC_RX_BUFSIZE    64
+// The debug task drains one packet per call; backlog stays in its bounded log ring.
+#define CFG_TUD_CDC_TX_BUFSIZE    64
 #define CFG_TUD_CDC_EP_BUFSIZE    64
 
 #ifdef __cplusplus

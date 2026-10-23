@@ -26,6 +26,12 @@ AirPods stem media commands and absolute volume go to the phone during phone
 playback. USB media commands stay on the USB path. Music only: phone calls, HFP,
 SCO and a BLE settings interface are not implemented.
 
+Confirmed AirPods volume is mirrored to both hosts. A host volume request remains
+an intent until the AirPods confirm it; temporary AVRCP busy states retain the
+latest request. A controls-only connection or input switch does not replay a
+reported level as a new request. New AirPods connections start with unknown
+volume until fresh readback arrives. USB mute preserves volume and silences PCM.
+
 LibrePods connects to the saved phone's encrypted, bonded RFCOMM service for
 device settings, hearing profiles, saved checks, audio profiles, performance
 readings and nearby finding. See [control extensions](CONTROL-EXTENSIONS.md) for

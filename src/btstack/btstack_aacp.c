@@ -25,6 +25,7 @@
 #include "btstack_aacp.h"
 #include "aacp_mic_dec.h"
 #include "dongle_settings.h"
+#include "../tinyusb/dongle_rpc.h"
 #include "../tinyusb/uac.h"
 
 #define AACP_PSM              0x1001
@@ -105,6 +106,9 @@ static cached_report_t reports[] = {
 static dongle_readback_t control_readback;
 static dongle_settings_t settings;
 static uint8_t setting_tx[11];
+static uint32_t setting_since;
+static bool setting_pending;
+static int setting_result;
 static uint8_t receive_buffer_tx[11];
 static uint32_t receive_buffer_serial;
 static uint16_t receive_buffer_last;
@@ -125,6 +129,10 @@ static void control_reset(void) {
     if (research_pending || research_result) {
         aacp_research_cancel();
         research_result = 2;
+    }
+    if (setting_pending || setting_result) {
+        aacp_setting_cancel();
+        setting_result = 2;
     }
 }
 static uint16_t aacp_cid;
@@ -293,15 +301,35 @@ uint8_t aacp_setting_write(uint8_t id, uint32_t value) {
     if (!setting_value_valid(id,value)) return DONGLE_MALFORMED;
     if (!aacp_control_ready()) return DONGLE_DISCONNECTED;
     if (!settings_supported(&settings,id,value)) return DONGLE_UNSUPPORTED;
-    if (usb_mic_requested() || aacp_mic_active() || aacp_tx_count>=AACP_TX_QUEUE_LEN-2)
+    if (setting_pending || setting_result || usb_mic_requested() || aacp_mic_active() ||
+        aacp_tx_count>=AACP_TX_QUEUE_LEN-2)
         return DONGLE_BUSY;
-    for (unsigned i=0;i<aacp_tx_count;++i)
-        if (aacp_tx_queue[(aacp_tx_head+i)%AACP_TX_QUEUE_LEN].data==setting_tx) return DONGLE_BUSY;
     if (l2cap_get_remote_mtu_for_local_cid(aacp_cid)<sizeof(setting_tx)) return DONGLE_UNSUPPORTED;
     memcpy(setting_tx,"\x04\0\x04\0\x09\0",6);
     setting_tx[6]=id; dongle_put32(setting_tx+7,value);
-    if (!aacp_tx_enqueue(setting_tx,sizeof(setting_tx))) return DONGLE_BUSY;
+    setting_since=btstack_run_loop_get_time_ms();
+    setting_pending=true;
+    if (!aacp_tx_enqueue(setting_tx,sizeof(setting_tx))) {
+        setting_pending=false;
+        return DONGLE_BUSY;
+    }
     return DONGLE_ACCEPTED;
+}
+void aacp_setting_cancel(void) {
+    unsigned kept=0;
+    for (unsigned i=0;i<aacp_tx_count;++i) {
+        aacp_pkt_t packet=aacp_tx_queue[(aacp_tx_head+i)%AACP_TX_QUEUE_LEN];
+        if (packet.data==setting_tx) continue;
+        aacp_tx_queue[(aacp_tx_head+kept++)%AACP_TX_QUEUE_LEN]=packet;
+    }
+    aacp_tx_count=(uint8_t)kept;
+    setting_pending=false;
+    setting_result=0;
+}
+int aacp_setting_take(void) {
+    int result=setting_result;
+    setting_result=0;
+    return result;
 }
 uint16_t aacp_settings_snapshot(uint8_t *out, uint16_t capacity) {
     if (!aacp_control_ready()) return 0;
@@ -526,6 +554,20 @@ void aacp_mic_stop(void) {
 static void aacp_handle_can_send_now(void) {
     if (!aacp_connected || aacp_tx_count == 0) return;
     aacp_pkt_t p = aacp_tx_queue[aacp_tx_head];
+    uint32_t now=btstack_run_loop_get_time_ms();
+    if ((p.data==setting_tx || p.data==research_tx) &&
+        (!dongle_rpc_transport_current() || usb_mic_requested() || aacp_mic_active() ||
+         (uint32_t)(now-(p.data==setting_tx ? setting_since : research_since))>=3000u)) {
+        if (p.data==setting_tx) {
+            aacp_setting_cancel();
+            setting_result=2;
+        } else {
+            aacp_research_cancel();
+            research_result=2;
+        }
+        if (aacp_tx_count) l2cap_request_can_send_now_event(aacp_cid);
+        return;
+    }
     if (p.data == aacp_mic_start_bytes && !usb_mic_requested()) {
         aacp_mic_stop();
         return;
@@ -554,6 +596,7 @@ static void aacp_handle_can_send_now(void) {
     // Pro 3 can leave Allow Off unreported; a sent choice is not a device report.
     if (p.data==setting_tx && setting_tx[6]==0x34 && settings.profile && settings.profile->silent_allow_off)
         settings.allow_off_requested=dongle_u32(setting_tx+7)==1;
+    if (p.data==setting_tx) { setting_pending=false; setting_result=1; }
     if (p.data==receive_buffer_tx) {
         receive_buffer_last=(uint16_t)dongle_u32(p.data+7);
         if (++receive_buffer_serial==0) ++receive_buffer_serial;
@@ -594,6 +637,10 @@ void aacp_poll(void) {
     if (research_pending && (uint32_t)(now - research_since) >= 3000u) {
         aacp_research_cancel();
         research_result = 2;
+    }
+    if (setting_pending && (uint32_t)(now-setting_since)>=3000u) {
+        aacp_setting_cancel();
+        setting_result=2;
     }
     if (aacp_cid != 0 &&
         ((!aacp_connected || !aacp_got_control || !aacp_init_sent) &&

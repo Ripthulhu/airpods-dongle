@@ -121,7 +121,7 @@ void dongle_control_poll(void) {
             dongle_put32(next + 24 + i * 4, readback->known[i] ? now - readback->updated[i] : UINT32_MAX);
         dongle_put32(next + 36, c->last_sequence);
         next[40] = c->last_result; next[41] = c->last_opcode;
-        next[42] = 1 | 4 | 8 | 16 | (readback->anc ? 2 : 0);
+        next[42] = 1 | 4 | 8 | 16 | 32 | (readback->anc ? 2 : 0);
         irq = save_and_disable_interrupts();
         memcpy(c->status, next, 64);
         c->initialized = true;

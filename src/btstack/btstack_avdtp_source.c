@@ -57,6 +57,8 @@
 #include "pico/time.h"
 #include "phone_sink.h"
 #include "phone_clock.h"
+#include "volume_scale.h"
+#include "volume_sync.h"
 #include "btstack_resample.h"
 #include "../tinyusb/uac.h"
 
@@ -137,7 +139,6 @@ typedef struct {
     uint16_t codec_storage_count;
     uint8_t  codec_ready_to_send;
     uint16_t codec_num_frames;
-    uint8_t volume;
 }  a2dp_media_sending_context_t;
 
 
@@ -149,6 +150,8 @@ static AACENC_InfoStruct aacinf;
 #endif
 
 static a2dp_media_sending_context_t media_tracker;
+static volume_sync_t sink_volume;
+static bool _bt_sink_volume_changed;
 
 static int current_sample_rate = 48000;
 
@@ -411,6 +414,54 @@ static void playback_encode_measured(uint32_t started) {
     if (elapsed>playback_metrics.encoder_max_us) playback_metrics.encoder_max_us=elapsed;
 }
 
+static void bt_volume_select_peer(void) {
+    if (volume_sync_select(&sink_volume, (const uint8_t *)get_device_addr()))
+        phone_sink_volume_invalidated();
+}
+
+static void bt_volume_publish(void) {
+    uint8_t level;
+    if (volume_sync_get(&sink_volume, &level)) {
+        _bt_sink_volume_changed = true;
+        phone_sink_volume_changed(level);
+    } else if (!sink_volume.pending && !sink_volume.inflight) {
+        phone_sink_volume_invalidated();
+    }
+}
+
+void bt_volume_cancel_phone(void) { volume_sync_cancel_phone(&sink_volume); }
+
+bool get_bt_volume(uint8_t *level) {
+    bt_volume_select_peer();
+    return volume_sync_get(&sink_volume, level);
+}
+
+void set_bt_volume(int16_t db256) {
+    bt_volume_select_peer();
+    if (volume_sync_request(&sink_volume, usb_volume_to_bt(db256), false,
+                           btstack_run_loop_get_time_ms()) && !sink_volume.pending)
+        bt_volume_publish(); // Normalize a fractional USB request to confirmed readback.
+}
+
+void bt_volume_poll(void) {
+    bt_volume_select_peer();
+    if (is_usb_streaming || usb_mic_requested() || !phone_sink_owns_controls())
+        bt_volume_cancel_phone();
+    bool active = sink_volume.pending || sink_volume.inflight;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    uint8_t level;
+    if (volume_sync_due(&sink_volume, now, &level)) {
+        uint8_t status = avrcp_controller_set_absolute_volume(sink_volume.cid, level);
+        avrcp_connection_t *connection = avrcp_get_connection_for_avrcp_cid_for_role(
+            AVRCP_CONTROLLER, sink_volume.cid);
+        // The public response event omits its transaction label. The pinned stack
+        // assigns it synchronously here and exposes the received label in callbacks.
+        volume_sync_send(&sink_volume, now, status == ERROR_CODE_SUCCESS && connection != NULL,
+                         connection ? connection->transaction_id : 0);
+    }
+    if (active && !sink_volume.pending && !sink_volume.inflight) bt_volume_publish();
+}
+
 bool bridge_phone_open(void) {
     if (is_usb_streaming || usb_mic_requested() ||
         !peer_address_valid((const uint8_t *)get_device_addr())) return false;
@@ -474,14 +525,15 @@ void bridge_phone_pcm_push(const int16_t *src, uint16_t frames) {
     }
 }
 
-void bridge_phone_volume(uint8_t volume) {
-    if (volume > 127 || is_usb_streaming || usb_mic_requested()) return;
-    media_tracker.volume = volume;
-    if (media_tracker.avrcp_cid != 0)
-        avrcp_controller_set_absolute_volume(media_tracker.avrcp_cid, volume);
+bool bridge_phone_volume(uint8_t volume) {
+    if (volume > 127 || is_usb_streaming || usb_mic_requested()) return false;
+    bt_volume_select_peer();
+    bool accepted = volume_sync_request(&sink_volume, volume, true, btstack_run_loop_get_time_ms());
+    if (accepted && !sink_volume.pending) bt_volume_publish();
+    return accepted;
 }
 
-uint8_t bridge_phone_get_volume(void) { return media_tracker.volume; }
+bool bridge_phone_get_volume(uint8_t *volume) { return get_bt_volume(volume); }
 
 static bool a2dp_demo_timer_start(a2dp_media_sending_context_t *context);
 static void a2dp_demo_timer_stop(a2dp_media_sending_context_t *context);
@@ -1559,25 +1611,15 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 }
 
 void increase_vol_by_key(){
-    if (media_tracker.volume > 117){
-         media_tracker.volume = 127;
-    } else {
-                media_tracker.volume += 10;
-    }
-    printf(" - volume up (via set absolute volume) %d%% (%d)\n",  media_tracker.volume * 100 / 127,  media_tracker.volume);
-    avrcp_controller_set_absolute_volume(media_tracker.avrcp_cid, media_tracker.volume);
+    bt_volume_select_peer();
+    volume_sync_step(&sink_volume, true, btstack_run_loop_get_time_ms());
 }
 
 
 void decrease_vol_by_key(){
 
-    if (media_tracker.volume < 10){
-        media_tracker.volume = 0;
-    } else {
-        media_tracker.volume -= 10;
-    }
-    printf(" - volume down (via set absolute volume) %d%% (%d)\n",  media_tracker.volume * 100 / 127,  media_tracker.volume);
-    avrcp_controller_set_absolute_volume(media_tracker.avrcp_cid, media_tracker.volume);
+    bt_volume_select_peer();
+    volume_sync_step(&sink_volume, false, btstack_run_loop_get_time_ms());
     
 }
 
@@ -1607,14 +1649,6 @@ static void show_usage(void){
     printf("---\n");
 }
 
-
-void set_bt_volume(int16_t val){
-    if (val < -50) val = -50;
-    if (val > 0) val = 0;
-    media_tracker.volume = (val * 2 + 100) * 127 / 100;
-    avrcp_controller_set_absolute_volume(media_tracker.avrcp_cid, media_tracker.volume);
-    //printf("(via set usb volume) %d%% (%d)\n",  media_tracker.volume * 100 / 127,  media_tracker.volume);
-}
 
 static void stdin_process(char cmd){
     uint8_t status = ERROR_CODE_SUCCESS;
@@ -1742,22 +1776,10 @@ static void stdin_process(char cmd){
 
 
         case 'v':
-            if (media_tracker.volume > 117){
-                media_tracker.volume = 127;
-            } else {
-                media_tracker.volume += 10;
-            }
-            printf(" - volume up (via set absolute volume) %d%% (%d)\n",  media_tracker.volume * 100 / 127,  media_tracker.volume);
-            status = avrcp_controller_set_absolute_volume(media_tracker.avrcp_cid, media_tracker.volume);
+            increase_vol_by_key();
             break;
         case 'V':
-            if (media_tracker.volume < 10){
-                media_tracker.volume = 0;
-            } else {
-                media_tracker.volume -= 10;
-            }
-            printf(" - volume down (via set absolute volume) %d%% (%d)\n",  media_tracker.volume * 100 / 127,  media_tracker.volume);
-            status = avrcp_controller_set_absolute_volume(media_tracker.avrcp_cid, media_tracker.volume);
+            decrease_vol_by_key();
             break;
 
         case 'p':
@@ -2223,8 +2245,6 @@ void start_led_blink(){
 
 }
 
-static bool _bt_sink_volume_changed = false;
-
 // getter returns a pointer to that storage
 bool * get_is_bt_sink_volume_changed_ptr(void){
     return &_bt_sink_volume_changed;
@@ -2242,7 +2262,7 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
     
     switch (packet[2]){
         case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED:
-            if (size < 14) return;
+            if (size != 14) return;
             local_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
             status = avrcp_subevent_connection_established_get_status(packet);
             if (status != ERROR_CODE_SUCCESS){
@@ -2256,7 +2276,14 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                 avrcp_disconnect(local_cid);
                 return;
             }
+            bt_volume_select_peer();
+            if (!sink_volume.selected || memcmp(event_addr, sink_volume.peer, 6)) {
+                avrcp_disconnect(local_cid);
+                return;
+            }
             media_tracker.avrcp_cid = local_cid;
+            volume_sync_connection(&sink_volume, local_cid, btstack_run_loop_get_time_ms());
+            phone_sink_volume_invalidated();
 
             printf("AVRCP: Channel to %s successfully opened, avrcp_cid 0x%02x\n", bd_addr_to_str(event_addr), media_tracker.avrcp_cid);
              
@@ -2272,9 +2299,11 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             return;
         
         case AVRCP_SUBEVENT_CONNECTION_RELEASED:
-            if (size < 5 || avrcp_subevent_connection_released_get_avrcp_cid(packet) != media_tracker.avrcp_cid) return;
+            if (size != 5 || avrcp_subevent_connection_released_get_avrcp_cid(packet) != media_tracker.avrcp_cid) return;
             printf("AVRCP Target: Disconnected, avrcp_cid 0x%02x\n", avrcp_subevent_connection_released_get_avrcp_cid(packet));
             media_tracker.avrcp_cid = 0;
+            volume_sync_connection(&sink_volume, 0, btstack_run_loop_get_time_ms());
+            phone_sink_volume_invalidated();
             return;
         default:
             break;
@@ -2339,10 +2368,6 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
     }
 }
 
-uint8_t get_bt_volume(){
-    return media_tracker.volume;
-}
-
 static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     if (phone_sink_handle_controller(packet_type, channel, packet, size)) return;
     UNUSED(channel);
@@ -2351,17 +2376,30 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
     if (media_tracker.avrcp_cid == 0 || little_endian_read_16(packet, 3) != media_tracker.avrcp_cid) return;
     if (!media_tracker.avrcp_cid) return;
+    bt_volume_select_peer();
     
     switch (packet[2]){
         case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:
-            if (size < 7) break;
-            media_tracker.volume = avrcp_subevent_notification_volume_changed_get_absolute_volume(packet);
-            
-            if (phone_sink_owns_controls() && !is_usb_streaming && !usb_mic_requested())
-                phone_sink_volume_changed(media_tracker.volume);
-            else _bt_sink_volume_changed = true;
-            printf("AVRCP Controller: Notification Absolute Volume %d %%\n", media_tracker.volume * 100 / 127);\
-
+            if (size != 7 || (packet[5] != AVRCP_CTYPE_RESPONSE_INTERIM &&
+                             packet[5] != AVRCP_CTYPE_RESPONSE_CHANGED_STABLE)) break;
+            {
+                uint8_t previous, current;
+                bool known = volume_sync_get(&sink_volume, &previous);
+                if (volume_sync_notification(&sink_volume, little_endian_read_16(packet, 3), packet[6]) &&
+                    volume_sync_get(&sink_volume, &current) && (!known || previous != current)) bt_volume_publish();
+            }
+            break;
+        case AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE:
+            if (size != 7 || (packet[5] != AVRCP_CTYPE_RESPONSE_ACCEPTED &&
+                             packet[5] != AVRCP_CTYPE_RESPONSE_REJECTED &&
+                             packet[5] != AVRCP_CTYPE_RESPONSE_NOT_IMPLEMENTED)) break;
+            {
+                avrcp_connection_t *connection = avrcp_get_connection_for_avrcp_cid_for_role(
+                    AVRCP_CONTROLLER, media_tracker.avrcp_cid);
+                if (connection && volume_sync_response(&sink_volume, little_endian_read_16(packet, 3),
+                    connection->controller_last_confirmed_transaction_id,
+                    packet[5] == AVRCP_CTYPE_RESPONSE_ACCEPTED, packet[6])) bt_volume_publish();
+            }
             break;
         case AVRCP_SUBEVENT_NOTIFICATION_EVENT_BATT_STATUS_CHANGED:
             if (size < 7) break;
