@@ -124,6 +124,17 @@ def main():
         finder_run = [*run[:-1], str(finder)] if args.arm else [str(finder)]
         subprocess.run(finder_run, check=True, timeout=30)
 
+        case = Path(temporary) / "case-battery"
+        case_command = [command[0], "-I", str(ROOT / "tests/case_stubs"),
+                        *command[1:], "-DCASE_REAL_AES", "-DENABLE_RIJNDAEL_DECRYPT", "-I", str(aes)]
+        case_sources = [ROOT / "tests/dongle_case_battery_test.c", aes / "rijndael.c"]
+        if args.arm:
+            case_sources += [support, ROOT / "tools/codec_probe/startup.c"]
+        subprocess.run(case_command + finder_link + [str(p) for p in case_sources] +
+                       libraries + ["-o", str(case)], check=True, timeout=60)
+        case_run = [*run[:-1], str(case)] if args.arm else [str(case)]
+        subprocess.run(case_run, check=True, timeout=30)
+
 
 if __name__ == "__main__":
     main()

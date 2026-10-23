@@ -1,6 +1,6 @@
 # Phone bridge
 
-Firmware 0.1.9 provides wireless stereo audio and a separate app control service.
+Firmware 0.1.11 provides wireless stereo audio and a separate app control service.
 Both paths remain untested on Pico hardware.
 
 ```text
@@ -22,9 +22,23 @@ AirPods slots. Only the selected AirPods and saved phone are accepted outside
 that explicit pairing window. A new phone must complete encrypted, bonded access
 before its identity is retained.
 
+Pause playback and close microphone use before pairing a new phone. Firmware
+rejects pairing while audio is active or changing state, and closes an unfinished
+pairing window if audio starts. Saved phones can reconnect during playback.
+An already in-flight BTstack link-key notification can still write flash before
+the application's cancellation check; this does not guarantee uninterrupted
+audio when a host starts playback during bonding.
+
 AirPods stem media commands and absolute volume go to the phone during phone
 playback. USB media commands stay on the USB path. Music only: phone calls, HFP,
 SCO and a BLE settings interface are not implemented.
+
+The settings service accepts legacy Call Management (`0x24`) values `00 03 00 00`
+(double press to end a call) and `00 02 00 00` (single press to end). These do not
+establish a complementary mute assignment or add phone-call transport. Newer
+Apple versions contain independent end-call and mute fields; do not flatten a
+newer or unknown report into one of these legacy values. Complete modern writes
+and physical call behavior through this dongle remain unverified.
 
 Confirmed AirPods volume is mirrored to both hosts. A host volume request remains
 an intent until the AirPods confirm it; temporary AVRCP busy states retain the
@@ -104,7 +118,7 @@ to AAC-ELD is still a lossy transcode.
 
 Bluetooth, USB, playback encoding and PCM publication run on core 0. Core 1 owns
 phone LHDC/aptX/SBC decoding or USB microphone decoding; the two inputs are mutually
-exclusive. The phone worker allocates 9,776 bytes only during phone sessions or the
+exclusive. The phone worker allocates 9,780 bytes only during phone sessions or the
 silent startup check. The LHDC decoder's ARM32 preparation requests 11,264 bytes
 live and peaks at 13,792 bytes; its static state is included in the linked heap budget.
 An idle microphone decoder is detached by core 1

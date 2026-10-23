@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 #include "pico/stdio/driver.h"
 #include "hardware/sync.h"
@@ -23,10 +24,15 @@
 #define DBG_BUF_SIZE 2048u                 // must be a power of two
 #define DBG_BUF_MASK (DBG_BUF_SIZE - 1u)
 
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2, "Diagnostic requests require lock-free IRQ publication");
+#endif
+
 static uint8_t           dbg_buf[DBG_BUF_SIZE];
 static volatile uint32_t dbg_head = 0;     // producer index
 static volatile uint32_t dbg_tail = 0;     // consumer index (USB task only)
 static volatile uint32_t dbg_dropped = 0;  // bytes discarded while the ring was full
+static atomic_bool timing_requested;
 
 // Producer side. Runs with IRQs disabled so thread- and IRQ-context printf
 // calls can't interleave, and so the USB-task consumer can't preempt a push.
@@ -60,15 +66,35 @@ static stdio_driver_t debug_cdc_driver = {
 };
 
 void debug_cdc_init(void) {
+    atomic_store_explicit(&timing_requested, false, memory_order_relaxed);
     stdio_set_driver_enabled(&debug_cdc_driver, true);
 }
 
+bool debug_cdc_take_timing_request(void) {
+    return atomic_exchange_explicit(&timing_requested, false, memory_order_acq_rel);
+}
+
 void debug_cdc_task(void) {
-    if (dbg_tail == dbg_head && dbg_dropped == 0) return;
     // Drain only while a terminal is actually attached (DTR asserted). Until
     // then, output accumulates in the 2KB ring, so recent boot/pairing logs are still
     // delivered when the user opens the terminal late.
-    if (!tud_cdc_connected()) return;
+    if (!tud_cdc_connected()) {
+        atomic_store_explicit(&timing_requested, false, memory_order_release);
+        tud_cdc_read_flush();
+        return;
+    }
+
+    // Only request read-only diagnostics here; main context prints the result.
+    // Other bytes never reach the inherited pairing/storage console commands.
+    uint8_t input[64];
+    uint32_t received = tud_cdc_read(input, sizeof(input));
+    for (uint32_t i = 0; i < received; ++i) {
+        if (input[i] == 't') {
+            atomic_store_explicit(&timing_requested, true, memory_order_release);
+            break;
+        }
+    }
+    if (dbg_tail == dbg_head && dbg_dropped == 0) return;
 
     // If bytes were discarded while the ring was full, report the gap once the
     // ring has room again, so a log gap is never silent. (We run in the USB

@@ -31,17 +31,28 @@ command. Bluetooth work runs on core 0, outside the USB interrupt.
 | 19–21 | Left, right, case battery percent; 255 unknown |
 | 22 | Charging flags: left 1, right 2, case 4 |
 | 23 | Output codec: 0 unknown, 1 SBC, 2 AAC, 3 AAC-ELD |
-| 24–35 | Three independent battery ages in milliseconds; FFFFFFFF unknown |
+| 24–35 | Three independent battery ages in milliseconds; known ages saturate at FFFFFFFE, FFFFFFFF unknown |
 | 36–39 | Last command sequence |
 | 40 | Result: 0 none, 1 accepted, 2 busy, 3 stale target, 4 unsupported, 5 disconnected, 6 malformed |
 | 41 | Last command opcode; 0 for an invalid opcode |
-| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16), settings workflow lease (32) |
-| 44–63 | Reserved zero |
+| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16), settings workflow lease (32), battery observation flags (64) |
+| 44 | With capability 64: component present mask, left 1, right 2, case 4 |
+| 45 | With capability 64: components observed through case BLE association, same bit order |
+| 46–63 | Reserved zero |
 
 Acceptance means queued/performed locally, not device readback. In particular,
 ANC remains its last reported value until the AirPods report a new value.
 Battery slots omitted from a report retain their independent age. Session changes
-clear all reports. No raw addresses or HID paths need to appear in the UI.
+clear connected readback. Selected-pair case observations can survive same-peer
+AACP loss; changing pair or key clears them. No raw addresses or HID paths need
+to appear in the UI.
+
+Firmware 0.1.11 adds capability 64. Updated apps must use its presence mask:
+an absent component may retain a percentage and its original age, with presence
+and charging cleared. Older firmware keeps the original interpretation. Case
+provenance means keyed layout association, not IRK-resolved or authenticated
+identity. It must never authorize audio, pairing, ear actions or finder results.
+See [case BLE observations](CONTROL-EXTENSIONS.md#case-ble-battery-observations).
 
 ## Command report
 

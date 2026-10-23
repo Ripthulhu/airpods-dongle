@@ -12,12 +12,19 @@
 #ifndef DEBUG_CDC_H
 #define DEBUG_CDC_H
 
+#include <stdbool.h>
+
 // Register the CDC stdio driver so printf() output is captured. Call once,
 // after stdio_init_all() and tinyusb_main().
 void debug_cdc_init(void);
 
-// Drain buffered stdout to the CDC IN endpoint. Call from the USB task
+// Drain buffered stdout and read at most one 64-byte diagnostic input chunk.
+// Call from the USB task
 // (same context as tud_task), after tud_task().
 void debug_cdc_task(void);
+
+// Main context only: consumes a coalesced 't' request without printing in USB IRQ.
+// USB service clears pending input and requests when the terminal drops DTR.
+bool debug_cdc_take_timing_request(void);
 
 #endif // DEBUG_CDC_H

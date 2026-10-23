@@ -4,8 +4,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
+set(PICOTOOL_GIT_BRANCH 2041936441b48a3cc53ae3da9e805229fe8f4e18)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.9 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.11 LANGUAGES C CXX ASM)
 pico_sdk_init()
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
@@ -17,7 +18,7 @@ execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools
 if(NOT sdk_check EQUAL 0)
     message(FATAL_ERROR "Pinned SDK patches are required; see README.md")
 endif()
-set(dongle_linker "${CMAKE_CURRENT_BINARY_DIR}/airpods.ld")
+set(dongle_linker "${CMAKE_CURRENT_BINARY_DIR}/airpods-linker")
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/make_linker.py"
     --sdk "${PICO_SDK_PATH}" --output "${dongle_linker}" RESULT_VARIABLE linker_check)
 if(NOT linker_check EQUAL 0)
@@ -63,6 +64,7 @@ add_executable(airpods_dongle
     src/btstack/phone_sink.c
     src/btstack/phone_control.c
     src/btstack/dongle_finder.c
+    src/btstack/dongle_case_battery.c
     src/btstack/phone_codec.c
     src/btstack/phone_worker.c
     src/btstack/phone_benchmark.c
@@ -90,10 +92,11 @@ target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_codec_finger
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_lhdc_fingerprint"
     "-Wl,--undefined=airpods_phone_worker_storage_bytes")
 target_compile_definitions(airpods_dongle PRIVATE
-    CYW43_LWIP=0 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
+    CYW43_LWIP=0 CYW43_PIO_CLOCK_DIV_DYNAMIC=1 ENABLE_RIJNDAEL_DECRYPT=1 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
     PICO_CORE1_STACK_SIZE=0 PICO_STACK_SIZE=16384 PICO_USE_STACK_GUARDS=1
 )
-pico_set_linker_script(airpods_dongle "${dongle_linker}")
+pico_add_linker_script_override_path(airpods_dongle "${dongle_linker}"
+    FILES section_heap.incl sections_stack.incl section_end.incl)
 pico_set_program_name(airpods_dongle "AirPods Dongle")
 pico_set_program_version(airpods_dongle "${PROJECT_VERSION}")
 pico_init_picotool()

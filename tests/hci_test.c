@@ -5,6 +5,8 @@
 // The transport header has unrelated static encoder declarations.
 #define PICOW_USB_BT_AUDIO_SSP_COUNTER_H
 void avdtp_source_establish_stream(void);
+bool get_usb_streaming(void);
+bool dongle_playback_transitioning(void);
 #include "../src/btstack/btstack_hci.c"
 
 static bd_addr_t saved[2];
@@ -20,6 +22,8 @@ static unsigned pin_rejections, confirmations, confirmation_rejections, passkey_
 static uint8_t discoverable, security_level;
 static bool phone_has_key, missing_acl, tlv_missing, tlv_fail, tlv_corrupt;
 static unsigned phone_writes;
+static unsigned busy_routes, disconnect_calls;
+static bool busy_during_key_read;
 static phone_record_t stored_phone;
 static int stored_phone_length;
 static bd_addr_t phone_key_address;
@@ -50,6 +54,7 @@ void gap_pin_code_response(bd_addr_t address, const char *pin) {
 }
 bool gap_get_link_key_for_bd_addr(bd_addr_t address, link_key_t key, link_key_type_t *type) {
     if (phone_has_key && memcmp(address, phone_key_address, 6) == 0) {
+        if (busy_during_key_read) busy_routes = 1;
         memset(key, 0x22, sizeof(link_key_t));
         *type = 1;
         return true;
@@ -93,6 +98,12 @@ hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t address[6], 
     return missing_acl ? NULL : &connection;
 }
 uint8_t gap_security_level(uint16_t handle) { assert(handle == 1); return security_level; }
+uint8_t gap_disconnect(uint16_t handle) { assert(handle == 1); ++disconnect_calls; return 0; }
+bool get_usb_streaming(void) { return (busy_routes & 1u) != 0; }
+bool dongle_playback_transitioning(void) { return (busy_routes & 2u) != 0; }
+bool usb_mic_requested(void) { return (busy_routes & 4u) != 0; }
+bool aacp_mic_active(void) { return (busy_routes & 8u) != 0; }
+bool phone_sink_active(void) { return (busy_routes & 16u) != 0; }
 static int phone_get_tag(void *context, uint32_t tag, uint8_t *buffer, uint32_t size) {
     (void)context;
     assert(tag == PHONE_TAG);
@@ -166,6 +177,8 @@ static void fixture(void) {
     security_level = LEVEL_2;
     phone_has_key = missing_acl = tlv_missing = tlv_fail = tlv_corrupt = false;
     phone_writes = 0;
+    busy_routes = disconnect_calls = 0;
+    busy_during_key_read = false;
     stored_phone_length = 0;
     memset(&stored_phone, 0, sizeof(stored_phone));
     memset(phone_key_address, 0, sizeof(phone_key_address));
@@ -495,6 +508,76 @@ static void test_phone_storage_rejects_unknown_and_failed_writes(void) {
     }
 }
 
+static void test_new_phone_pairing_requires_quiet_routes(void) {
+    for (unsigned busy = 1; busy <= 16; busy <<= 1) {
+        fixture();
+        bt_hci_init();
+        busy_routes = busy;
+        assert(bt_hci_phone_pairing_busy());
+        assert(!bt_hci_phone_pairing_start());
+        assert(!phone_pairing && discoverable == 0);
+        assert(!allow(nearby, HCI_LINK_TYPE_ACL));
+
+        busy_routes = 0;
+        assert(bt_hci_phone_pairing_start());
+        busy_routes = busy;
+        assert(!allow(nearby, HCI_LINK_TYPE_ACL)); // Demand can arrive before the first ACL.
+        assert(!phone_pairing && discoverable == 0 && disconnect_calls == 0);
+
+        busy_routes = 0;
+        assert(bt_hci_phone_pairing_start() && allow(nearby, HCI_LINK_TYPE_ACL));
+        memcpy(phone_key_address, nearby, 6);
+        phone_has_key = true;
+        busy_routes = busy;
+        assert(!bt_hci_phone_peer_connected(nearby)); // Nor can a candidate persist after demand returns.
+        assert(!phone_writes && !phone_bonded && disconnect_calls == 1);
+        assert(!phone_pairing && discoverable == 0);
+        authentication_event(HCI_EVENT_USER_CONFIRMATION_REQUEST, nearby);
+        assert(confirmations == 0 && confirmation_rejections == 1);
+        bt_hci_phone_poll();
+        assert(disconnect_calls == 1); // Cancellation is idempotent.
+
+        busy_routes = 0;
+        assert(bt_hci_phone_pairing_start() && allow(nearby, HCI_LINK_TYPE_ACL));
+        assert(bt_hci_phone_peer_connected(nearby));
+        assert(phone_writes == 1 && phone_bonded);
+        busy_routes = busy;
+        assert(allow(nearby, HCI_LINK_TYPE_ACL)); // A durable phone reconnect needs no flash write.
+        assert(bt_hci_phone_peer_connected(nearby) && phone_writes == 1);
+        assert(disconnect_calls == 1);
+    }
+}
+
+static void test_phone_candidate_timeout_and_busy_poll_close_only_candidate(void) {
+    fixture();
+    bt_hci_init();
+    assert(bt_hci_phone_pairing_start() && allow(nearby, HCI_LINK_TYPE_ACL));
+    now = PHONE_PAIRING_MS;
+    bt_hci_phone_poll();
+    assert(!phone_pairing && discoverable == 0 && disconnect_calls == 1 && !phone_writes);
+    bt_hci_phone_poll();
+    assert(disconnect_calls == 1);
+
+    assert(bt_hci_phone_pairing_start() && allow(nearby, HCI_LINK_TYPE_ACL));
+    busy_routes = 1;
+    bt_hci_phone_poll();
+    assert(!phone_pairing && discoverable == 0 && disconnect_calls == 2 && !phone_writes);
+    busy_routes = 0;
+    assert(bt_hci_phone_pairing_start() && allow(nearby, HCI_LINK_TYPE_ACL));
+    missing_acl = true;
+    busy_routes = 4;
+    bt_hci_phone_poll();
+    assert(!phone_pairing && disconnect_calls == 2);
+
+    busy_routes = 0;
+    missing_acl = false;
+    assert(bt_hci_phone_pairing_start() && allow(nearby, HCI_LINK_TYPE_ACL));
+    memcpy(phone_key_address, nearby, 6);
+    phone_has_key = busy_during_key_read = true;
+    assert(!bt_hci_phone_peer_connected(nearby));
+    assert(!phone_pairing && !phone_writes && !phone_bonded && disconnect_calls == 3);
+}
+
 int main(void) {
     test_selected_bond_auto_connects();
     test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback();
@@ -506,6 +589,8 @@ int main(void) {
     test_phone_pairing_is_bounded_and_keeps_airpods_slots();
     test_phone_pairing_expiry_authentication_and_inquiry_roles();
     test_phone_storage_rejects_unknown_and_failed_writes();
-    puts("HCI selected-peer ownership, phone pairing/authentication/storage and BLE coordination: 10 groups passed");
+    test_new_phone_pairing_requires_quiet_routes();
+    test_phone_candidate_timeout_and_busy_poll_close_only_candidate();
+    puts("HCI selected-peer ownership, quiet phone pairing/authentication/storage and BLE coordination: 12 groups passed");
     return 0;
 }

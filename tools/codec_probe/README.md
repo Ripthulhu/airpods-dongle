@@ -53,10 +53,10 @@ The check covers:
   The worker size is read from a retained value in that ELF, rather than copied
   from a source constant. Each mode starts with a fresh allocator arena.
 
-With GCC 13.2.1 and firmware 0.1.9, live stereo/microphone allocations total
+With GCC 13.2.1, Pico SDK 2.3.1 and firmware 0.1.10, live stereo/microphone allocations total
 186,872 bytes; the tested allocator peak is 188,040 bytes. LHDC/ELD/worker live
 allocations total 85,512 bytes and peak at 90,816 bytes. The linked heap is
-385,752 bytes, leaving 197,712 bytes at the heavier peak before other runtime allocations.
+386,008 bytes, leaving 197,968 bytes at the heavier peak before other runtime allocations.
 The 64 KiB reserve is a policy allowance, not a measured application requirement.
 
 Stack markers start 128 bytes below the helper's stack pointer. Tested decoder

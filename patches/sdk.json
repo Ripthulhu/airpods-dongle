@@ -2,14 +2,14 @@
   "btstack": {
     "patch": "btstack-airpods.patch",
     "original": {
-      "src/hci.c": "d36c0a51b388565b261784a4cc43808dd254b0bf634582cab97b9b5f8e1b20ce",
-      "src/l2cap.c": "76654c73dd8c02792099fc4edbb2d467ee3cb7284b8def33202bf07cd715d190",
-      "src/l2cap.h": "759c69c5f495187c040cedcca8a74b2d73b49d8b689a743666dd1d682ea4bbe8"
+      "src/hci.c": "a9cabb8713943c0d7d4bd9fe2442828b6d88dab5bf9282d81e072be5b11ee4df",
+      "src/l2cap.c": "4c95a41e650f33a65e3f729cfe02a3d70255d43db1eaf3bdb32300f8286b9455",
+      "src/l2cap.h": "df3239ee1e64ffe39ee089eef0ad4469d415759516a6b1117a08ca076ba1b248"
     },
     "patched": {
-      "src/hci.c": "af02a2013d60a791a255876f13bb82ed80839e9b1272820cb89091361ccab00f",
-      "src/l2cap.c": "e8114cddd6504d6b70a621de5bc364890e2ee5c0bd436319d4664a5aefaa59af",
-      "src/l2cap.h": "d02fd9d602d00e1cd3589e2afe333d28ebd47bed8269367cf1f0cadf9b9ef356"
+      "src/hci.c": "c1e23fb529d5301b83cfe3a080e4fded81cb02bc827bd8087256a58f8e5eb8e2",
+      "src/l2cap.c": "5c7fcf0c65f4e33674195b13b1395e390e6a0015be90a9b4f16122874bd079a9",
+      "src/l2cap.h": "0e26b9b93eaa726154bed131bacb45f727b188000e9a38bd451cade81e523a68"
     }
   },
   "tinyusb": {
@@ -19,15 +19,6 @@
     },
     "patched": {
       "src/portable/raspberrypi/rp2040/rp2040_usb.c": "2ee43590be7703b9ceca9b35b1e4703b5e0d5a30f864653b7e5748da70943c48"
-    }
-  },
-  "sdk": {
-    "patch": "pico-sdk-airpods.patch",
-    "original": {
-      "tools/Findpicotool.cmake": "6e7331656225f993fc5718f04e3a9fdab662c9518de19c6f7c5189aab02075bd"
-    },
-    "patched": {
-      "tools/Findpicotool.cmake": "8044cf86c7b1fc233df19b73deca0c91a7199a5477d8a28d3d96f28e60ce7455"
     }
   }
 }

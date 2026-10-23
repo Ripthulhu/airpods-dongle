@@ -1,4 +1,5 @@
 /build*/
+/outputs/
 /.sdk/
 /.vscode/
 __pycache__/

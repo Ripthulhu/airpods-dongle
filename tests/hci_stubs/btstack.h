@@ -56,6 +56,7 @@ int gap_ssp_passkey_negative(const uint8_t address[6]);
 uint32_t btstack_run_loop_get_time_ms(void);
 hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t address[6], uint8_t type);
 uint8_t gap_security_level(uint16_t handle);
+uint8_t gap_disconnect(uint16_t handle);
 const char *bd_addr_to_str(const uint8_t *address);
 
 static inline uint8_t hci_event_packet_get_type(const uint8_t *p) { return p[0]; }

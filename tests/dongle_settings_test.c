@@ -75,6 +75,32 @@ static void test_model_and_firmware(void) {
         assert(setting_firmware_major((const uint8_t *)firmware[i].text,(unsigned)strlen(firmware[i].text))==firmware[i].major);
     assert(setting_packed_major((const uint8_t *)"4294967296",10)==0);
 }
+static void test_all_hold_cycle_combinations(void) {
+    const uint8_t masks[]={3,5,6,7,9,10,11,12,13,14,15};
+    dongle_settings_t s; settings_reset(&s);
+    identify(&s,"A3063","9A348",""); reported(&s,0x34,1,0);
+    reported(&s,0x16,0x0501,0);
+    for (unsigned value=0;value<256;++value) {
+        bool valid=memchr(masks,(int)value,sizeof(masks))!=NULL;
+        assert(setting_value_valid(0x1a,value)==valid);
+        assert(settings_supported(&s,0x1a,value)==valid);
+    }
+    assert(!setting_value_valid(0x1a,UINT32_C(0x1000b)));
+    for (unsigned i=0;i<sizeof(masks);++i) {
+        reported(&s,0x1a,masks[i],i+1);
+        assert(setting_report_is(&s,0x1a,masks[i]) && setting_report_is(&s,0x16,0x0501));
+    }
+    reported(&s,0x34,2,20);
+    for (unsigned i=0;i<sizeof(masks);++i)
+        assert(settings_supported(&s,0x1a,masks[i])==!(masks[i]&1));
+    identify(&s,"A2083","6F21",""); reported(&s,0x34,1,21);
+    for (unsigned i=0;i<sizeof(masks);++i)
+        assert(settings_supported(&s,0x1a,masks[i])==!(masks[i]&8));
+    identify(&s,"A2931","5E135",""); reported(&s,0x34,1,21);
+    assert(settings_supported(&s,0x1a,7) && !settings_supported(&s,0x1a,11));
+    identify(&s,"A2931","6A300","");
+    assert(settings_supported(&s,0x1a,11));
+}
 static void test_metadata_bounds(void) {
     dongle_settings_t s;
     uint8_t packet[385]; unsigned n=metadata(packet,"A3063","9A348","");
@@ -114,6 +140,7 @@ static void test_report_replacement_and_snapshot(void) {
     settings_reset(&s); assert(settings_snapshot(&s,8,out,sizeof(out))==2 && !out[1]);
 }
 int main(void) {
-    test_values(); test_model_and_firmware(); test_metadata_bounds(); test_report_replacement_and_snapshot();
+    test_values(); test_model_and_firmware(); test_all_hold_cycle_combinations();
+    test_metadata_bounds(); test_report_replacement_and_snapshot();
     puts("dongle settings: bounded catalog, firmware gates, malformed replacement and non-optimistic snapshots passed");
 }

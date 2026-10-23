@@ -23,6 +23,7 @@ void btstack_run_loop_set_timer_handler(btstack_timer_source_t *timer,
 void btstack_run_loop_set_timer(btstack_timer_source_t *timer, uint32_t delay) { timer->delay = delay; }
 void btstack_run_loop_add_timer(btstack_timer_source_t *timer) { timer->active = true; }
 uint32_t btstack_run_loop_get_time_ms(void) { return now; }
+uint64_t dongle_uptime_ms(void) { return now; }
 uint8_t l2cap_create_channel(btstack_packet_handler_t handler, bd_addr_t addr,
                              uint16_t psm, uint16_t mtu, uint16_t *cid) {
     (void)handler; (void)addr; (void)mtu;
@@ -682,6 +683,29 @@ static void test_typed_setting_owner_lifecycle(void) {
     assert(aacp_tx_queue[0].data==aacp_mic_stop_bytes && aacp_tx_queue[1].data==aacp_request_notifications);
     drain();assert(setting_sends==1 && stops==1);
 }
+static void test_hold_cycle_wire_and_assignments(void) {
+    const uint8_t masks[]={3,5,6,7,9,10,11,12,13,14,15};
+    fixture(); ready(); model_report_for("A3063","9A348");
+    setting_report(0x34,1); setting_report(0x16,0x0501); setting_report(0x1a,6);
+    uint8_t previous=6;
+    for (unsigned i=0;i<sizeof(masks);++i) {
+        assert(aacp_setting_write(0x1a,masks[i])==DONGLE_ACCEPTED);
+        const uint8_t expected[]={4,0,4,0,9,0,0x1a,masks[i],0,0,0};
+        assert(sizeof(setting_tx)==sizeof(expected) && !memcmp(setting_tx,expected,sizeof(expected)));
+        assert(setting_report_is(&settings,0x1a,previous)); // Send is not a report.
+        assert(setting_report_is(&settings,0x16,0x0501));
+        drain(); assert(aacp_setting_take()==1);
+        setting_report(0x1a,masks[i]); previous=masks[i];
+        assert(setting_report_is(&settings,0x1a,previous) && setting_report_is(&settings,0x16,0x0501));
+    }
+    assert(aacp_setting_write(0x1a,8)==DONGLE_MALFORMED);
+    assert(aacp_setting_write(0x1a,0x1000b)==DONGLE_MALFORMED);
+    setting_report(0x34,2);
+    assert(aacp_setting_write(0x1a,11)==DONGLE_UNSUPPORTED);
+    model_report_for("A2083","6F21");
+    assert(aacp_setting_write(0x1a,10)==DONGLE_UNSUPPORTED);
+    assert(setting_report_is(&settings,0x16,0x0501));
+}
 static void test_host_writes_recheck_owner_and_microphone(void) {
     for(unsigned route=0;route<4;++route) {
         fixture();ready();model_report_for("A3063","9A348");
@@ -788,12 +812,26 @@ static void test_pair_keys_and_receive_buffer_policy(void) {
     assert(!aacp_pair_irk(address,key)); keys_report(packet);
     audio(packet,aacp_cid,47);
     assert(aacp_pair_irk(address,key) && memcmp(address,peer,6)==0 && memcmp(key,packet+11,16)==0);
+    assert(!aacp_pair_case_key(address,key));
+    model_report_for("A3063","9A348");
+    assert(aacp_pair_case_key(address,key) && !memcmp(key,packet+31,16));
+    assert(!aacp_pair_case_key(NULL,key) && !aacp_pair_case_key(address,NULL));
+    aacp_disconnect(); assert(aacp_pair_case_key(address,key));
+    ready(); model_report_for("A2084","6A326");
+    assert(!aacp_pair_case_key(address,key));
+    model_report_for("A3064","9A348");
+    assert(aacp_pair_case_key(address,key));
+    uint8_t invalid_model_header[]={4,0,4,0,0x1d,1};
+    audio(invalid_model_header,aacp_cid,sizeof(invalid_model_header));
+    assert(!aacp_pair_case_key(address,key));
+    model_report_for("A3063","9A348");
+    assert(aacp_pair_case_key(address,key));
     assert(!aacp_pair_irk(NULL,key) && !aacp_pair_irk(address,NULL));
     aacp_disconnect(); assert(aacp_pair_irk(address,key));
     ready(); assert(aacp_pair_irk(address,key));
     for (unsigned n=6;n<47;++n) {
         keys_report(packet); audio(packet,aacp_cid,47);
-        audio(packet,aacp_cid,n); assert(!aacp_pair_irk(address,key));
+        audio(packet,aacp_cid,n); assert(!aacp_pair_irk(address,key) && !aacp_pair_case_key(address,key));
     }
     const unsigned corrupt[]={5,6,7,8,9,10,27,28,29,30};
     for (unsigned i=0;i<sizeof(corrupt)/sizeof(*corrupt);++i) {
@@ -809,7 +847,7 @@ static void test_pair_keys_and_receive_buffer_policy(void) {
     uint8_t first[20]; memcpy(first,packet+7,20); memcpy(packet+7,packet+27,20); memcpy(packet+27,first,20);
     audio(packet,aacp_cid,47); assert(aacp_pair_irk(address,key) && memcmp(key,packet+31,16)==0);
     bd_addr_t next={7,8,9,10,11,12}; aacp_connect(next);
-    assert(!aacp_pair_irk(address,key));
+    assert(!aacp_pair_irk(address,key) && !aacp_pair_case_key(address,key));
     fixture(); ready();
     assert(!aacp_model_game_supported() && aacp_receive_buffer(60)==DONGLE_UNSUPPORTED);
     model_report_for("A3063","9A348"); assert(aacp_model_game_supported());
@@ -843,10 +881,11 @@ int main(void) {
     test_research_allowed_packets();
     test_typed_settings_and_confirmation();
     test_typed_setting_owner_lifecycle();
+    test_hold_cycle_wire_and_assignments();
     test_host_writes_recheck_owner_and_microphone();
     test_typed_setting_timeout_reset_and_retry();
     test_settings_invalid_replacement_and_stale_ear_events();
     test_pair_keys_and_receive_buffer_policy();
-    puts("AACP lifecycle and packet validation: 23 groups passed");
+    puts("AACP lifecycle and packet validation: 24 groups passed");
     return 0;
 }

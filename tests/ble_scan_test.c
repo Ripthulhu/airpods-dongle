@@ -5,7 +5,7 @@
 
 #include "../src/btstack/btstack_ble_scan.c"
 
-_Static_assert(sizeof(ble_scan_report_t) <= 52, "Keep advertisements without redundant type storage");
+_Static_assert(sizeof(ble_scan_report_t) <= 56, "Keep advertisements without redundant type storage");
 _Static_assert(sizeof(ble_scan_stats_t) <= 28, "Aggregate diagnostics must not copy report payloads");
 
 static unsigned registrations, starts, stops, params, duplicate_calls;
@@ -30,6 +30,7 @@ uint32_t btstack_run_loop_get_time_ms(void) { return now; }
 static void reset(void) {
     memset(&scan_state, 0, sizeof(scan_state));
     scan_initialized = false;
+    uptime_ms = 0;
     registrations = starts = stops = params = duplicate_calls = now = 0;
     supports_le = true;
     callback = NULL;

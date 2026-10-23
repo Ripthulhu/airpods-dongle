@@ -12,13 +12,13 @@
 #define BLE_SCAN_PAUSE_USB_SUSPEND (1u << 2)
 
 typedef struct {
+    uint64_t received_ms;  // Extended Bluetooth uptime, shared with battery readback.
+    uint32_t reports;
     uint8_t address[6];
     uint8_t address_type;
     uint8_t event_type;
     int8_t rssi;
     bool rssi_valid;
-    uint32_t received_ms;  // BTstack monotonic clock; compare ages by unsigned subtraction.
-    uint32_t reports;
     uint8_t data_length;
     uint8_t data[BLE_SCAN_DATA_MAX];
 } ble_scan_report_t;
@@ -41,6 +41,8 @@ typedef struct {
 } ble_scan_snapshot_t;
 
 // Call these from the BTstack context or while holding its async-context lock.
+// The unconditional main-loop case poll observes every 32-bit clock wrap.
+uint64_t dongle_uptime_ms(void);
 void ble_scan_init(void);
 void ble_scan_controller_ready(bool ready);
 void ble_scan_set_paused(uint32_t reason, bool paused);

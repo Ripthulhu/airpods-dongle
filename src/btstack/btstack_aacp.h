@@ -67,6 +67,8 @@ uint32_t aacp_receive_buffer_serial(void);
 uint16_t aacp_receive_buffer_last(void);
 // Pair-bound key retained through same-peer radio loss, never a host-supplied key.
 bool aacp_pair_irk(uint8_t address[6], uint8_t key[16]);
+// Pro 3 only; private advertising key, retained across same-peer AACP loss.
+bool aacp_pair_case_key(uint8_t address[6], uint8_t key[16]);
 
 // Bounded settings transport; completion means sent locally, not device readback.
 bool aacp_research_send(const uint8_t *packet, uint16_t length);

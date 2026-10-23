@@ -5,8 +5,10 @@
 
 static unsigned setting_writes, profile_writes, game_writes, starts, stops, polls;
 static uint8_t result=DONGLE_ACCEPTED;
+static uint8_t expected_setting_id=0x28;
+static uint32_t expected_setting_value=UINT32_C(0x89abcdef);
 uint8_t aacp_setting_write(uint8_t id,uint32_t value) {
-    assert(id==0x28 && value==UINT32_C(0x89abcdef));setting_writes++;return result;
+    assert(id==expected_setting_id && value==expected_setting_value);setting_writes++;return result;
 }
 uint16_t aacp_settings_snapshot(uint8_t *out,uint16_t cap) {
     if(cap<2)return 0;
@@ -47,6 +49,11 @@ int main(void) {
         result=results[i];assert(dongle_features_request(1,p,6,out,64,&n)==errors[i] && n==0);
     }
     result=DONGLE_ACCEPTED;
+    const uint8_t hold_cycle[]={1,0x1a,11,0,0,0};
+    expected_setting_id=0x1a;expected_setting_value=11;
+    for(uint8_t client=0;client<2;++client)
+        assert(dongle_features_request(client,hold_cycle,sizeof(hold_cycle),out,64,&n)==0 && !n);
+    assert(setting_writes==8);
     uint8_t profile[]={3,3,1,0xb0,0xa7,2,0};
     assert(dongle_features_request(1,profile,7,out,19,&n)==1 && !profile_writes);
     assert(dongle_features_request(1,profile,7,out,64,&n)==0 && n==20 && profile_writes==1);

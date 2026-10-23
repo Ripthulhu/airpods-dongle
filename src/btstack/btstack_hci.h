@@ -18,6 +18,7 @@ void get_link_keys();
 
 // Phone identity is separate from the two selected AirPods slots.
 bool bt_hci_phone_pairing_start(void);
+bool bt_hci_phone_pairing_busy(void);
 bool bt_hci_phone_pairing_active(void);
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]);
 bool bt_hci_phone_peer_connected(const uint8_t address[6]);

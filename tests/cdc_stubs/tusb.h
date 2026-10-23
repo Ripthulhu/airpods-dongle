@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 bool tud_cdc_connected(void);
+uint32_t tud_cdc_read(void *buffer, uint32_t count);
+void tud_cdc_read_flush(void);
 uint32_t tud_cdc_write_available(void);
 uint32_t tud_cdc_write(const void *buffer, uint32_t count);
 uint32_t tud_cdc_write_flush(void);

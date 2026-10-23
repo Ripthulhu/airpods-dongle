@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "dongle_control.h"
+#include "../btstack/dongle_case_battery.h"
+#include "../btstack/btstack_ble_scan.h"
 #include "dongle_protocol.h"
 #include "dongle_rpc.h"
 #include "hardware/sync.h"
@@ -77,10 +79,15 @@ static void execute(control_client_t *c, const uint8_t *p) {
         if (!aacp_control_ready()) c->last_result = DONGLE_DISCONNECTED;
         else if (!aacp_control_readback()->anc) c->last_result = DONGLE_UNSUPPORTED;
         else if (!aacp_control_anc(p[22])) c->last_result = DONGLE_BUSY;
-    } else if (p[7] == 4 && !bt_hci_phone_pairing_start()) c->last_result = DONGLE_UNSUPPORTED;
+    } else if (p[7] == 4) {
+        if (bt_hci_phone_pairing_busy()) c->last_result = DONGLE_BUSY;
+        else if (!bt_hci_phone_pairing_start())
+            c->last_result = bt_hci_phone_pairing_busy() ? DONGLE_BUSY : DONGLE_UNSUPPORTED;
+    }
 }
 void dongle_control_poll(void) {
-    uint32_t now = btstack_run_loop_get_time_ms();
+    uint64_t now = dongle_uptime_ms();
+    dongle_case_battery_poll();
     const uint8_t empty[6] = {0};
     const uint8_t *address = (const uint8_t *)get_device_addr();
     if (!address) address = empty;
@@ -112,16 +119,21 @@ void dongle_control_poll(void) {
             (get_usb_streaming() ? 64 : 0);
         dongle_put32(next + 8, c->generation);
         memcpy(next + 12, selected, 6);
-        const dongle_readback_t *readback = aacp_control_readback();
+        dongle_readback_t observed=*aacp_control_readback();
+        uint8_t present, case_source;
+        dongle_case_battery_merge(&observed,aacp_control_ready(),&present,&case_source);
+        const dongle_readback_t *readback=&observed;
         next[18] = readback->anc;
         memcpy(next + 19, readback->battery, 3);
         next[22] = readback->charging;
         next[23] = dongle_output_codec();
         for (unsigned i = 0; i < 3; ++i)
-            dongle_put32(next + 24 + i * 4, readback->known[i] ? now - readback->updated[i] : UINT32_MAX);
+            dongle_put32(next + 24 + i * 4, dongle_readback_age(readback,i,now));
         dongle_put32(next + 36, c->last_sequence);
         next[40] = c->last_result; next[41] = c->last_opcode;
-        next[42] = 1 | 4 | 8 | 16 | 32 | (readback->anc ? 2 : 0);
+        next[42] = 1 | 4 | 8 | 16 | 32 | 64 | (readback->anc ? 2 : 0);
+        next[44] = present;
+        next[45] = case_source;
         irq = save_and_disable_interrupts();
         memcpy(c->status, next, 64);
         c->initialized = true;

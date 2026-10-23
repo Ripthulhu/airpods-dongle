@@ -37,23 +37,33 @@ reference file hashes used for these changes.
 | Hearing and diagnostics | USB controls cannot carry full settings records | Stage bounded HID fragments, commit once, use ATT on the existing Classic link and validate complete profile readback in NTPods |
 | BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity without a phone connection |
 | Build | Missing SDK patches can still produce a crashing or incompatible binary | Pin revisions and verify complete patched-file hashes before compilation |
+| Radio clock | CPU overclock also raises the CYW43 SPI clock | Set a rounded-up PIO divider before radio initialization, capping SPI at 31.25 MHz |
+| New phone pairing | Bond storage can overlap active audio | Require idle playback/microphone paths and cancel new pairing when they become busy; saved phones still reconnect |
 
 ## Hardware use
 
-Measured with GCC 13.2.1 and SDK 2.1.1 Release builds:
+Measured with GCC 13.2.1 and SDK 2.3.1 Release builds:
 
-| Linked layout | 0.1.9 |
+| Linked layout | 0.1.11 |
 | --- | ---: |
-| Main-heap capacity before codec allocations | 385,752 bytes |
-| Flash image | 1,708,080 bytes |
+| Main-heap capacity before codec allocations | 385,784 bytes |
+| Flash image | 1,729,304 bytes |
 | Full BLE cache copy for aggregate logs | 28 bytes |
 
 The encoder's 4 KiB PCM buffer fills scratch-X. Compressed microphone input and
 decode PCM use 3 KiB of scratch-Y. Core 1 has an explicit 16 KiB stack in ordinary
-RAM; a hash-checked SDK linker derivative reserves another 16 KiB at the top of
+RAM; hash-checked SDK linker overrides reserve another 16 KiB at the top of
 ordinary RAM for core 0, outside the heap. Stack guards are enabled on both cores.
 The lower heap capacity accounts for real stack reservations rather than assuming
 the SDK's small default stacks are sufficient. Allocator locking stays enabled.
+The selected-pair case battery fallback reuses the existing eight-entry BLE cache,
+allocates no heap and stays on core 0. Shared 64-bit timestamps for BLE reception,
+finder and battery observations add 120 bytes of static storage and 512 bytes
+of flash against the earlier 0.1.11 link, preserving ordering and stale ages across
+long absences. The main-loop poll advances this clock even without a selected
+pair or while scanning is paused. The AES schedule is a temporary 176-byte stack
+buffer, erased after use; core 1's codec
+work and both stack reservations remain unchanged.
 
 The inherited FDK decoder reserved 35,392 bytes in its internal decode function
 for a coupling-element parser, even on the mono ELD path. That parser now lives
@@ -80,7 +90,7 @@ their original dimensions.
 
 The real-codec probe keeps stereo ELD at 48 kHz/256 kbps and the microphone
 decoder open together. Live allocator use is 186,872 bytes, down from 379,864.
-The tested allocator peak is 188,040 bytes, leaving 197,712 bytes before other
+The tested allocator peak is 188,040 bytes, leaving 197,744 bytes before other
 application allocations. Heap alignment and allocation order affect arena use.
 Every firmware link verifies its exact FDK/LHDC archive fingerprints, derives capacity
 from the ELF and reserves 64 KiB for other runtime use. The reserve is a build
@@ -156,7 +166,7 @@ it. No core 1 allocation/free occurs. USB microphone takeover waits for the phon
 worker to detach, then frees its codec and queue before initializing a fresh
 microphone decoder. Stale output remains generation-tagged. The aptX context adds
 4,404 bytes while selected, and SBC uses 1,636 bytes of static decoder state/workspace.
-The phone-only worker allocation is 9,776 bytes: two bounded compressed packet
+The phone-only worker allocation is 9,780 bytes: two bounded compressed packet
 slots and one complete-packet PCM mailbox. Malformed partial output is discarded.
 The LHDC adapter requests 11,264 live heap bytes on ARM32 and prewarms transform
 tables on core 0. No decode allocation or second decoder worker is introduced.
@@ -176,6 +186,28 @@ The worker uses atomic queues and wake events, leaving the multicore FIFO to the
 SDK. BOOTSEL sampling also disconnects QSPI briefly, so it runs in thread context
 under flash lockout instead of directly in a timer interrupt. Logs cross through
 a coherent mailbox and are formatted only on core 0.
+
+The CYW43 SPI divider is derived from the actual system clock and rounded upward
+to cap the bus at 31.25 MHz. At the inherited 250 MHz CPU clock this selects 4.0;
+changing CPU speed does not implicitly overclock the radio bus. CPU overclock
+stability and sustained dual-link throughput remain board checks.
+
+The CDC console accepts only `t` as a diagnostic request, with one 64-byte receive
+chunk per USB tick and a coalesced request flag. Core 0 formats the response in
+thread context. It reports maximum wall time for the 500 us USB service callback
+and main-loop Bluetooth lock-held section, plus the phone worker's maximum decode
+time for its current allocation. Start-to-start gap maxima expose stalls between
+services even when the callback itself is short. USB overruns count callbacks over 500 us, not
+missing USB packets. These are wall times including higher-priority preemption;
+they do not measure CPU utilization or the separate SDK Bluetooth IRQ's runtime.
+Counts saturate at `UINT32_MAX`; the existing binary performance report is unchanged.
+
+XIP hit/access counters are read and cleared together with each console snapshot.
+They cover both cores and may saturate before the first request. Read once to
+start a measurement window, then read again under the intended load; samples are
+approximate because the hardware counters keep running during read/reset.
+No cache contents or code placement change. Selective SRAM placement and bounded
+HCI batching require measured contention and callback fairness first.
 
 ## Protocol choices
 

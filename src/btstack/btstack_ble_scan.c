@@ -7,6 +7,13 @@
 static btstack_packet_callback_registration_t scan_registration;
 static ble_scan_snapshot_t scan_state;
 static bool scan_initialized;
+static uint64_t uptime_ms;
+
+uint64_t dongle_uptime_ms(void) {
+    uint32_t now=btstack_run_loop_get_time_ms();
+    uptime_ms+=(uint32_t)(now-(uint32_t)uptime_ms);
+    return uptime_ms;
+}
 
 static void scan_update(void) {
     bool wanted = scan_state.stats.controller_ready && scan_state.stats.le_supported && scan_state.stats.pause_reasons == 0;
@@ -125,7 +132,7 @@ static void scan_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
     report.event_type = gap_event_advertising_report_get_advertising_event_type(packet);
     report.rssi = (int8_t)gap_event_advertising_report_get_rssi(packet);
     report.rssi_valid = report.rssi != 127;
-    report.received_ms = btstack_run_loop_get_time_ms();
+    report.received_ms = dongle_uptime_ms();
     report.data_length = (uint8_t)length;
     memcpy(report.data, data, length);
 
@@ -142,8 +149,7 @@ static void scan_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
         if (slot == BLE_SCAN_CACHE_SIZE) {
             slot = 0;
             for (unsigned i = 1; i < BLE_SCAN_CACHE_SIZE; ++i) {
-                if ((uint32_t)(report.received_ms - scan_state.reports[i].received_ms) >
-                    (uint32_t)(report.received_ms - scan_state.reports[slot].received_ms)) slot = i;
+                if (scan_state.reports[i].received_ms < scan_state.reports[slot].received_ms) slot = i;
             }
             scan_state.stats.evicted++;
         } else {

@@ -25,6 +25,7 @@
 #include "btstack_aacp.h"
 #include "aacp_mic_dec.h"
 #include "dongle_settings.h"
+#include "btstack_ble_scan.h"
 #include "../tinyusb/dongle_rpc.h"
 #include "../tinyusb/uac.h"
 
@@ -112,8 +113,8 @@ static int setting_result;
 static uint8_t receive_buffer_tx[11];
 static uint32_t receive_buffer_serial;
 static uint16_t receive_buffer_last;
-static uint8_t pair_irk[16], pair_key_address[6];
-static bool pair_irk_known;
+static uint8_t pair_irk[16], pair_advertising_key[16], pair_key_address[6];
+static bool pair_irk_known, pair_case_supported;
 static uint32_t control_session;
 // Static entries stay valid until their queued transmission completes.
 static const uint8_t control_anc[] = {4,0,4,0,9,0,0x0d,2,0,0,0};
@@ -189,7 +190,9 @@ void aacp_disconnect(void) {
 
 void aacp_init(void) {
     pair_irk_known=false;
+    pair_case_supported=false;
     memset(pair_irk,0,sizeof(pair_irk));
+    memset(pair_advertising_key,0,sizeof(pair_advertising_key));
     memset(pair_key_address,0,sizeof(pair_key_address));
     aacp_disconnect();
     aacp_mic_want = aacp_mic_failed = false;
@@ -224,7 +227,9 @@ void aacp_connect(bd_addr_t addr) {
     aacp_disconnect();
     if (memcmp(pair_key_address,addr,sizeof(pair_key_address))) {
         pair_irk_known=false;
+        pair_case_supported=false;
         memset(pair_irk,0,sizeof(pair_irk));
+        memset(pair_advertising_key,0,sizeof(pair_advertising_key));
         memcpy(pair_key_address,addr,sizeof(pair_key_address));
     }
     memcpy(aacp_addr, addr, sizeof(bd_addr_t));
@@ -278,11 +283,18 @@ bool aacp_pair_irk(uint8_t address[6], uint8_t key[16]) {
     if (!pair_irk_known || !address || !key) return false;
     memcpy(address,pair_key_address,6); memcpy(key,pair_irk,16); return true;
 }
+bool aacp_pair_case_key(uint8_t address[6], uint8_t key[16]) {
+    if (!pair_irk_known || !pair_case_supported || !address || !key) return false;
+    memcpy(address,pair_key_address,6);
+    memcpy(key,pair_advertising_key,16);
+    return true;
+}
 static void pair_keys_report(const uint8_t *p, uint16_t n) {
     pair_irk_known=false;
     memset(pair_irk,0,sizeof(pair_irk));
+    memset(pair_advertising_key,0,sizeof(pair_advertising_key));
     if (n!=47 || p[5] || p[6]!=2) return;
-    const uint8_t *identity=NULL;
+    const uint8_t *identity=NULL, *advertising=NULL;
     unsigned kinds=0;
     for (unsigned off=7;off<n;off+=20) {
         uint8_t id=p[off];
@@ -292,9 +304,12 @@ static void pair_keys_report(const uint8_t *p, uint16_t n) {
         if (!nonzero) return;
         kinds|=1u<<id;
         if (id==1) identity=p+off+4;
+        else advertising=p+off+4;
     }
     if (!identity || kinds!=((1u<<1)|(1u<<4))) return;
-    memcpy(pair_irk,identity,16); memcpy(pair_key_address,aacp_addr,6); pair_irk_known=true;
+    memcpy(pair_irk,identity,16);
+    memcpy(pair_advertising_key,advertising,16);
+    memcpy(pair_key_address,aacp_addr,6); pair_irk_known=true;
 }
 uint8_t aacp_setting_write(uint8_t id, uint32_t value) {
     if (setting_index(id)<0) return DONGLE_UNSUPPORTED;
@@ -734,13 +749,15 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
             aacp_handle_audio_sdu(packet, size);
         } else {
             settings_packet(&settings,packet,size,btstack_run_loop_get_time_ms());
+            if (packet[4]==0x1d)
+                pair_case_supported=!packet[5] && settings.profile && settings.profile->models[0]==3063 && settings.firmware_major;
             if (packet[4]==0x31) pair_keys_report(packet,size);
             if (size>=7 && packet[4]==9 && packet[5]==0 && packet[6]==0x0d) {
                 const setting_report_t *anc=&settings.reports[setting_index(0x0d)];
                 control_readback.anc=anc->known ? (uint8_t)anc->value : 0;
             }
             research_cache(packet, size);
-            dongle_readback_packet(&control_readback, packet, size, btstack_run_loop_get_time_ms());
+            dongle_readback_packet(&control_readback, packet, size, dongle_uptime_ms());
             aacp_got_control = true;
             aacp_try_mic_start();
         }

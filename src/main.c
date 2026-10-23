@@ -1,4 +1,5 @@
 #include "pico/cyw43_arch.h"
+#include "pico/cyw43_driver.h"
 #include "pico/stdlib.h"
 #include "btstack_run_loop.h"
 
@@ -27,6 +28,7 @@
 #include "hardware/sync.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
+#include "hardware/structs/xip.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
 #include "hardware/timer.h"
@@ -43,10 +45,33 @@
 #include "button_gesture.h"
 #include "pico/flash.h"
 #include "pico/multicore.h"
+#include "radio_clock.h"
+#include "realtime_metrics.h"
 
 // Scratch-X holds encoder PCM; give the decoder worker its own main-RAM stack.
 static uint32_t codec_stack[4096] __attribute__((aligned(8)));
 static atomic_uint codec_core_state;
+static realtime_metric_t usb_service_metric, bluetooth_main_metric;
+
+static void realtime_metrics_print(void) {
+    // USB can preempt the main loop; take a coherent short snapshot.
+    uint32_t irq = save_and_disable_interrupts();
+    realtime_metric_t usb = usb_service_metric, bluetooth = bluetooth_main_metric;
+    uint32_t hits = xip_ctrl_hw->ctr_hit, accesses = xip_ctrl_hw->ctr_acc;
+    xip_ctrl_hw->ctr_hit = 0;
+    xip_ctrl_hw->ctr_acc = 0;
+    restore_interrupts(irq);
+    uint32_t system_hz = clock_get_hz(clk_sys);
+    uint32_t divider256 = radio_clock_divider256(system_hz);
+    printf("[TIMING] cpu_hz=%lu spi_hz=%lu usb_calls=%lu usb_max_us=%lu usb_gap_max_us=%lu usb_over500=%lu bt_calls=%lu bt_max_us=%lu bt_gap_max_us=%lu phone_decode_max_us=%lu\n",
+           (unsigned long)system_hz, (unsigned long)((uint64_t)system_hz * 128u / divider256),
+           (unsigned long)usb.count, (unsigned long)usb.max_us, (unsigned long)usb.max_gap_us,
+           (unsigned long)usb.overruns, (unsigned long)bluetooth.count,
+           (unsigned long)bluetooth.max_us, (unsigned long)bluetooth.max_gap_us,
+           (unsigned long)phone_worker_max_decode_us());
+    printf("[XIP] hits=%lu accesses=%lu (read then cleared; counters saturate)\n",
+           (unsigned long)hits, (unsigned long)accesses);
+}
 
 void aacp_mic_dec_wake_worker(void) {
     __sev();
@@ -230,7 +255,9 @@ void check_bootsel_state(void)
 
 
 bool usb_timer_callback(repeating_timer_t *rt){
+    uint32_t started = time_us_32();
     tinyusb_task();
+    realtime_metric_record(&usb_service_metric, started, time_us_32(), REALTIME_USB_SERVICE_BUDGET_US);
     return true;
 }
 
@@ -305,6 +332,9 @@ int main() {
     printf("init ctw43.\n");
 
     // initialize CYW43 driver
+    // Keep radio SPI independent of the inherited CPU overclock.
+    uint32_t radio_divider256 = radio_clock_divider256(clock_get_hz(clk_sys));
+    cyw43_set_pio_clkdiv_int_frac8(radio_divider256 >> 8, (uint8_t)radio_divider256);
     if (cyw43_arch_init()) {
         printf("cyw43_arch_init() failed.\n");
         return -1;
@@ -344,7 +374,7 @@ int main() {
     // previous START, so tinyusb_task() runs at a steady cadence regardless of
     // how long each call takes. USB audio is isochronous — the OUT endpoint
     // must be serviced on a fixed rhythm or samples drift/underrun.
-    if (!add_repeating_timer_us(-500, usb_timer_callback, NULL, &usb_timer)) {
+    if (!add_repeating_timer_us(-(int64_t)REALTIME_USB_SERVICE_BUDGET_US, usb_timer_callback, NULL, &usb_timer)) {
         printf("USB service timer unavailable\n");
         return 1;
     }
@@ -367,6 +397,7 @@ int main() {
         bool mic_wanted;
         async_context_t *ctx = cyw43_arch_async_context();
         async_context_acquire_lock_blocking(ctx);
+        uint32_t bluetooth_started = time_us_32();
         bt_hci_phone_poll();
         if (usb_mic_take_request(&mic_wanted)) {
             // A fresh open also clears an earlier AACP failure before retrying.
@@ -401,6 +432,8 @@ int main() {
         dongle_features_poll();
         phone_control_poll();
         ble_diagnostics_task();
+        if (debug_cdc_take_timing_request()) realtime_metrics_print();
+        realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
         async_context_release_lock(ctx);
         sleep_ms(1);
     }

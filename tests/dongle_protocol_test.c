@@ -23,6 +23,9 @@ int main(void) {
     dongle_readback_packet(&readback, battery, sizeof(battery), 20);
     assert(readback.battery[0] == 95 && readback.battery[1] == 91 && readback.battery[2] == 62);
     assert(readback.charging == 5 && readback.updated[0] == 20);
+    assert(dongle_readback_age(&readback,0,20)==0);
+    assert(dongle_readback_age(&readback,0,20+UINT64_C(0xffffffff))==UINT32_MAX-1u);
+    assert(dongle_readback_age(&readback,0,20+(UINT64_C(1)<<33))==UINT32_MAX-1u);
     uint8_t absent[] = {4,0,4,0,4,0,1, 2,1,255,4,0};
     dongle_readback_packet(&readback, absent, sizeof(absent), 100);
     assert(readback.battery[1] == 255 && readback.updated[1] == 100 && readback.updated[0] == 20);
@@ -35,5 +38,10 @@ int main(void) {
     anc[8] = 1; dongle_readback_packet(&readback, anc, sizeof(anc), 210);
     assert(readback.anc == 3);
     dongle_readback_clear(&readback); assert(!readback.anc && !readback.known[1]);
+    assert(dongle_readback_age(&readback,1,UINT64_MAX)==UINT32_MAX);
+    battery[19]=62;
+    dongle_readback_packet(&readback,battery,sizeof(battery),(UINT64_C(1)<<32)+100);
+    assert(readback.updated[2]==(UINT64_C(1)<<32)+100);
+    assert(dongle_readback_age(&readback,2,(UINT64_C(1)<<32)+125)==25);
     puts("dongle protocol: bounded commands, readback, stale components and malformed packets passed");
 }

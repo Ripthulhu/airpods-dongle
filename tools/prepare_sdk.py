@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SDK_REVISION = "bddd20f928ce76142793bef434d4f75f4af6e433"
+SDK_REVISION = "079c6f39023649b154152db30f1d781e884879bc"
 SUBMODULES = ("btstack", "tinyusb", "cyw43-driver", "mbedtls", "lwip")
 
 
@@ -23,7 +23,7 @@ def sha256(path):
 
 def check(sdk, apply=False):
     if git(sdk, "rev-parse", "HEAD") != SDK_REVISION:
-        raise ValueError("Unsupported pico-sdk revision; use the pinned SDK 2.1.1 checkout")
+        raise ValueError("Unsupported pico-sdk revision; use the pinned SDK 2.3.1 checkout")
     manifest = json.loads((ROOT / "patches" / "sdk.json").read_text())
     for name in SUBMODULES:
         expected = git(sdk, "rev-parse", f"HEAD:lib/{name}")
@@ -57,7 +57,7 @@ def main():
     sdk = args.sdk.resolve()
     try:
         if not sdk.exists() and not args.check:
-            subprocess.run(["git", "-c", "core.autocrlf=false", "clone", "--branch", "2.1.1", "--depth", "1",
+            subprocess.run(["git", "-c", "core.autocrlf=false", "clone", "--branch", "2.3.1", "--depth", "1",
                             "https://github.com/raspberrypi/pico-sdk.git", str(sdk)], check=True)
         if not args.check:
             if git(sdk, "rev-parse", "HEAD") != SDK_REVISION:
@@ -68,7 +68,7 @@ def main():
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"SDK check failed: {error}", file=sys.stderr)
         return 1
-    print("SDK 2.1.1 revisions and patch readback verified")
+    print("SDK 2.3.1 revisions and patch readback verified")
     return 0
 
 

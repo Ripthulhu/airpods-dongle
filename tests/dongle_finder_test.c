@@ -8,10 +8,11 @@
 static uint8_t selected_peer[6]={1,2,3,4,5,6};
 static uint8_t key_fixture[16]={0x79,4,0x65,0x1e,0xe2,0xcc,0xd9,0x26,0xf2,0x6e,0x20,0xee,0x3e,0xcc,0xde,0x79};
 static bool identity=true;
-static uint32_t now=100;
+static uint64_t now=100;
 static ble_scan_stats_t scan={.controller_ready=true,.le_supported=true,.scan_requested=true};
 static ble_scan_report_t records[8];static unsigned record_count;
-uint32_t btstack_run_loop_get_time_ms(void){return now;}
+uint32_t btstack_run_loop_get_time_ms(void){return (uint32_t)now;}
+uint64_t dongle_uptime_ms(void){return now;}
 bd_addr_t *get_device_addr(void){return (bd_addr_t *)&selected_peer;}
 bool aacp_pair_irk(uint8_t address[6],uint8_t key[16]){if(!identity)return false;memcpy(address,selected_peer,6);memcpy(key,key_fixture,16);return true;}
 void ble_scan_get_stats(ble_scan_stats_t *out){*out=scan;}
@@ -61,7 +62,11 @@ int main(void){
     assert(dongle_finder_start(0)==1);now+=30000;dongle_finder_poll();assert(!dongle_finder_active());
     assert(dongle_finder_start(0)==1);dongle_finder_disconnect(0);assert(!dongle_finder_active());
     assert(dongle_finder_stop(0)==1 && !dongle_finder_snapshot(0,out,23));
-    now=UINT32_MAX-10;assert(dongle_finder_start(0)==1);now=20;dongle_finder_poll();assert(dongle_finder_active());
+    now=UINT32_MAX-10;assert(dongle_finder_start(0)==1);now=(UINT64_C(1)<<32)+20;dongle_finder_poll();assert(dongle_finder_active());
+    report(0,0x5d,-40);dongle_finder_poll();dongle_finder_snapshot(0,out,24);
+    assert((out[1]&0x7f)==2 && field(out,4)==0);
+    now+=UINT64_C(1)<<32;dongle_finder_snapshot(0,out,24);dongle_finder_poll();
+    dongle_finder_snapshot(0,out,24);assert((out[1]&0x7f)==3 && field(out,4)==UINT32_MAX-1u);
     dongle_finder_stop(0);for(unsigned i=0;i<16;i++)assert(irk[i]==0);
     puts("finder: selected IRK, address rotation, two pairs, long gaps, HQ mic pause, cancellation, lease and wrap passed");
 }

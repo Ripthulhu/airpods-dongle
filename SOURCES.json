@@ -8,13 +8,19 @@
     "revision": "6286ab1618ec1143d828b1fc377d8e22c449e567"
   },
   "pico_sdk": {
-    "version": "2.1.1",
-    "revision": "bddd20f928ce76142793bef434d4f75f4af6e433",
+    "version": "2.3.1",
+    "revision": "079c6f39023649b154152db30f1d781e884879bc",
     "patches": "patches/sdk.json"
   },
   "picotool": {
-    "version": "2.1.1",
-    "revision": "de8ae5ac334e1126993f72a5c67949712fd1e1a4"
+    "version": "2.3.1",
+    "revision": "2041936441b48a3cc53ae3da9e805229fe8f4e18"
+  },
+  "case_ble_layout": {
+    "repository": "https://github.com/stuffz/airpods",
+    "revision": "8bd035451668388860e62fcc0a4a624a608d9d3a",
+    "reference": "docs/ble-research.md",
+    "scope": "Pro 3 case advertisement layout observations; independent guarded decoder, hardware verification pending"
   },
   "ntpods_reference": {
     "repository": "https://github.com/Ripthulhu/ntpods",

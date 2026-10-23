@@ -10,7 +10,7 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Experimental firmware **0.1.9**. The firmware cross-compiles and the host
+Experimental firmware **0.1.11**. The firmware cross-compiles and the host
 regression tests pass.
 This version has not been tested on a Pico or AirPods. The source fork reports
 Pro 3 testing; that does not validate these changes.
@@ -20,6 +20,7 @@ Pro 3 testing; that does not validate these changes.
 - Simultaneous AACP microphone, opened only by a USB recording request.
 - Phone or microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
+- Pro 3 case BLE battery fallback with separate provenance and per-component ages; hardware verification pending.
 - 100 ms encoded startup silence for AAC-ELD, sent before accepting phone playback.
 - Confirmed AVDTP suspension after one second without input; fresh input restarts and primes the stream.
 - Stem media controls and volume routed to the active phone or USB input.
@@ -36,6 +37,9 @@ and readback without acquiring audio. USB uses Windows' built-in HID driver;
 USB audio and microphone also work independently of the app. There are no
 PC/phone handoff commands. Sensor streaming and case ringing are not implemented.
 The serial port remains a diagnostic console.
+Send `t` to read USB service and main-loop Bluetooth timing maxima, the current
+phone decoder maximum and flash-cache counters. Repeated requests are coalesced;
+counter collection does not acquire audio or run a sound-producing check.
 LDAC is unsupported: the inherited encoder path could exceed the negotiated packet
 limit, and AirPods do not need that codec.
 
@@ -86,10 +90,10 @@ cmake --build build --parallel
 Output: `build/airpods_dongle.uf2`. Hold BOOTSEL while connecting the Pico 2 W,
 then copy the UF2 onto its USB drive. The original Pico W has insufficient RAM.
 
-The SDK helper pins Pico SDK 2.1.1 and its submodules, checks original file hashes,
+The SDK helper pins Pico SDK 2.3.1 and its submodules, checks original file hashes,
 applies the reviewed patches, and verifies readback. Configuration and builds
 reject missing patches or unknown patch states. The UF2 tool is pinned to
-picotool 2.1.1. Use a separate SDK checkout rather than modifying a shared one.
+picotool 2.3.1. Use a separate SDK checkout rather than modifying a shared one.
 Every firmware link runs the [real-codec memory check](tools/codec_probe/README.md)
 against that ELF and its fingerprinted codec archives, including LHDC gain and
 signal-error checks against the original synthetic PCM. UF2 publication waits
@@ -146,22 +150,24 @@ capture. Check BLE reception during playback and restoration after microphone
 use. Capture the media flush flags and verify control traffic stays reliable.
 Check USB reset/re-enumeration with recording open and during BLE reception.
 
-The inherited 250 MHz / 1.20 V overclock needs validation on each board. Runtime
-heap margin and microphone clock drift remain unmeasured. The microphone uses
+The inherited 250 MHz / 1.20 V overclock needs validation on each board. Radio
+SPI is capped at 31.25 MHz independently of that CPU clock. Timing counters do
+not establish acoustic latency or sustained codec headroom. Runtime heap margin
+and microphone clock drift remain unmeasured. The microphone uses
 the inherited 64 kHz USB presentation clock with a 48 kHz AAC coding configuration;
 this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
 Both cores have guarded 16 KiB stacks. The build measures codec allocation peaks
 against the linked heap and requires at least 64 KiB left for runtime use.
-The 0.1.9 link leaves 385,752 bytes of heap. The ARM probe peaks at 90,816 bytes
+The 0.1.11 link leaves 385,784 bytes of heap. The ARM probe peaks at 90,816 bytes
 for LHDC plus AAC-ELD, or 188,040 bytes for playback plus USB microphone. The
-heavier case leaves 197,712 bytes before other runtime allocations.
+heavier case leaves 197,744 bytes before other runtime allocations.
 The [codec probe](tools/codec_probe/README.md) covers the real encoders, VBR frame
 bounds and decoder lifecycles; emulation does not measure full runtime heap or
 stack use. Performance readings expose queue fill, dropped/underflow frames,
 encode time and allocator use for hardware checks.
 Phone playback releases the idle microphone decoder before preparing its input
-codec and 9,776-byte worker queue; USB recording waits for worker detachment and
+codec and 9,780-byte worker queue; USB recording waits for worker detachment and
 frees both before allocating the microphone. Diagnostic history is limited to
 2 KiB, with dropped-byte counts, to leave more memory for audio.
 If microphone initialization fails, reopening recording makes one fresh attempt

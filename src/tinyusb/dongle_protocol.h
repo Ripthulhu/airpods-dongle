@@ -32,15 +32,24 @@ static inline bool dongle_command_valid(const uint8_t *p, unsigned size) {
 // Each component retains its own age; omitted slots are not refreshed.
 typedef struct {
     uint8_t anc, battery[3], charging;
-    uint32_t updated[3];
+    uint64_t updated[3];
     bool known[3];
 } dongle_readback_t;
 static inline void dongle_readback_clear(dongle_readback_t *s) {
     memset(s, 0, sizeof(*s));
     memset(s->battery, 255, sizeof(s->battery));
 }
+static inline uint32_t dongle_age_ms(uint64_t now, uint64_t updated) {
+    uint64_t age=now-updated;
+    // UINT32_MAX means unknown; known old observations must not wrap to fresh.
+    return age>=UINT32_MAX ? UINT32_MAX-1u : (uint32_t)age;
+}
+static inline uint32_t dongle_readback_age(const dongle_readback_t *s, unsigned slot,
+                                         uint64_t now) {
+    return s->known[slot] ? dongle_age_ms(now,s->updated[slot]) : UINT32_MAX;
+}
 static inline void dongle_readback_packet(dongle_readback_t *s, const uint8_t *p,
-                                         unsigned size, uint32_t now) {
+                                         unsigned size, uint64_t now) {
     static const uint8_t header[] = {4, 0, 4, 0};
     if (size < 7 || memcmp(p, header, 4)) return;
     if (size == 11 && p[4] == 9 && p[5] == 0 && p[6] == 0x0d &&

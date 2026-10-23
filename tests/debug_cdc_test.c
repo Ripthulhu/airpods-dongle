@@ -13,6 +13,8 @@ static uint32_t available, accept_limit, write_calls, flush_calls;
 static unsigned connected_queries;
 static char output[20000];
 static uint32_t output_size;
+static uint8_t input[256];
+static uint32_t input_size, input_offset, read_calls, read_flush_calls;
 
 void stdio_set_driver_enabled(stdio_driver_t *driver, bool enabled) {
     assert(enabled);
@@ -25,6 +27,19 @@ uint32_t save_and_disable_interrupts(void) {
 }
 void restore_interrupts(uint32_t previous) { interrupts_disabled = previous; }
 bool tud_cdc_connected(void) { connected_queries++; return connected; }
+uint32_t tud_cdc_read(void *buffer, uint32_t count) {
+    assert(connected && !interrupts_disabled && count <= 64u);
+    ++read_calls;
+    if (count > input_size - input_offset) count = input_size - input_offset;
+    memcpy(buffer, input + input_offset, count);
+    input_offset += count;
+    return count;
+}
+void tud_cdc_read_flush(void) {
+    assert(!connected && !interrupts_disabled);
+    ++read_flush_calls;
+    input_offset = input_size;
+}
 uint32_t tud_cdc_write_available(void) { return available; }
 uint32_t tud_cdc_write(const void *buffer, uint32_t count) {
     assert(!interrupts_disabled && count <= available && count <= 64);
@@ -44,6 +59,8 @@ static void reset(void) {
     available = accept_limit = UINT32_MAX;
     write_calls = flush_calls = output_size = 0;
     connected_queries = 0;
+    input_size = input_offset = read_calls = read_flush_calls = 0;
+    atomic_store(&timing_requested, false);
     memset(output, 0, sizeof(output));
 }
 
@@ -62,7 +79,7 @@ int main(void) {
     assert(registered != NULL && registered->out_chars != NULL);
     reset();
     for (unsigned i = 0; i < 2000; ++i) debug_cdc_task();
-    assert(connected_queries == 0 && write_calls == 0);
+    assert(connected_queries == 2000 && write_calls == 0 && read_calls == 0);
     registered->out_chars("boot\n", 5);
     debug_cdc_task();
     assert(write_calls == 0 && output_size == 0);
@@ -82,7 +99,42 @@ int main(void) {
     assert(strcmp(output, "boot\r\n") == 0);
     unsigned queries = connected_queries;
     for (unsigned i = 0; i < 2000; ++i) debug_cdc_task();
-    assert(connected_queries == queries);
+    assert(connected_queries == queries + 2000u);
+
+    // Input is serviced with an empty output ring and cannot run old commands.
+    reset();
+    connected = true;
+    memcpy(input, "pdlr\r\nT", 7);
+    input_size = 7;
+    debug_cdc_task();
+    assert(input_offset == 7u && !debug_cdc_take_timing_request());
+    assert(output_size == 0u && write_calls == 0u);
+    memset(input, 't', 128);
+    input_offset = 0;
+    input_size = 128;
+    read_calls = 0;
+    debug_cdc_task();
+    assert(input_offset == 64u && read_calls == 1u);
+    assert(debug_cdc_take_timing_request() && !debug_cdc_take_timing_request());
+    debug_cdc_task();
+    assert(input_offset == 128u && read_calls == 2u);
+    assert(debug_cdc_take_timing_request() && !debug_cdc_take_timing_request());
+
+    // A closed terminal discards both a pending request and unread old input.
+    input_offset = 0;
+    input_size = 128;
+    debug_cdc_task();
+    connected = false;
+    debug_cdc_task();
+    assert(!debug_cdc_take_timing_request());
+    assert(input_offset == input_size && read_flush_calls == 1u);
+    input_offset = 0;
+    input_size = 1;
+    debug_cdc_task();
+    connected = true;
+    debug_cdc_task();
+    assert(!debug_cdc_take_timing_request());
+    assert(output_size == 0u && write_calls == 0u);
 
     reset();
     connected = true;
@@ -93,15 +145,15 @@ int main(void) {
 
     reset();
     connected = true;
-    char input[DBG_BUF_SIZE + 3];
-    memset(input, 'x', sizeof(input));
-    registered->out_chars(input, sizeof(input));
+    char log_input[DBG_BUF_SIZE + 3];
+    memset(log_input, 'x', sizeof(log_input));
+    registered->out_chars(log_input, sizeof(log_input));
     assert(dbg_dropped == 4);
     drain();
     assert(output_size == DBG_BUF_SIZE - 1 + strlen("\r\n[log dropped 4 bytes]\r\n"));
     for (unsigned i = 0; i < DBG_BUF_SIZE - 1; ++i) assert(output[i] == 'x');
     assert(strcmp(output + DBG_BUF_SIZE - 1, "\r\n[log dropped 4 bytes]\r\n") == 0);
     assert(!interrupts_disabled);
-    puts("CDC bounded direct drain, partial writes, wrap, offline retention and overflow: passed");
+    puts("CDC bounded RX/TX, coalesced timing requests, DTR cleanup, partial writes, wrap, offline retention and overflow: passed");
     return 0;
 }

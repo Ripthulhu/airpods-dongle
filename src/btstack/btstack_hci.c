@@ -11,6 +11,9 @@
 #include "peer_address.h"
 #include "btstack_avdtp_source.h"
 #include "btstack_ble_scan.h"
+#include "btstack_aacp.h"
+#include "phone_sink.h"
+#include "../tinyusb/uac.h"
 #include "../pico_w_led.h"
 #include "../slot_storage.h"
 #include "btstack_tlv.h"
@@ -68,24 +71,46 @@ static void phone_load(void) {
     phone_bonded = gap_get_link_key_for_bd_addr(phone_address, key, &type);
 }
 
+bool bt_hci_phone_pairing_busy(void) {
+    return get_usb_streaming() || dongle_playback_transitioning() ||
+           usb_mic_requested() || aacp_mic_active() || phone_sink_active();
+}
+
 bool bt_hci_phone_pairing_active(void) {
     return phone_pairing &&
+        !bt_hci_phone_pairing_busy() &&
         (uint32_t)(btstack_run_loop_get_time_ms() - phone_pairing_since) < PHONE_PAIRING_MS;
 }
 
-void bt_hci_phone_poll(void) {
-    if (!phone_pairing || bt_hci_phone_pairing_active()) return;
+static void phone_pairing_stop(void) {
+    bd_addr_t candidate;
+    memcpy(candidate, phone_candidate, sizeof(candidate));
     phone_pairing = false;
     memset(phone_candidate, 0, sizeof(phone_candidate));
     gap_discoverable_control(0);
+    // Close only the uncommitted candidate; an existing phone bond remains usable.
+    if (peer_address_valid(candidate) &&
+        !(phone_bonded && memcmp(candidate, phone_address, 6) == 0)) {
+        hci_connection_t *connection = hci_connection_for_bd_addr_and_type(candidate, BD_ADDR_TYPE_ACL);
+        if (connection != NULL) gap_disconnect(connection->con_handle);
+    }
+}
+
+void bt_hci_phone_poll(void) {
+    if (phone_pairing && !bt_hci_phone_pairing_active()) phone_pairing_stop();
 }
 
 bool bt_hci_phone_pairing_start(void) {
+    if (bt_hci_phone_pairing_busy()) {
+        bt_hci_phone_poll();
+        printf("Pause audio before pairing a new phone\n");
+        return false;
+    }
     if (!phone_storage_supported) {
         printf("Phone identity storage unavailable or unsupported\n");
         return false;
     }
-    memset(phone_candidate, 0, sizeof(phone_candidate));
+    if (phone_pairing) phone_pairing_stop();
     phone_pairing_since = btstack_run_loop_get_time_ms();
     phone_pairing = true;
     gap_discoverable_control(1);
@@ -96,6 +121,7 @@ bool bt_hci_phone_pairing_start(void) {
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]) {
     if (address == NULL || !peer_address_valid(address) || airpods_address(address)) return false;
     if (phone_bonded && memcmp(address, phone_address, 6) == 0) return true;
+    bt_hci_phone_poll();
     return bt_hci_phone_pairing_active() && memcmp(address, phone_candidate, 6) == 0;
 }
 
@@ -113,6 +139,12 @@ bool bt_hci_phone_peer_connected(const uint8_t address[6]) {
     if (!phone_storage_supported || tlv == NULL) return false;
     phone_record_t record = {.version = 1}, verify;
     memcpy(record.address, address, 6);
+    if (!bt_hci_phone_pairing_active()) {
+        bt_hci_phone_poll();
+        return false;
+    }
+    // shortcut: BTstack may already have stored an in-flight link-key notification
+    // before our callback; coordinating that boundary needs a separate SDK change.
     if (tlv->store_tag(context, PHONE_TAG, (const uint8_t *)&record, sizeof(record)) != 0 ||
         tlv->get_tag(context, PHONE_TAG, NULL, 0) != (int)sizeof(verify) ||
         tlv->get_tag(context, PHONE_TAG, (uint8_t *)&verify, sizeof(verify)) != (int)sizeof(verify) ||
@@ -136,6 +168,7 @@ static int accept_classic_peer(bd_addr_t address, hci_link_type_t link_type) {
 }
 
 static bool pairing_peer_allowed(const uint8_t address[6]) {
+    bt_hci_phone_poll();
     return (peer_address_valid(device_addr) && memcmp(address, device_addr, 6) == 0) ||
         (bt_hci_phone_pairing_active() && bt_hci_phone_peer_allowed(address));
 }

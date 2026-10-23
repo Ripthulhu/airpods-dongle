@@ -25,7 +25,7 @@ typedef struct {
 } input_slot_t;
 
 typedef struct {
-    atomic_uint generation, input_read, input_written, last_decode_us;
+    atomic_uint generation, input_read, input_written, last_decode_us, max_decode_us;
     atomic_bool output_ready;
     input_slot_t input[INPUT_SLOTS];
     int16_t output[OUTPUT_FRAMES * 2u];
@@ -91,6 +91,7 @@ phone_worker_status_t phone_worker_prepare(void) {
     atomic_init(&next->input_written, 0u);
     atomic_init(&next->output_ready, false);
     atomic_init(&next->last_decode_us, 0u);
+    atomic_init(&next->max_decode_us, 0u);
     owned = next;
     reconfigure = false;
     active = next;
@@ -144,6 +145,10 @@ uint32_t phone_worker_last_decode_us(void) {
     return phone_worker_ready() ? atomic_load_explicit(&owned->last_decode_us, memory_order_acquire) : 0u;
 }
 
+uint32_t phone_worker_max_decode_us(void) {
+    return phone_worker_ready() ? atomic_load_explicit(&owned->max_decode_us, memory_order_acquire) : 0u;
+}
+
 bool phone_worker_close(void) {
     requested_codec = PHONE_CODEC_NONE;
     reconfigure = false;
@@ -186,7 +191,10 @@ bool phone_worker_step(void) {
         worker->output_generation = generation;
         uint32_t started = PHONE_WORKER_TIME_US();
         bool ok = phone_codec_decode(slot->payload, slot->length, slot->sbc_frames, collect_pcm, worker);
-        atomic_store_explicit(&worker->last_decode_us, PHONE_WORKER_TIME_US() - started, memory_order_release);
+        uint32_t elapsed = PHONE_WORKER_TIME_US() - started;
+        atomic_store_explicit(&worker->last_decode_us, elapsed, memory_order_release);
+        if (elapsed > atomic_load_explicit(&worker->max_decode_us, memory_order_relaxed))
+            atomic_store_explicit(&worker->max_decode_us, elapsed, memory_order_release);
         worker->output_ok = ok && worker->output_ok;
         // Never expose a partial decode or results cancelled during decoding.
         if (generation == atomic_load_explicit(&worker->generation, memory_order_acquire))

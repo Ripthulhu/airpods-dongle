@@ -94,6 +94,8 @@ def main():
     tests = {
         "peer": ["tests/peer_test.c"],
         "button_gesture": ["tests/button_gesture_test.c"],
+        "radio_clock": ["tests/radio_clock_test.c"],
+        "realtime_metrics": ["tests/realtime_metrics_test.c"],
         "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
@@ -103,6 +105,7 @@ def main():
         "phone_control": ["-Itests/phone_control_stubs", "tests/phone_control_test.c"],
         "ble_scan": ["-Itests/ble_scan_stubs", "tests/ble_scan_test.c"],
         "dongle_finder": ["-Itests/finder_stubs", "tests/dongle_finder_test.c"],
+        "dongle_case_battery": ["-Itests/case_stubs", "tests/dongle_case_battery_test.c"],
         "playback": ["tests/playback_test.c"],
         "playback_options": ["tests/playback_options_test.c"],
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],

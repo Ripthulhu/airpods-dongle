@@ -73,6 +73,19 @@ ordinary toggles use 1 on/2 off. Microphone preference is 0 automatic, 1 right,
 older UI indexes. Left/right actions are sent together, preserving the other
 side. Existing hearing/diagnostic RPCs and their restoration guards are unchanged.
 
+The native hold-cycle setting `1A` is a shared selection mask: Off `01`, ANC `02`,
+Transparency `04`, Adaptive `08`. Any supported combination of at least two modes
+is accepted, including Off + ANC + Adaptive (`0B`). This chooses membership, not
+a custom cycling order or a separate list for each ear. Adaptive requires a
+supported model and firmware major 6 or later; Off also requires Allow Off where
+the model exposes that choice. The host does not silently enable Off.
+
+Send typed feature bytes `01 1A 0B 00 00 00` for that example. The exact AACP
+packet is `04 00 04 00 09 00 1A 0B 00 00 00`. Both USB and phone use this same
+path and cached `1A` readback. It never sends `16` or changes either ear's hold
+assignment; only ears assigned noise control use the selected modes. A successful
+send remains separate from a fresh matching device report.
+
 ## Settings workflow lease
 
 Report-2 capability `0x20` signals this requirement. Subcommand 10 uses action
@@ -176,6 +189,43 @@ Counters accumulate from boot and wrap modulo u32. Heap remaining is linked
 heap capacity minus allocator-reported allocated bytes; it is not a stack or
 fragmentation measurement. `FFFFFFFF` means unavailable where defined.
 Snapshot reads never run a hardware self-check or acquire audio.
+
+## Case BLE battery observations
+
+Firmware 0.1.11 can supplement status-report batteries from a separate case
+advertisement. It requires the selected pair's advertising key from a complete
+AACP key response and valid Pro 3 model metadata (A3063/A3064/A3065). Keys remain
+in RAM, survive same-pair AACP loss and clear on pair change or invalid replacement.
+No key is supplied by a host or included in USB/RFCOMM responses.
+
+The bounded parser requires exactly one Apple type `07`, length `11` record:
+`07 11 06` followed by one AES-128-ECB block. Decrypted bytes 0–1 must be `29 20`;
+bytes 8, 10 and 11 must be zero, and byte 2's upper nibble must be zero. Byte 2
+contains the lid bit (8 means closed) and three-bit open counter. Bytes 3, 4 and 5
+are case, left and right battery: `FF` means absent; otherwise bit 7 is charging
+and the remaining percentage must be 0–100. Variant bytes 6–7 and counter bytes
+12–15 remain opaque; changes, resets and counter decreases are accepted.
+
+An identical last encrypted block cannot renew battery timestamps, even after
+address rotation. This is repeat suppression, not replay protection. A changed
+block updates present components; absence preserves the previous percentage and
+its timestamp while clearing presence and charging. Charging expires after 90
+seconds. Valid percentages from healthy AACP components and newer AACP
+observations, including unavailable values, take priority.
+Case data never modifies connected AACP readback or the connection generation.
+BLE reception, case observations and AACP batteries share an extended monotonic
+clock. Long absences cannot reverse their ordering or revive expired charging;
+the 32-bit status ages saturate below the reserved unknown value.
+
+The shared USB/phone status report exposes presence at byte 44 and case provenance
+at byte 45 only with capability 64. Use an updated app to interpret retained
+absent values. Association is a keyed plaintext-layout check, not authenticated
+identity or evidence of audio ownership. It is excluded from nearby finding,
+automatic reconnect, pairing, ear detection and sound controls.
+
+Layout evidence comes from [stuffz/airpods' Pro 3 observations](https://github.com/stuffz/airpods/blob/8bd035451668388860e62fcc0a4a624a608d9d3a/docs/ble-research.md).
+Our decoder and fixed-key synthetic fixtures have offline regression coverage;
+the Pico's case reception, cadence and physical advertiser remain unverified.
 
 ## Nearby snapshot (24 bytes)
 

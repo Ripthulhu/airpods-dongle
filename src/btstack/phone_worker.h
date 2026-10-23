@@ -19,6 +19,8 @@ bool phone_worker_submit(const uint8_t *payload, size_t length, uint8_t sbc_fram
 bool phone_worker_poll(phone_codec_pcm_callback callback, void *context);
 // Actual core-1 decode time; zero on host harnesses without the Pico clock.
 uint32_t phone_worker_last_decode_us(void);
+// Maximum since this worker was prepared, including failed/cancelled decodes.
+uint32_t phone_worker_max_decode_us(void);
 // Returns true only after core1 has detached and all phone memory is released.
 bool phone_worker_close(void);
 bool phone_worker_released(void);

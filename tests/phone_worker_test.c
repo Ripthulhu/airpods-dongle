@@ -16,6 +16,7 @@ static bool codec_configured;
 static unsigned delivered, callbacks;
 static int16_t expected_sample;
 static uint32_t fake_time;
+static uint32_t decode_time = 1250u;
 #define PHONE_WORKER_TIME_US() fake_time
 
 static void *test_calloc(size_t count, size_t size) {
@@ -63,7 +64,7 @@ void phone_codec_reset(void) {
 bool phone_codec_decode(const uint8_t *payload, size_t length, uint8_t count,
                         phone_codec_pcm_callback callback, void *context) {
     (void)count;
-    fake_time += 1250u;
+    fake_time += decode_time;
     assert(!atomic_exchange(&codec_busy, true));
     assert(codec_configured && length != 0);
     atomic_store(&decode_entered, true);
@@ -106,6 +107,7 @@ static void deterministic(void) {
     assert(phone_worker_released());
     fail_allocation = false;
     start();
+    assert(phone_worker_last_decode_us() == 0u && phone_worker_max_decode_us() == 0u);
     uint8_t data[] = {7, 0, 0, 0};
     assert(!phone_worker_submit(NULL, sizeof(data), 0));
     assert(!phone_worker_submit(data, 0, 0));
@@ -127,12 +129,17 @@ static void deterministic(void) {
     assert(phone_worker_poll(receive, &delivered));
     assert(delivered == 4 && callbacks == 1);
     assert(phone_worker_last_decode_us() == 1250u);
+    assert(phone_worker_max_decode_us() == 1250u);
     for (unsigned bad = 0xfe; bad <= 0xff; ++bad) {
+        decode_time = bad == 0xfe ? 2500u : 1250u;
+        fake_time = UINT32_MAX - 500u;
         data[0] = bad;
         assert(phone_worker_submit(data, sizeof(data), 0));
         assert(phone_worker_step());
         assert(!phone_worker_poll(receive, &delivered));
         assert(delivered == 4 && callbacks == 1);
+        assert(phone_worker_last_decode_us() == decode_time);
+        assert(phone_worker_max_decode_us() == 2500u);
         phone_worker_reset();
     }
     // Configuration changes wait for worker detachment; they cannot free or
@@ -141,7 +148,9 @@ static void deterministic(void) {
     assert(phone_worker_prepare() == PHONE_WORKER_WAITING);
     assert(phone_worker_step());
     assert(phone_worker_prepare() == PHONE_WORKER_READY);
+    assert(phone_worker_max_decode_us() == 0u);
     stop();
+    assert(phone_worker_last_decode_us() == 0u && phone_worker_max_decode_us() == 0u);
     assert(allocations == frees);
 }
 
