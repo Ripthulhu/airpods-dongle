@@ -95,6 +95,9 @@ def main():
             # Retain address/bounds checks there and full UB checks in our wrapper.
             if args.sanitize and source.is_relative_to(codec):
                 flags += ["-fno-sanitize=shift"]
+            # Mult64 explicitly carries a wrapping 32-bit low word in signed storage.
+            if source.name == "sbc_packing.c":
+                flags += ["-fwrapv"]
             subprocess.run(flags + ["-c", str(source), "-o", str(obj)],
                            check=True, timeout=30)
             objects.append(str(obj))
@@ -108,6 +111,36 @@ def main():
         run = ["qemu-system-arm", "-M", "mps2-an500", "-nographic", "-semihosting-config",
                "enable=on,target=native", "-kernel", str(binary)] if args.arm else [str(binary)]
         subprocess.run(run, check=True, timeout=30)
+
+        # Real HFP mSBC instance codec and H2 framing, including recycled state.
+        # Reuse the already sanitized Bluedroid codec objects above.
+        voice_sources = [ROOT / "tests/phone_call_codec_test.c",
+                         sdk / "lib/btstack/src/classic/btstack_sbc_bluedroid.c",
+                         sdk / "lib/btstack/src/classic/btstack_sbc_plc.c",
+                         sdk / "lib/btstack/src/classic/hfp_codec.c",
+                         sdk / "lib/btstack/src/btstack_util.c"]
+        voice_command = command + ["-DENABLE_HFP_WIDE_BAND_SPEECH", "-ffunction-sections", "-fdata-sections"]
+        voice_objects = [objects[i] for i, source in enumerate(sources)
+                         if source.is_relative_to(codec)]
+        for index, source in enumerate(voice_sources):
+            obj = Path(temporary) / f"voice-{index}.o"
+            flags = voice_command.copy()
+            if args.sanitize and source.is_relative_to(sdk):
+                flags += ["-fno-sanitize=shift"]
+            subprocess.run(flags + ["-c", str(source), "-o", str(obj)],
+                           check=True, timeout=30)
+            voice_objects.append(str(obj))
+        voice = Path(temporary) / "voice"
+        voice_link = ["-Wl,--gc-sections"]
+        if args.arm:
+            voice_objects += [objects[sources.index(support)],
+                              objects[sources.index(ROOT / "tools/codec_probe/startup.c")]]
+            voice_link += ["-nostartfiles", "-Wl,--wrap=printf", "-Wl,--wrap=puts",
+                           "-T", str(ROOT / "tools/codec_probe/probe.ld")]
+        subprocess.run(voice_command + voice_link + voice_objects + libraries + ["-o", str(voice)],
+                       check=True, timeout=90)
+        voice_run = [*run[:-1], str(voice)] if args.arm else [str(voice)]
+        subprocess.run(voice_run, check=True, timeout=30)
 
         if not args.arm:
             # Real worker/SDK resampler/production PCM scheduling against a
@@ -124,7 +157,7 @@ def main():
         finder = Path(temporary) / "finder"
         aes = sdk / "lib/btstack/3rd-party/rijndael"
         finder_command = [command[0], "-I", str(ROOT / "tests/finder_stubs"),
-                          *command[1:], "-DFINDER_REAL_AES", "-I", str(aes)]
+                          "-I", str(ROOT / "tests"), *command[1:], "-DFINDER_REAL_AES", "-I", str(aes)]
         finder_link = []
         finder_sources = [ROOT / "tests/dongle_finder_test.c", aes / "rijndael.c"]
         if args.arm:
@@ -138,7 +171,7 @@ def main():
 
         case = Path(temporary) / "case-battery"
         case_command = [command[0], "-I", str(ROOT / "tests/case_stubs"),
-                        *command[1:], "-DCASE_REAL_AES", "-DENABLE_RIJNDAEL_DECRYPT", "-I", str(aes)]
+                        "-I", str(ROOT / "tests"), *command[1:], "-DCASE_REAL_AES", "-DENABLE_RIJNDAEL_DECRYPT", "-I", str(aes)]
         case_sources = [ROOT / "tests/dongle_case_battery_test.c", aes / "rijndael.c"]
         if args.arm:
             case_sources += [support, ROOT / "tools/codec_probe/startup.c"]

@@ -12,8 +12,9 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.32** tests a 90 ms phone jitter reserve with new
-arrival/delivery timing counters. It is not yet hardware-verified. Two-unit
+Development candidate **0.1.33** adds an HFP phone-call bridge with CVSD
+voice audio, retaining **0.1.32**'s 90 ms phone jitter reserve and new
+arrival/delivery timing counters. Neither change is hardware-verified yet. Two-unit
 AAC-ELD packets in **0.1.31** reduced send waits substantially, but occasional
 hitches remained. Version **0.1.25** passed short
 Windows S16 and genuine IEEE
@@ -37,7 +38,9 @@ but wireless playback on 0.1.28 still crackled and could become silent. See
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
 - S16 USB compatibility plus IEEE float32 input; float processing quantizes once at the integer encoder boundary.
 - Phone Bluetooth input with guarded LHDC v5 at 48 kHz, then classic aptX/SBC fallback.
-- Simultaneous AACP microphone, opened only by a USB recording request.
+- AACP microphone, opened by USB recording or the active phone call, with one owner at a time.
+- HFP phone calls with CVSD and stem answer/end; hardware validation pending.
+- USB phone calls use the existing duplex headset interfaces and 64 kHz microphone presentation clock.
 - Phone or microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
 - Pro 3 case BLE battery fallback with separate provenance and per-component ages; hardware verification pending.
@@ -73,7 +76,8 @@ The firmware links both Classic and BLE through one BTstack controller. The
 | Communication | Transport | Current implementation |
 | --- | --- | --- |
 | Playback and stem media controls | Classic AVDTP / AVRCP | Implemented |
-| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Model-gated settings and readback; HQ microphone opened only by USB recording |
+| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Model-gated settings/readback; microphone requested by USB recording or a phone call |
+| Phone calls | HFP HF / SCO or eSCO | CVSD bridge to AirPods playback and AACP microphone; not hardware-verified |
 | Hearing profiles and saved diagnostics | ATT over Classic, PSM `0x001F` | Complete profile edits, saved checks, read-only hearing metadata and guarded in-case self-checks |
 | Proximity and offline advertisements | BLE | Passive cache; selected-pair nearby finder for verified proximity reports |
 | Phone app controls | Encrypted, bonded Classic RFCOMM | Same basic and settings reports as USB, with separate client transactions |
@@ -94,8 +98,8 @@ invalid key replacement. An old reading after 90 seconds does not prove absence.
 The finder stops when its view/client closes, its 30-second polling lease expires
 or the selected pair changes. HQ microphone use pauses scanning.
 Neither path identifies a separate case transmitter or sends locator commands.
-The current connection pool supports two links: phone and AirPods occupy
-both during wireless playback. Passive scanning uses no connection slot.
+The connection pool supports the phone and AirPods ACL links plus one phone
+SCO/eSCO voice link. Passive scanning uses no connection slot.
 
 ## Build
 
@@ -239,8 +243,8 @@ If microphone initialization fails, reopening recording makes one fresh attempt
 after any failed worker has detached.
 
 USB audio on Android needs an OTG/power and enumeration check. Wireless stereo
-bridging also needs dual-link radio and latency checks. Phone calls are not
-implemented.
+bridging also needs dual-link radio and latency checks. The HFP call bridge
+needs real incoming/outgoing call, duplex voice and controller-routing checks.
 
 See [implementation notes](docs/IMPLEMENTATION.md) for the reviewed differences
 and the boundaries that remain untested.

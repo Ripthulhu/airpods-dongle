@@ -43,6 +43,7 @@ static unsigned encode_calls, eld_packets, eld_units;
 static uint16_t eld_sequence;
 static bool send_requested, phone_opened, recovery_reset_encoder, suspend_recovery_pending;
 static bool phone_active, phone_output_recovery;
+static bool call_active, call_opened;
 static uint16_t phone_output_recovery_cid;
 static uint32_t phone_output_recovery_since;
 static uint8_t phone_output_recovery_peer[6], cur_active_device[6];
@@ -256,7 +257,7 @@ static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigne
     memset(&playback_metrics, 0, sizeof(playback_metrics));
     now = consumed = emitted = send_failures = 0;
     encode_calls=eld_packets=eld_units=0;aaceld_frame_sequence=eld_sequence=4095;
-    send_requested = false; phone_opened = phone_active = phone_output_recovery = false;
+    send_requested = false; phone_opened = phone_active = phone_output_recovery = call_active = call_opened = false;
     allow_recovery = synchronous_request = false;
     suspend_recovery_pending=recovery_reset_encoder=false;
     request_depth = 0;

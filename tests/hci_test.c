@@ -25,6 +25,7 @@ static bool phone_has_key, missing_acl, tlv_missing, tlv_fail, tlv_corrupt;
 static unsigned phone_writes;
 static unsigned busy_routes, disconnect_calls;
 static bool busy_during_key_read;
+static bool call_sco_allowed;
 static hci_connection_t credit_connections[3];
 static uint16_t credit_free_slots;
 static bool credit_packet_reserved;
@@ -117,6 +118,8 @@ bool dongle_playback_transitioning(void) { return (busy_routes & 2u) != 0; }
 bool usb_mic_requested(void) { return (busy_routes & 4u) != 0; }
 bool aacp_mic_active(void) { return (busy_routes & 8u) != 0; }
 bool phone_sink_active(void) { return (busy_routes & 16u) != 0; }
+bool phone_call_active(void) { return (busy_routes & 32u) != 0; }
+bool phone_call_sco_allowed(const uint8_t address[6]) { (void)address; return call_sco_allowed; }
 static int phone_get_tag(void *context, uint32_t tag, uint8_t *buffer, uint32_t size) {
     (void)context;
     assert(tag == PHONE_TAG);
@@ -192,7 +195,9 @@ static void fixture(void) {
     phone_writes = 0;
     busy_routes = disconnect_calls = 0;
     busy_during_key_read = false;
+    call_sco_allowed = false;
     memset(credit_connections,0,sizeof(credit_connections));
+    for (unsigned i = 0; i < 3; ++i) credit_connections[i].address_type = BD_ADDR_TYPE_ACL;
     credit_free_slots=MAX_NR_CONTROLLER_ACL_BUFFERS;credit_packet_reserved=false;
     stored_phone_length = 0;
     memset(&stored_phone, 0, sizeof(stored_phone));
@@ -420,11 +425,13 @@ static void test_phone_pairing_is_bounded_and_keeps_airpods_slots(void) {
     assert(!allow(nearby, HCI_LINK_TYPE_ACL));
     assert(!bt_hci_phone_peer_allowed(nearby));
     assert(!bt_hci_phone_peer_allowed(NULL));
+    uint8_t address[6];
+    assert(!bt_hci_phone_address(address) && !bt_hci_phone_address(NULL));
 
     bt_hci_phone_pairing_start();
     assert(bt_hci_phone_pairing_active() && discoverable == 1);
     assert(!allow(second, HCI_LINK_TYPE_ACL)); // A saved AirPods slot is never a phone.
-    assert(!allow(nearby, 0)); // No SCO/HFP support is advertised by this firmware.
+    assert(!allow(nearby, HCI_LINK_TYPE_SCO)); // Pairing does not authorize call audio.
     assert(allow(nearby, HCI_LINK_TYPE_ACL));
     assert(bt_hci_phone_peer_allowed(nearby));
     const uint8_t another[] = {0x40, 1, 2, 3, 4, 5};
@@ -442,6 +449,18 @@ static void test_phone_pairing_is_bounded_and_keeps_airpods_slots(void) {
     assert(phone_writes == 1 && writes == 0 && !bt_hci_phone_pairing_active() && discoverable == 0);
     assert(bt_hci_phone_peer_allowed(nearby) && allow(nearby, HCI_LINK_TYPE_ACL));
     assert(bt_hci_phone_peer_connected(nearby) && phone_writes == 1);
+    assert(bt_hci_phone_address(address) && memcmp(address, nearby, 6) == 0);
+    assert(!allow(nearby, HCI_LINK_TYPE_SCO)); // A matching live HFP service is required too.
+    call_sco_allowed = true;
+    assert(allow(nearby, HCI_LINK_TYPE_SCO) && allow(nearby, HCI_LINK_TYPE_ESCO));
+    assert(!allow(nearby, 3) && !allow(first, HCI_LINK_TYPE_SCO) && !allow(another, HCI_LINK_TYPE_SCO));
+    security_level = 1;
+    assert(!allow(nearby, HCI_LINK_TYPE_SCO));
+    security_level = LEVEL_2;
+    missing_acl = true;
+    assert(!allow(nearby, HCI_LINK_TYPE_ESCO));
+    missing_acl = false;
+    call_sco_allowed = false;
     assert(memcmp(saved[0], first, 6) == 0 && memcmp(saved[1], second, 6) == 0);
     get_link_keys();
     assert(memcmp(device_addr, first, 6) == 0 && selected_bonded);
@@ -524,7 +543,7 @@ static void test_phone_storage_rejects_unknown_and_failed_writes(void) {
 }
 
 static void test_new_phone_pairing_requires_quiet_routes(void) {
-    for (unsigned busy = 1; busy <= 16; busy <<= 1) {
+    for (unsigned busy = 1; busy <= 32; busy <<= 1) {
         if (busy == 2u) continue; // Idle output transitions have their own pairing-window test.
         fixture();
         bt_hci_init();
@@ -661,6 +680,11 @@ static void test_credit_diagnostics(void) {
     bt_hci_credit_diagnostics(&data);
     assert(data.airpods.events==2 && data.airpods.packets==2 && data.airpods.max_active_gap_ms==20);
     assert(data.phone.events==2 && data.phone.packets==3 && data.phone.max_active_gap_ms==20);
+    memcpy(credit_connections[2].address, nearby, 6);
+    credit_connections[2].address_type = BD_ADDR_TYPE_SCO;
+    credit_completion(0x33, 10);
+    bt_hci_credit_diagnostics(&data);
+    assert(data.phone.events==2 && data.phone.packets==3); // Voice credits are not ACL delivery evidence.
     busy_routes=0;bt_hci_phone_poll();now=5000;credit_completion(0x11,1);
     busy_routes=1;now=9000;credit_completion(0x11,1);now=9025;credit_completion(0x11,1);
     bt_hci_credit_diagnostics(&data);assert(data.airpods.max_active_gap_ms==25); // Idle duration is excluded.

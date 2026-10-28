@@ -37,6 +37,10 @@ void bt_volume_cancel_phone(void);
 
 void set_usb_streaming(bool flag);
 bool get_usb_streaming(void);
+bool bridge_call_open(void);
+bool bridge_call_ready(void);
+void bridge_call_stop(void);
+void bridge_call_pcm_push(const int16_t *stereo, uint16_t frames);
 
 bool * get_is_bt_sink_volume_changed_ptr();
 

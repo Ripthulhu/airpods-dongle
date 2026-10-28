@@ -23,6 +23,7 @@ static playback_adjust_t playback_adjust;
 enum { PLAYBACK_RUNNING, PLAYBACK_SUSPENDING, PLAYBACK_SUSPENDED, PLAYBACK_STARTING };
 static uint8_t playback_idle_phase, cur_codec = 4;
 static bool playback_idle_counting, phone_opened, phone_active, phone_buffer_started;
+static bool call_active, call_opened, call_capture;
 static bool phone_output_recovery;
 static uint16_t phone_output_recovery_cid;
 static uint32_t phone_output_recovery_since;
@@ -31,6 +32,13 @@ static phone_clock_t phone_clock;
 static unsigned phone_resampler, acc_num_simples=480;
 static void btstack_resample_init(void *resampler,unsigned channels) {(void)resampler;assert(channels==2);}
 static const uint8_t *get_device_addr(void) {return selected_peer;}
+static bool peer_address_valid(const uint8_t *peer) {return peer && peer[0];}
+void bridge_phone_stop(void);
+void bridge_call_stop(void);
+static unsigned phone_yields;
+static void phone_sink_yield(void) {++phone_yields;bridge_phone_stop();}
+static void phone_sink_pause_for_call(void) {phone_sink_yield();}
+static void avdtp_source_establish_stream(void) {}
 static bool is_usb_streaming, is_streaming, a2dp_is_connected_flag, finish_scan_avdtp_codec;
 static bool profile_pending, a2dp_connect_pending;
 static bool recovery_reset_encoder, suspend_recovery_pending, mic_requested, mic_active;
@@ -80,6 +88,7 @@ static unsigned avdtp_source_suspend(unsigned cid, unsigned seid) { assert(cid =
 static unsigned avdtp_source_start_stream(unsigned cid, unsigned seid) { assert(cid == 10 && seid == 5); ++starts; return start_error; }
 static bool aaceld_encoder_init(void) { ++resets; return encoder_ready; }
 static bool usb_mic_requested(void) { return mic_requested; }
+static bool aacp_mic_requested(void) { return mic_requested || call_capture; }
 static bool aacp_mic_active(void) { return mic_active; }
 static uint8_t avdtp_subevent_signaling_accept_get_local_seid(const uint8_t *p) { return *p; }
 static void set_led_mode_on(void) { }
@@ -106,6 +115,8 @@ static void fixture(void) {
     recovery_reset_encoder = suspend_recovery_pending = false;
     profile_pending = a2dp_connect_pending = false;
     is_usb_streaming = phone_opened = phone_active = mic_requested = mic_active = false;
+    call_active = call_opened = call_capture = false;
+    phone_yields=0;
     phone_output_recovery=false;
     for(unsigned i=0;i<6;++i)selected_peer[i]=cur_active_device[i]=(uint8_t)(i+1);
     cur_codec = 4;
@@ -208,7 +219,30 @@ static void phone_output_recovers_without_losing_input(void) {
     phone_recovery_start();bridge_phone_stop();assert(!phone_output_recovery);
 }
 
+static void call_output_ownership(void) {
+    fixture();phone_opened=phone_active=true;
+    assert(bridge_call_open() && bridge_call_ready() && phone_yields==1);
+    assert(call_active && !phone_active && !phone_opened && !phone_buffer_started);
+    assert(phone_clock.target_q8==1080*256 && playback_pcm.capacity==8192);
+    assert(bridge_call_open() && phone_yields==1);
+    playback_pcm.used=1200;phone_buffer_started=true;
+    bridge_phone_stop();bridge_phone_drop_pcm();
+    assert(bridge_call_ready() && playback_pcm.used==1200 && phone_buffer_started);
+    suspend_recovery_pending=recovery_reset_encoder=true;
+    accept(AVDTP_SI_SUSPEND,5);assert(call_opened && call_active && !bridge_call_ready());
+    accept(AVDTP_SI_START,5);
+    assert(call_active && !playback_pcm.used && playback_pcm.priming==4800 && !phone_buffer_started);
+    int16_t pcm[960];
+    for(unsigned i=0;i<10;++i) {playback_pcm_read(&playback_pcm,pcm,480);playback_pcm_sent(&playback_pcm);}
+    assert(bridge_call_ready());
+    set_usb_streaming(true);
+    assert(!call_active && !call_opened && !bridge_call_ready() && !bridge_call_open());
+    fixture();mic_requested=true;assert(!bridge_call_open());
+    fixture();assert(bridge_call_open());bridge_call_stop();assert(!call_opened && !call_active);
+}
+
 int main(void) {
+    call_output_ownership();
     phone_output_recovers_without_losing_input();
     usb_onset_survives_restart();
     fixture(); suspend_recovery_pending=recovery_reset_encoder=true; is_usb_streaming=true;

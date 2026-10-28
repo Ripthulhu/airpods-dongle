@@ -23,10 +23,11 @@ class SdkTests(unittest.TestCase):
             base = self.sdk / "lib" / name
             base.mkdir(parents=True)
             subprocess.run(["git", "init", "-q", str(base)], check=True)
+            subprocess.run(["git", "-C", str(base), "config", "core.autocrlf", "false"], check=True)
             (base / "input.c").write_bytes(b"old\n")
             (self.root / "patches" / f"{name}.patch").write_text(
                 "diff --git a/input.c b/input.c\n--- a/input.c\n+++ b/input.c\n"
-                "@@ -1 +1 @@\n-old\n+new\n")
+                "@@ -1 +1 @@\n-old\n+new\n", newline="\n")
             manifest[name] = {
                 "patch": f"{name}.patch",
                 "original": {"input.c": hashlib.sha256(b"old\n").hexdigest()},
@@ -60,6 +61,25 @@ class SdkTests(unittest.TestCase):
         prepare_sdk.check(self.sdk)
         prepare_sdk.check(self.sdk, apply=True)
         self.assertEqual((self.sdk / "lib/btstack/input.c").read_bytes(), b"new\n")
+
+    def test_independent_patch_can_extend_an_already_patched_library(self):
+        prepare_sdk.check(self.sdk, apply=True)
+        base = self.sdk / "lib/btstack"
+        (base / "voice.c").write_bytes(b"old\n")
+        manifest_path = self.root / "patches/sdk.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["btstack_voice"] = dict(manifest["btstack"], library="btstack", patch="voice.patch")
+        manifest["btstack_voice"]["original"] = {"voice.c": hashlib.sha256(b"old\n").hexdigest()}
+        manifest["btstack_voice"]["patched"] = {"voice.c": hashlib.sha256(b"new\n").hexdigest()}
+        (self.root / "patches/voice.patch").write_text(
+            "--- a/voice.c\n+++ b/voice.c\n@@ -1 +1 @@\n-old\n+new\n", newline="\n")
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "Missing btstack_voice patch"):
+            prepare_sdk.check(self.sdk)
+        prepare_sdk.check(self.sdk, apply=True)
+        prepare_sdk.check(self.sdk)
+        self.assertEqual((base / "input.c").read_bytes(), b"new\n")
+        self.assertEqual((base / "voice.c").read_bytes(), b"new\n")
 
     def test_tamper_is_detected_before_any_write(self):
         (self.sdk / "lib/tinyusb/input.c").write_bytes(b"unrelated local changes\n")

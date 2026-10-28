@@ -13,6 +13,12 @@ static bool decoder_ready = true, decode_ok = true;
 static bool decoder_reset_done = true, complete_on_submit = true;
 static uint32_t completed;
 static bool usb_capture_wanted;
+static bool usb_playback_wanted, usb_native_stream;
+static bool call_capture_wanted, pcm_irq, pcm_switch_owner;
+static unsigned pcm_available, pcm_reads, mic_request_changes;
+static bool pcm_reading;
+bool phone_call_mic_requested(void) {return call_capture_wanted && !usb_capture_wanted && !usb_playback_wanted;}
+void dongle_playback_mic_request_changed(void) {++mic_request_changes;}
 static bool transport_current;
 static bool playback_mic_ready=true, playback_recover_auto=true, playback_recover_accept=true;
 static uint32_t playback_recovery_revision;
@@ -70,10 +76,22 @@ bool aacp_mic_dec_reset_done(void) { return decoder_reset_done; }
 uint32_t aacp_mic_dec_completed(void) { return completed; }
 void aacp_mic_dec_reset_stats(void) {}
 void aacp_mic_dec_report(void) {}
-void aacp_mic_pcm_reset(void) {}
+void aacp_mic_pcm_reset(void) {pcm_available=0;}
+uint32_t aacp_mic_pcm_read(int16_t *pcm,uint32_t frames) {
+    assert(!pcm_reading);pcm_reading=true;++pcm_reads;
+    if(pcm_irq) {pcm_irq=false;int16_t irq[2];assert(!aacp_mic_usb_read(irq,2));}
+    if(pcm_switch_owner) {
+        pcm_switch_owner=false;usb_capture_wanted=!usb_capture_wanted;call_capture_wanted=!usb_capture_wanted;
+        assert(aacp_mic_update_owner(false));
+    }
+    if(frames>pcm_available)frames=pcm_available;
+    for(unsigned i=0;i<frames;++i)pcm[i]=1234;
+    pcm_available-=frames;pcm_reading=false;return frames;
+}
 bool aacp_mic_dec_submit(const uint8_t *au, uint16_t len) {
     assert(au != NULL && len != 0);
     decoded++;
+    if(usb_native_stream)pcm_available+=480;
     if (decode_ok && complete_on_submit) completed++;
     return decode_ok;
 }
@@ -130,6 +148,10 @@ static void fixture(void) {
     decoder_reset_done = complete_on_submit = true;
     completed = 0;
     usb_capture_wanted = false;
+    usb_playback_wanted=usb_native_stream=false;
+    call_capture_wanted=pcm_irq=pcm_switch_owner=pcm_reading=false;
+    pcm_available=pcm_reads=mic_request_changes=0;
+    atomic_store(&mic_owner,AACP_MIC_NONE);atomic_flag_clear(&mic_reader);
     transport_current = true;
     playback_mic_ready=playback_recover_auto=playback_recover_accept=true;
     playback_recovery_revision=playback_repairs=playback_aborts=0;
@@ -938,7 +960,85 @@ static void test_pair_keys_and_receive_buffer_policy(void) {
     drain(); assert(aacp_receive_buffer_last()==150 && buffer_send_callbacks==2);
 }
 
+static void test_microphone_consumer_ownership(void) {
+    fixture();ready();
+    int16_t pcm[8];
+    call_capture_wanted=true;
+    assert(aacp_mic_update_owner(false) && aacp_mic_requested());
+    pcm_available=8;pcm_irq=true;
+    assert(aacp_mic_call_read(pcm,4)==4 && pcm_reads==1 && !pcm_reading);
+    assert(aacp_mic_usb_read(pcm,4)==0 && pcm_available==4);
+    aacp_mic_call_changed();assert(!pcm_available && atomic_load(&mic_owner)==AACP_MIC_NONE);
+    assert(aacp_mic_update_owner(false)); // A coalesced call end/start must claim fresh PCM.
+    usb_capture_wanted=true;
+    assert(!aacp_mic_call_read(pcm,4)); // Immediate USB priority precedes main-loop claim.
+    assert(aacp_mic_update_owner(false) && !pcm_available);
+    pcm_available=8;
+    assert(aacp_mic_usb_read(pcm,4)==4 && !aacp_mic_call_read(pcm,4));
+    aacp_mic_call_changed();assert(pcm_available==4 && atomic_load(&mic_owner)==AACP_MIC_USB);
+    pcm_switch_owner=true;
+    assert(!aacp_mic_usb_read(pcm,4) && !pcm_available); // Claim changed during the IRQ read.
+    pcm_available=8;pcm_irq=pcm_switch_owner=true;
+    assert(!aacp_mic_call_read(pcm,4) && !pcm_available); // IRQ plus call-to-USB handoff.
+    assert(atomic_load(&mic_owner)==AACP_MIC_USB);
+    pcm_available=8;
+    assert(aacp_mic_update_owner(true) && !pcm_available); // Coalesced USB close/open.
+    usb_capture_wanted=call_capture_wanted=false;
+    assert(aacp_mic_update_owner(false) && !aacp_mic_requested());
+    pcm_available=8;
+    assert(!aacp_mic_usb_read(pcm,4) && !aacp_mic_call_read(pcm,4));
+}
+
+static void test_call_capture_wire_flow(void) {
+    fixture();ready();call_capture_wanted=true;
+    assert(aacp_mic_update_owner(false));
+    aacp_mic_start();drain();
+    assert(!usb_capture_wanted && starts==1 && aacp_mic_active());
+    uint8_t packet[64]={4,0,4,0,0x58,0,1,0};
+    packet[26]=2;packet[27]=0x11;packet[28]=0x22;
+    assert(audio(packet,aacp_cid,29)==1);
+    call_capture_wanted=false;aacp_mic_call_changed();aacp_mic_update_owner(false);
+    aacp_poll();drain();
+    assert(stops==1 && audio(packet,aacp_cid,29)==1);
+    assert(!aacp_mic_call_read((int16_t[8]){0},8));
+}
+
+#define USB_MIC_SAMPLE_RATE 64000
+#define TU_ARRAY_SIZE(a) (sizeof(a)/sizeof(*(a)))
+static int16_t usb_host_pcm[64];
+static unsigned usb_mic_frames;
+static uint16_t tud_audio_write(const void *pcm,uint16_t bytes) {
+    assert(bytes==sizeof(usb_host_pcm));memcpy(usb_host_pcm,pcm,bytes);++usb_mic_frames;return bytes;
+}
+#include "uac_mic_callback.inc"
+
+static void test_usb_duplex_native_cadence(void) {
+    fixture();ready();usb_playback_wanted=call_capture_wanted=true;
+    assert(!aacp_mic_requested()); // A competing Bluetooth request cannot claim USB playback.
+    usb_capture_wanted=true;assert(aacp_mic_update_owner(false));aacp_mic_start();drain();
+    assert(starts==1 && atomic_load(&mic_owner)==AACP_MIC_USB);
+    uint8_t packet[64]={4,0,4,0,0x58,0,1,0};packet[26]=2;packet[27]=0x11;packet[28]=0x22;
+    usb_native_stream=true;audio(packet,aacp_cid,29); // One AU of initial packet-phase reserve.
+    usb_mic_frames=0;
+    for(unsigned half_ms=0;half_ms<2000;++half_ms) {
+        now=half_ms/2;
+        if(half_ms%15u==0)audio(packet,aacp_cid,29); // Captured 480-sample / 7.5 ms clock.
+        if(half_ms%2u==0) {
+            assert(tud_audio_tx_done_pre_load_cb(0,2,0x82,1));
+            for(unsigned i=0;i<64;++i)assert(usb_host_pcm[i]==1234);
+        }
+        assert(pcm_available<=960 && usb_playback_wanted && !phone_call_mic_requested());
+    }
+    assert(usb_mic_frames==1000 && atomic_load(&mic_owner)==AACP_MIC_USB);
+    usb_capture_wanted=false;assert(aacp_mic_update_owner(false));drain();quiet_after_stop();
+    assert(usb_playback_wanted && !aacp_mic_active() && playback_repairs==1);
+    assert(!aacp_mic_call_read((int16_t[64]){0},64));
+}
+
 int main(void) {
+    test_microphone_consumer_ownership();
+    test_call_capture_wire_flow();
+    test_usb_duplex_native_cadence();
     test_playback_gate_and_repair_receipt();
     test_repair_failure_and_late_uplink_are_bounded();
     test_handshake_and_decoder_gate();

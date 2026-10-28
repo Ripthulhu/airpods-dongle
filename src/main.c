@@ -13,6 +13,7 @@
 #include "btstack/phone_worker.h"
 #include "btstack/phone_benchmark.h"
 #include "btstack/phone_control.h"
+#include "btstack/phone_call.h"
 #include "btstack/dongle_finder.h"
 #include "tinyusb/dongle_features.h"
 
@@ -438,35 +439,33 @@ int main() {
         }
         runtime_watch_set(WATCH_HCI);
         bt_hci_phone_poll();
+        phone_call_poll();
         runtime_watch_set(WATCH_MIC);
-        if (usb_mic_take_request(&mic_wanted)) {
+        if (aacp_mic_update_owner(usb_mic_take_request(&mic_wanted))) {
             // Preserve coalesced close/open revisions even when the final request stays true.
-            dongle_playback_mic_request_changed();
-            // A fresh open also clears an earlier AACP failure before retrying.
-            aacp_mic_stop();
-            mic_decoder_lifecycle_request(&decoder, mic_wanted, aacp_mic_dec_ready());
+            mic_decoder_lifecycle_request(&decoder, aacp_mic_requested(), aacp_mic_dec_ready());
         }
         // The idle microphone decoder is too large to retain during a phone
         // session. Core 1 detaches it before core 0 frees its allocations.
         mic_decoder_lifecycle_release(&decoder,
-            phone_sink_connected() && !usb_mic_requested() && !aacp_mic_active());
-        if ((usb_mic_requested() || aacp_mic_active() || get_usb_streaming()) && phone_sink_connected())
+            phone_sink_connected() && !aacp_mic_requested() && !aacp_mic_active());
+        if ((aacp_mic_requested() || aacp_mic_active() || get_usb_streaming()) && phone_sink_connected())
             phone_sink_yield();
         runtime_watch_set(WATCH_PHONE);
         if (!decoder.releasing) phone_sink_poll();
         ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND,
                             !usb_host_active() && !phone_sink_connected() && !dongle_finder_active());
-        ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, usb_mic_requested() || aacp_mic_active());
+        ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, aacp_mic_requested() || aacp_mic_active());
         // Keep decoder allocation in thread context and serialize malloc with
         // Bluetooth encoder callbacks. The USB service timer remains active.
         mic_decoder_prepare_t prepared = mic_decoder_lifecycle_prepare(&decoder,
-            usb_mic_requested(), phone_sink_decoder_released());
+            aacp_mic_requested(), phone_sink_decoder_released());
         if (prepared == MIC_DECODER_FAILED) printf("Microphone decoder unavailable; reopen recording to retry\n");
         aacp_mic_dec_poll();
         runtime_watch_set(WATCH_CONTROL);
         tinyusb_control_task();
         bt_volume_poll();
-        if (prepared == MIC_DECODER_READY && usb_mic_requested()) {
+        if (prepared == MIC_DECODER_READY && aacp_mic_requested()) {
             ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, true);
             aacp_mic_start();
         }
@@ -478,7 +477,7 @@ int main() {
         runtime_watch_set(WATCH_FEATURES);
         dongle_features_poll();
         phone_control_poll();
-        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print(); }
+        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report(); }
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
         runtime_watch_set(WATCH_UNLOCK);
         async_context_release_lock(ctx);

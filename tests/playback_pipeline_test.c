@@ -99,7 +99,7 @@ static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
         assert(pcm[2*i+1]==-pcm[2*i]);
         if(phone_priming_left) {
             assert(pcm[2*i]==0);--phone_priming_left;++phone_priming_encoded;
-        } else if(phone_active) {
+        } else if(phone_active || call_active) {
             assert(pcm[2*i]==signal(encoded-phone_priming_encoded+playback_trace.stats[TRACE_DEBT_DROP]));
         } else if(check_sequence) {
             int expected=encoded<PLAYBACK_FILTER_DELAY?0:signal(encoded-PLAYBACK_FILTER_DELAY);
@@ -397,7 +397,20 @@ static void phone_packet_priming(void) {
         assert(!playback_metrics.pcm_underflows && !playback_metrics.pcm_drops);
     }
 }
+static void call_prefill_uses_call_clock(void) {
+    fixture(0);is_usb_streaming=false;phone_active=false;call_active=call_opened=true;
+    phone_buffer_started=false;generated=encoded=0;encode_cost=0;
+    assert(playback_pcm_reset(&playback_pcm,8192,false));playback_pcm.primed_on_wire=true;
+    usb_clock.rate_q16=65000;
+    phone_ingress(1440);
+    now+=10;avdtp_audio_timeout_handler(&media_tracker.audio_timer);playback_audio_work(now);
+    assert(phone_buffer_started && playback_pcm.used==960 && encoded==480);
+    assert(usb_clock.rate_q16==65000 && !playback_metrics.pcm_underflows);
+    call_active=call_opened=false;
+}
+
 int main(void) {
+    call_prefill_uses_call_clock();
     startup_keeps_one_filter_phase();
     steady_and_stalls();clock_drift();delayed_timer_clock();send_wait_after_encoding();excessive_stall();stale_receiver_window();jitter_and_live_changes();measured_cpu_budget();
     phone_send_wait_keeps_source_time();

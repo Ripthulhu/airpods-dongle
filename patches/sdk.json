@@ -20,5 +20,15 @@
     "patched": {
       "src/portable/raspberrypi/rp2040/rp2040_usb.c": "2ee43590be7703b9ceca9b35b1e4703b5e0d5a30f864653b7e5748da70943c48"
     }
+  },
+  "btstack_voice": {
+    "library": "btstack",
+    "patch": "btstack-voice.patch",
+    "original": {
+      "src/classic/btstack_sbc_bluedroid.c": "cdd381ccb39d3aa83dc80ee53823a3374b96264158e7f04336df991de3b2d3de"
+    },
+    "patched": {
+      "src/classic/btstack_sbc_bluedroid.c": "3c112518620e35623c472af6d8e314c3a94b07c19b8223581cbb21632716902c"
+    }
   }
 }

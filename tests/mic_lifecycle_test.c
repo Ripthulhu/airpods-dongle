@@ -31,6 +31,11 @@ static bool usb_mic_take_request(bool *wanted) {return usb_mic_request_take(&usb
 bool aacp_mic_dec_ready(void) {return ready;}
 static void dongle_playback_mic_request_changed(void) {++request_notifications;}
 static void aacp_mic_stop(void) {++stopped;}
+static bool aacp_mic_requested(void) {return usb_mic_request_wanted(&usb_request);}
+static bool aacp_mic_update_owner(bool changed) {
+    if(changed) {dongle_playback_mic_request_changed();aacp_mic_stop();}
+    return changed;
+}
 #include "main_mic_request.inc"
 static void coalesced_request_reaches_playback(void) {
     mic_decoder_lifecycle_t state={0}; ready=true;

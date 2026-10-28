@@ -22,6 +22,7 @@ bool bt_hci_phone_pairing_busy(void);
 bool bt_hci_phone_pairing_active(void);
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]);
 bool bt_hci_phone_peer_connected(const uint8_t address[6]);
+bool bt_hci_phone_address(uint8_t address[6]);
 void bt_hci_phone_poll(void);
 
 typedef struct {

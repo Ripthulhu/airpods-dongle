@@ -134,7 +134,7 @@ void dongle_case_battery_merge(dongle_readback_t *out, bool aacp_healthy,
                               uint8_t *present, uint8_t *case_source) {
     *present=*case_source=0;
     uint64_t now=dongle_uptime_ms();
-    dongle_case_battery_snapshot_t report;
+    dongle_case_battery_snapshot_t report = {0};
     bool available=dongle_case_battery_snapshot(&report);
     for (unsigned i=0;i<3;++i) {
         uint8_t bit=(uint8_t)(1u<<i);

@@ -36,6 +36,7 @@
 
  #include "../btstack/btstack_avdtp_source.h"
  #include "../btstack/aacp_mic_dec.h"
+ #include "../btstack/btstack_aacp.h"
  #include "../btstack/volume_scale.h"
  #include "pico/flash.h"
  #include "pico/time.h"
@@ -562,7 +563,7 @@ void tinyusb_control_task(void){
    int16_t buf[USB_MIC_SAMPLE_RATE / 1000];   // 64 samples / ms, mono
    uint32_t got = 0;
    if (cur_alt_setting == 1 && usb_mic_requested())
-     got = aacp_mic_pcm_read(buf, TU_ARRAY_SIZE(buf));
+     got = aacp_mic_usb_read(buf, TU_ARRAY_SIZE(buf));
    memset(buf + got, 0, sizeof(buf) - got * sizeof(*buf));
 
    tud_audio_write(buf, sizeof(buf));

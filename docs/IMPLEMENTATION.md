@@ -104,9 +104,10 @@ limiter operation, playback recreation with the microphone retained and bit-exac
 encoding across ten AAC/AAC-ELD configurations and five ELD VBR frame ceilings. See
 [`tools/codec_probe`](../tools/codec_probe/README.md) for reproduction and limits.
 
-Unused Bluetooth HFP, HID and network profile pools are disabled. The
-implemented audio/control profiles, two HCI connections, GATT client capacity
-and security tables remain allocated. HFP is not implemented by this firmware.
+Unused Bluetooth HID and network profile pools are disabled. One HFP HF
+connection, two phone RFCOMM channels sharing one multiplexer, and three HCI
+connections (two ACL plus phone SCO/eSCO) are allocated. The HFP call bridge
+remains a hardware-unverified prototype; see [phone transport](PHONE-TRANSPORT.md).
 
 Playback and microphone queues use bounded contiguous copies instead of
 per-sample division/copy loops. Malformed USB playback packets clear the FIFO,

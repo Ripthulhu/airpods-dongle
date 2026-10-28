@@ -58,6 +58,7 @@
 #include "playback_options.h"
 #include "pico/time.h"
 #include "phone_sink.h"
+#include "phone_call.h"
 #include "phone_clock.h"
 
 _Static_assert(PHONE_PCM_CAPACITY <= PLAYBACK_PCM_FRAMES, "Phone jitter reserve must fit the shared PCM ring");
@@ -172,6 +173,7 @@ static uint8_t cur_capability = 0;
 static bool is_streaming = false;
 static bool is_usb_streaming;
 static bool phone_opened, phone_active, phone_buffer_started;
+static bool call_opened, call_active;
 static bool phone_output_recovery;
 static uint16_t phone_output_recovery_cid;
 static uint32_t phone_output_recovery_since;
@@ -408,10 +410,10 @@ static void a2dp_demo_send_media_packet(void) {
         context->codec_storage,context->codec_storage_count,sent_us);
     uint32_t gap_us=media_last_sent_us?sent_us-media_last_sent_us:0;
     uint32_t receiver_ms=playback_game.changed?playback_game.target:150u;
-    if(cur_codec==4 && (is_usb_streaming || phone_active) && media_last_sent_us &&
+    if(cur_codec==4 && (is_usb_streaming || phone_active || call_active) && media_last_sent_us &&
        !playback_adjust_busy(&playback_adjust) && gap_us>receiver_ms*1000u)
         playback_transport_stale=true;
-    if((is_usb_streaming || phone_active) && (wait_us>20000u || gap_us>40000u))
+    if((is_usb_streaming || phone_active || call_active) && (wait_us>20000u || gap_us>40000u))
         PB_EVENT(TRACE_SEND_WAIT,wait_us,gap_us);
     if(media_last_sent_us)PB_MAX(TRACE_SEND_GAP_US,sent_us-media_last_sent_us);
     if(packet_oldest_us)PB_MAX(TRACE_PACKET_AGE_US,sent_us-packet_oldest_us);
@@ -534,7 +536,7 @@ void set_bt_volume(int16_t db256) {
 
 void bt_volume_poll(void) {
     bt_volume_select_peer();
-    if (is_usb_streaming || usb_mic_requested() || !phone_sink_owns_controls())
+    if (is_usb_streaming || aacp_mic_requested() || !phone_sink_owns_controls())
         bt_volume_cancel_phone();
     bool active = sink_volume.pending || sink_volume.inflight;
     uint32_t now = btstack_run_loop_get_time_ms();
@@ -552,7 +554,7 @@ void bt_volume_poll(void) {
 }
 
 bool bridge_phone_open(void) {
-    if (is_usb_streaming || usb_mic_requested() ||
+    if (call_opened || call_active || is_usb_streaming || aacp_mic_requested() ||
         !peer_address_valid((const uint8_t *)get_device_addr())) return false;
     phone_opened = true;
     avdtp_source_establish_stream();
@@ -560,7 +562,7 @@ bool bridge_phone_open(void) {
 }
 
 bool bridge_phone_ready(void) {
-    if (!phone_opened || is_usb_streaming || usb_mic_requested() ||
+    if (!phone_opened || is_usb_streaming || aacp_mic_requested() ||
         !a2dp_is_connected_flag || !media_tracker.streaming || playback_idle_phase != PLAYBACK_RUNNING) return false;
     return playback_pcm_warm();
 }
@@ -568,7 +570,7 @@ bool bridge_phone_ready(void) {
 static bool phone_output_recovery_owned(void) {
     const uint8_t *peer = (const uint8_t *)get_device_addr();
     return phone_output_recovery && phone_opened && phone_active &&
-        !is_usb_streaming && !usb_mic_requested() && !aacp_mic_active() &&
+        !is_usb_streaming && !aacp_mic_requested() && !aacp_mic_active() &&
         a2dp_is_connected_flag && !profile_pending && !a2dp_connect_pending &&
         media_tracker.avdtp_cid == phone_output_recovery_cid && peer &&
         !memcmp(peer, phone_output_recovery_peer, 6) &&
@@ -594,7 +596,7 @@ bool bridge_phone_start(void) {
 
 void bridge_phone_drop_pcm(void) {
     critical_section_enter_blocking(&playback_pcm_lock);
-    if (phone_active) {
+    if (phone_active && !call_active) {
         playback_pcm_clear(&playback_pcm, PHONE_PCM_CAPACITY);
         phone_buffer_started = false;
         phone_clock_init(&phone_clock, acc_num_simples);
@@ -606,19 +608,24 @@ void bridge_phone_drop_pcm(void) {
 void bridge_phone_stop(void) {
     phone_output_recovery = false;
     critical_section_enter_blocking(&playback_pcm_lock);
-    if (phone_active)
+    if (phone_active && !call_active)
         playback_pcm_clear(&playback_pcm, audio_slot_capacity());
-    phone_opened = phone_active = phone_buffer_started = false;
+    phone_opened = phone_active = false;
+    if (!call_active) phone_buffer_started = false;
     critical_section_exit(&playback_pcm_lock);
 }
 
-void bridge_phone_pcm_push(const int16_t *src, uint16_t frames) {
-    if (src == NULL || !phone_active || (!bridge_phone_ready() && !bridge_phone_recovering())) return;
+static void bridge_input_pcm_push(const int16_t *src, uint16_t frames) {
+    if (src == NULL) return;
     while (frames != 0) {
         uint16_t count = frames > 128 ? 128 : frames;
         int16_t adjusted[130 * 2];
         uint16_t output = btstack_resample_block(&phone_resampler, src, count, adjusted);
-        if (output > 130) { bridge_phone_drop_pcm(); return; }
+        if (output > 130) {
+            if (call_active) bridge_call_stop();
+            else bridge_phone_drop_pcm();
+            return;
+        }
         critical_section_enter_blocking(&playback_pcm_lock);
         playback_pcm_push_measured(adjusted, output);
         PB_MAX(TRACE_PCM_MAX, playback_pcm.used);
@@ -628,8 +635,58 @@ void bridge_phone_pcm_push(const int16_t *src, uint16_t frames) {
     }
 }
 
+void bridge_phone_pcm_push(const int16_t *src, uint16_t frames) {
+    if (phone_active && (bridge_phone_ready() || bridge_phone_recovering())) bridge_input_pcm_push(src, frames);
+}
+
+static void call_clock_init(void) {
+    uint32_t a = 360u, b = acc_num_simples;
+    while (b) { uint32_t next = a % b; a = b; b = next; }
+    // Reserve 20 ms after reads, plus the 7.5 ms SCO arrival sawtooth.
+    phone_clock.target_q8 = (int32_t)(960u + (360u - a) / 2u) * 256;
+    phone_clock.fill_q8 = phone_clock.target_q8;
+    btstack_resample_init(&phone_resampler, 2);
+    phone_buffer_started = false;
+}
+
+bool bridge_call_open(void) {
+    if (is_usb_streaming || usb_mic_requested() ||
+        !peer_address_valid((const uint8_t *)get_device_addr())) return false;
+    if (!call_opened) {
+        call_opened = true;
+        phone_sink_pause_for_call();
+    }
+    if (!a2dp_is_connected_flag) avdtp_source_establish_stream();
+    if (!call_active && a2dp_is_connected_flag && media_tracker.streaming &&
+        playback_idle_phase == PLAYBACK_RUNNING && playback_pcm_warm()) {
+        critical_section_enter_blocking(&playback_pcm_lock);
+        playback_pcm_clear(&playback_pcm, PHONE_PCM_CAPACITY);
+        call_clock_init();
+        call_active = true;
+        critical_section_exit(&playback_pcm_lock);
+    }
+    return true;
+}
+
+bool bridge_call_ready(void) {
+    return call_opened && call_active && !is_usb_streaming && !usb_mic_requested() &&
+        a2dp_is_connected_flag && media_tracker.streaming &&
+        playback_idle_phase == PLAYBACK_RUNNING && playback_pcm_warm();
+}
+
+void bridge_call_stop(void) {
+    critical_section_enter_blocking(&playback_pcm_lock);
+    if (call_active && !phone_active) playback_pcm_clear(&playback_pcm, audio_slot_capacity());
+    call_opened = call_active = false;
+    critical_section_exit(&playback_pcm_lock);
+}
+
+void bridge_call_pcm_push(const int16_t *src, uint16_t frames) {
+    if (bridge_call_ready()) bridge_input_pcm_push(src, frames);
+}
+
 bool bridge_phone_volume(uint8_t volume) {
-    if (volume > 127 || is_usb_streaming || usb_mic_requested()) return false;
+    if (volume > 127 || is_usb_streaming || aacp_mic_requested()) return false;
     bt_volume_select_peer();
     bool accepted = volume_sync_request(&sink_volume, volume, true, btstack_run_loop_get_time_ms());
     if (accepted && !sink_volume.pending) bt_volume_publish();
@@ -674,7 +731,7 @@ static void audio_slot_queue_configure_with_count(uint16_t samples_per_slot, uin
 
 static void audio_slot_push_data(const void *src, uint16_t stereo_pair_count, bool floating) {
     critical_section_enter_blocking(&playback_pcm_lock);
-    if (!phone_active && src && stereo_pair_count) {
+    if (!phone_active && !call_active && src && stereo_pair_count) {
         if(inspect_enabled)playback_inspect_samples(&playback_inspect,src,2u*stereo_pair_count,floating,true,time_us_32());
         if(floating) {
             uint32_t available=playback_pcm.capacity-playback_pcm.used;
@@ -705,7 +762,7 @@ void audio_slot_push_float(const float *src,uint16_t frames) {
 }
 void audio_slot_usb_reset(void) {
     critical_section_enter_blocking(&playback_pcm_lock);
-    if(!phone_active)playback_pcm_clear(&playback_pcm,audio_slot_capacity());
+    if(!phone_active && !call_active)playback_pcm_clear(&playback_pcm,audio_slot_capacity());
     playback_usb_clock_reset(&usb_clock);
     usb_recovery_drops=0;
     critical_section_exit(&playback_pcm_lock);
@@ -713,8 +770,9 @@ void audio_slot_usb_reset(void) {
 
 static void audio_pcm_read(uint16_t frames) {
     critical_section_enter_blocking(&playback_pcm_lock);
+    bool external = phone_active || call_active;
     if (playback_adjust.running) {
-        if (is_usb_streaming && !phone_active &&
+        if (is_usb_streaming && !external &&
             playback_pcm_prepare_resample(&playback_pcm,&encoder_resample,frames,
                                           (uint32_t)playback_adjust.interval*65536u)) {
             critical_section_exit(&playback_pcm_lock);
@@ -725,15 +783,16 @@ static void audio_pcm_read(uint16_t frames) {
                                       playback_adjust_interval(&playback_adjust));
         playback_adjust.failed = true;
     }
-    if (phone_active && !phone_buffer_started && playback_pcm.priming == 0) {
-        if (playback_pcm.used < phone_clock_prefill(acc_num_simples)) {
+    if (external && !phone_buffer_started && playback_pcm.priming == 0) {
+        uint32_t prefill = call_active ? (uint32_t)frames + 960u : phone_clock_prefill(acc_num_simples);
+        if (playback_pcm.used < prefill) {
             memset(encoder_pcm, 0, (size_t)frames * 2 * sizeof(*encoder_pcm));
             critical_section_exit(&playback_pcm_lock);
             return;
         }
         phone_buffer_started = true;
     }
-    if(is_usb_streaming && !phone_active && playback_pcm.priming==0 &&
+    if(is_usb_streaming && !external && playback_pcm.priming==0 &&
        playback_pcm_prepare_resample(&playback_pcm,&encoder_resample,frames,usb_clock.rate_q16*10u)) {
         if(playback_pcm.used<playback_trace.stats[TRACE_PCM_MIN])playback_trace.stats[TRACE_PCM_MIN]=playback_pcm.used;
         // Keep the FIR delay from the first real frame; only its clock feedback waits for priming.
@@ -752,12 +811,12 @@ static void audio_pcm_read(uint16_t frames) {
     }
     uint32_t priming=playback_pcm.priming<frames ? playback_pcm.priming : frames;
     uint32_t copied=playback_pcm_read(&playback_pcm, encoder_pcm, frames);
-    if (is_usb_streaming || phone_active) playback_metrics.pcm_underflows+=frames-priming-copied;
+    if (is_usb_streaming || external) playback_metrics.pcm_underflows+=frames-priming-copied;
     uint32_t missing=frames-priming-copied;
-    bool active=(is_usb_streaming || phone_active) && playback_pcm.primed_on_wire;
+    bool active=(is_usb_streaming || external) && playback_pcm.primed_on_wire;
     PB_ADD(active?TRACE_ACTIVE_ZERO:TRACE_STARTUP_ZERO,missing);
     if(active && missing)PB_EVENT(TRACE_ZERO,missing,playback_pcm.used);
-    if (phone_active) {
+    if (external) {
         if (phone_buffer_started && playback_pcm.used < playback_trace.stats[TRACE_PCM_MIN])
             playback_trace.stats[TRACE_PCM_MIN] = playback_pcm.used;
         uint32_t factor = phone_clock_update(&phone_clock, playback_pcm.used, frames);
@@ -778,6 +837,7 @@ bool dongle_playback_transitioning(void) {
 bool get_usb_streaming(void) { return is_usb_streaming; }
 
 void set_usb_streaming(bool flag){
+    if (flag && (call_opened || call_active)) bridge_call_stop();
     if(is_usb_streaming!=flag) {
         critical_section_enter_blocking(&playback_pcm_lock);
         playback_usb_clock_reset(&usb_clock);
@@ -785,7 +845,7 @@ void set_usb_streaming(bool flag){
         usb_recovery_drops=0;
         critical_section_exit(&playback_pcm_lock);
     }
-    if (is_usb_streaming && !flag && !phone_active) {
+    if (is_usb_streaming && !flag && !phone_active && !call_active) {
         critical_section_enter_blocking(&playback_pcm_lock);
         playback_pcm_clear(&playback_pcm, audio_slot_capacity());
         critical_section_exit(&playback_pcm_lock);
@@ -961,7 +1021,7 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
 
         // Yield after one ELD unit; the next main-loop pass may complete its packet.
         if (cur_codec == 4 || cur_codec == 2 || context->codec_num_frames >=
-            (phone_opened ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3)) break;
+            ((phone_opened || call_opened) ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3)) break;
     }
     return total_samples_read;
 }
@@ -1013,7 +1073,7 @@ static bool playback_phone_recovery_poll(void) {
         }
         else if (bridge_phone_ready()) phone_output_recovery = false;
     }
-    if (phone_active && playback_transport_stale) playback_transport_recover(&media_tracker);
+    if ((phone_active || call_active) && playback_transport_stale) playback_transport_recover(&media_tracker);
     return false;
 }
 
@@ -1021,13 +1081,14 @@ static void playback_audio_work(uint32_t now) {
     static bool phone_overrun;
     a2dp_media_sending_context_t *context=&media_tracker;
     if(!context->streaming) {phone_overrun=false;return;}
-    if(!phone_active || context->samples_ready<acc_num_simples)phone_overrun=false;
+    bool external = phone_active || call_active;
+    if(!external || context->samples_ready<acc_num_simples)phone_overrun=false;
     bool recover=false;
     critical_section_enter_blocking(&playback_pcm_lock);
     uint32_t limit=4u*acc_num_simples;
     if(limit<PLAYBACK_USB_DEBT_LIMIT)limit=PLAYBACK_USB_DEBT_LIMIT;
     limit=limit*10u/playback_adjust_interval(&playback_adjust);
-    if(is_usb_streaming && !phone_active &&
+    if(is_usb_streaming && !external &&
        (usb_recovery_drops || context->samples_ready>limit || playback_transport_stale)) {
         uint32_t trimmed=playback_pcm_limit(&playback_pcm,PLAYBACK_USB_MIN_FRAMES);
         uint32_t skipped=usb_recovery_drops+trimmed;
@@ -1046,7 +1107,7 @@ static void playback_audio_work(uint32_t now) {
         if(playback_adjust_busy(&playback_adjust))playback_game.failed=true;
         playback_adjust_cancel(&playback_adjust);
         recover=true;
-    } else if(phone_active && context->samples_ready>limit) {
+    } else if(external && context->samples_ready>limit) {
         uint32_t excess=context->samples_ready-limit;
         uint32_t keep=playback_pcm.used>excess?playback_pcm.used-excess:0;
         uint32_t skipped=playback_pcm_limit(&playback_pcm,keep);
@@ -1203,7 +1264,7 @@ static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint3
                 if (fill_aac_audio_buffer(context) < 0) return;
 
                 if (context->codec_num_frames >=
-                    (phone_opened ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3) ||
+                    ((phone_opened || call_opened) ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3) ||
                     (context->codec_num_frames > 0 &&
                      (context->max_media_payload_size - context->codec_storage_count) <
                      (int)((aaceld_bitrate + 799) / 800 + 4))) {
@@ -1237,7 +1298,10 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
         return false;
     }
     critical_section_enter_blocking(&playback_pcm_lock);
-    if (bridge_phone_recovering()) {
+    if (call_active) {
+        playback_pcm_reset(&playback_pcm, PHONE_PCM_CAPACITY, cur_codec == 4);
+        call_clock_init();
+    } else if (bridge_phone_recovering()) {
         playback_pcm_reset(&playback_pcm, PHONE_PCM_CAPACITY, cur_codec == 4);
         phone_buffer_started = false;
         phone_clock_init(&phone_clock, acc_num_simples);
@@ -1298,11 +1362,11 @@ static void playback_idle_poll(uint32_t now) {
             playback_encoder_failed(&media_tracker);
         return;
     }
-    bool wanted = is_usb_streaming || phone_opened || phone_active || usb_mic_requested() || aacp_mic_active();
+    bool wanted = is_usb_streaming || phone_opened || phone_active || call_opened || call_active || aacp_mic_requested() || aacp_mic_active();
     if (playback_idle_phase == PLAYBACK_SUSPENDED) {
         if (!wanted) return;
         if (playback_game.requested && playback_game_eligible() &&
-            !usb_mic_requested() && !aacp_mic_active() && !playback_game.failed &&
+            !aacp_mic_requested() && !aacp_mic_active() && !playback_game.failed &&
             playback_game.phase != GAME_CONFIRMED) return;
         playback_idle_phase = PLAYBACK_STARTING;
         playback_idle_transition_since = now;
@@ -2443,7 +2507,7 @@ void set_next_capablity_and_start_stream(void) {
     finish_scan_avdtp_codec = true;
 }
 
-static uint8_t playback_input(void) { return is_usb_streaming ? 1 : phone_active ? 2 : 0; }
+static uint8_t playback_input(void) { return is_usb_streaming ? 1 : (phone_active || call_active) ? 2 : 0; }
 static bool playback_game_eligible(void) {
     return a2dp_is_connected_flag && cur_codec==4 && aacp_model_game_supported() &&
         selected_remote_sep_index<num_remote_seps && remote_seps[selected_remote_sep_index].delay_reporting &&
@@ -2482,7 +2546,7 @@ uint8_t dongle_playback_configure(uint8_t codec, uint8_t rate_mode, uint32_t bit
     if (!playback_options_valid(next)) return DONGLE_UNSUPPORTED;
     if (playback_options.codec==codec && playback_options.rate_mode==rate_mode && playback_options.bitrate==bitrate)
         return DONGLE_ACCEPTED;
-    if (is_usb_streaming || phone_active || phone_opened || usb_mic_requested() || aacp_mic_active() ||
+    if (is_usb_streaming || phone_active || phone_opened || aacp_mic_requested() || aacp_mic_active() ||
         profile_pending || a2dp_connect_pending || playback_game.changed) return DONGLE_BUSY;
     const uint8_t *peer=(const uint8_t *)get_device_addr();
     if (!peer || !peer_address_valid(peer)) return DONGLE_DISCONNECTED;
@@ -2600,7 +2664,7 @@ void dongle_playback_poll(void) {
     }
     uint32_t session=aacp_control_session();
     bool fresh_open=!mic_prepare_open;
-    if (!usb_mic_requested()) mic_prepare_open=false;
+    if (!aacp_mic_requested()) mic_prepare_open=false;
     else if (fresh_open || mic_prepare_session!=session) {
         mic_prepare_open=true; mic_prepare_session=session;
         mic_prepare_serial=aacp_receive_buffer_serial();
@@ -2627,8 +2691,8 @@ void dongle_playback_poll(void) {
         playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
         playback_game_session_lost(&playback_game); game_session=session;
     }
-    bool live=is_usb_streaming && !phone_active && media_tracker.streaming && playback_pcm_warm() &&
-        playback_game_eligible() && aacp_control_ready() && !usb_mic_requested() && !aacp_mic_active();
+    bool live=is_usb_streaming && !phone_active && !call_active && media_tracker.streaming && playback_pcm_warm() &&
+        playback_game_eligible() && aacp_control_ready() && !aacp_mic_requested() && !aacp_mic_active();
     if (!live) playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
     uint8_t previous_interval=playback_adjust_interval(&playback_adjust);
     playback_adjust_poll(&playback_adjust,now);
@@ -2641,7 +2705,7 @@ void dongle_playback_poll(void) {
         delay_revision!=playback_game.report_revision && reported_delay && reported_delay!=UINT16_MAX)
         playback_adjust_request(&playback_adjust,reported_delay,playback_game.target);
     // USB can adjust live; a phone source still prepares while suspended.
-    bool active=!usb_mic_requested() && !aacp_mic_active() &&
+    bool active=!aacp_mic_requested() && !aacp_mic_active() &&
         (!media_tracker.streaming || playback_game.changed || live);
     uint16_t target=playback_game_step(&playback_game,aacp_control_ready(),playback_game_eligible(),active,now,delay_revision,reported_delay);
     // A capture opened before Game Mode ever ran still needs a fresh normal-buffer receipt.
@@ -2673,7 +2737,7 @@ uint16_t dongle_playback_status(uint8_t *out, uint16_t capacity) {
     dongle_put32(out+8,actual_bitrate); out[12]=playback_game.requested; out[13]=playback_game.phase;
     out[14]=playback_input();
     out[15]=(profile_pending ? 1 : 0) | (media_tracker.streaming ? 2 : 0) |
-        ((usb_mic_requested() || aacp_mic_active()) ? 4 : 0) | (playback_game_eligible() ? 8 : 0);
+        ((aacp_mic_requested() || aacp_mic_active()) ? 4 : 0) | (playback_game_eligible() ? 8 : 0);
     out[16]=(uint8_t)reported_delay; out[17]=(uint8_t)(reported_delay>>8); out[18]=100;
     return 20;
 }
@@ -2699,7 +2763,7 @@ void dongle_playback_inspect_enable(bool enabled) {
 uint16_t dongle_playback_diagnostics(uint8_t *out, uint16_t capacity) {
     if (!out || capacity<64) return 0;
     memset(out,0,64); out[0]=1; out[1]=playback_input(); out[2]=dongle_output_codec();
-    out[3]=(media_tracker.streaming ? 1 : 0) | ((usb_mic_requested() || aacp_mic_active()) ? 2 : 0) |
+    out[3]=(media_tracker.streaming ? 1 : 0) | ((aacp_mic_requested() || aacp_mic_active()) ? 2 : 0) |
         (phone_sink_connected() ? 4 : 0) | (aacp_control_ready() ? 8 : 0);
     dongle_put32(out+4,btstack_run_loop_get_time_ms());
     if (playback_pcm_initialized) {
@@ -2874,7 +2938,8 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
             if (!button_pressed){
                 break;
             }
-            if (phone_sink_owns_controls() && !is_usb_streaming && !usb_mic_requested()) {
+            if (!is_usb_streaming && !usb_mic_requested() && phone_call_media_control((uint8_t)operation_id)) break;
+            if (phone_sink_owns_controls() && !is_usb_streaming && !aacp_mic_requested()) {
                 phone_sink_media_control((uint8_t)operation_id);
                 break;
             }
@@ -2948,6 +3013,7 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 int btstack_main(int argc, const char * argv[]){
 
     l2cap_init();
+    rfcomm_init();
     aacp_init();
     ble_scan_init();
     bt_hci_init();
@@ -3006,6 +3072,7 @@ int btstack_main(int argc, const char * argv[]){
     sdp_register_service(sdp_avrcp_controller_service_buffer);
 
     if (!phone_sink_init()) return 1;
+    if (!phone_call_init()) return 1;
 
 
 #ifdef HAVE_BTSTACK_STDIN

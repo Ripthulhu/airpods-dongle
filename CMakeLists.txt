@@ -6,9 +6,13 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 set(PICOTOOL_GIT_BRANCH 2041936441b48a3cc53ae3da9e805229fe8f4e18)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.32 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.33 LANGUAGES C CXX ASM)
 option(AIRPODS_USB_FLOAT "Expose IEEE float USB input alongside S16 compatibility" ON)
 pico_sdk_init()
+
+# Bluedroid's product-packing macro deliberately wraps its signed low word.
+set_source_files_properties("${PICO_BTSTACK_PATH}/3rd-party/bluedroid/encoder/srce/sbc_packing.c"
+    PROPERTIES COMPILE_OPTIONS "-fwrapv")
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
     message(FATAL_ERROR "Only Pico 2 W is supported; the audio buffers do not fit on RP2040")
@@ -63,6 +67,8 @@ add_executable(airpods_dongle
     src/btstack/btstack_att.c
     src/btstack/aacp_mic_dec.c
     src/btstack/phone_sink.c
+    src/btstack/phone_call.c
+    src/btstack/phone_call_audio.c
     src/btstack/phone_control.c
     src/btstack/dongle_finder.c
     src/btstack/dongle_case_battery.c

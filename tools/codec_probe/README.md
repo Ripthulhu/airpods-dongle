@@ -58,6 +58,9 @@ With GCC 13.2.1, Pico SDK 2.3.1 and firmware 0.1.10, live stereo/microphone allo
 allocations total 85,512 bytes and peak at 90,816 bytes. The linked heap is
 386,008 bytes, leaving 197,968 bytes at the heavier peak before other runtime allocations.
 The 64 KiB reserve is a policy allowance, not a measured application requirement.
+The CVSD phone-call path retains the same stereo playback/mono microphone codec
+pair; its static HFP and PCM state is included in the linked heap capacity.
+The memory gate does not emulate call transport, ownership or controller timing.
 
 Stack markers start 128 bytes below the helper's stack pointer. Tested decoder
 and stereo encoder depths are 7,420 and 7,332 bytes below the marker. The artificial

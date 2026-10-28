@@ -7,6 +7,7 @@
 #include "../btstack/btstack_att.h"
 #include "../btstack/btstack_aacp.h"
 #include "hardware/sync.h"
+#include "btstack_run_loop.h"
 
 #define RPC_LIMIT 512u
 #define CHUNK 42u

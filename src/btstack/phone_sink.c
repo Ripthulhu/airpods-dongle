@@ -7,6 +7,10 @@
 #include "phone_codec.h"
 #include "phone_worker.h"
 #include "phone_sink.h"
+#include "phone_call.h"
+#include "btstack_aacp.h"
+#include "btstack_avdtp_source.h"
+#include "../tinyusb/uac.h"
 
 #ifndef ENABLE_AVDTP_ACCEPTOR_EXPLICIT_START_STREAM_CONFIRMATION
 #error "Phone input requires explicit Start confirmation while AirPods prime"
@@ -33,6 +37,13 @@ static uint8_t lhdc_seid, aptx_seid, sbc_seid;
 static uint8_t sink_sdp[150];
 static bool initialized, lhdc_disabled, aptx_disabled;
 static bool retry_codec;
+static struct {
+    bd_addr_t peer;
+    uint16_t cid;
+    uint8_t attempts;
+    bool pending, clock_started, waiting;
+    uint32_t since_ms, attempt_ms;
+} call_resume;
 
 static struct {
     bd_addr_t address;
@@ -719,6 +730,66 @@ void phone_sink_yield(void) {
     retry_codec = false;
     if (!phone.disconnecting) disconnect_phone();
     phone_worker_close();
+}
+
+static void call_resume_cancel_attempt(void) {
+    if (call_resume.cid != 0) a2dp_sink_disconnect(call_resume.cid);
+    call_resume.cid = 0;
+    call_resume.waiting = false;
+}
+
+void phone_sink_pause_for_call(void) {
+    if (phone.cid != 0 && !phone.disconnecting && bt_hci_phone_peer_connected(phone.address)) {
+        if (call_resume.cid != phone.cid) call_resume_cancel_attempt();
+        memset(&call_resume, 0, sizeof(call_resume));
+        memcpy(call_resume.peer, phone.address, 6);
+        call_resume.pending = true;
+    } else call_resume_cancel_attempt();
+    call_resume.clock_started = false;
+    phone_sink_yield();
+}
+
+void phone_sink_resume_after_call(void) {
+    if (!call_resume.pending) return;
+    if (phone_call_active() || get_usb_streaming() || usb_mic_requested() || aacp_mic_active()) {
+        call_resume_cancel_attempt();
+        call_resume.clock_started = false;
+        return;
+    }
+    bd_addr_t saved;
+    if (!bt_hci_phone_address(saved) || memcmp(saved, call_resume.peer, 6) != 0 ||
+        !bt_hci_phone_peer_connected(call_resume.peer)) {
+        call_resume_cancel_attempt();
+        memset(&call_resume, 0, sizeof(call_resume));
+        return;
+    }
+    if (phone.cid != 0 && !phone.disconnecting) {
+        if (call_resume.cid != 0 && call_resume.cid != phone.cid) call_resume_cancel_attempt();
+        memset(&call_resume, 0, sizeof(call_resume));
+        return;
+    }
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (!call_resume.clock_started) {
+        call_resume.clock_started = true;
+        call_resume.since_ms = now;
+    }
+    if ((uint32_t)(now - call_resume.since_ms) >= 10000u) {
+        call_resume_cancel_attempt();
+        memset(&call_resume, 0, sizeof(call_resume));
+        return;
+    }
+    if (phone.cid != 0) return; // Wait for the original call-time disconnect.
+    if (call_resume.waiting && (uint32_t)(now - call_resume.attempt_ms) < 2500u) return;
+    if (call_resume.waiting) call_resume_cancel_attempt();
+    if (call_resume.attempts >= 3) { call_resume.pending = false; return; }
+    if (call_resume.attempts && (uint32_t)(now - call_resume.attempt_ms) < 500u) return;
+    ++call_resume.attempts;
+    call_resume.attempt_ms = now;
+    call_resume.waiting = true;
+    uint16_t cid = 0;
+    uint8_t status = a2dp_sink_establish_stream(call_resume.peer, &cid);
+    call_resume.cid = cid;
+    if (status != ERROR_CODE_SUCCESS || cid == 0) call_resume_cancel_attempt();
 }
 
 bool phone_sink_decoder_released(void) { return phone_worker_released(); }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the pinned SDK and apply only the reviewed transport/USB patches."""
+"""Fetch the pinned SDK and apply only the reviewed, hash-checked patches."""
 
 import argparse
 import hashlib
@@ -32,7 +32,8 @@ def check(sdk, apply=False):
     # Validate every input before changing any checkout.
     pending = []
     for library, spec in manifest.items():
-        base = sdk if library == "sdk" else sdk / "lib" / library
+        target = spec.get("library", library)
+        base = sdk if target == "sdk" else sdk / "lib" / target
         hashes = {name: sha256(base / name) for name in spec["original"]}
         if hashes == spec["patched"]:
             continue

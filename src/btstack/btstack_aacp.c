@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "btstack.h"
 #include "btstack_aacp.h"
@@ -29,6 +30,49 @@
 #include "btstack_ble_scan.h"
 #include "../tinyusb/dongle_rpc.h"
 #include "../tinyusb/uac.h"
+#include "phone_call.h"
+
+static _Atomic aacp_mic_owner_t mic_owner;
+static atomic_flag mic_reader = ATOMIC_FLAG_INIT;
+
+static aacp_mic_owner_t requested_mic_owner(void) {
+    if (usb_mic_requested()) return AACP_MIC_USB;
+    return phone_call_mic_requested() ? AACP_MIC_CALL : AACP_MIC_NONE;
+}
+
+bool aacp_mic_requested(void) { return requested_mic_owner() != AACP_MIC_NONE; }
+
+void aacp_mic_call_changed(void) {
+    if (atomic_load_explicit(&mic_owner, memory_order_acquire) != AACP_MIC_CALL) return;
+    atomic_store_explicit(&mic_owner, AACP_MIC_NONE, memory_order_release);
+    aacp_mic_pcm_reset();
+}
+
+bool aacp_mic_update_owner(bool fresh_usb_request) {
+    aacp_mic_owner_t requested = requested_mic_owner();
+    if (!fresh_usb_request && requested == atomic_load_explicit(&mic_owner, memory_order_acquire)) return false;
+    atomic_store_explicit(&mic_owner, AACP_MIC_NONE, memory_order_release);
+    dongle_playback_mic_request_changed();
+    aacp_mic_stop();
+    aacp_mic_pcm_reset();
+    atomic_store_explicit(&mic_owner, requested, memory_order_release);
+    return true;
+}
+
+static uint32_t mic_read(aacp_mic_owner_t owner, int16_t *pcm, uint32_t frames) {
+    if (atomic_flag_test_and_set_explicit(&mic_reader, memory_order_acquire)) return 0;
+    uint32_t copied = 0;
+    bool allowed = owner == AACP_MIC_USB ? usb_mic_requested() : phone_call_mic_requested() && !usb_mic_requested();
+    if (owner == atomic_load_explicit(&mic_owner, memory_order_acquire) && allowed) {
+        copied = aacp_mic_pcm_read(pcm, frames);
+        allowed = owner == AACP_MIC_USB ? usb_mic_requested() : phone_call_mic_requested() && !usb_mic_requested();
+        if (owner != atomic_load_explicit(&mic_owner, memory_order_acquire) || !allowed) copied = 0;
+    }
+    atomic_flag_clear_explicit(&mic_reader, memory_order_release);
+    return copied;
+}
+uint32_t aacp_mic_usb_read(int16_t *pcm, uint32_t frames) { return mic_read(AACP_MIC_USB, pcm, frames); }
+uint32_t aacp_mic_call_read(int16_t *pcm, uint32_t frames) { return mic_read(AACP_MIC_CALL, pcm, frames); }
 
 #define AACP_PSM              0x1001
 // Requested local MTU. BTstack clamps this to l2cap_max_mtu() =
@@ -284,7 +328,7 @@ uint8_t aacp_receive_buffer(uint16_t milliseconds) {
     if (milliseconds!=60 && milliseconds!=150) return DONGLE_MALFORMED;
     if (!aacp_control_ready()) return DONGLE_DISCONNECTED;
     if (!aacp_model_game_supported()) return DONGLE_UNSUPPORTED;
-    if ((milliseconds==60 && (usb_mic_requested() || aacp_mic_active())) ||
+    if ((milliseconds==60 && (aacp_mic_requested() || aacp_mic_active())) ||
         aacp_tx_count>=AACP_TX_QUEUE_LEN-2) return DONGLE_BUSY;
     for (unsigned i=0;i<aacp_tx_count;++i)
         if (aacp_tx_queue[(aacp_tx_head+i)%AACP_TX_QUEUE_LEN].data==receive_buffer_tx) return DONGLE_BUSY;
@@ -330,7 +374,7 @@ uint8_t aacp_setting_write(uint8_t id, uint32_t value) {
     if (!setting_value_valid(id,value)) return DONGLE_MALFORMED;
     if (!aacp_control_ready()) return DONGLE_DISCONNECTED;
     if (!settings_supported(&settings,id,value)) return DONGLE_UNSUPPORTED;
-    if (setting_pending || setting_result || usb_mic_requested() || aacp_mic_active() ||
+    if (setting_pending || setting_result || aacp_mic_requested() || aacp_mic_active() ||
         aacp_tx_count>=AACP_TX_QUEUE_LEN-2)
         return DONGLE_BUSY;
     if (l2cap_get_remote_mtu_for_local_cid(aacp_cid)<sizeof(setting_tx)) return DONGLE_UNSUPPORTED;
@@ -487,14 +531,14 @@ static void aacp_mic_update_progress(void) {
     uint32_t completed = aacp_mic_dec_completed();
     if (completed == aacp_mic_completed_seen) return;
     aacp_mic_completed_seen = completed;
-    if (aacp_mic_want && aacp_mic_running && usb_mic_requested()) {
+    if (aacp_mic_want && aacp_mic_running && aacp_mic_requested()) {
         mic_stats.last_sdu_ms = btstack_run_loop_get_time_ms();
         aacp_mic_gap_reset = false;
     }
 }
 
 static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
-    if (aacp_mic_want && !usb_mic_requested()) {
+    if (aacp_mic_want && !aacp_mic_requested()) {
         aacp_mic_stop();
         return;
     }
@@ -526,7 +570,7 @@ static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
 }
 
 static void aacp_try_mic_start(void) {
-    if (!usb_mic_requested() || !aacp_mic_want || aacp_mic_failed || aacp_mic_running ||
+    if (!aacp_mic_requested() || !aacp_mic_want || aacp_mic_failed || aacp_mic_running ||
         aacp_mic_remote_active || aacp_mic_stopping || aacp_mic_restore_required ||
         !aacp_connected || !aacp_got_control || !aacp_init_sent ||
         aacp_mic_start_queued()) return;
@@ -597,7 +641,7 @@ static void aacp_handle_can_send_now(void) {
     aacp_pkt_t p = aacp_tx_queue[aacp_tx_head];
     uint32_t now=btstack_run_loop_get_time_ms();
     if ((p.data==setting_tx || p.data==research_tx) &&
-        (!dongle_rpc_transport_current() || usb_mic_requested() || aacp_mic_active() ||
+        (!dongle_rpc_transport_current() || aacp_mic_requested() || aacp_mic_active() ||
          (uint32_t)(now-(p.data==setting_tx ? setting_since : research_since))>=3000u)) {
         if (p.data==setting_tx) {
             aacp_setting_cancel();
@@ -609,7 +653,7 @@ static void aacp_handle_can_send_now(void) {
         if (aacp_tx_count) l2cap_request_can_send_now_event(aacp_cid);
         return;
     }
-    if (p.data == aacp_mic_start_bytes && !usb_mic_requested()) {
+    if (p.data == aacp_mic_start_bytes && !aacp_mic_requested()) {
         aacp_mic_stop();
         return;
     }
@@ -680,7 +724,7 @@ static void aacp_handle_can_send_now(void) {
 
 void aacp_poll(void) {
     // USB IRQs can revoke capture while the main loop still holds cached intent.
-    if (aacp_mic_want && !usb_mic_requested()) aacp_mic_stop();
+    if (aacp_mic_want && !aacp_mic_requested()) aacp_mic_stop();
     aacp_mic_update_progress();
     if (aacp_mic_start_waiting_for_reset && aacp_mic_dec_reset_done()) {
         aacp_mic_start_waiting_for_reset = false;
@@ -774,8 +818,8 @@ static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
     }
     uint32_t now = btstack_run_loop_get_time_ms();
     // Late or unsolicited uplink packets must not reach a closed USB recording.
-    if (!usb_mic_requested() && aacp_mic_want) aacp_mic_stop();
-    if (!usb_mic_requested() || !aacp_mic_want || !aacp_mic_running) {
+    if (!aacp_mic_requested() && aacp_mic_want) aacp_mic_stop();
+    if (!aacp_mic_requested() || !aacp_mic_want || !aacp_mic_running) {
         aacp_last_uplink_ms = now;
         if (!aacp_mic_want && !aacp_mic_remote_active && !aacp_mic_stopping &&
             !aacp_mic_restore_required) {
@@ -793,7 +837,7 @@ static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
         aacp_mic_gap_reset = true;
     }
     for (unsigned off = TYPE58_HEADER_LEN; off < size;) {
-        if (!usb_mic_requested()) {
+        if (!aacp_mic_requested()) {
             aacp_mic_stop();
             return;
         }

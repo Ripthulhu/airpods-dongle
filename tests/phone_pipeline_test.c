@@ -30,6 +30,7 @@ bool phone_codec_decode(const uint8_t *payload,size_t length,uint8_t count,
 }
 static bool bridge_phone_recovering(void) {return false;}
 static void bridge_phone_drop_pcm(void) {assert(false);}
+static void bridge_call_stop(void) {assert(false);}
 #include "playback_phone_push.inc"
 
 static void receive_pcm(const int16_t *pcm,uint16_t frames,void *context) {

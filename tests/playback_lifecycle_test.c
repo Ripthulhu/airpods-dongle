@@ -9,6 +9,7 @@ static playback_adjust_t playback_adjust;
 
 #define ERROR_CODE_SUCCESS 0
 static bool is_usb_streaming, phone_active, phone_opened, profile_pending;
+static bool call_active, call_capture;
 static bool a2dp_connect_pending, a2dp_is_connected_flag, profile_reconnect;
 static bool allow_switch_slot, finish_scan_avdtp_codec;
 static bool have_aaceld_codec_capabilities, finish_setup_aac;
@@ -62,7 +63,7 @@ static uint8_t buffer_result;
 void dongle_playback_receive_buffer_sent(uint32_t now);
 
 static bool mic_requested, mic_active;
-static bool usb_mic_requested(void) { return mic_requested; }
+static bool aacp_mic_requested(void) { return mic_requested || call_capture; }
 static bool aacp_mic_active(void) { return mic_active; }
 static bool aacp_mic_uplink_active(void) {return mic_active;}
 static bool peer_address_valid(const uint8_t *p) { return p[0] != 0; }
@@ -346,13 +347,15 @@ static void microphone_and_toggle_cancel_live_clock(void) {
 }
 
 
-static void microphone_prepares_normal_buffer_and_binds_repair(void) {
+static void microphone_prepares_normal_buffer_and_binds_repair(bool call) {
     prepare_live_adjustment(11);
+    mic_requested=call_capture=false;
+    bool *demand=call?&call_capture:&mic_requested;
     a2dp_is_connected_flag=finish_scan_avdtp_codec=true;
     media_tracker.local_seid=5; media_tracker.avdtp_cid=10;
     playback_idle_phase=PLAYBACK_RUNNING;
     mic_prepare_open=mic_recovery_pending=mic_recovery_started=false;
-    mic_requested=true; buffer_serial=20; delay_revision=10;
+    *demand=true; buffer_serial=20; delay_revision=10;
     assert(!dongle_playback_mic_ready());
     // A fresh Pico boot may meet AirPods retaining 60 ms even before local metadata arrives.
     playback_adjust_cancel(&playback_adjust);
@@ -382,8 +385,8 @@ static void microphone_prepares_normal_buffer_and_binds_repair(void) {
     assert(!dongle_playback_mic_ready());
     // A failed fresh-150 attempt can be retried once by actually closing/opening capture.
     game_eligible=true; playback_game.changed=true; playback_game.target=150;
-    mic_requested=false; dongle_playback_poll(); assert(playback_game.restore_failed);
-    mic_requested=true; dongle_playback_poll();
+    *demand=false; dongle_playback_poll(); assert(playback_game.restore_failed);
+    *demand=true; dongle_playback_poll();
     assert(!playback_game.restore_failed && playback_game.waiting_report);
     sent=playback_game.sent_since; ++delay_revision; now=sent+500; dongle_playback_poll();
     assert(dongle_playback_mic_ready());
@@ -397,10 +400,10 @@ static void microphone_prepares_normal_buffer_and_binds_repair(void) {
     assert(dongle_playback_mic_ready());
     // Reopening during physical cleanup cannot clear that operation's failure guard.
     playback_game.restore_failed=true; mic_active=true;
-    mic_requested=false; dongle_playback_poll(); mic_requested=true; dongle_playback_poll();
+    *demand=false; dongle_playback_poll(); *demand=true; dongle_playback_poll();
     assert(playback_game.restore_failed && !dongle_playback_mic_ready());
     playback_game.restore_failed=false; playback_game.changed=false;
-    mic_requested=false; mic_active=true; playback_recoveries=0;
+    *demand=false; mic_active=true; playback_recoveries=0;
     uint32_t before=dongle_playback_mic_recovery_revision();
     assert(dongle_playback_mic_recover()); dongle_playback_poll();
     assert(mic_recovery_pending && mic_recovery_started && playback_recoveries==1);
@@ -421,7 +424,8 @@ int main(void) {
     game_waits_for_encoder_warmup();
     saved_pair_reconnects_with_backoff();
     microphone_and_toggle_cancel_live_clock();
-    microphone_prepares_normal_buffer_and_binds_repair();
+    microphone_prepares_normal_buffer_and_binds_repair(false);
+    microphone_prepares_normal_buffer_and_binds_repair(true);
     playback_game=(playback_game_t){.requested=true};game_eligible=true;
     assert(dongle_playback_game_toggle()==DONGLE_ACCEPTED && !playback_game.requested);
     assert(game_feedback_count==1 && !game_feedback_enabled);

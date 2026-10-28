@@ -13,6 +13,7 @@
 #include "btstack_ble_scan.h"
 #include "btstack_aacp.h"
 #include "phone_sink.h"
+#include "phone_call.h"
 #include "../tinyusb/uac.h"
 #include "../pico_w_led.h"
 #include "../slot_storage.h"
@@ -80,7 +81,7 @@ static void phone_load(void) {
 }
 
 static bool phone_pairing_audio_busy(void) {
-    return get_usb_streaming() || usb_mic_requested() || aacp_mic_active() || phone_sink_active();
+    return get_usb_streaming() || usb_mic_requested() || aacp_mic_active() || phone_sink_active() || phone_call_active();
 }
 
 static uint16_t credit_u16(const uint8_t *p) { return (uint16_t)p[0] | (uint16_t)p[1] << 8; }
@@ -106,7 +107,7 @@ static void credit_event(const uint8_t *p, uint16_t size) {
         for (unsigned offset = 3; offset < size; offset += 4) {
             uint16_t handle = credit_u16(p + offset) & 0x0fffu;
             hci_connection_t *connection = hci_connection_for_handle(handle);
-            if (connection == NULL) continue;
+            if (connection == NULL || connection->address_type != BD_ADDR_TYPE_ACL) continue;
             int role = memcmp(connection->address, device_addr, 6) == 0 ? 0 :
                 ((peer_address_valid(phone_address) && memcmp(connection->address, phone_address, 6) == 0) ||
                  (peer_address_valid(phone_candidate) && memcmp(connection->address, phone_candidate, 6) == 0)) ? 1 : -1;
@@ -232,8 +233,17 @@ bool bt_hci_phone_peer_connected(const uint8_t address[6]) {
     return true;
 }
 
+bool bt_hci_phone_address(uint8_t address[6]) {
+    if (address == NULL || !phone_bonded || !peer_address_valid(phone_address)) return false;
+    memcpy(address, phone_address, 6);
+    return true;
+}
+
 static int accept_classic_peer(bd_addr_t address, hci_link_type_t link_type) {
-    if (link_type != HCI_LINK_TYPE_ACL || !peer_address_valid(address)) return 0;
+    if (!peer_address_valid(address)) return 0;
+    if (link_type != HCI_LINK_TYPE_ACL)
+        return (link_type == HCI_LINK_TYPE_SCO || link_type == HCI_LINK_TYPE_ESCO) &&
+            phone_call_sco_allowed(address) && bt_hci_phone_peer_connected(address);
     if (peer_address_valid(device_addr) && memcmp(address, device_addr, 6) == 0) return 1;
     if (bt_hci_phone_peer_allowed(address)) return 1;
     if (!bt_hci_phone_pairing_active() || airpods_address(address) ||

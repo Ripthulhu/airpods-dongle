@@ -1,0 +1,10 @@
+--- a/src/classic/btstack_sbc_bluedroid.c
++++ b/src/classic/btstack_sbc_bluedroid.c
+@@ -604,6 +604,6 @@
+ };
+ 
+ const btstack_sbc_decoder_t * btstack_sbc_decoder_bluedroid_init_instance(btstack_sbc_decoder_bluedroid_t * context){
+-    memset(context, 0, sizeof(btstack_sbc_encoder_bluedroid_t));
++    memset(context, 0, sizeof(*context));
+     return &btstack_sbc_decoder_bluedroid;
+ }

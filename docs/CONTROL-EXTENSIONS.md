@@ -215,7 +215,9 @@ Bytes 0–3: version 1, requested codec, actual codec, rate mode. Codec values a
 0 unknown/automatic, 1 SBC, 2 AAC, 3 ELD. Requested and actual bitrates are u32 at
 4 and 8. Byte 12 is the Game Mode preference; byte 13 is its state: 0 off,
 1 pending, 2 sent/unconfirmed, 3 confirmed by a fresh delay report, 4 failed,
-5 unsupported, 6 restoring. Byte 14 is input ownership: 0 idle, 1 USB, 2 phone.
+5 unsupported, 6 restoring. Byte 14 is input ownership: 0 idle, 1 USB,
+2 phone (music or call). Calls keep the existing value for compatibility;
+the microphone flag and explicit CDC call snapshot provide additional context.
 Byte 15 flags: profile pending 1, streaming 2, microphone 4, Game Mode supported 8.
 Delay is u16 at 16 in tenths of milliseconds (`FFFF` unknown); startup priming
 is u16 at 18 in milliseconds, fixed at 100. Delay confirmation is transport

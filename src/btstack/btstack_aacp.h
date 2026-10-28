@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "btstack.h"
+#include "bluetooth.h"
 #include "../tinyusb/dongle_protocol.h"
 
 // One-time setup. Call once from btstack_main() after l2cap_init().
@@ -36,6 +36,14 @@ void aacp_poll(void);
 bool aacp_is_connected(void);
 
 // --- Hi-res mic stream ---
+typedef enum { AACP_MIC_NONE, AACP_MIC_USB, AACP_MIC_CALL } aacp_mic_owner_t;
+bool aacp_mic_requested(void);
+// Main-loop ownership transition; a fresh USB revision also invalidates old PCM.
+bool aacp_mic_update_owner(bool fresh_usb_request);
+void aacp_mic_call_changed(void);
+uint32_t aacp_mic_usb_read(int16_t *pcm, uint32_t frames);
+// Main-loop call consumer; USB reads may interrupt and are serialized here.
+uint32_t aacp_mic_call_read(int16_t *pcm, uint32_t frames);
 
 // Send the mic START / STOP byte sequences. If the channel is not open yet,
 // START is remembered and fired once it is. START also arms the per-second

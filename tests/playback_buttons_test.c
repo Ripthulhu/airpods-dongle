@@ -31,6 +31,10 @@ static const char *avrcp_operation2str(uint8_t operation) {(void)operation;retur
 static uint8_t avrcp_target_play_status(uint16_t cid,unsigned length,unsigned position,unsigned status) {(void)cid;(void)length;(void)position;(void)status;return 0;}
 static bool phone_sink_owns_controls(void) {return phone_controls;}
 static bool usb_mic_requested(void) {return mic;}
+static bool aacp_mic_requested(void) {return mic;}
+static bool call_controls;
+static unsigned call_events;
+static bool phone_call_media_control(uint8_t operation) {(void)operation;if(call_controls)++call_events;return call_controls;}
 static void phone_sink_media_control(uint8_t operation) {(void)operation;++phone_events;}
 bool usb_media_enqueue(enum usb_media_command command) {last=command;++usb_events;return true;}
 #include "playback_buttons.inc"
@@ -51,5 +55,10 @@ int main(void) {
     is_usb_streaming=true;
     event[5]=AVRCP_OPERATION_ID_FORWARD;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);
     assert(usb_events==3 && last==USB_MEDIA_NEXT);
-    puts("stem buttons: actual SDK callback length, press/release, stale CID and USB/phone ownership passed");
+    is_usb_streaming=false;call_controls=true;event[5]=AVRCP_OPERATION_ID_PLAY;
+    avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(call_events==1 && phone_events==1);
+    event[3]=8;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(call_events==1);
+    event[3]=7;is_usb_streaming=true;
+    avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(call_events==1 && usb_events==4);
+    puts("stem buttons: actual SDK callback length, press/release, stale CID and USB/phone/call ownership passed");
 }

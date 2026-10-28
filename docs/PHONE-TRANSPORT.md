@@ -12,6 +12,8 @@ improved playback, but the listener still heard crackle. Version 0.1.31 tests
 two AAC-ELD units per phone-output packet. Send waits fell to 8 ms, but small
 hitches remained. Version 0.1.32 adds input timing diagnostics and a replay-tested
 90 ms jitter reserve; its hardware validation is pending.
+Version 0.1.33 adds a phone-call bridge; its bidirectional voice path is also
+awaiting a physical call test.
 The separate app control service remains untested on Pico hardware.
 
 ```text
@@ -42,12 +44,14 @@ the application's cancellation check; this does not guarantee uninterrupted
 audio when a host starts playback during bonding.
 
 AirPods stem media commands and absolute volume go to the phone during phone
-playback. USB media commands stay on the USB path. Music only: phone calls, HFP,
-SCO and a BLE settings interface are not implemented.
+playback. USB media commands stay on the USB path. During ringing or an active
+phone call, a supported stem press answers or ends the call through HFP. A BLE
+settings interface is not implemented.
 
 The settings service accepts legacy Call Management (`0x24`) values `00 03 00 00`
 (double press to end a call) and `00 02 00 00` (single press to end). These do not
-establish a complementary mute assignment or add phone-call transport. Newer
+establish a complementary mute assignment. They are independent of the HFP
+transport described below. Newer
 Apple versions contain independent end-call and mute fields; do not flatten a
 newer or unknown report into one of these legacy values. Complete modern writes
 and physical call behavior through this dongle remain unverified.
@@ -62,7 +66,83 @@ LibrePods connects to the saved phone's encrypted, bonded RFCOMM service for
 device settings, hearing profiles, saved checks, audio profiles, performance
 readings and nearby finding. See [control extensions](CONTROL-EXTENSIONS.md) for
 the UUID and wire format. These controls do not need a PC, a phone vendor-ID
-override or an audio stream. The microphone path still requires USB recording.
+override or an audio stream.
+
+## Phone calls over Bluetooth (prototype)
+
+The Pico advertises an HFP Hands-Free service on RFCOMM channel 8; the companion
+control service keeps channel 7. The saved phone uses standard CVSD (8 kHz)
+mono voice over SCO/eSCO. The Pico converts downlink voice to its
+48 kHz stereo AirPods output and sends the AirPods AACP microphone back through
+the selected call codec. Both companion apps can remain closed.
+
+Only the current HFP session on the saved, encrypted phone connection may open
+voice audio. Pairing mode alone never permits SCO. A call does not dial or
+answer itself. Use the phone's call interface, or a supported stem press to
+answer an incoming call/end an active call. Call-waiting, conferencing and
+voice-assistant commands are not advertised.
+
+USB playback or recording has priority over call audio; it releases the phone's
+voice route without ending the telephone call. The caller can use the phone's
+own audio route. Phone music decoding is released before the AirPods microphone
+decoder is allocated. USB and call capture have explicit, exclusive ownership;
+changing owners invalidates queued microphone samples. Calls use the existing
+normal-buffer microphone policy and playback cleanup, preserving the requested
+Game Mode for music afterward.
+
+The converters and queues are bounded, with no per-packet logging or allocation.
+Corrupt/missing voice is concealed or silenced; a malformed packet cannot be
+treated as valid PCM. The microphone's USB format remains unchanged.
+Call gains are local attenuation from mute to unity; they do not overwrite the
+AirPods' confirmed absolute volume. The microphone converter uses averaged
+queue occupancy for continuous clock correction bounded near ±1,000 ppm.
+
+Wideband mSBC is not advertised. Its additional decoder/encoder state exceeded
+the linked codec-memory gate's required 64 KiB runtime reserve. A real-SDK
+framing/reset regression remains in the codec suite, including a hash-checked
+fix for the pinned SDK's partial decoder initialization; passing that test does
+not enable wideband calls on the board.
+
+**Hardware gate:** build and host tests cannot prove CYW43 voice routing or
+full-duplex radio timing. The pinned transport carries HCI SCO packets, and
+[Raspberry Pi lists HFP examples](https://github.com/raspberrypi/pico-examples),
+but [BTstack's chipset table](https://github.com/bluekitchen/btstack#supported-chipsets)
+does not confirm CYW43 SCO-over-HCI support. Before calling this supported,
+verify incoming and outgoing calls, audible speech in both directions, call
+answer/end, USB takeover, call end followed by music, and radio loss/reconnect.
+No end-to-end call latency has been measured.
+
+## Phone calls over USB
+
+With the Pico connected to a phone's USB port, the phone sends call playback
+through the USB speaker interface and opens the USB microphone interface for
+uplink. This path uses neither HFP nor SCO between phone and Pico; both
+companion apps can remain closed. Active USB playback or capture prevents the
+Bluetooth call bridge from acquiring audio. Closing capture performs the same
+microphone drain/playback repair as other USB recording sessions.
+
+The USB microphone remains 16-bit mono at 64 kHz, with its existing direct PCM
+delivery. Captured Pro 3 runs decoded about 132–136 units per second, each
+containing 480 mono samples, consistent with that presentation clock. The
+hardcoded AAC decoder ASC reports 48 kHz; this coding configuration alone does
+not establish the physical sample cadence or justify a USB rate conversion.
+The Bluetooth call uplink therefore converts from the measured 64 kHz
+presentation clock to CVSD's 8 kHz. Its drift correction handles small clock
+differences, not a 48/64 kHz mismatch. Playback remains a separate 48 kHz clock.
+See [microphone cadence evidence](AUDIO-CONTINUITY.md#microphone-coexistence-investigation-0122-s16).
+USB and Bluetooth consumers never share capture ownership.
+
+The existing headphone/microphone terminals and HID interface satisfy
+[AOSP's USB headset classification](https://android.googlesource.com/platform/frameworks/base/+/master/services/usb/java/com/android/server/usb/descriptors/UsbDescriptorParser.java).
+Stem commands retain Consumer Play/Pause (`0x0c:0x00cd`), which Android's
+[USB headset specification](https://source.android.com/docs/core/interaction/accessories/headset/usb-device)
+and [Telecom handler](https://android.googlesource.com/platform/packages/services/Telecomm/+/master/src/com/android/server/telecom/HeadsetMediaButton.java)
+use for answering/ending calls. The phone interprets the current call context;
+the Pico does not infer a USB telephone call merely because a microphone opens.
+
+Actual Pixel telephony routing, microphone speech quality, stem behavior during
+a call and return to music still require a physical USB call test. A media-only
+or Symfonium-exclusive playback test does not validate communication capture.
 Opening settings never takes audio; no PC/phone handoff commands are added.
 
 Automatic pause belongs to the app using the active input. It consumes fresh

@@ -123,7 +123,6 @@ static void packet_handler(uint8_t type,uint16_t channel,uint8_t *packet,uint16_
     }
 }
 bool phone_control_init(void) {
-    rfcomm_init();
     // RFCOMM inherits the required encrypted security level; the saved peer and
     // persistent link key are independently checked before every request/send.
     gap_set_security_level(LEVEL_2);

@@ -96,7 +96,7 @@ static uint16_t tud_audio_read(void *buf, uint16_t bytes) {
 }
 static bool tud_audio_clear_ep_out_ff(void) { ++fifo_clears; rx_used = 0; return true; }
 static void aacp_mic_pcm_reset(void) { ++mic_resets; mic_available = 0; }
-static uint32_t aacp_mic_pcm_read(int16_t *buf, uint32_t count) {
+static uint32_t aacp_mic_usb_read(int16_t *buf, uint32_t count) {
     ++mic_reads;
     if (count > mic_available) count = (uint32_t)mic_available;
     memcpy(buf, mic_pcm, count * sizeof(*buf));
@@ -473,7 +473,37 @@ static void float_packets_and_switching(void) {
     assert(played_float[98]==0 && played_float[99]==0);
 }
 #endif
+static void usb_speaker_microphone_duplex(void) {
+    for(unsigned alt=1;alt<=(AIRPODS_USB_FLOAT?2u:1u);++alt) {
+        fixture();open_speaker();interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,(uint16_t)alt,false);
+        interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,1,false);
+        int16_t speaker[96];float floating[96];
+        for(unsigned i=0;i<96;++i) {speaker[i]=(int16_t)(i-48);floating[i]=(float)speaker[i]/32768.0f;}
+        for(unsigned ms=0;ms<1000;++ms) {
+            if(ms==500)interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,0,true);
+            if(ms==600)interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,1,false);
+            now=ms*1000u;
+            played_samples=played_float_samples=0;
+            assert(alt==1?packet(speaker,sizeof(speaker),sizeof(speaker),1):
+                          packet(floating,sizeof(floating),sizeof(floating),2));
+            assert(alt==1?played_samples==96:played_float_samples==96);
+            for(unsigned i=0;i<64;++i)mic_pcm[i]=(int16_t)(ms<600?1000:2000);
+            mic_available=64;
+            unsigned before=mic_reads;
+            assert(tud_audio_tx_done_pre_load_cb(0,ITF_NUM_AUDIO_STREAMING_MIC,0x82,usb_mic_requested()?1:0));
+            if(usb_mic_requested()) {
+                assert(mic_reads==before+1 && !mic_available);
+                for(unsigned i=0;i<64;++i)assert(host_mic[i]==(ms<600?1000:2000));
+            } else {assert(mic_reads==before);expect_silence(host_mic,64);}
+            service();assert(speaker_active && starts==1 && !stops);
+        }
+        interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,0,true);
+        assert(speaker_active && !usb_mic_requested() && !stops);
+    }
+}
+
 int main(void) {
+    usb_speaker_microphone_duplex();
     current_packet_stereo();
     malformed_packets_are_discarded();
     mute_preserves_volume_and_stereo();

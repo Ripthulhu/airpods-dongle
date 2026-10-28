@@ -11,6 +11,10 @@ bool phone_sink_init(void);
 void phone_sink_poll(void);
 // Thread context, under the Bluetooth lock: release phone decoder before USB mic allocation.
 void phone_sink_yield(void);
+// Remember only the music profile actually relinquished to a phone call.
+void phone_sink_pause_for_call(void);
+// Bounded profile reconnect after cleanup; never sends a playback command.
+void phone_sink_resume_after_call(void);
 bool phone_sink_decoder_released(void);
 bool phone_sink_connected(void);
 bool phone_sink_active(void);

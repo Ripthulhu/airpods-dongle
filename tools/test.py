@@ -14,6 +14,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 def uac_sources(directory):
     source = (ROOT / "src/tinyusb/uac.c").read_text()
+    start = source.index(" bool tud_audio_tx_done_pre_load_cb(")
+    end = source.index("\n }", start) + 3
+    (directory / "uac_mic_callback.inc").write_text(source[start:end])
     start = source.index(" const uint32_t sample_rates[]")
     end = source.index(" static void usb_speaker_stop(void)")
     declarations = source[start:end]
@@ -118,9 +121,12 @@ def playback_lifecycle_sources(directory):
         end = source.index("\n}", start) + 2
         production_pcm.append(source[start:end])
     (directory / "playback_pipeline.inc").write_text("\n".join(production_pcm))
+    start = source.index("\nstatic void bridge_input_pcm_push(") + 1
+    end = source.index("\n}", start) + 2
+    shared = source[start:end]
     start = source.index("\nvoid bridge_phone_pcm_push(") + 1
     end = source.index("\n}", start) + 2
-    (directory / "playback_phone_push.inc").write_text(source[start:end])
+    (directory / "playback_phone_push.inc").write_text(shared + "\n" + source[start:end])
     instrumentation = '''
 #include "playback_test_hooks.h"
 '''
@@ -131,12 +137,15 @@ def playback_lifecycle_sources(directory):
                       "static bool playback_pcm_warm(void) {",
                       "static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){",
                       "static int playback_encoder_failed(",
+                      "static void call_clock_init(",
                       "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
                       "static void playback_idle_poll(", "bool bridge_phone_ready(void)",
                       "static bool phone_output_recovery_owned(", "bool bridge_phone_recovering(void)",
                       "static void suspend_recovery_handler(",
                       "static void playback_transport_recover(", "static bool playback_phone_recovery_poll(",
-                      "void set_usb_streaming(bool flag)", "void bridge_phone_stop(void)"]:
+                      "void set_usb_streaming(bool flag)", "void bridge_phone_stop(void)",
+                      "void bridge_phone_drop_pcm(", "bool bridge_call_open(", "bool bridge_call_ready(",
+                      "void bridge_call_stop("]:
         start = source.index("\n" + signature) + 1
         end = source.index("\n}", start) + 2
         functions.append(source[start:end])
@@ -148,7 +157,7 @@ def playback_lifecycle_sources(directory):
 
 def main_button_sources(directory):
     source = (ROOT / "src/main.c").read_text(encoding="utf-8")
-    start=source.index("        if (usb_mic_take_request(&mic_wanted)) {")
+    start=source.index("        if (aacp_mic_update_owner(usb_mic_take_request(&mic_wanted))) {")
     end=source.index("\n        }",start)+10
     (directory / "main_mic_request.inc").write_text(
         "static void main_mic_request(mic_decoder_lifecycle_t *state) {\n"
@@ -182,6 +191,8 @@ def main():
         "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
+        "phone_call": ["-Itests/phone_call_stubs", "tests/phone_call_test.c"],
+        "phone_call_audio": ["tests/phone_call_audio_test.c", "-lm"],
         "phone_worker": ["tests/phone_worker_test.c", "-pthread"],
         "phone_benchmark": ["tests/phone_benchmark_test.c"],
         "phone_control_protocol": ["tests/phone_control_protocol_test.c"],
