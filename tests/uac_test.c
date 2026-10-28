@@ -7,6 +7,7 @@
 #include "../src/tinyusb/mic_request.h"
 #include "../src/tinyusb/audio_control_validation.h"
 #include "../src/btstack/volume_scale.h"
+#include "../src/btstack/playback_pcm.h"
 
 // TinyUSB's full-speed endpoint sizing and public control wire layouts.
 #define CFG_TUSB_MCU 1
@@ -51,6 +52,8 @@ static uint8_t rx_fifo[2 * CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX];
 static size_t rx_used, short_read_limit;
 static int16_t played[2048];
 static size_t played_samples;
+static float played_float[2048];
+static size_t played_float_samples;
 static int16_t mic_pcm[USB_MIC_SAMPLE_RATE / 1000], host_mic[USB_MIC_SAMPLE_RATE / 1000];
 static size_t mic_available;
 static uint8_t control_reply[64];
@@ -64,12 +67,23 @@ static void host_volume(int16_t db256);
 
 static uint32_t time_us_32(void) { return now; }
 static void set_usb_streaming(bool active) { if (active) ++starts; else ++stops; }
+static void dongle_playback_usb_packet(uint32_t us,uint16_t frames,uint8_t format,uint8_t error) {
+    (void)us;(void)frames;(void)format;(void)error;
+}
+static void dongle_playback_usb_format(uint8_t format) {(void)format;}
 static void audio_slot_push_samples(const int16_t *pcm, uint16_t frames) {
     assert(played_samples + 2u * frames <= TU_ARRAY_SIZE(played));
     memcpy(played + played_samples, pcm, 2u * frames * sizeof(*pcm));
     played_samples += 2u * frames;
     ++pushes;
 }
+static void audio_slot_push_float(const float *pcm,uint16_t frames) {
+    assert(played_float_samples+2u*frames<=TU_ARRAY_SIZE(played_float));
+    memcpy(played_float+played_float_samples,pcm,2u*frames*sizeof(float));
+    played_float_samples+=2u*frames;
+    ++pushes;
+}
+static void audio_slot_usb_reset(void) { }
 static uint16_t tud_audio_read(void *buf, uint16_t bytes) {
     assert(bytes <= CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX);
     size_t count = bytes < rx_used ? bytes : rx_used;
@@ -152,6 +166,7 @@ static void fixture(void) {
     starts = stops = pushes = reads = fifo_clears = mic_reads = mic_resets = 0;
     usb_tasks = media_tasks = debug_tasks = int_attempts = notifications = bt_sets = 0;
     played_samples = rx_used = mic_available = control_reply_size = 0;
+    played_float_samples=0;speaker_format=0;
     short_read_limit = SIZE_MAX;
     last_bt_db256 = 999;
     bt_volume = 127;
@@ -201,7 +216,7 @@ static void current_packet_stereo(void) {
     assert(played_samples == TU_ARRAY_SIZE(first) + TU_ARRAY_SIZE(second));
     assert(memcmp(played + TU_ARRAY_SIZE(first), second, sizeof(second)) == 0);
     assert(rx_used == 0 && pushes == 2 && starts == 1 && stops == 0);
-    int16_t largest[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(int16_t)];
+    int16_t largest[CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT / sizeof(int16_t)];
     for (unsigned i = 0; i < TU_ARRAY_SIZE(largest); ++i) largest[i] = (int16_t)(500 + i);
     assert(packet(largest, sizeof(largest), sizeof(largest), 1));
     assert(memcmp(played + TU_ARRAY_SIZE(first) + TU_ARRAY_SIZE(second), largest, sizeof(largest)) == 0);
@@ -437,6 +452,27 @@ static void confirmed_shared_readbacks_never_echo(void) {
     host_volume(bt_volume_to_usb(17)); tinyusb_control_task();
     assert(bt_sets == 1 && last_bt_db256 == bt_volume_to_usb(17));
 }
+#if AIRPODS_USB_FLOAT
+static void float_packets_and_switching(void) {
+    fixture();open_speaker();
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,2,false);
+    float input[98];
+    for(unsigned i=0;i<49;++i) {input[2*i]=.12345678f;input[2*i+1]=-.23456789f;}
+    assert(sizeof(input)==392);
+    assert(packet(input,sizeof(input),sizeof(input),2));
+    assert(played_float_samples==98 && !memcmp(input,played_float,sizeof(input)));
+    assert(!packet(input,12,12,2)); // Float stereo frames require eight-byte alignment.
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,1,false);
+    assert(packet(input,8,8,2) && played_float_samples==98); // Stale-format callback cannot push.
+    const int16_t integer[]={1,-2,3,-4};
+    assert(packet(integer,sizeof(integer),sizeof(integer),1));
+    assert(played_samples==4 && !memcmp(integer,played,sizeof(integer)));
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,2,false);
+    uint8_t muted=1;assert(feature_set(AUDIO_FU_CTRL_MUTE,0,&muted,1));
+    assert(packet(input,8,8,2));
+    assert(played_float[98]==0 && played_float[99]==0);
+}
+#endif
 int main(void) {
     current_packet_stereo();
     malformed_packets_are_discarded();
@@ -450,5 +486,8 @@ int main(void) {
     volume_scale_preserves_every_bt_level();
     exact_usb_requests_and_resolution();
     confirmed_shared_readbacks_never_echo();
+#if AIRPODS_USB_FLOAT
+    float_packets_and_switching();
+#endif
     puts("UAC: 12 regressions passed (PCM, FIFO, mute, ownership, idle, lifecycle, mic, notifications, SET/readback race, scale, exact SET, confirmed-only readback)");
 }

@@ -6,6 +6,12 @@
 
 #define REALTIME_USB_SERVICE_BUDGET_US 500u
 
+// Pace idle passes without adding a millisecond to an already busy codec pass.
+static inline uint32_t realtime_loop_idle_us(uint32_t started_us, uint32_t now_us) {
+    uint32_t elapsed = now_us - started_us;
+    return elapsed < 1000u ? 1000u - elapsed : 0u;
+}
+
 // Single-writer counters. Read on the owner thread, or copy while that writer
 // is excluded; volatile alone does not synchronize an IRQ or another core.
 typedef struct {

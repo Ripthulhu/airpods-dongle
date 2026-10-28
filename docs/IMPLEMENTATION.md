@@ -6,7 +6,9 @@ reference file hashes used for these changes.
 
 | Area | Baseline problem | Current behavior |
 | --- | --- | --- |
-| Playback start | Audio begins before both ears have settled | Encode 100 ms of silence on each real AVDTP Start and retain source PCM in a packed 32 KiB pool |
+| Playback start | Audio begins before both ears have settled | Encode 100 ms of silence on each real AVDTP Start; retain at most 1,440 USB PCM frames during startup, with separate active stall capacity |
+| USB latency | Audio received during priming or disconnection leaves the queue almost full even when the encoder keeps pace | Keep the newest bounded USB audio, preserving whole stereo frames and independent startup priming; phone buffering is unchanged |
+| Game Mode sends | A synchronous L2CAP callback can complete before the stream records its pending request | Arm the request before enqueueing and capture the delay-report revision at the actual successful send |
 | AAC-ELD | Encoder requests 265 kbps while negotiation caps 256 kbps | Validate capabilities and select matching CBR at or below the peer's ceiling and 256 kbps |
 | Unused LDAC path | Encoder output has no capacity argument and its configured packet size exceeds the transport limit | Remove LDAC selection and encoding; keep AAC-ELD, AAC-LC and SBC |
 | Media packets | Unchecked lengths and clearing buffered data on failed sends | Bound capability/MTU/packet sizes; retain failed payloads and their timestamps |
@@ -14,6 +16,7 @@ reference file hashes used for these changes.
 | Idle playback | Encoding and radio transmission continue without an input | Request Suspend after one second idle; await confirmation, restart on demand and re-prime AAC-ELD while retaining new USB PCM |
 | Recovery | Encoder resets or playback resumes without confirmed remote state | Confirm Suspend before resetting; close on rejected or timed-out recovery |
 | Connection ownership | Late events can replace the selected peer or revive a cancelled connection | Validate address, CID and pending intent; ignore stale AVRCP and AVDTP events |
+| Case return | A failed connection attempt leaves the saved headset disconnected until a manual retry | Retry the selected address with 1–8 second backoff; cancel retries during pairing and pending codec changes |
 | Saved slots | Key iteration order can substitute another paired device | Require the selected saved address and its matching bond |
 | Slot storage | Two custom buffers erase a sector on each slot/address update | Reuse the SDK's two-bank TLV journal, import the old page, skip unchanged writes and verify readback |
 | Media flushing | Expired controller media can stall control or trigger disconnect | Mark only the media CID flushable, use 200 ms when non-flushable control is supported, and keep flush events from tearing down the ACL |
@@ -90,8 +93,10 @@ their original dimensions.
 
 The real-codec probe keeps stereo ELD at 48 kHz/256 kbps and the microphone
 decoder open together. Live allocator use is 186,872 bytes, down from 379,864.
-The tested allocator peak is 188,040 bytes, leaving 197,744 bytes before other
-application allocations. Heap alignment and allocation order affect arena use.
+The tested allocator peak is 188,040 bytes. The historical 0.1.11 layout left
+197,744 bytes before other application allocations; the 0.1.25 float-capable
+layout has a 263,432-byte heap and leaves 75,392 bytes at that peak. Heap alignment
+and allocation order affect arena use.
 Every firmware link verifies its exact FDK/LHDC archive fingerprints, derives capacity
 from the ELF and reserves 64 KiB for other runtime use. The reserve is a build
 policy, not a measured bound on the application. Tests cover malformed input,
@@ -211,14 +216,47 @@ HCI batching require measured contention and callback fairness first.
 
 ## Protocol choices
 
+Boot enables saved-peer connection intent and requests Game Mode by default;
+the firmware poller runs without a HID or companion client. Existing model,
+firmware, codec and delay-report gates still apply. Unsupported headsets retain
+normal audio. Pairing cancellation still disarms retries for the old peer.
+
+The pinned BTstack AVRCP operation emitter declares its 19-byte scratch buffer
+in the event header but passes only the bytes used to the callback. The headset
+target accepts that known header or an exact header, validating actual size
+against the operand count before parsing. USB PLAY and PAUSE use Consumer
+Play/Pause (0xCD), so the USB host's player owns its playback state.
+
 The existing 48 kHz playback sample-counter RTP clock and encoder SBR setting are
 preserved. A Mac capture's different clock or framing is not enough to establish
 safe start, stop and recovery behavior on this radio.
 
-Playback sends retain at least 40 ms of bounded timer debt, or four codec frames
+Audio callbacks follow the previous timer deadline, compensating for the pinned
+SDK's extra millisecond in `set_timer`. A late callback retains the next tick's
+phase; a missed whole interval schedules a fresh interval rather than spinning.
+Live USB Game Mode also waits for completed encoder priming and 500 ms of warm
+readiness, so its resampled reads cannot consume priming silence.
+
+Playback sends retain at least 60 ms of bounded timer debt, or four codec frames
 when larger. Successful sends can drain another packet from that debt without
 advancing the clock again. Failed sends retry from the main loop, preserving the
 original 200 ms recovery deadline instead of recursively requesting callbacks.
+
+Live USB Game Mode changes use the captured finite 0.9/1.1 interval adjustment,
+with matching stereo fractional resampling from the existing PCM ring. Each 480-frame
+ELD unit consumes 432 or 528 source frames during adjustment; neither the RTP
+sample counter nor encoder is reset. Pacing changes at a complete packet
+boundary. Drift uses successfully sent frames against nominal elapsed time,
+with a ten-second failure limit. USB uses a 960-frame steady reserve and
+3,840-frame transient bound for AAC-ELD. The resampler retains float PCM, phase and a 33-tap
+windowed-sinc history across blocks/rate changes, with 16 frames (0.33 ms) of
+filter delay. It copies a bounded source window while excluding USB IRQs, then
+filters with interrupts enabled. Quantization occurs once at the unchanged S16
+encoder boundary. Two-point interpolation was rejected for continuous clock
+adaptation because fractional phase attenuates high frequencies; synthetic tests
+cover tone fidelity through 20 kHz.
+This adapts the captured producer-clock change to USB's fixed-rate input;
+it does not infer a new RTP clock or claim a reconstructed Core Audio resampler.
 
 One second without USB playback, phone preparation/playback or HQ microphone
 demand requests AVDTP Suspend. Only its acknowledgement marks playback stopped.
@@ -268,7 +306,8 @@ handling using small transport/codec stubs. AddressSanitizer and
 UndefinedBehaviorSanitizer cover those host executions. Cross-compilation checks
 the pinned Pico SDK APIs, descriptors and link limits.
 
-USB descriptors still need Windows enumeration tests. Radio retries, negotiated
+Windows enumeration and actual float alt 2 have been verified on 0.1.25; current
+Android and Symfonium USB-exclusive checks remain pending. Radio retries, negotiated
 MTU, controller flush behavior, audio quality, heap high-water mark, overclock
 stability and microphone clock/gain require the board. Older models need separate
 compatibility checks. Classic audio with concurrent BLE reception and microphone

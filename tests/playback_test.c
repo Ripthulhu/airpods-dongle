@@ -118,6 +118,42 @@ static void test_pcm_matches_linear_queue(void) {
     }
 }
 
+static void test_live_usb_backlog_stays_bounded(void) {
+    assert(playback_pcm_reset(&pcm, 7680, true));
+    int16_t input[96], output[960];
+    for (unsigned ms = 0; ms < 150; ++ms) {
+        for (unsigned frame = 0; frame < 48; ++frame) {
+            input[frame * 2] = (int16_t)(ms * 48 + frame + 1);
+            input[frame * 2 + 1] = (int16_t)-input[frame * 2];
+        }
+        playback_pcm_push(&pcm, input, 48);
+        playback_pcm_limit(&pcm, PLAYBACK_USB_MIN_FRAMES);
+        assert(pcm.used <= PLAYBACK_USB_MIN_FRAMES);
+        if (ms % 10 == 9) {
+            uint32_t copied = playback_pcm_read(&pcm, output, 480);
+            if (ms < 100) assert(copied == 0);
+            else {
+                assert(copied == 480);
+                for (unsigned frame = 0; frame < 480; ++frame) {
+                    int16_t expected = (int16_t)((ms + 1) * 48 - PLAYBACK_USB_MIN_FRAMES + frame + 1);
+                    assert(output[frame * 2] == expected);
+                    assert(output[frame * 2 + 1] == (int16_t)-expected);
+                }
+            }
+        }
+    }
+    // Trimming a wrapped full queue preserves its newest stereo frames.
+    assert(playback_pcm_reset(&pcm, 8, false));
+    const int16_t small[] = {1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,7,-7,8,-8};
+    playback_pcm_push(&pcm, small, 8);
+    assert(playback_pcm_read(&pcm, output, 5) == 5);
+    playback_pcm_push(&pcm, small, 8);
+    assert(playback_pcm_limit(&pcm, 3) == 5);
+    assert(playback_pcm_limit(&pcm, 8) == 0);
+    assert(playback_pcm_read(&pcm, output, 3) == 3);
+    assert(memcmp(output, small + 10, 6 * sizeof(*small)) == 0);
+}
+
 static void test_eld_negotiation(void) {
     uint8_t cap[] = {0x4c,0,0,0,1,0x80,0,0x80,0,0x8c,0,0x83,0xe8,0};
     uint8_t config[14];
@@ -251,6 +287,7 @@ int main(void) {
     test_short_source_and_reset();
     test_overflow_and_usb_chunk_boundaries();
     test_pcm_matches_linear_queue();
+    test_live_usb_backlog_stays_bounded();
     test_eld_negotiation();
     test_eld_packet_bounds_and_sequence_wrap();
     test_peer_fences_cancelled_and_old_connections();

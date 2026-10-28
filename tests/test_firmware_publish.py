@@ -8,7 +8,7 @@ import tempfile
 import textwrap
 import unittest
 
-from test_codec_probe import ROOT, PHONE_RESULT, SYMBOLS, USB_RESULT, probe
+from test_codec_probe import ROOT, PHONE_RESULT, SYMBOLS, TABLE_SYMBOLS, USB_RESULT, probe
 
 PICOTOOL = os.environ.get("PICOTOOL") or shutil.which("picotool")
 
@@ -64,7 +64,7 @@ class FirmwarePublicationTests(unittest.TestCase):
                 root = Path(__file__).resolve().parent.parent
                 args = sys.argv[1:]
                 if "--defined-only" in args:
-                    print({SYMBOLS!r}, end="")
+                    print({TABLE_SYMBOLS!r} if "--format=sysv" in args else {SYMBOLS!r}, end="")
                 elif "-o" in args:
                     Path(args[args.index("-o") + 1]).write_bytes(b"probe")
                 elif "-kernel" in args:

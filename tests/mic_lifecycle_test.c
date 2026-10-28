@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "../src/btstack/mic_decoder_lifecycle.h"
+#include "../src/tinyusb/mic_request.h"
 
 static bool ready, init_succeeds, release_ack = true;
 static unsigned attempts, releases;
@@ -21,6 +22,25 @@ static mic_decoder_prepare_t poll(mic_decoder_lifecycle_t *state, bool wanted,
                                    bool phone_connected, bool phone_released) {
     mic_decoder_lifecycle_release(state, phone_connected && !wanted);
     return mic_decoder_lifecycle_prepare(state, wanted, phone_released);
+}
+
+
+static usb_mic_request_t usb_request;
+static unsigned request_notifications, stopped;
+static bool usb_mic_take_request(bool *wanted) {return usb_mic_request_take(&usb_request,wanted);}
+bool aacp_mic_dec_ready(void) {return ready;}
+static void dongle_playback_mic_request_changed(void) {++request_notifications;}
+static void aacp_mic_stop(void) {++stopped;}
+#include "main_mic_request.inc"
+static void coalesced_request_reaches_playback(void) {
+    mic_decoder_lifecycle_t state={0}; ready=true;
+    usb_mic_request_set(&usb_request,true); main_mic_request(&state);
+    assert(request_notifications==1 && stopped==1 && state.start_pending);
+    state.start_pending=false;
+    usb_mic_request_set(&usb_request,false); usb_mic_request_set(&usb_request,true);
+    main_mic_request(&state);
+    assert(request_notifications==2 && stopped==2 && state.start_pending);
+    main_mic_request(&state); assert(request_notifications==2 && stopped==2);
 }
 
 int main(void) {
@@ -66,5 +86,6 @@ int main(void) {
     assert(poll(&state, true, true, false) == MIC_DECODER_WAITING && attempts == 3);
     assert(poll(&state, true, false, true) == MIC_DECODER_READY && attempts == 4);
     assert(releases > 0);
+    coalesced_request_reaches_playback();
     puts("microphone lifecycle: bounded failed allocation, fresh-open recovery, detach and cancellation passed");
 }

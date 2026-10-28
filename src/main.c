@@ -47,6 +47,15 @@
 #include "pico/multicore.h"
 #include "radio_clock.h"
 #include "realtime_metrics.h"
+#include "runtime_watch.h"
+
+// Preserve fault status for the watchdog reboot; do not attempt to resume a fault.
+void __attribute__((noreturn)) isr_hardfault(void) {
+    runtime_watch_fault(watchdog_hw->scratch,
+        *(volatile uint32_t *)0xe000ed28u,*(volatile uint32_t *)0xe000ed2cu);
+    if(get_core_num())hw_set_bits(&watchdog_hw->scratch[0],RUNTIME_WATCH_CORE1);
+    for (;;) __asm volatile("wfe");
+}
 
 // Scratch-X holds encoder PCM; give the decoder worker its own main-RAM stack.
 static uint32_t codec_stack[4096] __attribute__((aligned(8)));
@@ -157,45 +166,42 @@ static void process_button_actions(void){
     async_context_t *ctx = cyw43_arch_async_context();
 
     if (atomic_exchange(&btn_phone_pending, false)) {
+        runtime_watch_set(WATCH_BUTTON_ACTION_LOCK);
         async_context_acquire_lock_blocking(ctx);
+        runtime_watch_set(WATCH_BUTTON_ACTION);
         bt_hci_phone_pairing_start();
+        runtime_watch_set(WATCH_BUTTON_ACTION_UNLOCK);
         async_context_release_lock(ctx);
     }
 
     if (atomic_exchange(&btn_single_pending, false)) {
+        runtime_watch_set(WATCH_BUTTON_ACTION_LOCK);
         async_context_acquire_lock_blocking(ctx);
+        runtime_watch_set(WATCH_BUTTON_ACTION);
         if (! get_a2dp_connected_flag()) {
             a2dp_source_reconnect();
         } else {
             increase_vol_by_key();
         }
+        runtime_watch_set(WATCH_BUTTON_ACTION_UNLOCK);
         async_context_release_lock(ctx);
     }
 
     if (atomic_exchange(&btn_double_pending, false)) {
+        runtime_watch_set(WATCH_BUTTON_ACTION_LOCK);
         async_context_acquire_lock_blocking(ctx);
-        bool allow = get_allow_switch_slot();
-        if (!allow) decrease_vol_by_key();
-
-        if (allow) {
-            uint8_t currect_slot = read_uint8_last_flash();
-            uint8_t next_slot = currect_slot == 1 ? 2 : 1;
-            if (write_uint8_last_flash(next_slot)) {
-                set_led_mode_off();
-                if (next_slot == 2) set_led_mode_triple_blink();
-                else set_led_mode_double_blink();
-                get_link_keys();
-                avdtp_source_establish_stream();
-            } else {
-                printf("Slot selection could not be saved\n");
-            }
-        }
+        runtime_watch_set(WATCH_BUTTON_ACTION);
+        (void)dongle_playback_game_toggle();
+        runtime_watch_set(WATCH_BUTTON_ACTION_UNLOCK);
         async_context_release_lock(ctx);
     }
 
     if (atomic_exchange(&btn_long_pending, false)) {
+        runtime_watch_set(WATCH_BUTTON_ACTION_LOCK);
         async_context_acquire_lock_blocking(ctx);
+        runtime_watch_set(WATCH_BUTTON_ACTION);
         avdtp_disconnect_and_scan();
+        runtime_watch_set(WATCH_BUTTON_ACTION_UNLOCK);
         async_context_release_lock(ctx);
     }
 }
@@ -212,14 +218,18 @@ static uint64_t press_start_us   = 0;       // when current press began
 static button_gesture_t button_gesture;
 
 static void __no_inline_not_in_flash_func(read_bootsel)(void *value) {
+    runtime_watch_set(WATCH_BOOTSEL_READ);
     *(bool *)value = get_bootsel_button();
+    runtime_watch_set(WATCH_BOOTSEL_EXIT);
 }
 
 // BOOTSEL temporarily disconnects QSPI; pause core1 before sampling it.
 void check_bootsel_state(void)
 {
     bool raw;
+    runtime_watch_set(WATCH_BOOTSEL_ENTER);
     if (flash_safe_execute(read_bootsel, &raw, 1) != PICO_OK) return;
+    runtime_watch_set(WATCH_BUTTON);
     uint64_t now = time_us_64();
 
     // --- debounce ---
@@ -255,9 +265,11 @@ void check_bootsel_state(void)
 
 
 bool usb_timer_callback(repeating_timer_t *rt){
+    hw_set_bits(&watchdog_hw->scratch[0],RUNTIME_WATCH_USB);
     uint32_t started = time_us_32();
     tinyusb_task();
     realtime_metric_record(&usb_service_metric, started, time_us_32(), REALTIME_USB_SERVICE_BUDGET_US);
+    hw_clear_bits(&watchdog_hw->scratch[0],RUNTIME_WATCH_USB);
     return true;
 }
 
@@ -303,14 +315,26 @@ int main() {
     debug_cdc_init();   // route printf() into the CDC ring from the very start
                         // (drained over USB once tusb is up and a terminal opens)
 
+    if(watchdog_enable_caused_reboot() &&
+       (watchdog_hw->scratch[0]&0xffff0000u)==RUNTIME_WATCH_MAGIC) {
+        printf("[HANG] state=%08lx checkpoint_us=%lu cfsr=%08lx hfsr=%08lx\n",
+            (unsigned long)watchdog_hw->scratch[0],(unsigned long)watchdog_hw->scratch[1],
+            (unsigned long)watchdog_hw->scratch[2],(unsigned long)watchdog_hw->scratch[3]);
+    }
+    // Scratch 4..7 belong to SDK reboot/BOOTSEL handling.
+    for(unsigned i=0;i<4;++i)watchdog_hw->scratch[i]=0;
+    runtime_watch_set(WATCH_BOOT);
+
     if (!codec_core_start()) {
         printf("Codec core flash coordination unavailable\n");
         return 1;
     }
 
     // Distinguish watchdog resets from clean power-on boots in the debug log.
-    if (watchdog_caused_reboot()) {
+    if (watchdog_enable_caused_reboot()) {
         printf("!!! BOOT REASON: WATCHDOG RESET (previous run hung)\n");
+    } else if (watchdog_caused_reboot()) {
+        printf("boot reason: requested watchdog reboot\n");
     } else {
         printf("boot reason: normal power-on/reset\n");
     }
@@ -386,20 +410,29 @@ int main() {
     mic_decoder_lifecycle_t decoder = {0};
     uint32_t button_sample_ms = to_ms_since_boot(get_absolute_time());
     while (1) {
-        watchdog_update();  // feed the watchdog
+        runtime_watch_set(WATCH_LOOP);
+        if(!(watchdog_hw->scratch[0]&RUNTIME_WATCH_FAULT))watchdog_update();
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if ((uint32_t)(now_ms - button_sample_ms) >= 20u) {
-            button_sample_ms = now_ms;
-            check_bootsel_state();
-        }
+        runtime_watch_set(WATCH_BUTTON_ACTIONS);
         process_button_actions();
 
         bool mic_wanted;
         async_context_t *ctx = cyw43_arch_async_context();
+        runtime_watch_set(WATCH_LOCK);
         async_context_acquire_lock_blocking(ctx);
         uint32_t bluetooth_started = time_us_32();
+        // Serialize SDK flash lockout with Bluetooth's interrupt-driven TLV writes.
+        if ((uint32_t)(now_ms - button_sample_ms) >= 20u) {
+            runtime_watch_set(WATCH_BUTTON);
+            button_sample_ms = now_ms;
+            check_bootsel_state();
+        }
+        runtime_watch_set(WATCH_HCI);
         bt_hci_phone_poll();
+        runtime_watch_set(WATCH_MIC);
         if (usb_mic_take_request(&mic_wanted)) {
+            // Preserve coalesced close/open revisions even when the final request stays true.
+            dongle_playback_mic_request_changed();
             // A fresh open also clears an earlier AACP failure before retrying.
             aacp_mic_stop();
             mic_decoder_lifecycle_request(&decoder, mic_wanted, aacp_mic_dec_ready());
@@ -410,6 +443,7 @@ int main() {
             phone_sink_connected() && !usb_mic_requested() && !aacp_mic_active());
         if ((usb_mic_requested() || aacp_mic_active() || get_usb_streaming()) && phone_sink_connected())
             phone_sink_yield();
+        runtime_watch_set(WATCH_PHONE);
         if (!decoder.releasing) phone_sink_poll();
         ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND,
                             !usb_host_active() && !phone_sink_connected() && !dongle_finder_active());
@@ -420,22 +454,28 @@ int main() {
             usb_mic_requested(), phone_sink_decoder_released());
         if (prepared == MIC_DECODER_FAILED) printf("Microphone decoder unavailable; reopen recording to retry\n");
         aacp_mic_dec_poll();
+        runtime_watch_set(WATCH_CONTROL);
         tinyusb_control_task();
         bt_volume_poll();
         if (prepared == MIC_DECODER_READY && usb_mic_requested()) {
             ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, true);
             aacp_mic_start();
         }
+        runtime_watch_set(WATCH_AACP);
         aacp_poll();
         dongle_control_poll();
+        runtime_watch_set(WATCH_RPC);
         dongle_rpc_poll();
+        runtime_watch_set(WATCH_FEATURES);
         dongle_features_poll();
         phone_control_poll();
-        ble_diagnostics_task();
-        if (debug_cdc_take_timing_request()) realtime_metrics_print();
+        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print(); }
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
+        runtime_watch_set(WATCH_UNLOCK);
         async_context_release_lock(ctx);
-        sleep_ms(1);
+        runtime_watch_set(WATCH_IDLE);
+        uint32_t idle_us = realtime_loop_idle_us(bluetooth_started, time_us_32());
+        if (idle_us) sleep_us(idle_us);
     }
 
 }

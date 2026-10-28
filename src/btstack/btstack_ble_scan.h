@@ -10,6 +10,7 @@
 #define BLE_SCAN_PAUSE_MIC (1u << 0)
 #define BLE_SCAN_PAUSE_INQUIRY (1u << 1)
 #define BLE_SCAN_PAUSE_USB_SUSPEND (1u << 2)
+#define BLE_SCAN_PAUSE_DIAGNOSTIC (1u << 3)
 
 typedef struct {
     uint64_t received_ms;  // Extended Bluetooth uptime, shared with battery readback.
@@ -46,6 +47,8 @@ uint64_t dongle_uptime_ms(void);
 void ble_scan_init(void);
 void ble_scan_controller_ready(bool ready);
 void ble_scan_set_paused(uint32_t reason, bool paused);
+// Temporary A/B test only; automatically resumes within two minutes.
+void ble_scan_diagnostic_pause(bool paused);
 void ble_scan_get_stats(ble_scan_stats_t *stats);
 void ble_scan_snapshot(ble_scan_snapshot_t *snapshot);
 // Borrow each cache entry under the Bluetooth lock; avoid copying the whole cache.

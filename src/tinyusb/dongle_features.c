@@ -4,6 +4,7 @@
 #include "../btstack/btstack_aacp.h"
 #include "../btstack/btstack_avdtp_source.h"
 #include "../btstack/dongle_finder.h"
+#include "../btstack/btstack_ble_scan.h"
 
 static uint8_t error(uint8_t result) {
     switch(result){
@@ -55,6 +56,18 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
         case 9:
             if(size!=1)return 1;
             *length=dongle_playback_status(out,capacity);return *length?0:7;
+        case 11:
+            if(size!=1)return 1;
+            *length=dongle_playback_trace(out,capacity);return *length?0:7;
+        case 12:
+            if(size!=2 || p[1]>1)return 1;
+            ble_scan_diagnostic_pause(p[1]==0);return 0;
+        case 13:
+            if(size!=1)return 1;
+            *length=dongle_playback_inspect(out,capacity);return *length?0:7;
+        case 14:
+            if(size!=2 || p[1]>1)return 1;
+            dongle_playback_inspect_enable(p[1]!=0);return 0;
         default:return 7;
     }
 }

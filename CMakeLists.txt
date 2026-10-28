@@ -6,7 +6,8 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 set(PICOTOOL_GIT_BRANCH 2041936441b48a3cc53ae3da9e805229fe8f4e18)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.11 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.25 LANGUAGES C CXX ASM)
+option(AIRPODS_USB_FLOAT "Expose IEEE float USB input alongside S16 compatibility" ON)
 pico_sdk_init()
 
 if(NOT PICO_BOARD STREQUAL "pico2_w")
@@ -92,11 +93,13 @@ target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_codec_finger
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_lhdc_fingerprint"
     "-Wl,--undefined=airpods_phone_worker_storage_bytes")
 target_compile_definitions(airpods_dongle PRIVATE
+    AIRPODS_USB_FLOAT=$<BOOL:${AIRPODS_USB_FLOAT}>
     CYW43_LWIP=0 CYW43_PIO_CLOCK_DIV_DYNAMIC=1 ENABLE_RIJNDAEL_DECRYPT=1 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
     PICO_CORE1_STACK_SIZE=0 PICO_STACK_SIZE=16384 PICO_USE_STACK_GUARDS=1
 )
 pico_add_linker_script_override_path(airpods_dongle "${dongle_linker}"
-    FILES section_heap.incl sections_stack.incl section_end.incl)
+    FILES section_heap.incl sections_stack.incl section_end.incl
+    default_text_excludes.incl default_rodata_excludes.incl)
 pico_set_program_name(airpods_dongle "AirPods Dongle")
 pico_set_program_version(airpods_dongle "${PROJECT_VERSION}")
 pico_init_picotool()
@@ -108,12 +111,18 @@ set(codec_check_command
     --compiler "${CMAKE_C_COMPILER}" --nm "${CMAKE_NM}"
     --picotool "$<TARGET_FILE:picotool>" --uf2-family "${PICO_PLATFORM}"
     --output "${CMAKE_CURRENT_BINARY_DIR}/codec-probe")
+if(AIRPODS_USB_FLOAT)
+    list(APPEND codec_check_command --usb-audio float)
+else()
+    list(APPEND codec_check_command --usb-audio s16)
+endif()
 if(PICO_RP2350_A2_SUPPORTED)
     list(APPEND codec_check_command --uf2-abs-block)
 endif()
 airpods_add_checked_outputs(airpods_dongle ${codec_check_command})
 set_property(TARGET airpods_dongle APPEND PROPERTY LINK_DEPENDS
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/run.py"
+    "${CMAKE_CURRENT_LIST_DIR}/tools/check_usb_audio.py"
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/probe.c"
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/lhdc_quality.h"
     "${CMAKE_CURRENT_LIST_DIR}/tools/codec_probe/publish.cmake"

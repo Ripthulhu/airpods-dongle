@@ -6,6 +6,14 @@
 static unsigned setting_writes, profile_writes, game_writes, starts, stops, polls;
 static uint8_t result=DONGLE_ACCEPTED;
 static uint8_t expected_setting_id=0x28;
+static bool diagnostic_scan_paused;
+static bool inspection_active;
+void dongle_playback_inspect_enable(bool active) {inspection_active=active;}
+uint16_t dongle_playback_inspect(uint8_t *out,uint16_t cap) {
+    if(cap<400)return 0;
+    memset(out,0,400);out[0]=1;return 400;
+}
+void ble_scan_diagnostic_pause(bool paused) {diagnostic_scan_paused=paused;}
 static uint32_t expected_setting_value=UINT32_C(0x89abcdef);
 uint8_t aacp_setting_write(uint8_t id,uint32_t value) {
     assert(id==expected_setting_id && value==expected_setting_value);setting_writes++;return result;
@@ -25,6 +33,10 @@ uint16_t dongle_playback_status(uint8_t *out,uint16_t cap) {
 uint16_t dongle_playback_diagnostics(uint8_t *out,uint16_t cap) {
     if(cap<64)return 0;
     memset(out,0,64);out[0]=1;return 64;
+}
+uint16_t dongle_playback_trace(uint8_t *out,uint16_t cap) {
+    if(cap<512)return 0;
+    memset(out,0,512);out[0]=1;return 512;
 }
 uint8_t dongle_finder_start(uint8_t client) {assert(client==1);starts++;return result;}
 uint8_t dongle_finder_stop(uint8_t client) {assert(client==1);stops++;return result;}
@@ -68,6 +80,19 @@ int main(void) {
     p[0]=2;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==2 && out[0]==1);
     p[0]=5;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==64);
     p[0]=9;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==20);
+    uint8_t trace[512];p[0]=11;
+    assert(dongle_features_request(1,p,1,trace,511,&n)==7 && !n);
+    assert(dongle_features_request(1,p,1,trace,512,&n)==0 && n==512 && trace[0]==1);
+    const uint8_t scan_off[]={12,0},scan_on[]={12,1},bad_scan[]={12,2};
+    assert(dongle_features_request(1,scan_off,2,out,64,&n)==0 && !n && diagnostic_scan_paused);
+    assert(dongle_features_request(1,scan_on,2,out,64,&n)==0 && !diagnostic_scan_paused);
+    assert(dongle_features_request(1,bad_scan,2,out,64,&n)==1);
+    p[0]=13;assert(dongle_features_request(1,p,1,trace,399,&n)==7 && !n);
+    assert(dongle_features_request(1,p,1,trace,400,&n)==0 && n==400 && trace[0]==1);
+    const uint8_t enable[]={14,1},disable[]={14,0},bad_enable[]={14,2};
+    assert(dongle_features_request(1,enable,2,out,64,&n)==0 && inspection_active && !n);
+    assert(dongle_features_request(1,disable,2,out,64,&n)==0 && !inspection_active);
+    assert(dongle_features_request(1,bad_enable,2,out,64,&n)==1);
     p[0]=0;assert(dongle_features_request(1,p,1,out,64,&n)==7 && n==0);
     dongle_features_poll();dongle_features_disconnect(1);assert(polls==2 && stops==2);
     puts("typed features: validation, exact integer values, aliased buffers, bounded responses and result mapping passed");

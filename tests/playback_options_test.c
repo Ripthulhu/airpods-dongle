@@ -44,7 +44,7 @@ static void test_game_confirmation_and_restore(void) {
     assert(!playback_game_step(&s,true,true,true,700,10,1500) && s.phase==GAME_SENT);
     assert(!playback_game_step(&s,true,true,true,701,11,0) && s.phase==GAME_SENT);
     assert(!playback_game_step(&s,true,true,true,702,12,600) && s.phase==GAME_CONFIRMED);
-    // Pause/microphone holds restore even while the user's preference stays on.
+    // Microphone takeover restores while the user's preference stays on.
     assert(playback_game_step(&s,true,true,false,703,12,600)==150 && s.requested);
     playback_game_queued(&s,150,703,6);
     assert(!playback_game_step(&s,true,true,false,704,13,600));

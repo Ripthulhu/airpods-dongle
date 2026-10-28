@@ -24,6 +24,7 @@
 #include "btstack.h"
 #include "btstack_aacp.h"
 #include "aacp_mic_dec.h"
+#include "btstack_avdtp_source.h"
 #include "dongle_settings.h"
 #include "btstack_ble_scan.h"
 #include "../tinyusb/dongle_rpc.h"
@@ -146,6 +147,10 @@ static btstack_timer_source_t aacp_connect_timer;
 #define TYPE58_HEADER_LEN 22
 static bool aacp_mic_running, aacp_mic_want, aacp_mic_failed, aacp_mic_remote_active;
 static bool aacp_mic_stopping;
+static bool aacp_mic_restore_required, aacp_mic_restore_started, aacp_mic_restore_complete;
+static uint32_t aacp_mic_restore_revision, aacp_mic_restore_since;
+static bool aacp_mic_playback_waiting;
+static uint32_t aacp_mic_playback_since;
 static bool aacp_mic_preparing;
 static bool aacp_mic_start_waiting_for_reset;
 static bool aacp_mic_gap_reset;
@@ -168,6 +173,7 @@ static void aacp_try_mic_start(void);
 static void aacp_mic_teardown(void) {
     aacp_mic_running = false;
     aacp_mic_preparing = false;
+    aacp_mic_playback_waiting=false;
     aacp_mic_gap_reset = false;
     btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
     aacp_mic_pcm_reset();
@@ -175,6 +181,8 @@ static void aacp_mic_teardown(void) {
 
 // Clear ownership before disconnect: a late event must not revive this channel.
 void aacp_disconnect(void) {
+    if (aacp_mic_restore_required && aacp_mic_restore_started)
+        aacp_mic_recovery_failed();
     control_reset();
     uint16_t cid = aacp_cid;
     aacp_session = false;
@@ -182,6 +190,7 @@ void aacp_disconnect(void) {
     aacp_connected = aacp_got_control = aacp_init_sent = false;
     aacp_mic_remote_active = false;
     aacp_mic_stopping = false;
+    aacp_mic_restore_required=aacp_mic_restore_started=aacp_mic_restore_complete=false;
     aacp_tx_head = aacp_tx_count = 0;
     btstack_run_loop_remove_timer(&aacp_connect_timer);
     aacp_mic_teardown();
@@ -241,7 +250,11 @@ void aacp_connect(bd_addr_t addr) {
 }
 
 bool aacp_is_connected(void) { return aacp_connected; }
-bool aacp_mic_active(void) { return aacp_mic_remote_active; }
+bool aacp_mic_active(void) { return aacp_mic_remote_active || aacp_mic_restore_required; }
+bool aacp_mic_uplink_active(void) { return aacp_mic_remote_active || aacp_mic_stopping; }
+void aacp_mic_recovery_failed(void) {
+    aacp_mic_want=false; aacp_mic_failed=true;
+}
 
 static bool aacp_tx_enqueue(const uint8_t *data, uint16_t len) {
     if (aacp_cid == 0 || !aacp_connected || aacp_tx_count == AACP_TX_QUEUE_LEN)
@@ -261,6 +274,7 @@ bool aacp_control_address(bd_addr_t address) {
     return true;
 }
 const dongle_readback_t *aacp_control_readback(void) { return &control_readback; }
+bool aacp_model_known(void) { return settings.profile && settings.firmware_major; }
 bool aacp_model_game_supported(void) {
     return settings.profile && settings.profile->silent_allow_off && settings.firmware_major>=8;
 }
@@ -497,7 +511,7 @@ static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
         bool restart = aacp_mic_restarts++ < AACP_MIC_RESTARTS;
         aacp_mic_teardown();
         if (!aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes))) {
-            aacp_channel_failed();
+            dongle_playback_mic_recovery_abort();
             return;
         }
         if (!restart) {
@@ -513,9 +527,20 @@ static void aacp_mic_stats_report(btstack_timer_source_t *ts) {
 
 static void aacp_try_mic_start(void) {
     if (!usb_mic_requested() || !aacp_mic_want || aacp_mic_failed || aacp_mic_running ||
-        aacp_mic_remote_active || aacp_mic_stopping ||
+        aacp_mic_remote_active || aacp_mic_stopping || aacp_mic_restore_required ||
         !aacp_connected || !aacp_got_control || !aacp_init_sent ||
         aacp_mic_start_queued()) return;
+    if (!dongle_playback_mic_ready()) {
+        uint32_t now=btstack_run_loop_get_time_ms();
+        if (!aacp_mic_playback_waiting) {
+            aacp_mic_playback_waiting=true; aacp_mic_playback_since=now;
+        } else if ((uint32_t)(now-aacp_mic_playback_since)>=3000u) {
+            aacp_mic_failed=true;
+            printf("[MIC] normal playback buffer not ready; close capture before retrying\n");
+        }
+        return;
+    }
+    aacp_mic_playback_waiting=false;
     if (!aacp_mic_dec_ready()) {
         if (aacp_mic_preparing) {
             aacp_mic_failed = true;
@@ -558,12 +583,13 @@ void aacp_mic_start(void) {
 void aacp_mic_stop(void) {
     aacp_mic_want = false;
     aacp_mic_failed = false;
+    aacp_mic_playback_waiting=false;
     aacp_mic_restarts = 0;
     aacp_drop_mic_commands();
     bool sent = aacp_mic_remote_active;
     aacp_mic_teardown();
     if (sent && !aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes)))
-        aacp_channel_failed();
+        dongle_playback_mic_recovery_abort();
 }
 
 static void aacp_handle_can_send_now(void) {
@@ -591,6 +617,15 @@ static void aacp_handle_can_send_now(void) {
         aacp_drop_mic_commands();
         return;
     }
+    if (p.data == aacp_mic_start_bytes &&
+        (aacp_mic_restore_required || !dongle_playback_mic_ready())) {
+        // Retire only this stale Start; a queued Stop must retain its drain receipt.
+        aacp_tx_head=(uint8_t)((aacp_tx_head+1u)%AACP_TX_QUEUE_LEN);
+        --aacp_tx_count;
+        aacp_mic_preparing=aacp_mic_start_waiting_for_reset=false;
+        if (aacp_tx_count) l2cap_request_can_send_now_event(aacp_cid);
+        return;
+    }
     if (p.data == aacp_mic_start_bytes && !aacp_mic_dec_reset_done()) {
         if (!aacp_mic_dec_ready()) {
             aacp_mic_failed = true;
@@ -615,6 +650,7 @@ static void aacp_handle_can_send_now(void) {
     if (p.data==receive_buffer_tx) {
         receive_buffer_last=(uint16_t)dongle_u32(p.data+7);
         if (++receive_buffer_serial==0) ++receive_buffer_serial;
+        dongle_playback_receive_buffer_sent(now);
     }
     aacp_tx_since_ms = btstack_run_loop_get_time_ms();
     if (p.data == research_tx) { research_pending = false; research_result = 1; }
@@ -623,6 +659,8 @@ static void aacp_handle_can_send_now(void) {
         aacp_mic_preparing = false;
         aacp_mic_running = true;
         aacp_mic_remote_active = true;
+        aacp_mic_restore_required=true;
+        aacp_mic_restore_started=aacp_mic_restore_complete=false;
         aacp_mic_completed_seen = aacp_mic_dec_completed();
         mic_stats.last_sdu_ms = btstack_run_loop_get_time_ms();
         btstack_run_loop_remove_timer(&aacp_mic_stats_timer);
@@ -634,6 +672,7 @@ static void aacp_handle_can_send_now(void) {
         if (!aacp_mic_stopping) aacp_mic_stop_retries = 0;
         aacp_mic_stopping = true;
         aacp_mic_stop_since_ms = aacp_last_uplink_ms = btstack_run_loop_get_time_ms();
+        aacp_mic_restore_since=aacp_mic_stop_since_ms;
     }
     if (aacp_tx_count != 0) l2cap_request_can_send_now_event(aacp_cid);
     aacp_try_mic_start();
@@ -676,11 +715,33 @@ void aacp_poll(void) {
             if (aacp_mic_stop_retries++ == 0) {
                 aacp_mic_stop_since_ms = now;
                 if (!aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes)))
-                    aacp_channel_failed();
+                    dongle_playback_mic_recovery_abort();
             } else {
-                aacp_channel_failed();
+                dongle_playback_mic_recovery_abort();
             }
             return;
+        }
+    }
+    if (aacp_mic_restore_required && !aacp_mic_remote_active && !aacp_mic_stopping) {
+        if (!aacp_mic_restore_started) {
+            aacp_mic_restore_revision=dongle_playback_mic_recovery_revision();
+            aacp_mic_restore_started=dongle_playback_mic_recover();
+            if (!aacp_mic_restore_started && (uint32_t)(now-aacp_mic_restore_since)>=8000u) {
+                dongle_playback_mic_recovery_abort();
+                return;
+            }
+        } else if (dongle_playback_mic_recovery_revision()!=aacp_mic_restore_revision) {
+            if (!aacp_mic_restore_complete) {
+                aacp_mic_restore_complete=true;
+                aacp_mic_restore_since=now;
+            }
+            if ((uint32_t)(now-aacp_mic_restore_since)>=AACP_MIC_QUIET_MS &&
+                (uint32_t)(now-aacp_last_uplink_ms)>=AACP_MIC_QUIET_MS) {
+                aacp_mic_restore_required=aacp_mic_restore_started=aacp_mic_restore_complete=false;
+            } else if ((uint32_t)(now-aacp_mic_restore_since)>=AACP_MIC_DRAIN_MS) {
+                dongle_playback_mic_recovery_abort();
+                return;
+            }
         }
     }
     aacp_try_mic_start();
@@ -716,8 +777,11 @@ static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
     if (!usb_mic_requested() && aacp_mic_want) aacp_mic_stop();
     if (!usb_mic_requested() || !aacp_mic_want || !aacp_mic_running) {
         aacp_last_uplink_ms = now;
-        if (!aacp_mic_want && !aacp_mic_remote_active && !aacp_mic_stopping) {
+        if (!aacp_mic_want && !aacp_mic_remote_active && !aacp_mic_stopping &&
+            !aacp_mic_restore_required) {
             aacp_mic_remote_active = true;
+            aacp_mic_restore_required=true;
+            aacp_mic_restore_started=aacp_mic_restore_complete=false;
             if (!aacp_tx_enqueue(aacp_mic_stop_bytes, sizeof(aacp_mic_stop_bytes)))
                 aacp_channel_failed();
         }

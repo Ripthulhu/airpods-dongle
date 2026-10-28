@@ -49,6 +49,8 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 8: stop nearby finder | none | empty |
 | 9: audio profile status | none | profile status below |
 | 10: settings workflow lease | action u8, token u32 | acquire: version u8=1, token u32; renew/release: empty |
+| 11: audio trace | none | read-only 512-byte version-1 snapshot; see audio continuity document |
+| 12: diagnostic BLE scan policy | enabled u8 (0/1) | empty; disabling expires after 120 seconds |
 
 Cached report slot 6 also returns the settings snapshot. Format: version u8=1,
 count u8, then count records of control ID u8, age milliseconds u32, report
@@ -138,25 +140,73 @@ negotiation. Explicit choices never fall back silently, and pending negotiation
 has a 15-second deadline.
 Starting headset pairing cancels any pending profile reconnect before discovery.
 
-Startup priming stays fixed at 100 ms. Profiles do not change timestamps,
-packet grouping, PCM reserve or flush policy. These controls report transport
+Startup priming stays fixed at 100 ms. USB retains at most 1,440 frames during
+startup, targets 960 frames remaining after a normal read, and allows 3,840 frames
+during active AAC-ELD playback. Larger codec units extend the active capacity.
+Excessive stalls reconcile discarded PCM and scheduling debt in one counted
+recovery; healthy playback no longer uses the old unconditional 30 ms trim.
+The phone queue is unchanged. See [audio continuity](AUDIO-CONTINUITY.md).
+Profiles do not change timestamps, packet grouping, PCM allocation or flush policy. These controls report transport
 configuration, not an acoustic quality or latency measurement.
 
 ## Game Mode
 
+Game Mode is requested by default at boot. It does not require a companion
+command, and a session override is reset at the next power cycle.
+
 The current gate requires a recognized Pro 3, firmware major at least 8,
 negotiated AAC-ELD and that endpoint's advertised delay-reporting support.
-After 500 ms of active playback, firmware requests the reviewed 60 ms receive
-buffer with AACP control `0B`. It restores 150 ms on pause, source loss,
-microphone use or disable, retaining a restore obligation across a same-pair
-AACP reconnect. Missing confirmations time out rather than retrying forever.
-The user preference can remain on while playback is paused.
+The AAC-ELD Set Configuration also selects the delay-reporting service category;
+advertising support alone does not enable reports. Reports must match both the
+active connection ID and local stream endpoint.
+Firmware requests the reviewed 60 ms receive buffer with AACP control `0B`
+after 500 ms of stereo readiness. Firmware 0.1.16 can enter or leave Game Mode
+during USB playback. A fresh report selects a finite interval change: 1.1 when
+the delay exceeds the target, or 0.9 when below. The absolute difference is the
+drift goal, minus 10 ms of headroom on entry when the difference exceeds 10 ms.
+The adjustment begins between complete media packets. USB PCM is resampled at
+the matching ratio so fixed-rate ingress does not become a new latency backlog.
+Successful media sends measure drift against nominal elapsed frames; reaching
+the goal returns pacing to normal. A ten-second deadline fails the adjustment
+and requests restoration rather than claiming completion. Pauses, microphone
+use, peer/session changes and transport stops cancel the temporary rate.
+Gaming ELD packets hold at most two access units, versus three normally.
+The phone input still prepares while suspended; its live clock is separate.
+Resume waits for the preparation's report or bounded failure. Ordinary pauses
+retain the target; microphone use or disable restores 150 ms. A same-pair AACP
+reconnect retains the restore obligation. Missing confirmations time out rather
+than retrying forever. The user's preference can stay on while paused.
+
+Pro 3 / 9A348 testing of the live request produced a fresh 159 ms report and no
+clear audible reduction. With 0.1.15 and the stream suspended, disabling then
+enabling Game Mode produced fresh reports of 150 ms then 60 ms on the same
+connection. A paused player can leave Windows' USB stream running; preparation
+in 0.1.15 waited for actual stream suspension. These reports do not measure acoustic delay;
+the playback comparison remains separate from the paused protocol check.
+The listener then confirmed less delay and clean audio after resuming. Five
+playback samples retained the same connection, with zero underflows, send
+failures or recoveries and no increase in the cumulative PCM drop counter.
+The last delay report remained 60 ms; no new report was received during playback.
 
 Queued, sent and confirmed are separate states. Confirmation requires actual
 successful command transmission and a new nonzero AVDTP delay report within
 two seconds. An old report cannot confirm a new request. This establishes a
 transport response, not measured speaker delay or a guarantee that the buds
-adopted exactly the requested buffer.
+adopted exactly the requested buffer. During a live adjustment, status remains
+pending (or restoring) until its finite rate change ends. On 27 October 2026,
+the 0.1.16 live board check completed on/off/on adjustments without a reconnect
+or media suspension. The listener confirmed clean, continuous playback in both
+directions and less delay on entry. The immediate reports were 76, 65 and 116 ms;
+the finite adjustments completed in 32, 815 and 406 ms. These reports precede the
+completed clock adjustment and must not be presented as final acoustic latency.
+Separately, the user measured total speaker latency at approximately 60 ms
+with Game Mode on using a visual test while listening.
+No send failures or recoveries occurred. The three comparison windows added no
+underflow frames, but the bounded source queue did discard 1296, 384 and 864
+frames respectively; this is not a lossless PCM or long-duration stability claim.
+The request is armed before enqueueing because BTstack may send synchronously.
+The successful-send callback records the delay-report revision, so a report that
+arrived while the command was queued cannot confirm it.
 
 ## Audio profile status (20 bytes)
 
@@ -189,6 +239,13 @@ Counters accumulate from boot and wrap modulo u32. Heap remaining is linked
 heap capacity minus allocator-reported allocated bytes; it is not a stack or
 fragmentation measurement. `FFFFFFFF` means unavailable where defined.
 Snapshot reads never run a hardware self-check or acquire audio.
+
+Feature 11 adds USB ingress, source discontinuities, packet timing, controller
+events and the selected USB alternate setting without changing features 5 or 9.
+Feature 12 changes only the temporary diagnostic scan pause; normal microphone,
+pairing and suspend policy still applies. It is intended for bounded A/B captures,
+not as a persistent playback preference. Neither command edits hearing settings.
+The exact layout and capture commands are in [audio continuity](AUDIO-CONTINUITY.md).
 
 ## Case BLE battery observations
 
@@ -260,3 +317,40 @@ existing player-specific pause ownership; stale reports, reconnects and manual
 playback changes cannot authorize an unrelated player to resume. USB/phone input
 ownership in the profile status also revokes the other app's automatic pause.
 Firmware sends no global media resume on ear reinsertion.
+
+
+## AAC-ELD signal inspection (typed feature 13, firmware 0.1.22)
+
+Request is one byte, 13. Response is exactly 400 bytes, little-endian. It is a
+read-only opt-in diagnostic, unsupported for other codecs. Header bytes 0..3:
+version 1, codec 3 (AAC-ELD), flags (bit 0 AU truncated, bit 1 capture active), ASC length 1..8. Offset 4 is
+snapshot microseconds (u32). Fourteen u32 values begin at offset 8, in order:
+USB sample count; USB nonzero samples; latest USB packet peak Q15 (0..32768);
+last nonzero USB microseconds; encoder-input sample count; encoder nonzero
+samples; latest encoder-input peak Q15; last nonzero encoder microseconds;
+submitted AU count; last submitted AU microseconds; actual last AU byte length;
+encoder generation; last AU sequence (12-bit); last USB packet microseconds.
+Counts are interleaved samples, not stereo frames; all u32 counters/times wrap.
+
+Offset 64 is the RTP timestamp (u32), 68..75 the ASC padded to eight bytes,
+76 malformed submitted-packet count (u32), and 80..399 the last AU, padded to
+320 bytes. A longer AU sets the truncation flag and is unsuitable for decoding.
+Only an accepted transport submission updates the AU; malformed packet framing
+increments its error count without replacing the previous good snapshot.
+Neither an accepted send nor this snapshot proves receiver delivery. Inspection
+includes a short segment of program audio; default counters omit it.
+
+Double-pressing BOOTSEL now requests the opposite Game Mode through the same
+live control path as typed feature 4. On acceptance, enabling displays two finite
+LED pulses; disabling displays three seconds off, then restores the underlying
+connected/off state. It does not block the audio worker or write pairing flash.
+Game Mode continues to default on at power-up.
+
+Typed feature 14 takes two bytes, 14 and enabled (0/1), and returns no payload.
+Detailed inspection starts disabled. Enable/renew grants a 120-second capture
+lease; disable ends it immediately while retaining the latest snapshot. The
+collector's --inspect option enables it, renews every ten seconds, and disables
+it on exit. Expiry also bounds overhead if the collector disappears. Feature 13
+itself remains read-only. Normal playback does not scan sample arrays or cache
+codec frames, and periodic BLE status printing and BTstack information-level logging are disabled; CDC timing prints
+occur only on an explicit diagnostic request.

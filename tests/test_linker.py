@@ -12,6 +12,8 @@ import make_linker
 # The build validates complete pinned SDK includes; these fixtures isolate the
 # boundaries while preserving markers for untouched SDK sections and aliases.
 SOURCE = {
+    "default_text_excludes.incl": b"*(EXCLUDE_FILE(*libgcc.a: *libm.a:) .text*)\n",
+    "default_rodata_excludes.incl": b"*(EXCLUDE_FILE(*libgcc.a: *libm.a:) .rodata*)\n",
     "section_heap.incl": b"""/* Original SDK notice. */
     .heap (NOLOAD): {
         __end__ = .;
@@ -83,8 +85,26 @@ class LinkerTests(unittest.TestCase):
         with self.fixture_hash(), self.assertRaisesRegex(ValueError, "Unsupported SDK linker"):
             make_linker.generate({})
 
+    def test_only_named_codec_objects_join_existing_ram_exclusions(self):
+        with self.fixture_hash():
+            generated = make_linker.generate(SOURCE)["default_text_excludes.incl"].decode()
+        objects = " ".join("*libfdk-aac.a:" + name for name in make_linker.CODEC_RAM_OBJECTS)
+        self.assertIn("*(EXCLUDE_FILE(*libgcc.a: *libm.a: " + objects + ") .text*)", generated)
+        self.assertEqual(len(make_linker.CODEC_RAM_OBJECTS), 10)
+        self.assertNotIn("*libfdk-aac.a:", generated.replace(objects, ""))
+
+    def test_only_encoder_rom_joins_existing_ram_rodata_exclusions(self):
+        with self.fixture_hash():
+            outputs = make_linker.generate(SOURCE)
+        generated = outputs["default_rodata_excludes.incl"].decode()
+        self.assertIn("*(EXCLUDE_FILE(*libgcc.a: *libm.a: *libfdk-aac.a:aacEnc_rom.cpp.o) .rodata*)", generated)
+        self.assertEqual(generated.count("*libfdk-aac.a:"), 1)
+        self.assertNotIn("aacEnc_rom.cpp.o", outputs["default_text_excludes.incl"].decode())
+
     def test_missing_or_duplicate_context_rejected(self):
         for name, value in [("section_heap.incl", SOURCE["section_heap.incl"].replace(b"KEEP(*(.heap*))", b"changed heap")),
+                            ("default_text_excludes.incl", b"*(EXCLUDE_FILE(*libgcc.a:) .text*)\n"),
+                            ("default_rodata_excludes.incl", b"*(EXCLUDE_FILE(*libgcc.a:) .rodata*)\n"),
                             ("section_end.incl", SOURCE["section_end.incl"] + b"    __StackLimit = ORIGIN(RAM) + LENGTH(RAM);\n")]:
             sources = dict(SOURCE, **{name: value})
             with self.fixture_hash(sources), self.assertRaisesRegex(ValueError, "Unexpected linker context"):

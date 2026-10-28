@@ -17,7 +17,7 @@ def uac_sources(directory):
     start = source.index(" const uint32_t sample_rates[]")
     end = source.index(" static void usb_speaker_stop(void)")
     declarations = source[start:end]
-    start = source.index(" static int16_t spk_buf[")
+    start = source.index(" static union {")
     end = source.index(" //void led_blinking_task", start)
     declarations += source[start:end]
     functions = []
@@ -45,33 +45,87 @@ def uac_sources(directory):
 
 def playback_lifecycle_sources(directory):
     source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    defaults = []
+    for declaration in ["static playback_game_t playback_game", "static bool a2dp_accept_incoming"]:
+        start = source.index(declaration)
+        defaults.append(source[start:source.index(";", start) + 1])
+    (directory / "playback_defaults.inc").write_text("\n".join(defaults))
+    match = re.search(r"(?m)^static void avrcp_target_packet_handler\([^;]*?\)\s*\{", source)
+    if match is None:
+        raise ValueError("Missing AVRCP target callback")
+    start = match.start()
+    end = source.index("\n}", start) + 2
+    (directory / "playback_buttons.inc").write_text(source[start:end])
+    clock_functions = []
+    for signature in ["static void playback_clock_switch(", "static void playback_adjust_cancel_stream("]:
+        match = re.search(r"(?m)^" + re.escape(signature) + r"[^;]*?\{", source)
+        if match is None:
+            raise ValueError("Missing playback clock function: " + signature)
+        start = match.start()
+        end = source.index("\n}", start) + 2
+        clock_functions.append(source[start:end])
+    (directory / "playback_cancel.inc").write_text("\n".join(clock_functions))
     functions = []
     for signature in ["bool avdtp_disconnect_and_scan(void)",
                       "void avdtp_source_establish_stream(void)",
-                      "uint8_t dongle_playback_configure(", "void dongle_playback_poll(void)"]:
+                      "uint8_t dongle_playback_configure(",
+                      "void dongle_playback_mic_request_changed(",
+                      "bool dongle_playback_mic_ready(", "bool dongle_playback_mic_recover(",
+                      "uint32_t dongle_playback_mic_recovery_revision(",
+                      "void dongle_playback_mic_recovery_abort(",
+                      "uint8_t dongle_playback_game_mode(", "uint8_t dongle_playback_game_toggle(",
+                      "void dongle_playback_receive_buffer_sent(",
+                      "static void playback_reconnect_poll(", "void dongle_playback_poll(void)"]:
         start = source.index("\n" + signature) + 1
         end = source.index("\n}", start) + 2
         functions.append(source[start:end])
     (directory / "playback_lifecycle.inc").write_text("\n".join(functions))
+    functions = []
+    for signature in ["static int setup_aaceld_configuration(){", "static bool playback_game_eligible(void) {"]:
+        start = source.index("\n" + signature) + 1
+        end = source.index("\n}", start) + 2
+        functions.append(source[start:end])
+    (directory / "playback_delay.inc").write_text("\n".join(functions))
+    start = source.index("        case AVDTP_SUBEVENT_SIGNALING_DELAY_REPORT:")
+    start = source.index("\n", start) + 1
+    end = source.index("        case ", start)
+    (directory / "playback_delay_report.inc").write_text(source[start:end])
     start = source.index("        case AVDTP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:")
     start = source.index("\n", start) + 1
     end = source.index("        default:", start)
     (directory / "playback_release.inc").write_text(source[start:end])
 
     functions = []
-    for signature in ["static int fill_sbc_audio_buffer(", "static int fill_aac_audio_buffer(",
+    for signature in ["static void playback_clock_accrue(", "static void playback_clock_switch(",
+                      "static void playback_adjust_cancel_stream(",
+                      "static void playback_transport_recover(",
+                      "static int fill_sbc_audio_buffer(", "static int fill_aac_audio_buffer(",
                       "static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint32_t now)",
                       "static void avdtp_audio_timeout_handler(",
                       "static void a2dp_demo_send_media_packet("]:
         if "\n" + signature not in source:
             continue
-        start = source.index("\n" + signature) + 1
+        match=re.search(r"(?m)^"+re.escape(signature)+r"[^;]*?\{",source)
+        if match is None:raise ValueError("Missing playback function: "+signature)
+        start = match.start()
         end = source.index("\n}", start) + 2
         functions.append(source[start:end])
-    (directory / "playback_timing.inc").write_text("\n".join(functions))
+    production_pcm = []
+    for signature in ["static void playback_pcm_push_measured(", "static void audio_slot_push_data(",
+                      "void audio_slot_push_samples(", "void audio_slot_push_float(",
+                      "static void audio_pcm_read(", "static void playback_audio_work("]:
+        start = source.index("\n" + signature) + 1
+        end = source.index("\n}", start) + 2
+        production_pcm.append(source[start:end])
+    (directory / "playback_pipeline.inc").write_text("\n".join(production_pcm))
+    instrumentation = '''
+#include "playback_test_hooks.h"
+'''
+    (directory / "playback_timing.inc").write_text(instrumentation+"\n".join(functions))
 
     functions = []
     for signature in ["static void playback_idle_reset(void) {",
+                      "static bool playback_pcm_warm(void) {",
                       "static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){",
                       "static int playback_encoder_failed(",
                       "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
@@ -86,6 +140,25 @@ def playback_lifecycle_sources(directory):
     (directory / "playback_accept.inc").write_text(source[start:end])
 
 
+def main_button_sources(directory):
+    source = (ROOT / "src/main.c").read_text(encoding="utf-8")
+    start=source.index("        if (usb_mic_take_request(&mic_wanted)) {")
+    end=source.index("\n        }",start)+10
+    (directory / "main_mic_request.inc").write_text(
+        "static void main_mic_request(mic_decoder_lifecycle_t *state) {\n"
+        "    mic_decoder_lifecycle_t decoder=*state; bool mic_wanted;\n"+
+        source[start:end]+"\n    *state=decoder;\n}\n")
+    loop = source.index("    mic_decoder_lifecycle_t decoder = {0};")
+    start = source.index("        uint32_t now_ms =", loop)
+    end = source.index("        bt_hci_phone_poll();", start)
+    (directory / "main_button_poll.inc").write_text(
+        "static void main_button_poll(uint32_t *last_sample) {\n"
+        "    uint32_t button_sample_ms=*last_sample;\n" + source[start:end] +
+        "    (void)mic_wanted; (void)bluetooth_started;\n"
+        "    *last_sample=button_sample_ms;\n"
+        "    async_context_release_lock(ctx);\n}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
@@ -94,8 +167,12 @@ def main():
     tests = {
         "peer": ["tests/peer_test.c"],
         "button_gesture": ["tests/button_gesture_test.c"],
+        "led": ["-Itests/led_stubs", "tests/led_test.c"],
         "radio_clock": ["tests/radio_clock_test.c"],
         "realtime_metrics": ["tests/realtime_metrics_test.c"],
+        "runtime_watch": ["tests/runtime_watch_test.c"],
+        "main_button_lock": ["tests/main_button_lock_test.c"],
+        "playback_inspect": ["tests/playback_inspect_test.c"],
         "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
@@ -108,14 +185,21 @@ def main():
         "dongle_case_battery": ["-Itests/case_stubs", "tests/dongle_case_battery_test.c"],
         "playback": ["tests/playback_test.c"],
         "playback_options": ["tests/playback_options_test.c"],
+        "playback_adjust": ["tests/playback_adjust_test.c"],
+        "playback_delay": ["tests/playback_delay_test.c"],
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],
+        "playback_buttons": ["tests/playback_buttons_test.c"],
         "playback_timing": ["tests/playback_timing_test.c"],
+        "playback_trace": ["tests/playback_trace_test.c"],
+        "playback_float": ["tests/playback_float_test.c", "-lm"],
+        "playback_pipeline": ["-Wno-unused-function", "tests/playback_pipeline_test.c"],
         "playback_idle": ["tests/playback_idle_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],
         "dongle_settings": ["tests/dongle_settings_test.c"],
         "att": ["-Itests/aacp_stubs", "-Wno-unused-function", "tests/att_test.c"],
         "usb_control": ["tests/usb_control_test.c"],
         "uac": ["tests/uac_test.c"],
+        "uac_s16": ["-DAIRPODS_USB_FLOAT=0", "tests/uac_test.c"],
         "volume_sync": ["tests/volume_sync_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],
@@ -135,12 +219,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:
         playback_lifecycle_sources(pathlib.Path(tmp))
         uac_sources(pathlib.Path(tmp))
+        main_button_sources(pathlib.Path(tmp))
         for name, sources in tests.items():
             binary = pathlib.Path(tmp) / name
             command = [args.cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-g", "-O1"]
             if args.sanitize:
                 command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-no-pie"]
-            subprocess.run([*command, "-I", tmp, *sources, "-o", str(binary)], cwd=ROOT, check=True)
+            subprocess.run([*command, "-I", tmp, "-Itests", *sources, "-o", str(binary)], cwd=ROOT, check=True)
             subprocess.run([str(binary)], cwd=ROOT, check=True)
             print(f"PASS {name}", flush=True)
     subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],

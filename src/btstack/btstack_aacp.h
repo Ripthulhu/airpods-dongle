@@ -43,8 +43,12 @@ bool aacp_is_connected(void);
 void aacp_mic_start(void);
 void aacp_mic_stop(void);
 
-// True after START is sent or unsolicited audio arrives, until quiet after STOP/close.
+// True through uplink drain and confirmed playback repair after an attempted START.
 bool aacp_mic_active(void);
+// Physical uplink/drain only; the broader active guard also owns playback cleanup.
+bool aacp_mic_uplink_active(void);
+// Playback repair failure requires a fresh USB capture request, never an automatic loop.
+void aacp_mic_recovery_failed(void);
 
 // Bounded host controls; readback is separate from command acceptance.
 uint32_t aacp_control_session(void);
@@ -61,10 +65,13 @@ void aacp_setting_cancel(void); // Remove only its unsent queue entry and clear 
 // Version 1, count, then {id:u8, age_ms:u32, revision:u32, value:u32} records.
 uint16_t aacp_settings_snapshot(uint8_t *out, uint16_t capacity);
 bool aacp_model_game_supported(void);
+bool aacp_model_known(void);
 // Only the stream-owned 60/150 ms policy is allowed; not a general buffer knob.
 uint8_t aacp_receive_buffer(uint16_t milliseconds);
 uint32_t aacp_receive_buffer_serial(void);
 uint16_t aacp_receive_buffer_last(void);
+// Stream-owner callback at the actual send, before any new delay report can arrive.
+void dongle_playback_receive_buffer_sent(uint32_t now);
 // Pair-bound key retained through same-peer radio loss, never a host-supplied key.
 bool aacp_pair_irk(uint8_t address[6], uint8_t key[16]);
 // Pro 3 only; private advertising key, retained across same-peer AACP loss.

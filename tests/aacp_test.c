@@ -6,6 +6,7 @@ static uint32_t now;
 static uint16_t next_cid, last_disconnected;
 static unsigned connects, disconnects, sends, starts, stops, decoded, resets;
 static unsigned setting_sends;
+static unsigned buffer_send_callbacks;
 static uint8_t create_result, send_result;
 static uint16_t remote_mtu = 512;
 static bool decoder_ready = true, decode_ok = true;
@@ -13,6 +14,17 @@ static bool decoder_reset_done = true, complete_on_submit = true;
 static uint32_t completed;
 static bool usb_capture_wanted;
 static bool transport_current;
+static bool playback_mic_ready=true, playback_recover_auto=true, playback_recover_accept=true;
+static uint32_t playback_recovery_revision;
+static unsigned playback_repairs, playback_aborts;
+bool dongle_playback_mic_ready(void) {return playback_mic_ready;}
+bool dongle_playback_mic_recover(void) {
+    ++playback_repairs;
+    if (playback_recover_accept && playback_recover_auto) ++playback_recovery_revision;
+    return playback_recover_accept;
+}
+uint32_t dongle_playback_mic_recovery_revision(void) {return playback_recovery_revision;}
+void dongle_playback_mic_recovery_abort(void) {++playback_aborts;aacp_mic_recovery_failed();aacp_disconnect();}
 static bd_addr_t peer = {1, 2, 3, 4, 5, 6};
 
 void btstack_run_loop_remove_timer(btstack_timer_source_t *timer) { timer->active = false; }
@@ -34,6 +46,10 @@ uint8_t l2cap_create_channel(btstack_packet_handler_t handler, bd_addr_t addr,
 }
 void l2cap_disconnect(uint16_t cid) { disconnects++; last_disconnected = cid; }
 void l2cap_request_can_send_now_event(uint16_t cid) { assert(cid != 0); }
+void dongle_playback_receive_buffer_sent(uint32_t sent_at) {
+    assert(sent_at==now && aacp_receive_buffer_serial()!=0);
+    ++buffer_send_callbacks;
+}
 uint16_t l2cap_get_remote_mtu_for_local_cid(uint16_t cid) { assert(cid != 0); return remote_mtu; }
 uint8_t l2cap_send(uint16_t cid, uint8_t *data, uint16_t len) {
     assert(cid == aacp_cid && len != 0);
@@ -91,6 +107,12 @@ static void quiet_after_stop(void) {
     now += AACP_MIC_QUIET_MS;
     aacp_poll();
     drain();
+    if (playback_recover_auto) {
+        aacp_poll(); // Observe the asynchronous media Start receipt.
+        now += AACP_MIC_QUIET_MS;
+        aacp_poll();
+        drain();
+    }
 }
 static void fixture(void) {
     aacp_init();
@@ -102,12 +124,15 @@ static void fixture(void) {
     last_disconnected = 0;
     connects = disconnects = sends = starts = stops = decoded = resets = 0;
     setting_sends = 0;
+    buffer_send_callbacks = 0;
     create_result = send_result = 0;
     decoder_ready = decode_ok = true;
     decoder_reset_done = complete_on_submit = true;
     completed = 0;
     usb_capture_wanted = false;
     transport_current = true;
+    playback_mic_ready=playback_recover_auto=playback_recover_accept=true;
+    playback_recovery_revision=playback_repairs=playback_aborts=0;
 }
 static void request_capture(void) {
     usb_capture_wanted = true;
@@ -137,6 +162,57 @@ static unsigned audio(uint8_t *p, uint16_t cid, unsigned size) {
     aacp_packet_handler(L2CAP_DATA_PACKET, cid, p, (uint16_t)size);
     aacp_poll();
     return decoded;
+}
+
+
+static unsigned audio(uint8_t *,uint16_t,unsigned);
+static void test_playback_gate_and_repair_receipt(void) {
+    fixture(); ready(); playback_mic_ready=false; request_capture();
+    aacp_poll(); assert(!starts && !aacp_mic_start_queued());
+    now=2999; aacp_poll(); assert(!aacp_mic_failed);
+    now=3000; aacp_poll(); assert(aacp_mic_failed && !starts);
+    playback_mic_ready=true; aacp_poll(); assert(!aacp_mic_start_queued());
+    close_capture(); request_capture(); assert(aacp_mic_start_queued());
+    // A delayed send must recheck the normal-buffer receipt, not just the click.
+    playback_mic_ready=false; drain(); assert(!starts && !aacp_mic_start_queued());
+    playback_mic_ready=true; aacp_poll(); drain(); assert(starts==1);
+    playback_recover_auto=false; close_capture(); drain();
+    request_capture(); // A rapid reopen cannot bypass the previous Stop/repair.
+    now+=499; aacp_poll(); assert(!playback_repairs && starts==1);
+    ++now; aacp_poll(); assert(playback_repairs==1 && aacp_mic_active());
+    assert(!aacp_mic_uplink_active() && !aacp_mic_start_queued());
+    aacp_poll(); assert(playback_repairs==1 && starts==1);
+    ++playback_recovery_revision; aacp_poll();
+    now+=499; aacp_poll(); assert(aacp_mic_active() && starts==1);
+    ++now; aacp_poll(); assert(!aacp_mic_active() && aacp_mic_start_queued());
+    drain(); assert(starts==2 && aacp_mic_active());
+    assert(!playback_aborts);
+}
+static void test_repair_failure_and_late_uplink_are_bounded(void) {
+    fixture(); capture(); playback_recover_auto=false;
+    close_capture(); drain(); now+=500; aacp_poll();
+    assert(playback_repairs==1 && aacp_mic_restore_started);
+    aacp_disconnect(); // A rejected/missing media receipt must not retry a held capture.
+    assert(aacp_mic_failed && !aacp_mic_want && !aacp_mic_active());
+    usb_capture_wanted=true; ready(); aacp_poll(); drain(); assert(starts==1);
+    close_capture(); request_capture(); drain(); assert(starts==2);
+    fixture(); capture(); playback_recover_auto=false;
+    close_capture(); drain(); now+=500; aacp_poll();
+    ++playback_recovery_revision; aacp_poll();
+    uint8_t p[29]={4,0,4,0,0x58,0,1,0};p[26]=2;p[27]=1;p[28]=2;
+    for (unsigned i=0;i<4;++i) {
+        now+=499; audio(p,aacp_cid,sizeof(p));
+        assert(aacp_mic_active());
+    }
+    now+=4; audio(p,aacp_cid,sizeof(p));
+    assert(playback_aborts==1 && !aacp_mic_active() && aacp_mic_failed);
+    fixture(); capture();
+    // A full control queue cannot silently lose the only Stop.
+    while(aacp_tx_count<AACP_TX_QUEUE_LEN)assert(aacp_tx_enqueue(aacp_handshake,sizeof(aacp_handshake)));
+    close_capture(); assert(playback_aborts==1 && !aacp_mic_active() && aacp_mic_failed);
+    fixture(); capture(); playback_recover_auto=false; playback_recover_accept=false;
+    close_capture(); drain(); now+=500; aacp_poll();
+    now+=7500; aacp_poll(); assert(playback_aborts==1 && aacp_mic_failed);
 }
 
 static void test_handshake_and_decoder_gate(void) {
@@ -323,7 +399,7 @@ static void test_unwanted_uplink_retries_stop_then_closes(void) {
         aacp_poll();
     }
     assert(aacp_cid == 0 && !aacp_mic_active() && decoded == 0);
-    assert(aacp_connect_timer.active && !aacp_mic_want);
+    assert(!aacp_connect_timer.active && !aacp_mic_want && aacp_mic_failed && playback_aborts==1);
 }
 
 static void test_gap_and_wrap_clear_predictor_history(void) {
@@ -856,12 +932,15 @@ static void test_pair_keys_and_receive_buffer_policy(void) {
     assert(aacp_receive_buffer(60)==DONGLE_ACCEPTED && aacp_receive_buffer_serial()==serial);
     assert(aacp_receive_buffer(150)==DONGLE_BUSY);
     drain(); assert(aacp_receive_buffer_serial()!=serial && aacp_receive_buffer_last()==60);
+    assert(buffer_send_callbacks==1);
     usb_capture_wanted=true;
     assert(aacp_receive_buffer(60)==DONGLE_BUSY && aacp_receive_buffer(150)==DONGLE_ACCEPTED);
-    drain(); assert(aacp_receive_buffer_last()==150);
+    drain(); assert(aacp_receive_buffer_last()==150 && buffer_send_callbacks==2);
 }
 
 int main(void) {
+    test_playback_gate_and_repair_receipt();
+    test_repair_failure_and_late_uplink_are_bounded();
     test_handshake_and_decoder_gate();
     test_usb_cancel_and_stop_are_not_lost();
     test_stale_channel_events();

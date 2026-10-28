@@ -4,6 +4,14 @@
 #include <string.h>
 #include "../src/btstack/playback_pcm.h"
 #include "../src/btstack/playback_eld.h"
+#include "../src/btstack/playback_options.h"
+#include "../src/btstack/playback_adjust.h"
+#include "../src/btstack/playback_usb_clock.h"
+static playback_usb_clock_t usb_clock;
+static uint32_t usb_recovery_drops;
+static uint32_t media_last_sent_us,packet_oldest_us;
+static bool playback_transport_stale;
+static playback_adjust_t playback_adjust;
 
 #define ERROR_CODE_SUCCESS 0
 #define PLAYBACK_IDLE_MS 1000u
@@ -16,15 +24,22 @@ static bool playback_idle_counting, phone_opened, phone_active, phone_buffer_sta
 static bool is_usb_streaming, is_streaming, a2dp_is_connected_flag, finish_scan_avdtp_codec;
 static bool profile_pending, a2dp_connect_pending;
 static bool recovery_reset_encoder, suspend_recovery_pending, mic_requested, mic_active;
+static bool mic_recovery_pending, mic_recovery_started;
+static uint16_t mic_recovery_cid;
+static uint32_t mic_recovery_revision;
 static uint32_t playback_idle_since, playback_idle_transition_since, now;
 static unsigned suspends, starts, closes, resets;
 static uint8_t suspend_error, start_error;
 static bool encoder_ready = true;
+static bool game_eligible;
+static playback_game_t playback_game;
+static bool playback_game_eligible(void) { return game_eligible; }
 static void *handleAAC = (void *)1;
 static uint32_t aaceld_bitrate = 256000;
 static uint16_t pcm_frame_samples = 480, active_slot_count = 16;
 static unsigned audio_timer_interval = 10;
 static playback_pcm_t playback_pcm;
+static uint32_t audio_slot_capacity(void) {return pcm_frame_samples*active_slot_count;}
 static unsigned playback_pcm_lock;
 typedef struct timer { bool active; void *context; } btstack_timer_source_t;
 static btstack_timer_source_t suspend_recovery_timer;
@@ -40,6 +55,7 @@ typedef struct {
 static a2dp_media_sending_context_t media_tracker;
 static void critical_section_enter_blocking(void *p) { (void)p; }
 static void critical_section_exit(void *p) { (void)p; }
+static uint32_t btstack_run_loop_get_time_ms(void) {return now;}
 static void btstack_run_loop_remove_timer(btstack_timer_source_t *t) { t->active = false; }
 static void btstack_run_loop_set_timer(btstack_timer_source_t *t, unsigned delay) { (void)t; (void)delay; }
 static void btstack_run_loop_add_timer(btstack_timer_source_t *t) { t->active = true; }
@@ -55,7 +71,7 @@ static bool aaceld_encoder_init(void) { ++resets; return encoder_ready; }
 static bool usb_mic_requested(void) { return mic_requested; }
 static bool aacp_mic_active(void) { return mic_active; }
 static uint8_t avdtp_subevent_signaling_accept_get_local_seid(const uint8_t *p) { return *p; }
-static void start_led_blink(void) { }
+static void set_led_mode_on(void) { }
 #include "playback_idle.inc"
 
 static void accept(unsigned signal, uint8_t seid) {
@@ -79,6 +95,7 @@ static void fixture(void) {
     profile_pending = a2dp_connect_pending = false;
     is_usb_streaming = phone_opened = phone_active = mic_requested = mic_active = false;
     cur_codec = 4;
+    game_eligible=false; playback_game=(playback_game_t){0};
 }
 static void suspend_idle(void) {
     playback_idle_poll(now);
@@ -92,6 +109,7 @@ static void suspend_idle(void) {
 }
 static void usb_onset_survives_restart(void) {
     fixture(); suspend_idle();
+    for(unsigned i=0;i<PLAYBACK_FILTER_TAPS*2;++i)playback_pcm.history[i]=0.5f;
     int16_t onset[960], output[960];
     for (unsigned i = 0; i < 960; ++i) onset[i] = (int16_t)(i + 1);
     set_usb_streaming(true); playback_pcm_push(&playback_pcm, onset, 480);
@@ -102,6 +120,7 @@ static void usb_onset_survives_restart(void) {
     accept(AVDTP_SI_START, 5);
     assert(media_tracker.streaming && is_streaming && playback_idle_phase == PLAYBACK_RUNNING);
     assert(playback_pcm.priming == 4800 && playback_pcm.used == 480);
+    for(unsigned i=0;i<PLAYBACK_FILTER_TAPS*2;++i)assert(playback_pcm.history[i]==0.0f);
     for (unsigned i = 0; i < 10; ++i) {
         assert(playback_pcm_read(&playback_pcm, output, 480) == 0);
         for (unsigned j = 0; j < 960; ++j) assert(output[j] == 0);
@@ -111,6 +130,39 @@ static void usb_onset_survives_restart(void) {
 }
 int main(void) {
     usb_onset_survives_restart();
+    fixture(); suspend_recovery_pending=recovery_reset_encoder=true; is_usb_streaming=true;
+    mic_recovery_pending=mic_recovery_started=true; mic_recovery_cid=10; mic_recovery_revision=4;
+    accept(AVDTP_SI_SUSPEND,5);
+    assert(mic_recovery_pending && mic_recovery_revision==4 && playback_idle_phase==PLAYBACK_STARTING);
+    accept(AVDTP_SI_START,6); assert(mic_recovery_pending && mic_recovery_revision==4);
+    accept(AVDTP_SI_START,5); assert(!mic_recovery_pending && mic_recovery_revision==5);
+    accept(AVDTP_SI_START,5); assert(mic_recovery_revision==5);
+    fixture(); suspend_recovery_pending=recovery_reset_encoder=true; is_usb_streaming=true;
+    mic_recovery_pending=mic_recovery_started=true; mic_recovery_cid=11;
+    accept(AVDTP_SI_SUSPEND,5); accept(AVDTP_SI_START,5);
+    assert(mic_recovery_pending && mic_recovery_revision==5); // Wrong-CID repair cannot complete.
+    mic_recovery_pending=mic_recovery_started=false;
+    fixture();suspend_recovery_pending=recovery_reset_encoder=true;is_usb_streaming=true;
+    accept(AVDTP_SI_SUSPEND,5);
+    assert(resets==1 && starts==1 && playback_idle_phase==PLAYBACK_STARTING && !media_tracker.streaming);
+    playback_idle_poll(3000);
+    assert(closes==1 && !finish_scan_avdtp_codec); // Missing recovery Start cannot strand audio.
+    fixture();suspend_recovery_pending=recovery_reset_encoder=true;is_usb_streaming=true;
+    accept(AVDTP_SI_SUSPEND,5);accept(AVDTP_SI_START,5);
+    assert(resets==1 && media_tracker.streaming && playback_idle_phase==PLAYBACK_RUNNING);
+    fixture(); suspend_idle(); is_usb_streaming=game_eligible=true;
+    playback_game_request(&playback_game,true);
+    playback_idle_poll(++now); assert(starts==0);
+    playback_game.phase=GAME_SENT;
+    playback_idle_poll(++now); assert(starts==0);
+    playback_game.phase=GAME_CONFIRMED;
+    playback_idle_poll(++now); assert(starts==1);
+    fixture(); suspend_idle(); is_usb_streaming=game_eligible=true;
+    playback_game_request(&playback_game,true); playback_game.failed=true;
+    playback_idle_poll(++now); assert(starts==1); // A failed preparation cannot strand audio.
+    fixture(); suspend_idle(); is_usb_streaming=game_eligible=mic_requested=true;
+    playback_game_request(&playback_game,true);
+    playback_idle_poll(++now); assert(starts==1);
     for (unsigned codec = 1; codec <= 2; ++codec) {
         fixture(); cur_codec = (uint8_t)codec; suspend_idle();
         is_usb_streaming = true; playback_idle_poll(++now);

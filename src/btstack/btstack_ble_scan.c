@@ -8,6 +8,7 @@ static btstack_packet_callback_registration_t scan_registration;
 static ble_scan_snapshot_t scan_state;
 static bool scan_initialized;
 static uint64_t uptime_ms;
+static uint32_t diagnostic_started;
 
 uint64_t dongle_uptime_ms(void) {
     uint32_t now=btstack_run_loop_get_time_ms();
@@ -16,6 +17,9 @@ uint64_t dongle_uptime_ms(void) {
 }
 
 static void scan_update(void) {
+    if((scan_state.stats.pause_reasons&BLE_SCAN_PAUSE_DIAGNOSTIC) &&
+       (uint32_t)(btstack_run_loop_get_time_ms()-diagnostic_started)>=120000u)
+        scan_state.stats.pause_reasons&=~BLE_SCAN_PAUSE_DIAGNOSTIC;
     bool wanted = scan_state.stats.controller_ready && scan_state.stats.le_supported && scan_state.stats.pause_reasons == 0;
     if (wanted == scan_state.stats.scan_requested) return;
     scan_state.stats.scan_requested = wanted;
@@ -46,6 +50,13 @@ void ble_scan_set_paused(uint32_t reason, bool paused) {
     if (!scan_initialized || reason == 0) return;
     if (paused) scan_state.stats.pause_reasons |= reason;
     else scan_state.stats.pause_reasons &= ~reason;
+    scan_update();
+}
+void ble_scan_diagnostic_pause(bool paused) {
+    if(!scan_initialized)return;
+    diagnostic_started=btstack_run_loop_get_time_ms();
+    if(paused)scan_state.stats.pause_reasons|=BLE_SCAN_PAUSE_DIAGNOSTIC;
+    else scan_state.stats.pause_reasons&=~BLE_SCAN_PAUSE_DIAGNOSTIC;
     scan_update();
 }
 

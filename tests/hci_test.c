@@ -7,6 +7,7 @@
 void avdtp_source_establish_stream(void);
 bool get_usb_streaming(void);
 bool dongle_playback_transitioning(void);
+void dongle_playback_controller_event(const uint8_t *p,uint16_t size) {(void)p;(void)size;}
 #include "../src/btstack/btstack_hci.c"
 
 static bd_addr_t saved[2];

@@ -24,8 +24,7 @@ static uint16_t last_usage;
 bool usb_media_enqueue(enum usb_media_command command) {
     uint16_t usage;
     switch (command) {
-        case USB_MEDIA_PLAY: usage = 0x00b0; break;
-        case USB_MEDIA_PAUSE: usage = 0x00b1; break;
+        case USB_MEDIA_PLAY: case USB_MEDIA_PAUSE: usage = 0x00cd; break;
         case USB_MEDIA_NEXT: usage = 0x00b5; break;
         case USB_MEDIA_PREVIOUS: usage = 0x00b6; break;
         case USB_MEDIA_STOP: usage = 0x00b7; break;

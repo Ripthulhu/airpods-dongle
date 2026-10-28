@@ -10,18 +10,31 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Experimental firmware **0.1.11**. The firmware cross-compiles and the host
-regression tests pass.
-This version has not been tested on a Pico or AirPods. The source fork reports
-Pro 3 testing; that does not validate these changes.
+Development candidate **0.1.25** has passed short Windows S16 and genuine IEEE
+float32 USB listening checks, including microphone open/close with normal stereo
+afterward. Windows' device format and the Pico's selected alt 2 confirm float
+transport; volume and mute were unchanged. The listener accepted the remaining
+microphone transition behavior. One opening resync and the deliberate closing
+repair remain in the counters. Full 30-minute/path acceptance and the updated
+Android/Symfonium checks remain open.
+
+Standalone Windows and Pixel USB playback, stem pause/resume and saved-pair/
+case-return reconnect have been exercised with Pro 3 firmware 9A348. Game Mode
+defaults on, and a prior visual/listening test measured approximately 60 ms total
+speaker latency. Double-pressing BOOTSEL toggles it: two LED pulses on enable,
+three seconds dark on disable. Live switching retains the accepted brief pitch
+change while latency adjusts. Wireless phone bridging still needs hardware
+validation. See [audio continuity](docs/AUDIO-CONTINUITY.md) for evidence and checks.
 
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
+- S16 USB compatibility plus IEEE float32 input; float processing quantizes once at the integer encoder boundary.
 - Phone Bluetooth input with guarded LHDC v5 at 48 kHz, then classic aptX/SBC fallback.
 - Simultaneous AACP microphone, opened only by a USB recording request.
 - Phone or microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
 - Pro 3 case BLE battery fallback with separate provenance and per-component ages; hardware verification pending.
 - 100 ms encoded startup silence for AAC-ELD, sent before accepting phone playback.
+- USB playback separates its 20 ms steady reserve from 80 ms transient capacity and the 30 ms startup limit.
 - Confirmed AVDTP suspension after one second without input; fresh input restarts and primes the stream.
 - Stem media controls and volume routed to the active phone or USB input.
 - NTPods USB controls and LibrePods controls over an encrypted, bonded phone connection.
@@ -29,6 +42,7 @@ Pro 3 testing; that does not validate these changes.
 - Selectable output codecs and supported bitrates, guarded Game Mode and performance readings.
 - Nearby signal readings resolved against the selected pair's identity key.
 - Two saved headset slots; reconnect uses the selected address and its bond.
+- Solid LED while connected, including playback; pairing retains its blink.
 - Bounded recovery, packet validation and USB suspend/disconnect cleanup.
 
 NTPods uses the [USB control interface](docs/USB-CONTROL.md); LibrePods uses the
@@ -90,6 +104,10 @@ cmake --build build --parallel
 Output: `build/airpods_dongle.uf2`. Hold BOOTSEL while connecting the Pico 2 W,
 then copy the UF2 onto its USB drive. The original Pico W has insufficient RAM.
 
+For the S16-only comparison build, configure a separate build directory with
+`-DAIRPODS_USB_FLOAT=OFF`. This keeps identical processing but omits the float USB
+alternative. The normal build exposes both formats; the host chooses one.
+
 The SDK helper pins Pico SDK 2.3.1 and its submodules, checks original file hashes,
 applies the reviewed patches, and verifies readback. Configuration and builds
 reject missing patches or unknown patch states. The UF2 tool is pinned to
@@ -102,14 +120,35 @@ outputs. Tested allocations must leave a 64 KiB runtime reserve.
 
 ## Use
 
+The dongle starts reconnecting to its saved headset on power-up. Game Mode is
+enabled by default for supported AirPods/codec combinations; other headsets keep
+normal playback. NTPods is optional: pairing, reconnects, audio, volume and stem
+media keys run in firmware. A companion toggle lasts until the next power cycle.
+Standalone Windows startup, playback and stems are verified. Earlier Pixel 10
+Pro XL USB playback and stems worked, with intermittent crackle. Its current
+firmware recheck and Symfonium USB-exclusive comparison are pending. On Windows,
+0.1.24 completed a clean 349.888-second unpolled steady interval, and 0.1.25's
+short S16/float microphone checks were accepted by the listener.
+
+USB hosts need USB Audio Class 2 support and sufficient power. Playback is
+48 kHz stereo using S16 or IEEE float32; recording advertises fixed 64 kHz,
+16-bit mono. Windows 10 version 1703 or later supplies the audio driver. Phone support also depends
+on USB host/audio support and the data cable or OTG adapter; it is not a promise
+for every phone. See [Microsoft's class driver](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/usb-2-0-audio-drivers)
+and [Android's USB audio baseline](https://source.android.com/docs/core/audio/usb).
+
 Select **AirPods Dongle** as the USB playback and recording device. Hold BOOTSEL
 for at least one second but less than three and release to pair a headset already
 in pairing mode. Hold for at least three seconds to allow phone pairing for two
 minutes, then select **AirPods Dongle** in the phone's Bluetooth settings. For
 wireless use, power the Pico externally. USB playback and recording take priority
-over phone audio. See [phone bridge](docs/PHONE-TRANSPORT.md) for details. While idle, a single
-press reconnects the selected headset and a double press selects the other slot
-and connects it. During playback, those presses adjust volume instead.
+over phone audio. See [phone bridge](docs/PHONE-TRANSPORT.md) for details.
+The selected saved headset reconnects automatically, with 1–8 seconds between
+failed connection attempts. Pairing and codec negotiation suspend these retries.
+A single press reconnects the saved headset while idle and raises volume during
+playback. Double-press BOOTSEL to toggle Game Mode live: enabling gives two
+brief LED pulses; disabling turns the LED off for three seconds. It then returns
+to the connected solid light. Hold BOOTSEL for AirPods pairing, as above.
 
 Opening the USB microphone starts capture; closing it, suspending USB or losing
 the USB configuration cancels capture. **AirPods Dongle Console** exposes bounded diagnostic logs.
@@ -159,9 +198,10 @@ this does not establish 64 kHz acoustic bandwidth or calibrated recording speed.
 
 Both cores have guarded 16 KiB stacks. The build measures codec allocation peaks
 against the linked heap and requires at least 64 KiB left for runtime use.
-The 0.1.11 link leaves 385,784 bytes of heap. The ARM probe peaks at 90,816 bytes
-for LHDC plus AAC-ELD, or 188,040 bytes for playback plus USB microphone. The
-heavier case leaves 197,744 bytes before other runtime allocations.
+The 0.1.25 float-capable link leaves 263,432 bytes of heap. The ARM probe peaks at
+90,816 bytes for LHDC plus AAC-ELD, or 188,040 bytes for playback plus USB
+microphone. The heavier case leaves 75,392 bytes before other runtime allocations,
+above the required 65,536-byte reserve.
 The [codec probe](tools/codec_probe/README.md) covers the real encoders, VBR frame
 bounds and decoder lifecycles; emulation does not measure full runtime heap or
 stack use. Performance readings expose queue fill, dropped/underflow frames,

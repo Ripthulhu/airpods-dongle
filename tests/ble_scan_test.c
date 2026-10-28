@@ -219,6 +219,12 @@ int main(void) {
     retain_exact_reports();
     reject_malformed();
     bounded_cache_and_wrap();
+    reset();now=UINT32_MAX-60000;
+    ble_scan_diagnostic_pause(true);assert(!scan_state.stats.scan_requested);
+    now+=119999;ble_scan_set_paused(BLE_SCAN_PAUSE_MIC,false);
+    assert(!scan_state.stats.scan_requested);
+    ++now;ble_scan_set_paused(BLE_SCAN_PAUSE_MIC,false);
+    assert(scan_state.stats.scan_requested);
     puts("BLE passive lifecycle, complete TLV validation and bounded identity-free cache: passed");
     return 0;
 }

@@ -201,6 +201,7 @@ bool gap_start_scanning(void){
 static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     UNUSED(channel);
     if (packet_type != HCI_EVENT_PACKET || size < 2 || (unsigned)packet[1] + 2 != size) return;
+    dongle_playback_controller_event(packet,size);
     uint8_t status;
     UNUSED(status);
 
@@ -232,6 +233,10 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             }
             break;
 
+        case HCI_EVENT_DISCONNECTION_COMPLETE:
+            if (size < 6) return;
+            printf("[HCI] disconnect: status=0x%02x reason=0x%02x\n", packet[2], packet[5]);
+            break;
         case HCI_EVENT_COMMAND_STATUS:
             if (size < 6 || !scan_active ||
                 hci_event_command_status_get_command_opcode(packet) != HCI_OPCODE_HCI_INQUIRY ||

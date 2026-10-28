@@ -45,7 +45,7 @@ int main(void) {
     assert(!usb_media_enqueue((enum usb_media_command)99));
     assert(usb_media_enqueue(USB_MEDIA_PLAY));
     tick();
-    assert(reports[1] == 0xb0);
+    assert(reports[1] == 0xcd);
     usb_media_task();
     assert(count == 2); // endpoint busy: never overwrite a press with its release
     tick();
@@ -59,7 +59,7 @@ int main(void) {
     }
     assert(usb_media_enqueue(USB_MEDIA_PAUSE));
     tick();
-    assert(reports[count - 1] == 0xb1);
+    assert(reports[count - 1] == 0xcd);
     assert(usb_media_enqueue(USB_MEDIA_STOP));
     unsigned before = count;
     usb_media_set_available(false);

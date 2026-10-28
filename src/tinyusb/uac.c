@@ -131,8 +131,12 @@
 
  // Buffer for speaker data
  // One receive callback carries at most one descriptor-sized USB packet.
- static int16_t spk_buf[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(int16_t)];
+ static union {
+   int16_t pcm16[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(int16_t)];
+   float pcm32[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(float)];
+ } spk_buf;
  static bool speaker_interface_open;
+ static uint8_t speaker_format;
 
  //void led_blinking_task(void);
  void audio_task(void);
@@ -181,6 +185,8 @@ void tinyusb_control_task(void){
  {
    usb_speaker_stop();
    speaker_interface_open = false;
+   speaker_format=0;
+   dongle_playback_usb_format(0);
    usb_media_set_available(true);
    usb_mounted = true;
    usb_suspended = false;
@@ -194,6 +200,8 @@ void tinyusb_control_task(void){
    usb_media_set_available(false);
    usb_mounted = false;
    speaker_interface_open = false;
+   speaker_format=0;
+   dongle_playback_usb_format(0);
    mic_interface_open = false;
    usb_mic_update_request();
    usb_speaker_stop();
@@ -455,16 +463,19 @@ void tinyusb_control_task(void){
    (void)rhport;
    uint16_t itf = tu_le16toh(request->wIndex);
    uint16_t alt = tu_le16toh(request->wValue);
-   if (alt > 1) return false;
    if (itf == ITF_NUM_AUDIO_STREAMING_SPK) {
-     if (alt == 0) {
+     if(alt>(AIRPODS_USB_FLOAT?2:1))return false;
+     if (speaker_format!=alt) {
        blink_interval_ms = BLINK_MOUNTED;
        speaker_interface_open = false;
        usb_speaker_stop();
+       audio_slot_usb_reset();
+       speaker_format=0;
+       dongle_playback_usb_format(0);
      }
      return true;
    }
-   if (itf != ITF_NUM_AUDIO_STREAMING_MIC) return false;
+   if (itf != ITF_NUM_AUDIO_STREAMING_MIC || alt>1) return false;
    if (alt == 0) {
      mic_interface_open = false;
      usb_mic_update_request();
@@ -477,15 +488,22 @@ void tinyusb_control_task(void){
    (void)rhport;
    uint16_t itf = tu_le16toh(request->wIndex);
    uint16_t alt = tu_le16toh(request->wValue);
-   if (alt > 1) return false;
    if (itf == ITF_NUM_AUDIO_STREAMING_MIC) {
+     if(alt>1)return false;
      mic_interface_open = alt == 1;
      usb_mic_update_request();
      return true;
    }
-   if (itf != ITF_NUM_AUDIO_STREAMING_SPK) return false;
-   speaker_interface_open = alt == 1;
-   blink_interval_ms = alt == 1 ? BLINK_STREAMING : BLINK_MOUNTED;
+   if (itf != ITF_NUM_AUDIO_STREAMING_SPK || alt>(AIRPODS_USB_FLOAT?2:1)) return false;
+   if(speaker_format!=alt) {
+     usb_speaker_stop();
+     audio_slot_usb_reset();
+     if(speaker_format)(void)tud_audio_clear_ep_out_ff();
+   }
+   speaker_format=(uint8_t)alt;
+   dongle_playback_usb_format((uint8_t)alt);
+   speaker_interface_open = alt != 0;
+   blink_interval_ms = alt != 0 ? BLINK_STREAMING : BLINK_MOUNTED;
    if (alt == 0) usb_speaker_stop();
    return true;
  }
@@ -497,16 +515,20 @@ void tinyusb_control_task(void){
    (void)func_id;
    (void)ep_out;
 
-   if (n_bytes_received > sizeof(spk_buf) || n_bytes_received % (2u * sizeof(int16_t)) != 0) {
+   uint16_t frame_bytes=cur_alt_setting==2?8u:4u;
+   uint16_t maximum=cur_alt_setting==2?CFG_TUD_AUDIO_FUNC_1_FORMAT_2_EP_SZ_OUT:CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT;
+   if (n_bytes_received > sizeof(spk_buf) || n_bytes_received > maximum || n_bytes_received % frame_bytes != 0) {
+     dongle_playback_usb_packet(time_us_32(),0,cur_alt_setting,1);
      (void)tud_audio_clear_ep_out_ff();
      return false;
    }
-   uint16_t spk_data_size = tud_audio_read(spk_buf, n_bytes_received);
+   uint16_t spk_data_size = tud_audio_read(&spk_buf, n_bytes_received);
    if (spk_data_size != n_bytes_received) {
+     dongle_playback_usb_packet(time_us_32(),0,cur_alt_setting,2);
      (void)tud_audio_clear_ep_out_ff();
      return false;
    }
-   if (cur_alt_setting != 1 || !speaker_interface_open ||
+   if ((cur_alt_setting!=1 && cur_alt_setting!=2) || cur_alt_setting!=speaker_format || !speaker_interface_open ||
        !usb_mounted || usb_suspended) return true;
 
    if (spk_data_size)
@@ -516,11 +538,13 @@ void tinyusb_control_task(void){
       speaker_active = true;
       set_usb_streaming(true);
     }
-    uint16_t sample_count = spk_data_size / (2u * sizeof(*spk_buf));
+    uint16_t sample_count = spk_data_size/frame_bytes;
+    dongle_playback_usb_packet(speaker_last_packet_us,sample_count,cur_alt_setting,0);
     // USB mute must preserve the AirPods volume for a later unmute.
     if (atomic_load_explicit(&mute[0], memory_order_acquire))
-      memset(spk_buf, 0, spk_data_size);
-    audio_slot_push_samples(spk_buf, sample_count);
+      memset(&spk_buf, 0, spk_data_size);
+    if(cur_alt_setting==2)audio_slot_push_float(spk_buf.pcm32,sample_count);
+    else audio_slot_push_samples(spk_buf.pcm16,sample_count);
    }
 
    return true;

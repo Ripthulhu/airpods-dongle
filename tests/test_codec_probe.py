@@ -34,7 +34,12 @@ def elf_header():
 
 
 SYMBOLS = ("20020000 B end\n2007c000 A __StackLimit\n"
-           "10001000 R airpods_phone_worker_storage_bytes\n")
+           "10001000 R airpods_phone_worker_storage_bytes\n") + "".join(
+    f"{0x20001000 + index * 0x100:08x} T {name}\n"
+    for index, name in enumerate(probe.CODEC_RAM_FUNCTIONS.values()))
+TABLE_SYMBOLS = "".join(
+    f"{name}|{0x20003000 + index * 0x100:08x}| T |OBJECT|00000400||.data\n"
+    for index, name in enumerate(probe.CODEC_RAM_TABLES.values()))
 USB_RESULT = "SUCCESS frames=16 checksum=4105af5d\nHEAP_PEAK bytes=188040\nCHECKS complete\n"
 PHONE_RESULT = ("PHONE_QUALITY cycle=0 reference_samples=819 gain_ppm=999345/1001227 snr_above_30db=1\n"
                 "PHONE_QUALITY cycle=1 reference_samples=819 gain_ppm=999345/1001227 snr_above_30db=1\n"
@@ -51,6 +56,31 @@ def firmware_image(worker_bytes=9772):
 
 
 class CodecMemoryCheckTests(unittest.TestCase):
+    def test_encoder_rom_must_be_linked_into_main_ram(self):
+        self.assertEqual(set(probe.codec_ram_tables(TABLE_SYMBOLS)), set(probe.CODEC_RAM_TABLES))
+        for index, (member, name) in enumerate(probe.CODEC_RAM_TABLES.items()):
+            line = f"{name}|{0x20003000 + index * 0x100:08x}| T |OBJECT|00000400||.data\n"
+            for invalid in ("", line.replace("20003000", "10001000"),
+                            line.replace("20003000", "20080000"),
+                            line.replace("20003000", "2007fffe"),
+                            line.replace("20003000", "1ffffffe"),
+                            line.replace("20003000", "invalid"),
+                            line.replace("00000400", "00000000"),
+                            line.replace("OBJECT", "FUNC"), line.replace(".data", ".bss"),
+                            line + line):
+                with self.subTest(member=member, invalid=invalid):
+                    self.assertRaises(ValueError, probe.codec_ram_tables, TABLE_SYMBOLS.replace(line, invalid))
+
+    def test_each_selected_codec_member_must_be_linked_into_main_ram(self):
+        checked = probe.codec_ram_functions(SYMBOLS)
+        self.assertEqual(set(checked), set(probe.CODEC_RAM_FUNCTIONS))
+        for index, (member, name) in enumerate(probe.CODEC_RAM_FUNCTIONS.items()):
+            line = f"{0x20001000 + index * 0x100:08x} T {name}\n"
+            for invalid in ("", f"10001000 T {name}\n", f"20080000 T {name}\n",
+                            f"1ffffffe T {name}\n", f"20001000 B {name}\n", line + line):
+                with self.subTest(member=member, invalid=invalid):
+                    self.assertRaises(ValueError, probe.codec_ram_functions, SYMBOLS.replace(line, invalid))
+
     def test_budget_comes_from_firmware_symbols(self):
         self.assertEqual(probe.firmware_heap(elf_header(), SYMBOLS), 0x5c000)
 
@@ -174,7 +204,7 @@ class CodecMemoryCheckTests(unittest.TestCase):
             args = self.inputs(directory)
             def invoke(command, **kwargs):
                 if "--defined-only" in command:
-                    return subprocess.CompletedProcess(command, 0, SYMBOLS, "")
+                    return subprocess.CompletedProcess(command, 0, TABLE_SYMBOLS if "--format=sysv" in command else SYMBOLS, "")
                 if "-kernel" not in command:
                     return subprocess.CompletedProcess(command, 0, "", "")
                 args.firmware.write_bytes(args.firmware.read_bytes() + b"changed")
@@ -191,7 +221,7 @@ class CodecMemoryCheckTests(unittest.TestCase):
                    phone_transcript=PHONE_RESULT):
         def invoke(command, **kwargs):
             if "--defined-only" in command:
-                return subprocess.CompletedProcess(command, 0, SYMBOLS, "")
+                return subprocess.CompletedProcess(command, 0, TABLE_SYMBOLS if "--format=sysv" in command else SYMBOLS, "")
             if "convert" in command:
                 self.assertEqual(command[command.index("-t") + 1], "uf2")
                 Path(command[5]).write_bytes(b"validated UF2")
