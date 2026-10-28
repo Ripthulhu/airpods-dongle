@@ -95,7 +95,8 @@ NTPods uses the [USB control interface](docs/USB-CONTROL.md); LibrePods uses the
 and readback without acquiring audio. USB uses Windows' built-in HID driver;
 USB audio and microphone also work independently of the app. There are no
 companion handoff commands. The physical single-press takeover request uses the
-LibrePods AACP routing exchange; two-dongle handoff remains unverified.
+LibrePods AACP routing exchange. Short two-dongle handoff checks passed in both
+directions; extended handoff and call testing remain pending.
 Sensor streaming and case ringing are not implemented.
 The serial port remains a diagnostic console.
 Send `t` to read USB service and main-loop Bluetooth timing maxima, the current
