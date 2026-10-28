@@ -111,12 +111,34 @@ listener reported the imbalance.
   software attenuation. Keeping local hardware volume without restoring it
   avoids the bounce, but leaves the phone slider independent.
 
+## 0.1.38 listening result and Android maximum-cue limit
+
+The Pixel listener confirmed balanced ears, a following phone-volume slider,
+and one smooth audible change. This accepts the tested relative-volume relay,
+not absolute agreement between Android's slider and the AirPods' hardware gain.
+The listener still heard frequent maximum-volume cues below the phone UI maximum.
+
+Completed HID presses rose 13→74→132 during user activity, then remained at 132
+with the controls untouched. These cumulative counts do not establish one event
+per gesture, but no runaway key loop was confirmed in that observation.
+
+The firmware restores hardware anchor 126; a native upward swipe can reach 127
+before that restoration. This is consistent with a hardware maximum cue while
+Android's separate software volume is lower. No individual cue was correlated
+with a captured packet, so this remains the supported mechanism, not per-cue proof.
+
+The Pixel's observed UAC SET revision remained 2 while HID keys and its UI advanced.
+Modern AOSP AIDL USB code supports direct hardware-volume writes; normal mixed
+playback can still apply software volume. Host/app-selected bit-perfect playback
+is a separate optional path, not a USB descriptor switch for all apps. These
+reference sources do not identify the HAL binary shipped on this Pixel.
+
 Primary references:
 [AVRCP 1.6.3, section 6.13](https://files.bluetooth.com/wp-content/uploads/dlm_uploads/2024/10/AVRCP_v1.6.3.pdf)
 defines rendering volume and permits returned levels to differ from requests.
 [AOSP mixer documentation](https://source.android.com/docs/core/audio/preferred-mixer-attr)
 distinguishes default software volume from optional host-selected bit-perfect
 hardware-volume playback. Current
-[AOSP USB HAL](https://android.googlesource.com/platform/hardware/libhardware/+/refs/heads/main/modules/usbaudio/audio_hal.c)
-selects its mixer volume control for bit-perfect output; this is not proof of the
-exact HAL binary running on the Pixel.
+[AOSP AIDL USB stream](https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/main/audio/aidl/default/usb/StreamUsb.cpp)
+implements hardware-volume writes through the ALSA mixer; the host's playback
+policy determines whether those writes track ordinary media-volume changes.
