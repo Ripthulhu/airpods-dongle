@@ -39,6 +39,8 @@ static struct { unsigned inputChannels; } aacinf = {2};
 static struct { bool rate_mode; } playback_options;
 static uint16_t aaceld_frame_sequence;
 static uint32_t now, consumed, emitted, frame_size, sample_frames, send_failures;
+static unsigned encode_calls, eld_packets, eld_units;
+static uint16_t eld_sequence;
 static bool send_requested, phone_opened, recovery_reset_encoder, suspend_recovery_pending;
 static bool phone_active, phone_output_recovery;
 static uint16_t phone_output_recovery_cid;
@@ -126,15 +128,22 @@ static playback_trace_t playback_trace;
 #define PB_EVENT(kind,a,b) playback_trace_record(&playback_trace,time_us_32(),kind,a,b)
 static unsigned playback_pcm_lock,usb_recovery_drops,pcm_frame_samples=480;
 static bool is_usb_streaming=true,phone_buffer_started;
+#ifdef PLAYBACK_REAL_PHONE
+#include "btstack_resample.h"
+#include "../src/btstack/phone_clock.h"
+static phone_clock_t phone_clock;
+static btstack_resample_t phone_resampler;
+#else
 static struct { unsigned unused; } phone_clock;
 static unsigned phone_resampler;
-static bool pcm_locked;
-static void pipeline_filter_cost(void);
 static unsigned phone_clock_prefill(unsigned frames) {(void)frames;return 1440;}
 static unsigned phone_clock_update(void *clock,unsigned remaining,unsigned frames) {
     (void)clock;(void)remaining;(void)frames;return 65536;
 }
 static void btstack_resample_set_factor(void *resampler,unsigned rate) {(void)resampler;(void)rate;}
+#endif
+static bool pcm_locked;
+static void pipeline_filter_cost(void);
 static void critical_section_enter_blocking(void *p) {(void)p;assert(!pcm_locked);pcm_locked=true;}
 static void critical_section_exit(void *p) {(void)p;assert(pcm_locked);pcm_locked=false;}
 static void pipeline_render(const playback_resample_t *work,int16_t *dst) {
@@ -181,7 +190,20 @@ static unsigned a2dp_source_stream_send_media_payload_rtp(unsigned a, unsigned b
         assert(length == 1 + packet[0] * frame_size);
         emitted += packet[0] * sample_frames;
     } else {
-        if (cur_codec == 4 && phone_opened) assert(media_tracker.codec_num_frames == 1);
+        if (cur_codec == 4) {
+            unsigned offset=0,units=0;
+            while(offset<length) {
+                assert(length-offset>=4);
+                assert(packet[offset]==(uint8_t)(0xb0|(eld_sequence>>8)));
+                assert(packet[offset+1]==(uint8_t)eld_sequence);
+                assert((packet[offset+2]&0xf8)==0x10);
+                unsigned bytes=((packet[offset+2]&7u)<<8)|packet[offset+3];
+                assert(bytes && bytes<=length-offset-4);
+                for(unsigned i=0;i<bytes;++i)assert(packet[offset+4+i]==(uint8_t)eld_units);
+                offset+=4+bytes;++units;++eld_units;eld_sequence=(eld_sequence+1)&0xfff;
+            }
+            assert(units==media_tracker.codec_num_frames);++eld_packets;
+        }
         emitted += media_tracker.codec_num_frames * sample_frames;
     }
 #ifdef PLAYBACK_PIPELINE
@@ -201,7 +223,7 @@ static AACENC_ERROR aacEncEncode(void *handle, AACENC_BufDesc *input, AACENC_Buf
     assert(args->numInSamples == sample_frames * 2);
     unsigned bytes = frame_size - (cur_codec == 4 ? 4 : 0);
     assert(output->bufSizes[0] >= (int)bytes);
-    memset(output->bufs[0], 0, bytes); result->numOutBytes = (int)bytes;
+    memset(output->bufs[0], (uint8_t)encode_calls++, bytes); result->numOutBytes = (int)bytes;
     return AACENC_OK;
 }
 #include "playback_timing.inc"
@@ -233,6 +255,7 @@ static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigne
     memset(&media_tracker, 0, sizeof(media_tracker));
     memset(&playback_metrics, 0, sizeof(playback_metrics));
     now = consumed = emitted = send_failures = 0;
+    encode_calls=eld_packets=eld_units=0;aaceld_frame_sequence=eld_sequence=4095;
     send_requested = false; phone_opened = phone_active = phone_output_recovery = false;
     allow_recovery = synchronous_request = false;
     suspend_recovery_pending=recovery_reset_encoder=false;
@@ -264,6 +287,46 @@ static void timing(unsigned codec, unsigned samples, unsigned bytes, unsigned in
     drain();
     assert(consumed - before <= (samples * 4 > 1920 ? samples * 4 : 1920));
     assert(playback_metrics.recoveries == 0);
+}
+static void phone_packet_groups(void) {
+    const unsigned mtus[]={324,647,648,986};
+    for(unsigned target=60;target<=150;target+=90)for(unsigned m=0;m<4;++m) {
+        initialize(4,480,324,10,mtus[m]);phone_opened=true;
+        playback_game.changed=true;playback_game.target=(uint16_t)target;
+        btstack_timer_source_t timer={.context=&media_tracker};
+        unsigned group=mtus[m]<648?1:2;
+        for(unsigned unit=0;unit<600;++unit) {
+            if(unit==301)playback_game.target=(uint16_t)(210-target); // Change modes with one AU queued.
+            now+=10;avdtp_audio_timeout_handler(&timer);
+            unsigned before=encode_calls;playback_prepare_packet(&media_tracker,now);
+            assert(encode_calls==before+1); // Each main-loop pass yields after one AU.
+            if((unit+1)%group)assert(!send_requested && media_tracker.codec_num_frames==1);
+            else {
+                assert(send_requested && media_tracker.codec_num_frames==group);
+                send_requested=false;a2dp_demo_send_media_packet();
+            }
+        }
+        assert(eld_packets==600/group && eld_units==600 && consumed==288000);
+        assert(emitted==consumed && media_tracker.rtp_timestamp==consumed);
+    }
+    initialize(4,480,324,10,986);phone_opened=true;
+    btstack_timer_source_t timer={.context=&media_tracker};
+    now=20;avdtp_audio_timeout_handler(&timer);
+    playback_prepare_packet(&media_tracker,now);
+    assert(encode_calls==1 && !send_requested && media_tracker.codec_num_frames==1);
+    playback_prepare_packet(&media_tracker,now);
+    assert(send_requested && media_tracker.codec_num_frames==2);
+    uint8_t saved[648];memcpy(saved,media_tracker.codec_storage,sizeof(saved));
+    send_requested=false;send_failures=1;a2dp_demo_send_media_packet();
+    assert(!emitted && media_tracker.codec_ready_to_send==2 && !media_tracker.rtp_timestamp);
+    assert(!memcmp(saved,media_tracker.codec_storage,sizeof(saved)));
+    playback_prepare_packet(&media_tracker,now);send_requested=false;a2dp_demo_send_media_packet();
+    assert(emitted==960 && eld_packets==1 && eld_units==2 && encode_calls==2);
+    initialize(4,480,324,10,986);phone_opened=synchronous_request=true;
+    now=100;avdtp_audio_timeout_handler(&timer);
+    playback_prepare_packet(&media_tracker,now);assert(encode_calls==1 && !emitted);
+    playback_prepare_packet(&media_tracker,now);
+    assert(encode_calls==2 && emitted==960 && request_depth==0); // Inline send still yields to main.
 }
 static void live_clock(uint16_t delay, uint16_t target) {
     initialize(4,480,324,10,986);
@@ -307,6 +370,7 @@ static void rate_boundaries_preserve_source_time(void) {
 }
 #ifndef PLAYBACK_PIPELINE
 int main(void) {
+    phone_packet_groups();
     rate_boundaries_preserve_source_time();
     fixed_deadlines();
     live_clock(1590,60); live_clock(900,150);
@@ -316,7 +380,7 @@ int main(void) {
     timing(1, 128, 118, 10, 120, false); // A valid small MTU cannot reduce the playback rate.
     timing(2, 1024, 587, 12, 656, false);
     timing(4, 480, 324, 10, 986, false);
-    timing(4, 480, 324, 10, 986, true); // Phone preparation uses one AU even when three would fit.
+    timing(4, 480, 324, 10, 986, true);
     initialize(1, 128, 118, 10, 656);
     btstack_timer_source_t timer = {.context=&media_tracker};
     now = 10;

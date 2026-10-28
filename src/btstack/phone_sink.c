@@ -47,12 +47,16 @@ static struct {
     bool configured, opening, opened, started, start_pending, start_accepted, disconnecting, controls_owned;
     bool sequence_valid, volume_valid, volume_notification_pending, volume_event_supported;
     bool requested_volume_valid;
+    bool media_gap_armed, pcm_gap_armed, timestamp_valid;
     uint16_t last_sequence;
+    uint16_t rtp_frame_samples;
     uint8_t last_codec_sequence;
     uint8_t decode_failures;
     uint32_t ssrc, pending_since_ms;
     uint32_t packets, malformed, sequence_gaps;
     uint32_t submit_failures, total_decode_failures, buffer_resets, decoded_frames, last_packet_ms;
+    uint32_t last_media_ms, last_pcm_ms, max_media_gap_ms, max_pcm_gap_ms;
+    uint32_t next_timestamp, timestamp_discontinuities;
     uint8_t volume, requested_volume;
     uint8_t controls[PHONE_CONTROL_QUEUE], control_head, control_count;
     uint32_t control_since_ms;
@@ -112,7 +116,19 @@ static uint32_t read_be32(const uint8_t *p) {
            ((uint32_t)p[2] << 8) | p[3];
 }
 
+static void diagnostic_gap(uint32_t now, uint32_t *last, uint32_t *maximum, bool *armed) {
+    uint32_t gap = now - *last;
+    if (*armed && gap > *maximum) *maximum = gap;
+    *last = now;
+    *armed = true;
+}
+
+static void diagnostic_disarm(void) {
+    phone.media_gap_armed = phone.pcm_gap_armed = phone.timestamp_valid = false;
+}
+
 static void reset_phone_buffer(void) {
+    diagnostic_disarm();
     ++phone.buffer_resets;
     phone_worker_reset();
 }
@@ -333,6 +349,8 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
                 return;
             }
             phone.codec = codec;
+            phone.rtp_frame_samples = codec == PHONE_CODEC_LHDCV5 ? 240u :
+                codec == PHONE_CODEC_SBC ? (uint16_t)(sbc.blocks * sbc.subbands) : 0u;
             phone.seid = packet[5];
             phone.configured = true;
             phone.opened = already_open;
@@ -443,11 +461,17 @@ static void phone_avdtp_handler(uint8_t type, uint16_t channel, uint8_t *packet,
 
 static void decoded_pcm(const int16_t *stereo, uint16_t frames, void *context) {
     (void)context;
-    if (phone.started && frames != 0 && (bridge_phone_ready() || bridge_phone_recovering())) {
-        phone.decode_failures = 0;
-        phone.decoded_frames += frames;
-        bridge_phone_pcm_push(stereo, frames);
+    if (!phone.started) { diagnostic_disarm(); return; }
+    if (frames == 0) return;
+    if (!bridge_phone_ready() && !bridge_phone_recovering()) {
+        diagnostic_disarm();
+        return;
     }
+    diagnostic_gap(btstack_run_loop_get_time_ms(), &phone.last_pcm_ms,
+                   &phone.max_pcm_gap_ms, &phone.pcm_gap_armed);
+    phone.decode_failures = 0;
+    phone.decoded_frames += frames;
+    bridge_phone_pcm_push(stereo, frames);
 }
 
 static void bad_packet(void) {
@@ -457,7 +481,11 @@ static void bad_packet(void) {
 }
 
 static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
-    if (!phone.started || seid != phone.seid || (!bridge_phone_ready() && !bridge_phone_recovering())) return;
+    if (seid != phone.seid) return;
+    if (!phone.started || (!bridge_phone_ready() && !bridge_phone_recovering())) {
+        diagnostic_disarm();
+        return;
+    }
     phone.last_packet_ms = btstack_run_loop_get_time_ms();
     // Classic aptX on Android has raw codewords, without RTP or a media header.
     if (phone.codec == PHONE_CODEC_APTX) {
@@ -465,6 +493,8 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
             bad_packet();
             return;
         }
+        diagnostic_gap(phone.last_packet_ms, &phone.last_media_ms,
+                       &phone.max_media_gap_ms, &phone.media_gap_armed);
         if (!phone_worker_submit(packet, size, 0)) {
             ++phone.submit_failures;
             // Keep older audio; the worker marks the first post-drop decode boundary.
@@ -515,6 +545,7 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
     if (length == 0 || length > PHONE_CODEC_MAX_PAYLOAD) { bad_packet(); return; }
     uint16_t sequence = ((uint16_t)packet[2] << 8) | packet[3];
     uint32_t ssrc = read_be32(packet + 8);
+    uint32_t timestamp = read_be32(packet + 4);
     if (phone.sequence_valid && ssrc == phone.ssrc) {
         uint16_t advance = (uint16_t)(sequence - phone.last_sequence);
         if (advance == 0 || advance >= 0x8000u) return; // duplicate or late packet
@@ -523,6 +554,9 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
             phone.sequence_gaps++;
             reset_phone_buffer();
             bridge_phone_drop_pcm();
+        } else if (phone.timestamp_valid && timestamp != phone.next_timestamp &&
+                   phone.timestamp_discontinuities != UINT32_MAX) {
+            ++phone.timestamp_discontinuities;
         }
     } else if (phone.sequence_valid) {
         reset_phone_buffer();
@@ -532,6 +566,10 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
     phone.last_sequence = sequence;
     phone.ssrc = ssrc;
     phone.last_codec_sequence = codec_sequence;
+    phone.timestamp_valid = true;
+    phone.next_timestamp = timestamp + (uint32_t)frames * phone.rtp_frame_samples;
+    diagnostic_gap(phone.last_packet_ms, &phone.last_media_ms,
+                   &phone.max_media_gap_ms, &phone.media_gap_armed);
     if (!phone_worker_submit(packet + offset, length, frames)) {
         ++phone.submit_failures;
         return;
@@ -690,23 +728,24 @@ bool phone_sink_active(void) { return phone.started || phone.start_accepted; }
 bool phone_sink_owns_controls(void) { return phone.controls_owned; }
 
 uint16_t phone_sink_diagnostics(uint8_t *out, uint16_t capacity) {
-    if (out == NULL || capacity < 52u) return 0;
+    if (out == NULL || capacity < 64u) return 0;
     phone_worker_queue_snapshot_t queue = phone_worker_queue_snapshot();
-    out[0] = 1;
+    out[0] = 2;
     out[1] = (uint8_t)phone.codec;
     out[2] = (phone.cid != 0 ? 1u : 0u) | (phone.configured ? 2u : 0u) |
         (phone.opened ? 4u : 0u) | (phone.started ? 8u : 0u) |
         (phone.start_pending ? 16u : 0u) | (phone.start_accepted ? 32u : 0u) |
         (phone_worker_ready() ? 64u : 0u) | (bridge_phone_ready() ? 128u : 0u);
-    out[3] = 12;
+    out[3] = 15;
     const uint32_t fields[] = {phone.packets, phone.malformed, phone.sequence_gaps,
         phone.submit_failures, phone.total_decode_failures, phone.buffer_resets,
         phone.decoded_frames, phone.last_packet_ms, queue.queued_packets,
-        queue.output_ready ? 1u : 0u, phone_worker_last_decode_us(), phone_worker_max_decode_us()};
+        queue.output_ready ? 1u : 0u, phone_worker_last_decode_us(), phone_worker_max_decode_us(),
+        phone.max_media_gap_ms, phone.max_pcm_gap_ms, phone.timestamp_discontinuities};
     for (unsigned i = 0; i < sizeof(fields) / sizeof(*fields); ++i)
         for (unsigned byte = 0; byte < 4; ++byte)
             out[4u + i * 4u + byte] = (uint8_t)(fields[i] >> (byte * 8u));
-    return 52;
+    return 64;
 }
 
 bool phone_sink_handle_avrcp(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {

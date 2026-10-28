@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include "../../btstack_config.h"
 
 #define UNUSED(x) ((void)(x))
 #define ERROR_CODE_SUCCESS 0
@@ -18,7 +19,6 @@
 #define HCI_EVENT_DISCONNECTION_COMPLETE 0x05
 #define HCI_OPCODE_HCI_INQUIRY 0x0401
 #define HCI_OPCODE_HCI_READ_BUFFER_SIZE 0x1005
-#define MAX_NR_CONTROLLER_ACL_BUFFERS 3
 #define GAP_EVENT_INQUIRY_RESULT 0xdc
 #define GAP_EVENT_INQUIRY_COMPLETE 0xdd
 #define INQUIRY_MODE_RSSI_AND_EIR 2

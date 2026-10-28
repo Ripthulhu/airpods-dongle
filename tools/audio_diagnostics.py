@@ -307,12 +307,15 @@ def decode_inspect(data):
 
 
 def decode_phone(data):
-    if len(data) != 52 or data[0] != 1 or data[1] > 3 or data[3] != 12:
+    if (len(data) not in (52, 64) or data[1] > 3 or
+            (data[0], data[3], len(data)) not in ((1, 12, 52), (2, 15, 64))):
         raise RuntimeError('Unsupported phone diagnostic layout')
     names = ('packets', 'malformed', 'sequence_gaps', 'submit_failures',
              'decode_failures', 'buffer_resets', 'decoded_frames', 'last_packet_ms',
              'queued_packets', 'output_ready', 'last_decode_us', 'max_decode_us')
-    result = dict(zip(names, struct.unpack_from('<12I', data, 4)))
+    if data[0] == 2:
+        names += ('max_media_gap_ms', 'max_pcm_gap_ms', 'timestamp_discontinuities')
+    result = dict(zip(names, struct.unpack_from('<' + str(data[3]) + 'I', data, 4)))
     if result['output_ready'] > 1:
         raise RuntimeError('Invalid phone output state')
     result.update(codec=data[1], flags=data[2])

@@ -39,8 +39,9 @@
 #define MAX_NR_WHITELIST_ENTRIES 16
 #define MAX_NR_LE_DEVICE_DB_ENTRIES 16
 
-// Limit number of ACL/SCO Buffer to use by stack to avoid cyw43 shared bus overrun
-#define MAX_NR_CONTROLLER_ACL_BUFFERS 3
+// Prototype: test the controller's reported TX window, up to eight ACL packets.
+// The inherited cap of three guarded shared-bus overruns; hardware validation is still required.
+#define MAX_NR_CONTROLLER_ACL_BUFFERS 8
 #define MAX_NR_CONTROLLER_SCO_PACKETS 3
 
 // Enable and configure HCI Controller to Host Flow Control to avoid cyw43 shared bus overrun

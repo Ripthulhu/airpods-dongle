@@ -5,8 +5,13 @@ but its phone buffering can lose samples. Version 0.1.27's larger PCM reserve
 did not fix the audible crackle: hardware counters exposed compressed-input
 queue overflow and repeated decoder/PCM resets. Version 0.1.28 stopped those
 losses in the initial capture and improved playback, but PCM overflow, crackle
-and eventual silence remain. Version 0.1.29 addresses phone-output accounting
-and recovery; hardware validation is pending.
+and eventual silence remained. Version 0.1.29 corrected output accounting and
+automatically recovered without dropping the phone connection, but the listener
+still reported interruptions. Version 0.1.30's eight-slot controller window
+improved playback, but the listener still heard crackle. Version 0.1.31 tests
+two AAC-ELD units per phone-output packet. Send waits fell to 8 ms, but small
+hitches remained. Version 0.1.32 adds input timing diagnostics and a replay-tested
+90 ms jitter reserve; its hardware validation is pending.
 The separate app control service remains untested on Pico hardware.
 
 ```text
@@ -102,9 +107,9 @@ revokes that ownership. Stored device ear detection is a separate AirPods settin
   next accepted packet for a decoder reset after the older queued work finishes.
   It does not clear valid queued PCM or repeatedly reset for each rejected packet.
   Decoded PCM uses the existing 8,192-frame pool as a 170.7 ms
-  transient bound, with an independent 80 ms phone-input jitter reserve. Initial
-  prefill is about 83 ms for SBC output, 90 ms for AAC-ELD and 101 ms for AAC.
-  The reserve adds 60 ms of phone buffering; USB thresholds and its allocation
+  transient bound, with an independent 90 ms phone-input jitter reserve. Initial
+  prefill is about 93 ms for SBC output, 100 ms for AAC-ELD and 111 ms for AAC.
+  This candidate adds 10 ms to the 0.1.31 phone reserve; USB thresholds and its allocation
   are unchanged. Extra compressed slots provide burst capacity without a new
   startup or playout delay.
   A bounded resampling correction follows queue fill to compensate for independent
@@ -119,8 +124,10 @@ revokes that ownership. Stored device ear detection is a separate AirPods settin
   restarts a locally suspended stream; AAC-ELD resets and repeats its 100 ms prime.
   USB PCM arriving during that restart is retained. Each transition has a
   three-second deadline; phone Start waits until restart and priming finish.
-- Phone AAC-ELD output uses one 10 ms frame per packet. USB retains its existing
-  packet grouping. Output profiles offer discrete supported AAC/ELD bitrates;
+- Phone AAC-ELD output groups two 10 ms frames per packet when the negotiated
+  payload fits them. Encoding still yields after one frame per main-loop pass.
+  This halves media-packet frequency and adds 10 ms of packet holding versus
+  0.1.30. USB retains its existing packet grouping. Output profiles offer discrete supported AAC/ELD bitrates;
   an explicit unsupported choice never falls back silently. Profile changes
   require idle audio and reopen AVDTP for negotiation. Timestamps, startup
   priming and controller flush policy remain fixed. The
@@ -171,7 +178,7 @@ The phone jitter regression also uses production PCM, clock feedback and the
 real resampler for three-frame/15 ms LHDC packets delivered in 20 ms batches.
 After two minutes of settling it injects a 72 ms ingress gap and a 60 ms encoder
 stall, separately and together, at ten encoder phases. The old buffer loses
-samples; the 80 ms reserve and full existing pool pass without loss. These tests
+samples; the current reserve and full existing pool pass this synthetic case. These tests
 and the real decoder safety checks run in the float CI job after SDK preparation.
 Typed feature 15 and `audio_diagnostics.py --phone` expose queue, decoder,
 sequence-gap and reset counters without enabling per-packet logging. On 0.1.27,
@@ -207,6 +214,38 @@ The phone's completion counts describe
 outgoing control traffic, not incoming music acknowledgements. These counters
 do not enable packet logging. A long completion interval is cadence evidence;
 it does not by itself establish a radio stall or exhausted credits.
+
+On 0.1.29, an on-demand snapshot reported eight physical controller ACL slots,
+an effective firmware limit of three, zero free slots, three outstanding packets
+and no reserved host packet buffer. Version 0.1.30 changes only the outgoing
+limit to eight for the next comparison, retaining the 250 MHz clock, three
+incoming host slots, audio framing and bitrates. BTstack still clips the limit
+to the controller's advertised capacity. The older shared-bus warning remains
+a reason to check bus writes/resets and USB latency; this is a controlled
+experiment, not established proof that the three-slot limit caused the faults.
+The initial approximately 44-second active interval then had no new PCM or
+input losses or recoveries, although the listener still heard crackle. A later
+snapshot showed a 59 ms maximum send wait, versus approximately 100 ms before,
+and some subsequent losses. The next two-unit packet comparison retains that
+window, clock and bitrate to test packet overhead separately from CPU speed.
+
+On 0.1.31, the first approximately 47 active seconds had 299 zero-filled frames
+and no drops, rejected input, decode errors or RTP gaps. A later snapshot showed
+4,451 zero-filled frames and 217 drops, with no transport recovery and an 8 ms
+maximum send wait. The remaining fault therefore needs input-timing investigation
+as well as the earlier output corrections.
+
+An integrated replay now runs the production phone worker, PCM publication,
+real SDK resampler and playout path against three uninterrupted timing-only
+capture segments, after clock-feedback settling. It reproduces up to 387 missing
+frames at 80 ms. Near-instant decoding still reproduces the fault. The source
+can accumulate 86.84 ms of lateness despite a 72.22 ms maximum individual gap;
+the previous isolated-gap simulation missed that waveform. A 90 ms reserve passes
+the phase/cost sweep without rejects or FIFO drops; 87.5 ms still fails.
+Its smallest modeled low-side margin is only 93 frames, so 90 ms is a controlled
+hardware candidate. Larger reserves also risk consuming real high-side headroom.
+Version-2 phone diagnostics measure actual Pico arrival/publication gaps and RTP
+timestamp discontinuities to validate this tradeoff on the next connection.
 
 Control tests cover fragmented/coalesced RFCOMM frames, encrypted saved-peer
 checks, per-client RPC ownership, replay protection, blocked writers and cleanup.

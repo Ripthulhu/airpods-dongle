@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from test import playback_lifecycle_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 ARM_SUPPORT = """#include <stddef.h>
@@ -107,6 +108,17 @@ def main():
         run = ["qemu-system-arm", "-M", "mps2-an500", "-nographic", "-semihosting-config",
                "enable=on,target=native", "-kernel", str(binary)] if args.arm else [str(binary)]
         subprocess.run(run, check=True, timeout=30)
+
+        if not args.arm:
+            # Real worker/SDK resampler/production PCM scheduling against a
+            # timing-only phone capture; codec values and CPU cost are synthetic.
+            playback_lifecycle_sources(Path(temporary))
+            pipeline = Path(temporary) / "phone-pipeline"
+            subprocess.run(command + ["-Wno-unused-function", "-I", temporary,
+                           "-I", str(ROOT / "tests"), str(ROOT / "tests/phone_pipeline_test.c"),
+                           str(sdk / "lib/btstack/src/btstack_resample.c"), "-lm", "-o", str(pipeline)],
+                           check=True, timeout=30)
+            subprocess.run([str(pipeline)], check=True, timeout=30)
 
         # Exercise the selected-pair resolver with the pinned AES implementation.
         finder = Path(temporary) / "finder"

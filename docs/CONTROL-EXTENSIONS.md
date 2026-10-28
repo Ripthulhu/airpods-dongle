@@ -51,7 +51,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 10: settings workflow lease | action u8, token u32 | acquire: version u8=1, token u32; renew/release: empty |
 | 11: audio trace | none | read-only 512-byte version-1 snapshot; see audio continuity document |
 | 12: diagnostic BLE scan policy | enabled u8 (0/1) | empty; disabling expires after 120 seconds |
-| 15: phone input counters | none | read-only 52-byte version-1 queue/decoder snapshot |
+| 15: phone input counters | none | read-only queue/decoder snapshot: v1 52 bytes, v2 64 bytes |
 
 Cached report slot 6 also returns the settings snapshot. Format: version u8=1,
 count u8, then count records of control ID u8, age milliseconds u32, report
@@ -358,9 +358,10 @@ occur only on an explicit diagnostic request.
 
 ## Phone input counters (typed feature 15, firmware 0.1.27)
 
-Request is one byte, 15. Response is 52 bytes, little-endian. Header bytes 0..3
-are version 1; codec (0 none, 1 SBC, 2 aptX, 3 LHDCv5); state flags; field count
-12. Flags are signaling connected (1), configured (2), opened (4), started (8),
+Request is one byte, 15. Response is little-endian: version 1 is 52 bytes with
+12 fields; version 2 (firmware 0.1.32) is 64 bytes with 15 fields. Header bytes
+0..3 are version; codec (0 none, 1 SBC, 2 aptX, 3 LHDCv5); state flags; field count.
+Flags are signaling connected (1), configured (2), opened (4), started (8),
 Start pending (16), Start accepted (32), worker ready (64), and AirPods output
 ready (128).
 
@@ -370,7 +371,17 @@ resets, published stereo PCM frames, latest media-packet milliseconds, queued
 packets, decoded output waiting (0/1), latest decode microseconds and maximum
 decode microseconds.
 
-Packet/error/reset/frame totals wrap at 32 bits and persist until firmware
+Version 2 appends three u32 values at offsets 52, 56 and 60: maximum active
+validated-media arrival gap in milliseconds; maximum nonempty decoded-PCM
+publication gap in milliseconds; RTP timestamp-discontinuity count. The latter
+checks contiguous RTP/codec sequences on the same SSRC against the previous
+packet's frame duration, and saturates at UINT32_MAX. Raw aptX has no RTP check.
+Idle, reset and genuine route loss disarm timing comparisons; scoped recovery
+remains eligible. Maxima/counts persist across those boundaries until firmware
+initialization. A publication gap can include decoder or main-loop delay and
+does not by itself identify CPU saturation. The collector supports both layouts.
+
+Other packet/error/reset/frame totals wrap at 32 bits and persist until firmware
 initialization. Resets include ordinary start/stop transitions, so compare
 steady-playback deltas. Timing and queue values describe the current worker.
 In 0.1.27, queue-full submissions also incremented malformed/reset totals and

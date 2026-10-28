@@ -724,13 +724,13 @@ static uint32_t phone_diagnostic_field(const uint8_t *data, unsigned field) {
 
 static void test_read_only_phone_diagnostics(void) {
     fixture(true);playing(true);async_worker=true;
-    uint8_t data[53], packet[64], raw[4]={1,2,3,4};
+    uint8_t data[65], packet[64], raw[4]={1,2,3,4};
     memset(data,0xa5,sizeof(data));
-    assert(phone_sink_diagnostics(NULL,52)==0 && phone_sink_diagnostics(data,51)==0);
+    assert(phone_sink_diagnostics(NULL,64)==0 && phone_sink_diagnostics(data,63)==0);
     for(unsigned i=0;i<sizeof(data);++i)assert(data[i]==0xa5);
     now=100;media_handler(phone.seid,raw,sizeof(raw));
-    assert(phone_sink_diagnostics(data,sizeof(data))==52);
-    assert(data[0]==1 && data[1]==PHONE_CODEC_APTX && data[2]==0xcf && data[3]==12 && data[52]==0xa5);
+    assert(phone_sink_diagnostics(data,sizeof(data))==64);
+    assert(data[0]==2 && data[1]==PHONE_CODEC_APTX && data[2]==0xcf && data[3]==15 && data[64]==0xa5);
     assert(phone_diagnostic_field(data,0)==1 && phone_diagnostic_field(data,8)==1);
     assert(phone_diagnostic_field(data,9)==0 && phone_diagnostic_field(data,10)==1250);
     assert(phone_diagnostic_field(data,11)==2500 && worker_pending); // Reading never consumes work.
@@ -743,7 +743,7 @@ static void test_read_only_phone_diagnostics(void) {
     now=120;decode_ok=true;media_handler(phone.seid,raw,sizeof(raw));phone_sink_poll();
     assert(phone.decoded_frames==240);
     now=130;media_handler(phone.seid,raw,3);
-    assert(phone_sink_diagnostics(data,sizeof(data))==52);
+    assert(phone_sink_diagnostics(data,sizeof(data))==64);
     assert(phone_diagnostic_field(data,0)==2 && phone_diagnostic_field(data,1)==2);
     assert(phone_diagnostic_field(data,3)==1 && phone_diagnostic_field(data,4)==1);
     assert(phone_diagnostic_field(data,5)==resets+2 && phone_diagnostic_field(data,6)==240);
@@ -761,6 +761,101 @@ static void test_read_only_phone_diagnostics(void) {
     phone_sink_diagnostics(data,sizeof(data));
     assert(phone_diagnostic_field(data,2)==1 && phone_diagnostic_field(data,5)==resets+3);
     assert((data[2]&8)==0 && phone_diagnostic_field(data,6)==12);
+}
+
+static void packet_timestamp(uint8_t *packet, uint32_t timestamp) {
+    for(unsigned i=0;i<4;++i)packet[4+i]=(uint8_t)(timestamp>>(24u-8u*i));
+}
+static void test_phone_gap_diagnostics(void) {
+    fixture(true);playing(true);async_worker=true;
+    uint8_t raw[4]={1,2,3,4},data[64];
+    now=100;media_handler(phone.seid,raw,sizeof(raw));now=105;phone_sink_poll();
+    now=120;media_handler(phone.seid,raw,sizeof(raw));
+    now=125;media_handler(phone.seid,raw,sizeof(raw)); // Queue rejection still observes ingress.
+    now=150;phone_sink_poll();
+    phone_sink_diagnostics(data,sizeof(data));
+    assert(phone_diagnostic_field(data,12)==20 && phone_diagnostic_field(data,13)==45);
+    assert(phone_diagnostic_field(data,14)==0 && phone.submit_failures==1);
+    output_ready=false;output_recovering=true;
+    now=180;media_handler(phone.seid,raw,sizeof(raw));now=210;phone_sink_poll();
+    assert(phone.max_media_gap_ms==55 && phone.max_pcm_gap_ms==60);
+    stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
+    assert(!phone.media_gap_armed && !phone.pcm_gap_armed);
+    now=9000;output_ready=true;output_recovering=false;
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);
+    media_handler(phone.seid,raw,sizeof(raw));phone_sink_poll();
+    assert(phone.max_media_gap_ms==55 && phone.max_pcm_gap_ms==60); // Paused time is excluded.
+    now=20000;media_handler(phone.seid,raw,3); // Reset marks a fresh gap epoch.
+    now=30000;media_handler(phone.seid,raw,sizeof(raw));phone_sink_poll();
+    assert(phone.max_media_gap_ms==55 && phone.max_pcm_gap_ms==60);
+    fixture(true);playing(false);
+    uint8_t packet[32];unsigned size=rtp(packet,1);
+    now=100;media_handler(phone.seid,packet,size);
+    rtp(packet,2);packet_timestamp(packet,128);now=120;media_handler(phone.seid,packet,size);
+    now=1000;media_handler((uint8_t)(phone.seid+1),packet,size);
+    decoded_pcm(NULL,0,NULL);
+    assert(phone.media_gap_armed && phone.pcm_gap_armed && phone.timestamp_valid);
+    output_ready=false;now=9000;rtp(packet,3);packet_timestamp(packet,90000);
+    media_handler(phone.seid,packet,size); // No sink poll or teardown between route loss and return.
+    assert(!phone.media_gap_armed && !phone.pcm_gap_armed && !phone.timestamp_valid);
+    output_ready=true;now=19000;media_handler(phone.seid,packet,size);
+    assert(phone.max_media_gap_ms==20 && phone.max_pcm_gap_ms==20 && !phone.timestamp_discontinuities);
+    const int16_t samples[4]={1,2,3,4};
+    output_ready=false;now=20000;decoded_pcm(samples,2,NULL);
+    assert(!phone.media_gap_armed && !phone.pcm_gap_armed && !phone.timestamp_valid);
+    output_ready=true;now=30000;decoded_pcm(samples,2,NULL);
+    assert(phone.max_pcm_gap_ms==20); // A publication callback independently observes route loss.
+    fixture(true);playing(true);async_worker=true;
+    now=UINT32_MAX-5u;media_handler(phone.seid,raw,sizeof(raw));phone_sink_poll();
+    now=7;media_handler(phone.seid,raw,sizeof(raw));phone_sink_poll();
+    assert(phone.max_media_gap_ms==13 && phone.max_pcm_gap_ms==13);
+    output_ready=false;phone_sink_poll();
+    assert(!phone.media_gap_armed && !phone.pcm_gap_armed);
+}
+static void test_rtp_timestamp_diagnostics(void) {
+    lhdc_playing_async();uint8_t packet[64],data[64];
+    unsigned size=lhdc_rtp(packet,0xffff,0xff,3,4);
+    packet_timestamp(packet,UINT32_MAX-479u);media_handler(phone.seid,packet,size);phone_sink_poll();
+    size=lhdc_rtp(packet,0,0,2,4);packet_timestamp(packet,240);
+    media_handler(phone.seid,packet,size);phone_sink_poll();
+    assert(!phone.timestamp_discontinuities); // Sequence, codec sequence and timestamp wrap.
+    size=lhdc_rtp(packet,1,1,4,4);packet_timestamp(packet,720);
+    media_handler(phone.seid,packet,size);phone_sink_poll();
+    size=lhdc_rtp(packet,2,2,1,4);packet_timestamp(packet,1681);
+    media_handler(phone.seid,packet,size);phone_sink_poll();
+    assert(phone.timestamp_discontinuities==1); // Previous count, not current count, sets duration.
+    packet_timestamp(packet,9999);media_handler(phone.seid,packet,size); // Duplicate is ignored.
+    size=lhdc_rtp(packet,1,1,1,4);media_handler(phone.seid,packet,size); // Late is ignored.
+    size=lhdc_rtp(packet,4,4,1,4);packet_timestamp(packet,5000);
+    media_handler(phone.seid,packet,size);phone_sink_poll(); // Sequence gap rebases.
+    size=lhdc_rtp(packet,5,8,1,4);packet_timestamp(packet,9000);
+    media_handler(phone.seid,packet,size);phone_sink_poll(); // Codec sequence gap rebases.
+    size=lhdc_rtp(packet,6,9,1,4);packet[11]=2;packet_timestamp(packet,10000);
+    media_handler(phone.seid,packet,size);phone_sink_poll(); // New SSRC rebases.
+    assert(phone.timestamp_discontinuities==1);
+    size=lhdc_rtp(packet,7,10,1,4);packet[11]=2;packet_timestamp(packet,10240);
+    submit_ok=false;media_handler(phone.seid,packet,size);submit_ok=true;
+    size=lhdc_rtp(packet,8,11,1,4);packet[11]=2;packet_timestamp(packet,10480);
+    media_handler(phone.seid,packet,size);phone_sink_poll();
+    assert(phone.timestamp_discontinuities==1 && phone.submit_failures==1);
+    media_handler(phone.seid,packet,3);
+    size=lhdc_rtp(packet,9,12,1,4);packet[11]=2;packet_timestamp(packet,50000);
+    media_handler(phone.seid,packet,size);phone_sink_poll();
+    assert(phone.timestamp_discontinuities==1); // Malformed/reset does not manufacture timestamp loss.
+    phone.timestamp_discontinuities=UINT32_MAX;
+    size=lhdc_rtp(packet,10,13,1,4);packet[11]=2;
+    media_handler(phone.seid,packet,size);phone_sink_poll();
+    assert(phone.timestamp_discontinuities==UINT32_MAX);
+    fixture(true);playing(false);
+    assert(phone.rtp_frame_samples==16*8);
+    size=rtp(packet,1);packet[12]=3;packet_timestamp(packet,100);
+    media_handler(phone.seid,packet,size);
+    size=rtp(packet,2);packet[12]=2;packet_timestamp(packet,484);
+    media_handler(phone.seid,packet,size);assert(!phone.timestamp_discontinuities);
+    size=rtp(packet,3);packet_timestamp(packet,741);
+    media_handler(phone.seid,packet,size);phone_sink_diagnostics(data,sizeof(data));
+    assert(phone_diagnostic_field(data,14)==1);
 }
 static void test_timeouts_and_stale_events(void) {
     fixture(true);signaling(0x40,phone_address);configure(false);opened();
@@ -944,6 +1039,8 @@ static void test_output_recovery_keeps_phone_stream(void) {
 }
 
 int main(void) {
+    test_phone_gap_diagnostics();
+    test_rtp_timestamp_diagnostics();
     test_output_recovery_keeps_phone_stream();
     test_queue_congestion_preserves_pending_audio();
     test_read_only_phone_diagnostics();

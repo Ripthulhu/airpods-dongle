@@ -262,24 +262,24 @@ static void test_prime_before_input_and_wire_ack(void) {
 
 static void test_phone_clock_bounded_correction(void) {
     phone_clock_t clock;
-    assert(phone_clock_prefill(128) == 3968);
-    assert(phone_clock_prefill(480) == 4320);
-    assert(phone_clock_prefill(1024) == 4864);
+    assert(phone_clock_prefill(128) == 4448);
+    assert(phone_clock_prefill(480) == 4800);
+    assert(phone_clock_prefill(1024) == 5344);
     phone_clock_init(&clock, 1024);
-    assert(clock.target_q8 == 4288 * 256);
+    assert(clock.target_q8 == 4768 * 256);
     phone_clock_init(&clock, 128);
-    assert(clock.target_q8 == 4288 * 256);
+    assert(clock.target_q8 == 4768 * 256);
     phone_clock_init(&clock, 480);
-    assert(clock.target_q8 == 4080 * 256);
+    assert(clock.target_q8 == 4560 * 256);
     for (unsigned i = 0; i < 1000; ++i)
-        assert(phone_clock_update(&clock, i % 2 ? 4320 : 3840, 480) == 0x10000u);
+        assert(phone_clock_update(&clock, i % 2 ? 4800 : 4320, 480) == 0x10000u);
     for (unsigned i = 0; i < 1000; ++i) phone_clock_update(&clock, 0, 480);
     assert(phone_clock_update(&clock, 0, 480) == 0x10000u - 32u);
     for (unsigned i = 0; i < 1000; ++i) phone_clock_update(&clock, PHONE_PCM_CAPACITY, 480);
     assert(phone_clock_update(&clock, PHONE_PCM_CAPACITY, 480) == 0x10000u + 32u);
     for (unsigned i = 0; i < 3000; ++i)
-        phone_clock_update(&clock, i % 2 ? 4320 : 3840, 480);
-    assert(phone_clock_update(&clock, 4080, 480) == 0x10000u);
+        phone_clock_update(&clock, i % 2 ? 4800 : 4320, 480);
+    assert(phone_clock_update(&clock, 4560, 480) == 0x10000u);
 }
 
 int main(void) {

@@ -621,6 +621,7 @@ void bridge_phone_pcm_push(const int16_t *src, uint16_t frames) {
         if (output > 130) { bridge_phone_drop_pcm(); return; }
         critical_section_enter_blocking(&playback_pcm_lock);
         playback_pcm_push_measured(adjusted, output);
+        PB_MAX(TRACE_PCM_MAX, playback_pcm.used);
         critical_section_exit(&playback_pcm_lock);
         src += count * 2;
         frames -= count;
@@ -756,9 +757,13 @@ static void audio_pcm_read(uint16_t frames) {
     bool active=(is_usb_streaming || phone_active) && playback_pcm.primed_on_wire;
     PB_ADD(active?TRACE_ACTIVE_ZERO:TRACE_STARTUP_ZERO,missing);
     if(active && missing)PB_EVENT(TRACE_ZERO,missing,playback_pcm.used);
-    if (phone_active)
-        btstack_resample_set_factor(&phone_resampler,
-                                   phone_clock_update(&phone_clock, playback_pcm.used, frames));
+    if (phone_active) {
+        if (phone_buffer_started && playback_pcm.used < playback_trace.stats[TRACE_PCM_MIN])
+            playback_trace.stats[TRACE_PCM_MIN] = playback_pcm.used;
+        uint32_t factor = phone_clock_update(&phone_clock, playback_pcm.used, frames);
+        btstack_resample_set_factor(&phone_resampler, factor);
+        playback_trace.stats[TRACE_CLOCK_Q16] = factor;
+    }
     critical_section_exit(&playback_pcm_lock);
 }
 
@@ -954,9 +959,9 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
         }
         context->codec_num_frames++;
 
-        // Use 10 ms packets during phone preparation as well as playback.
+        // Yield after one ELD unit; the next main-loop pass may complete its packet.
         if (cur_codec == 4 || cur_codec == 2 || context->codec_num_frames >=
-            (phone_opened ? 1 : playback_game.changed && playback_game.target == 60 ? 2 : 3)) break;
+            (phone_opened ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3)) break;
     }
     return total_samples_read;
 }
@@ -1198,7 +1203,7 @@ static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint3
                 if (fill_aac_audio_buffer(context) < 0) return;
 
                 if (context->codec_num_frames >=
-                    (phone_opened ? 1 : playback_game.changed && playback_game.target == 60 ? 2 : 3) ||
+                    (phone_opened ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3) ||
                     (context->codec_num_frames > 0 &&
                      (context->max_media_payload_size - context->codec_storage_count) <
                      (int)((aaceld_bitrate + 799) / 800 + 4))) {

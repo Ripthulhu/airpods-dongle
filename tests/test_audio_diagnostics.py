@@ -37,7 +37,7 @@ class FakeHid:
         self.writes.append(bytes(data))
         self.report = data[:]
         if data[7] == 7:
-            assert data[20] == 1 and data[22] in (5, 9, 11, 13)
+            assert data[20] == 1 and data[22] in (5, 9, 11, 13, 15)
             self.report[21] = 1
             struct.pack_into('<H', self.report, 18, 1)
         else:
@@ -140,6 +140,25 @@ class AudioDiagnosticsTests(unittest.TestCase):
             transact.assert_called_once_with(None, b'\x0f')
         with self.assertRaises(ValueError):
             diagnostics.feature(None, 16)
+
+    def test_phone_v2_gaps_and_pagination(self):
+        data = bytearray((2, 3, 0xff, 15)) + bytearray(60)
+        values = list(range(15))
+        values[9] = 1
+        struct.pack_into('<15I', data, 4, *values)
+        decoded = diagnostics.decode_phone(data)
+        self.assertEqual(decoded['max_media_gap_ms'], 12)
+        self.assertEqual(decoded['max_pcm_gap_ms'], 13)
+        self.assertEqual(decoded['timestamp_discontinuities'], 14)
+        self.assertEqual(diagnostics.feature(FakeHid(data), 15), data)
+        for bad in (b'', data[:-1], bytearray((1, 3, 0xff, 15)) + data[4:],
+                    bytearray((2, 3, 0xff, 12)) + data[4:],
+                    bytearray((2, 4, 0xff, 15)) + data[4:]):
+            with self.assertRaises(RuntimeError):
+                diagnostics.decode_phone(bad)
+        struct.pack_into('<I', data, 40, 2)
+        with self.assertRaises(RuntimeError):
+            diagnostics.decode_phone(data)
 
     def test_phone_capture_handles_older_firmware(self):
         audio, perf = bytearray(20), bytearray(64)

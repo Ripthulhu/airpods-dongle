@@ -118,6 +118,9 @@ def playback_lifecycle_sources(directory):
         end = source.index("\n}", start) + 2
         production_pcm.append(source[start:end])
     (directory / "playback_pipeline.inc").write_text("\n".join(production_pcm))
+    start = source.index("\nvoid bridge_phone_pcm_push(") + 1
+    end = source.index("\n}", start) + 2
+    (directory / "playback_phone_push.inc").write_text(source[start:end])
     instrumentation = '''
 #include "playback_test_hooks.h"
 '''

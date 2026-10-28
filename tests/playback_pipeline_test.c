@@ -24,6 +24,10 @@ static unsigned sink_frames,sink_underruns;
 static bool sink_started;
 static unsigned phone_arrivals,phone_queued,phone_decode_due,phone_decoded;
 static bool phone_decoding,phone_output_ready;
+static unsigned phone_priming_left,phone_priming_encoded;
+#ifdef PLAYBACK_REAL_PHONE
+static void phone_pipeline_encoded(const int16_t *pcm,unsigned frames);
+#endif
 
 static void pipeline_received(unsigned frames) {
     sink_frames+=frames;
@@ -87,10 +91,16 @@ static void advance(unsigned ms) {
 }
 static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
     const int16_t *pcm=input->bufs[0];
+#ifdef PLAYBACK_REAL_PHONE
+    phone_pipeline_encoded(pcm,args->numInSamples/2);
+    encoded+=args->numInSamples/2;
+#else
     for(unsigned i=0;i<args->numInSamples/2;++i) {
         assert(pcm[2*i+1]==-pcm[2*i]);
-        if(phone_active) {
-            assert(pcm[2*i]==signal(encoded+playback_trace.stats[TRACE_DEBT_DROP]));
+        if(phone_priming_left) {
+            assert(pcm[2*i]==0);--phone_priming_left;++phone_priming_encoded;
+        } else if(phone_active) {
+            assert(pcm[2*i]==signal(encoded-phone_priming_encoded+playback_trace.stats[TRACE_DEBT_DROP]));
         } else if(check_sequence) {
             int expected=encoded<PLAYBACK_FILTER_DELAY?0:signal(encoded-PLAYBACK_FILTER_DELAY);
             assert(pcm[2*i]==expected);
@@ -104,6 +114,7 @@ static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
         previous=(uint32_t)(int32_t)pcm[2*i];have_previous=true;++encoded;
     }
     advance(variable_cost?5u+now%4u:encode_cost);
+#endif
 }
 static void pipeline_filter_cost(void) { advance(filter_cost); }
 static void fixture(int ppm) {
@@ -123,12 +134,14 @@ static void fixture(int ppm) {
     check_sequence=ppm==0;have_previous=false;
     usb_jitter=variable_cost=false;delayed_frames=0;
     sink_frames=sink_underruns=0;sink_started=false;
+    phone_priming_left=phone_priming_encoded=0;
     for(unsigned i=0;i<20;++i)ingress(48);
     media_tracker.audio_timer.context=&media_tracker;
     media_tracker.audio_timer.timeout=10;
 }
 static void step(void) {
     uint32_t started=now*1000u;
+    unsigned encoded_before=encode_calls;
     if(phone_active && phone_output_ready) {
         phone_ingress(720);phone_output_ready=false;
     }
@@ -139,6 +152,7 @@ static void step(void) {
         a2dp_demo_send_media_packet();
     }
     playback_audio_work(now);
+    assert(encode_calls-encoded_before<=1); // Can-send callbacks cannot recursively encode.
     advance(loop_cost);
     advance(realtime_loop_idle_us(started,now*1000u)/1000u);
 }
@@ -292,7 +306,7 @@ static void phone_send_wait_keeps_source_time(void) {
     assert(playback_pcm_reset(&playback_pcm,8192,false));playback_pcm.primed_on_wire=true;
     generated=encoded=0;phone_arrivals=phone_queued=phone_decode_due=phone_decoded=0;
     phone_decoding=phone_output_ready=false;
-    phone_ingress(4320); // The established 80 ms phone reserve plus one encoder unit.
+    phone_ingress(4800); // The 90 ms phone reserve plus one encoder unit.
     request_wait=100;next_wait=500;
     while(now<10000)step();
     assert(playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
@@ -357,6 +371,32 @@ static void phone_reprime_then_fresh_pcm(void) {
     }
     assert(!playback_metrics.pcm_underflows && !playback_metrics.pcm_drops);
 }
+static void phone_packet_priming(void) {
+    for(unsigned recovery=0;recovery<2;++recovery) {
+        fixture(0);is_usb_streaming=false;phone_opened=true;phone_active=recovery!=0;
+        phone_buffer_started=false;encode_cost=0;generated=encoded=0;
+        assert(playback_pcm_reset(&playback_pcm,8192,true));phone_priming_left=4800;
+        for(unsigned unit=0;unit<10;++unit) {
+            now+=10;avdtp_audio_timeout_handler(&media_tracker.audio_timer);
+            unsigned before=encode_calls;playback_audio_work(now);
+            assert(encode_calls==before+1 && !playback_pcm.primed_on_wire);
+            if(send_requested) {send_requested=false;a2dp_demo_send_media_packet();}
+            assert(playback_pcm.primed_on_wire==(unit==9));
+        }
+        assert(!phone_priming_left && phone_priming_encoded==4800);
+        assert(eld_packets==5 && eld_units==10 && emitted==4800 && !playback_pcm.used);
+        phone_active=true;phone_ingress(4320);
+        for(unsigned unit=0;unit<2;++unit) {
+            now+=10;avdtp_audio_timeout_handler(&media_tracker.audio_timer);
+            unsigned before=encode_calls;playback_audio_work(now);
+            assert(encode_calls==before+1);
+            if(send_requested) {send_requested=false;a2dp_demo_send_media_packet();}
+        }
+        assert(phone_buffer_started && playback_pcm.used==3360 && encoded==5760);
+        assert(eld_packets==6 && eld_units==12 && emitted==5760);
+        assert(!playback_metrics.pcm_underflows && !playback_metrics.pcm_drops);
+    }
+}
 int main(void) {
     startup_keeps_one_filter_phase();
     steady_and_stalls();clock_drift();delayed_timer_clock();send_wait_after_encoding();excessive_stall();stale_receiver_window();jitter_and_live_changes();measured_cpu_budget();
@@ -364,6 +404,7 @@ int main(void) {
     phone_late_decode_keeps_unmatched_debt();
     phone_stale_receiver_window();
     phone_reprime_then_fresh_pcm();
+    phone_packet_priming();
     puts("production USB pipeline: real PCM, measured CPU budget, 1..40ms stalls, 10-minute clocks and bounded recovery passed");
     return 0;
 }

@@ -12,8 +12,11 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.29** includes phone-input queue and output-recovery
-corrections; its hardware validation is pending. Version **0.1.25** passed short Windows S16 and genuine IEEE
+Development candidate **0.1.32** tests a 90 ms phone jitter reserve with new
+arrival/delivery timing counters. It is not yet hardware-verified. Two-unit
+AAC-ELD packets in **0.1.31** reduced send waits substantially, but occasional
+hitches remained. Version **0.1.25** passed short
+Windows S16 and genuine IEEE
 float32 USB listening checks, including microphone open/close with normal stereo
 afterward. Windows' device format and the Pico's selected alt 2 confirm float
 transport; volume and mute were unchanged. The listener accepted the remaining

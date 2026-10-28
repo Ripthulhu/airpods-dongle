@@ -193,7 +193,7 @@ static void fixture(void) {
     busy_routes = disconnect_calls = 0;
     busy_during_key_read = false;
     memset(credit_connections,0,sizeof(credit_connections));
-    credit_free_slots=3;credit_packet_reserved=false;
+    credit_free_slots=MAX_NR_CONTROLLER_ACL_BUFFERS;credit_packet_reserved=false;
     stored_phone_length = 0;
     memset(&stored_phone, 0, sizeof(stored_phone));
     memset(phone_key_address, 0, sizeof(phone_key_address));
@@ -637,12 +637,16 @@ static void test_credit_diagnostics(void) {
     uint8_t buffer[]={HCI_EVENT_COMMAND_COMPLETE,11,1,5,0x10,0,0xfd,3,0,12,0,0,0};
     hci_packet_handler(HCI_EVENT_PACKET,0,buffer,sizeof(buffer));
     assert(bt_hci_credit_diagnostics(&data));
-    assert(data.raw_acl_count==12 && data.raw_acl_length==1021 && data.effective_acl_limit==3);
+    unsigned limit=12u<MAX_NR_CONTROLLER_ACL_BUFFERS?12u:MAX_NR_CONTROLLER_ACL_BUFFERS;
+    assert(data.raw_acl_count==12 && data.raw_acl_length==1021 && data.effective_acl_limit==limit);
     credit_free_slots=1;credit_packet_reserved=true;bt_hci_credit_diagnostics(&data);
-    assert(data.free_acl_slots==1 && data.outstanding_acl_packets==2 && data.packet_buffer_reserved==1);
+    assert(data.free_acl_slots==1 && data.outstanding_acl_packets==limit-1 && data.packet_buffer_reserved==1);
     buffer[5]=1;buffer[9]=99;hci_packet_handler(HCI_EVENT_PACKET,0,buffer,sizeof(buffer));
     buffer[5]=0;buffer[1]=10;hci_packet_handler(HCI_EVENT_PACKET,0,buffer,sizeof(buffer)-1);
     bt_hci_credit_diagnostics(&data);assert(data.raw_acl_count==12); // Failed/truncated replies cannot replace metadata.
+    buffer[1]=11;buffer[9]=2;hci_packet_handler(HCI_EVENT_PACKET,0,buffer,sizeof(buffer));
+    bt_hci_credit_diagnostics(&data);
+    assert(data.raw_acl_count==2 && data.effective_acl_limit==2 && data.outstanding_acl_packets==1);
     memcpy(phone_address,nearby,6);phone_bonded=true;
     credit_connections[0].con_handle=0x11;memcpy(credit_connections[0].address,first,6);
     credit_connections[1].con_handle=0x22;memcpy(credit_connections[1].address,nearby,6);

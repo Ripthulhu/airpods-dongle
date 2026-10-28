@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define PHONE_PCM_CAPACITY 8192u // Use the existing PCM pool for phone transport stalls.
-#define PHONE_JITTER_RESERVE 3840u // 80 ms covers observed phone ingress gaps.
+#define PHONE_JITTER_RESERVE 4320u // 90 ms covers recorded cumulative ingress lateness.
 #define PHONE_PACKET_FRAMES 960u // Allow a 20 ms ingress burst at 48 kHz.
 
 typedef struct { int32_t fill_q8, target_q8; } phone_clock_t;
