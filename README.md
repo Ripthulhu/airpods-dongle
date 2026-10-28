@@ -17,9 +17,11 @@ priming and starts in normal mode; double-press BOOTSEL to enable Game Mode.
 Version **0.1.38** can confirm the receiver-buffer preparation before
 Start, then miss the live timing adjustment after its 100 ms priming. A PC hitch
 investigation found continuous host/USB/encoder data and clean playback after a
-manual off/on retune. That supports correcting the missed adjustment; hardware
-validation of the candidate remains pending. The 60 ms target and packet grouping
-are unchanged.
+manual off/on retune. The original PC Pico now passes short normal-mode,
+double-press Game Mode and automatic case-return checks on 0.1.39. Its startup
+trace confirms the fresh post-prime request and completed adjustment. Extended
+playback, microphone and phone-call checks remain open. The 60 ms target and
+packet grouping are unchanged.
 
 Version **0.1.38** removes the unsuccessful extra AVRCP volume
 refresh, restores a short settling delay, and adds AACP audio ownership and a

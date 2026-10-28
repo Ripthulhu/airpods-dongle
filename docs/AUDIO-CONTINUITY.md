@@ -551,7 +551,25 @@ Game Mode now starts off by user request. A supported owned output receives a
 fresh normal-buffer preparation, so a prior low-buffer setting is not mistaken
 for the new default merely because the preference flag is off.
 
+The original PC Pico was then flashed with 0.1.39, with firmware readback and
+unchanged pairing storage verified. Before any USB frames or encoded audio,
+its boot state reported Game Mode requested false, phase OFF and a fresh
+150 ms normal preparation. The listener confirmed clean stereo in normal mode,
+then enabled Game Mode by double press and confirmed automatic, clean stereo
+after a closed-case return, with the companion closed.
+
+The case-return observer recorded a 60 ms preparation, Stream Started, another
+60 ms request, and a completed live correction. The post-prime report was 59 ms;
+the 48-frame fill correction completed in 97 ms without failure. The later
+snapshot retained float alt 2, Game Mode confirmed, and zero active discard,
+zero-fill, debt discard, controller flush or recovery since boot. Startup drops
+during connection/case absence were nonzero and must not be called lossless
+playback. This short check establishes automatic correction and clean observed
+playback; it does not complete a 30-minute run or measure final acoustic latency.
+
 Local evidence: `pc-hitch-ipc-20261028-182002.json`,
 `pc-hitch-hid-20261028-182427.json`, `pc-hitch-hid-20261028-182745.json`,
 `pc-hitch-hid-20261028-183546.json`, and
-`pc-hitch-loopback-game-on.log` in the bring-up artifact directory.
+`pc-hitch-loopback-game-on.log` in the bring-up artifact directory. The 0.1.39
+checks add `pc-0.1.39-boot-state.json`, `pc-0.1.39-normal-playing.json`,
+`pc-0.1.39-game-case-return.json`, and the matching `pc-startup-0.1.39-*.log`.
