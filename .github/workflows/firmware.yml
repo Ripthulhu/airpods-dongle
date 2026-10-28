@@ -1,0 +1,81 @@
+name: Firmware CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: C sanitizers and Python tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential cmake ninja-build python3
+      - name: Run regression tests with ASan and UBSan
+        run: python3 tools/test.py --sanitize
+
+  firmware:
+    name: Pico 2 W / ${{ matrix.variant }}
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: float
+            usb_float: "ON"
+          - variant: s16-only
+            usb_float: "OFF"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install firmware toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential cmake ninja-build python3 git pkg-config libusb-1.0-0-dev \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib qemu-system-arm
+      - name: Prepare pinned Pico SDK and verified patches
+        run: python3 tools/prepare_sdk.py --sdk .sdk/pico-sdk
+      - name: Configure Release firmware
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAIRPODS_USB_FLOAT=${{ matrix.usb_float }}
+      - name: Build and validate firmware
+        run: cmake --build build --parallel 2
+      - name: Package checked outputs
+        run: |
+          mkdir -p build/artifact
+          cp build/airpods_dongle.uf2 build/airpods_dongle.bin \
+            build/airpods_dongle.elf build/airpods_dongle.elf.map \
+            build/codec-probe/memory-check.json build/artifact/
+          git rev-parse HEAD > build/artifact/COMMIT.txt
+          arm-none-eabi-gcc --version > build/artifact/COMPILER.txt
+          cd build/artifact
+          sha256sum airpods_dongle.uf2 airpods_dongle.bin airpods_dongle.elf \
+            airpods_dongle.elf.map memory-check.json COMMIT.txt COMPILER.txt > SHA256SUMS
+      - name: Upload firmware download
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: airpods-dongle-pico2w-${{ matrix.variant }}
+          path: build/artifact/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,5 +1,7 @@
 # airpods-dongle
 
+[![Firmware CI](https://github.com/Ripthulhu/airpods-dongle/actions/workflows/firmware.yml/badge.svg)](https://github.com/Ripthulhu/airpods-dongle/actions/workflows/firmware.yml)
+
 AirPods USB and wireless phone audio bridge for Raspberry Pi Pico 2 W. The board
 owns Bluetooth; Windows uses its standard USB audio, media-key and serial drivers.
 
@@ -117,6 +119,23 @@ against that ELF and its fingerprinted codec archives, including LHDC gain and
 signal-error checks against the original synthetic PCM. UF2 publication waits
 for successful validation; a failed or interrupted recheck removes stale flash
 outputs. Tested allocations must leave a 64 KiB runtime reserve.
+
+### Automated builds
+
+[Firmware CI](https://github.com/Ripthulhu/airpods-dongle/actions/workflows/firmware.yml)
+runs on every push and pull request, and can be started with **Run workflow**.
+C/Python regression tests with address and undefined-behavior sanitizers must
+pass before the two Pico 2 W Release builds start. Each build uses the pinned SDK
+and picotool, including the existing codec, memory and USB descriptor checks.
+
+Open a successful run and download one of its **Artifacts**:
+
+- `airpods-dongle-pico2w-float`: normal firmware with float32 and S16 USB input.
+- `airpods-dongle-pico2w-s16-only`: compatibility firmware exposing S16 only.
+
+Each ZIP contains the UF2 to flash, BIN/ELF/map files, the memory-check receipt,
+source commit, compiler version and `SHA256SUMS`. Downloads are retained for
+30 days and require GitHub sign-in. CI does not replace hardware listening tests.
 
 ## Use
 
