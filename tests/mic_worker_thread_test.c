@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+#define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -8,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <aacdecoder_lib.h>
 #include "../src/btstack/aacp_mic_dec.h"
 
@@ -15,7 +17,7 @@ char __StackLimit[1];
 static CStreamInfo info = {48000, 480, 1, 39};
 static _Thread_local bool worker_thread;
 static _Atomic bool finished, worker_finished;
-static _Atomic unsigned delivered;
+static _Atomic unsigned delivered, probe_delivered;
 static _Atomic bool decoder_live;
 static _Atomic unsigned codec_calls;
 static uint16_t sequence;
@@ -96,8 +98,9 @@ static void *usb_consumer(void *arg) {
     for (;;) {
         unsigned count = aacp_mic_pcm_read(pcm, 64);
         for (unsigned i = 0; i < count; ++i) {
-            assert(pcm[i] >= previous && pcm[i] <= 20000);
+            assert(pcm[i] >= previous && pcm[i] <= 20001);
             previous = pcm[i];
+            if (pcm[i] == 20001) atomic_fetch_add(&probe_delivered, 1u);
         }
         atomic_fetch_add_explicit(&delivered, count, memory_order_relaxed);
         if (atomic_load_explicit(&worker_finished, memory_order_acquire) && count == 0) break;
@@ -129,6 +132,24 @@ int main(void) {
             aacp_mic_dec_poll();
             sched_yield();
         }
+    }
+    // Resets may discard every stress frame before a busy USB thread runs.
+    struct timespec start, now, pause = {0, 1000000};
+    assert(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+    while (!aacp_mic_dec_reset_done() || atomic_load(&output_read) != atomic_load(&output_written)) {
+        assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        assert(now.tv_sec - start.tv_sec < 5);
+        assert(nanosleep(&pause, NULL) == 0);
+    }
+    bytes[0] = (uint8_t)20001u;
+    bytes[1] = (uint8_t)(20001u >> 8);
+    for (unsigned i = 2; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(20001u + i);
+    assert(aacp_mic_dec_submit(bytes, sizeof(bytes)));
+    memset(bytes, 0xa5, sizeof(bytes));
+    while (atomic_load(&probe_delivered) != 480u) {
+        assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        assert(now.tv_sec - start.tv_sec < 5);
+        assert(nanosleep(&pause, NULL) == 0);
     }
     atomic_store_explicit(&finished, true, memory_order_release);
     assert(pthread_join(decoder, NULL) == 0 && pthread_join(usb, NULL) == 0);
