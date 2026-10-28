@@ -19,6 +19,8 @@ static bool reject_report;
 static uint16_t reports[128];
 static unsigned count;
 static unsigned ready_queries;
+static uint32_t test_time_us;
+uint32_t time_us_32(void) { return test_time_us; }
 
 bool tud_hid_ready(void) { ready_queries++; return ready; }
 bool tud_hid_report(uint8_t report_id, const void *report, uint16_t length) {
@@ -33,6 +35,93 @@ bool tud_hid_report(uint8_t report_id, const void *report, uint16_t length) {
 uint16_t tud_hid_get_report_cb(uint8_t, uint8_t, hid_report_type_t, uint8_t *, uint16_t);
 
 static void tick(void) { ready = true; usb_media_task(); }
+
+static void fresh_host(void) {
+    usb_media_set_available(false);
+    assert(!(usb_media_generation() & 1u));
+    usb_media_set_available(true);
+    assert(usb_media_generation() & 1u);
+    reject_report = false;
+    count = 0;
+    tick();
+    assert(count == 1 && reports[0] == 0);
+    count = 0;
+}
+
+static void test_volume_queue(void) {
+    fresh_host();test_time_us=100;
+    uint32_t sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    assert(usb_media_volume_sent()==sent); // Enqueue is not a delivered key.
+    reject_report=true;tick();assert(!count && usb_media_volume_sent()==sent);
+    reject_report=false;tick();assert(count==1 && reports[0]==0xe9 && usb_media_volume_sent()==sent+1);
+    tick();assert(count==2 && reports[1]==0 && usb_media_volume_sent()==sent+1);
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));tick();tick();
+    assert(reports[2]==0xea && reports[3]==0 && usb_media_volume_sent()==sent+2);
+
+    // Cancellation removes only unsent volume keys, preserving ordinary media.
+    fresh_host();sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    assert(usb_media_enqueue(USB_MEDIA_NEXT));
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));
+    usb_media_cancel_volume();tick();tick();tick();
+    assert(count==2 && reports[0]==0xb5 && reports[1]==0 && usb_media_volume_sent()==sent);
+    fresh_host();sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));usb_media_cancel_volume();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));tick();tick();
+    assert(count==2 && reports[0]==0xea && reports[1]==0 && usb_media_volume_sent()==sent+1);
+
+    // An already sent key must still be released even if its epoch is cancelled.
+    fresh_host();sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    assert(usb_media_enqueue(USB_MEDIA_PLAY));tick();
+    assert(count==1 && reports[0]==0xe9 && usb_media_volume_sent()==sent+1);
+    usb_media_cancel_volume();reject_report=true;tick();assert(count==1);
+    reject_report=false;tick();assert(count==2 && reports[1]==0);
+    tick();tick();assert(count==4 && reports[2]==0xcd && reports[3]==0);
+
+    // Opposite and repeated gestures retain their press/release order.
+    fresh_host();sent=usb_media_volume_sent();
+    const enum usb_media_command burst[]={USB_MEDIA_VOLUME_UP,USB_MEDIA_VOLUME_DOWN,
+        USB_MEDIA_VOLUME_UP,USB_MEDIA_VOLUME_UP,USB_MEDIA_VOLUME_DOWN,
+        USB_MEDIA_VOLUME_DOWN,USB_MEDIA_VOLUME_UP,USB_MEDIA_VOLUME_DOWN};
+    for(unsigned i=0;i<8;++i)assert(usb_media_enqueue(burst[i]));
+    assert(!usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    for(unsigned i=0;i<16;++i)tick();
+    assert(count==16 && usb_media_volume_sent()==sent+8);
+    for(unsigned i=0;i<8;++i)
+        assert(reports[2*i]==(burst[i]==USB_MEDIA_VOLUME_UP?0xe9:0xea) && reports[2*i+1]==0);
+
+    // An endpoint stall expires volume intent without expiring ordinary media.
+    fresh_host();sent=usb_media_volume_sent();test_time_us=1000;
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    assert(usb_media_enqueue(USB_MEDIA_PREVIOUS));
+    ready=false;usb_media_task();assert(!count);
+    test_time_us+=5000000u;tick();tick();
+    assert(count==2 && reports[0]==0xb6 && reports[1]==0 && usb_media_volume_sent()==sent);
+
+    // Deadline comparison remains exact across the uint32 microsecond wrap.
+    fresh_host();test_time_us=UINT32_MAX-100u;
+    uint32_t deadline=test_time_us+5000000u;
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    test_time_us=deadline-1u;tick();tick();assert(count==2 && reports[0]==0xe9 && reports[1]==0);
+    fresh_host();sent=usb_media_volume_sent();test_time_us=UINT32_MAX-100u;
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));
+    test_time_us=deadline;tick();assert(!count && usb_media_volume_sent()==sent);
+
+    // Bus ownership changes invalidate queued volume and force a clean release.
+    fresh_host();test_time_us=0;sent=usb_media_volume_sent();
+    uint32_t generation=usb_media_generation();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    usb_media_set_available(false);tick();assert(!count);
+    usb_media_set_available(true);assert(usb_media_generation()!=generation);
+    tick();tick();assert(count==1 && reports[0]==0 && usb_media_volume_sent()==sent);
+    fresh_host();sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));tick();assert(reports[0]==0xe9);
+    usb_media_set_available(false);tick();assert(count==1);
+    usb_media_set_available(true);tick();
+    assert(count==2 && reports[1]==0 && usb_media_volume_sent()==sent+1);
+}
 
 int main(void) {
     assert(!usb_media_enqueue(USB_MEDIA_PLAY));
@@ -97,5 +186,6 @@ int main(void) {
     reject_report = false;
     tick();
     assert(reports[count - 1] == 0);
-    puts("media controls: bounded queue, ordered releases, suspend/reset and retry passed");
+    test_volume_queue();
+    puts("media controls: bounded queue, ordered releases, volume receipts/epochs/expiry, suspend/reset and retry passed");
 }

@@ -12,9 +12,12 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.33** adds an HFP phone-call bridge with CVSD
+Development candidate **0.1.34** addresses USB stem-volume synchronization.
+Version **0.1.33** adds an HFP phone-call bridge with CVSD
 voice audio, retaining **0.1.32**'s 90 ms phone jitter reserve and new
-arrival/delivery timing counters. Neither change is hardware-verified yet. Two-unit
+arrival/delivery timing counters. Bluetooth calls and the phone jitter reserve
+still need hardware validation. A five-minute Pixel USB S16 run on 0.1.33 with
+Game Mode on was clean, with no new active sample loss or recovery. Two-unit
 AAC-ELD packets in **0.1.31** reduced send waits substantially, but occasional
 hitches remained. Version **0.1.25** passed short
 Windows S16 and genuine IEEE
@@ -65,6 +68,10 @@ The serial port remains a diagnostic console.
 Send `t` to read USB service and main-loop Bluetooth timing maxima, the current
 phone decoder maximum and flash-cache counters. Repeated requests are coalesced;
 counter collection does not acquire audio or run a sound-producing check.
+Version 0.1.34 also accepts `bootsel` followed by Enter on the USB serial port.
+Pause playback and close microphone/call use first. The command requests the ROM
+USB bootloader; it does not erase pairing or flash firmware. See
+[USB bootloader entry](docs/USB-CONTROL.md#usb-bootloader-entry) for the guarded handshake.
 LDAC is unsupported: the inherited encoder path could exceed the negotiated packet
 limit, and AirPods do not need that codec.
 

@@ -44,6 +44,8 @@ typedef struct {
 static uint32_t now;
 static bool mounted, usb_context, media_available, bt_changed, int_busy, interrupts_disabled;
 static bool inject_volume_set, bt_known;
+static bool volume_ready=true;
+static uint32_t media_generation, volume_cancels, seen_set_revision, media_sent, seen_receipt;
 static uint8_t bt_volume;
 static unsigned starts, stops, pushes, reads, fifo_clears, mic_reads, mic_resets;
 static unsigned usb_tasks, media_tasks, debug_tasks, int_attempts, notifications, bt_sets;
@@ -110,7 +112,10 @@ static uint16_t tud_audio_write(const void *buf, uint16_t size) {
 }
 static void tud_task(void) { assert(usb_context); ++usb_tasks; }
 static bool tud_mounted(void) { return mounted; }
-static void usb_media_set_available(bool available) { media_available = available; }
+static void usb_media_set_available(bool available) { media_available = available; media_generation=((media_generation+2u)&~1u)|(uint32_t)available; }
+static uint32_t usb_media_generation(void) {return media_generation;}
+static uint32_t usb_media_volume_sent(void) {return media_sent;}
+static void usb_media_cancel_volume(void) {++volume_cancels;}
 static void usb_media_task(void) { assert(usb_context); ++media_tasks; }
 static void debug_cdc_task(void) { assert(usb_context); ++debug_tasks; }
 static bool tud_audio_int_write(const audio_interrupt_data_t *data) {
@@ -134,7 +139,14 @@ static bool get_bt_volume(uint8_t *out) {
     *out = previous;
     return bt_known;
 }
-static void set_bt_volume(int16_t db256) { assert(!usb_context); last_bt_db256 = db256; ++bt_sets; }
+uint32_t usb_volume_set_revision(void);
+static bool bt_volume_usb_ready(void) {return volume_ready;}
+static void set_bt_volume_from_usb(int16_t db256,uint32_t revision,uint32_t generation,uint32_t receipt) {
+    seen_receipt=receipt;
+    assert(!usb_context && !interrupts_disabled && generation==media_generation);
+    assert(revision==usb_volume_set_revision());seen_set_revision=revision;
+    last_bt_db256=db256;++bt_sets;
+}
 static uint32_t save_and_disable_interrupts(void) {
     assert(!interrupts_disabled);
     interrupts_disabled = true;
@@ -155,6 +167,8 @@ static bool tud_audio_buffer_and_schedule_control_xfer(uint8_t rhport, const tus
 
 static void service(void) { usb_context = true; tinyusb_task(); usb_context = false; }
 static void fixture(void) {
+    volume_ready=true;media_generation=volume_cancels=seen_set_revision=media_sent=seen_receipt=0;
+    atomic_store(&volume_set_revision,0);atomic_store(&volume_set_generation,0);
     atomic_store(&need_change_bt_volume, false);
     for (unsigned i = 0; i < TU_ARRAY_SIZE(mute); ++i) { atomic_store(&mute[i], 0); atomic_store(&volume[i], 0); }
     mic_request = (usb_mic_request_t){0};
@@ -502,7 +516,28 @@ static void usb_speaker_microphone_duplex(void) {
     }
 }
 
+static void host_volume_proof_and_hold(void) {
+    fixture();mount_host();
+    uint32_t session=usb_media_generation();
+    assert(usb_volume_set_revision()==0);
+    uint8_t invalid[]={0xff,0x7f};
+    assert(!feature_set(AUDIO_FU_CTRL_VOLUME,0,invalid,2));
+    assert(usb_volume_set_revision()==0);
+    media_sent=1;host_volume(-6400);assert(usb_volume_set_revision()==1 && usb_volume_set_generation()==session);
+    media_sent=2; // A second key transmitted after SET IRQ but before the main task.
+    tinyusb_control_task();assert(bt_sets==1 && seen_set_revision==1 && seen_receipt==1);
+    volume_ready=false;bt_known=true;bt_volume=80;bt_changed=true;
+    tinyusb_control_task();assert(bt_changed && read_volume()==-6400);
+    volume_ready=true;tinyusb_control_task();
+    assert(!bt_changed && read_volume()==bt_volume_to_usb(80));
+    host_volume(-9000);tud_umount_cb();mount_host();
+    assert(usb_media_generation()!=session);
+    tinyusb_control_task();assert(bt_sets==1); // Previous USB session cannot command the pair.
+    host_volume(-8000);tinyusb_control_task();assert(bt_sets==2 && seen_set_revision==3);
+}
+
 int main(void) {
+    host_volume_proof_and_hold();
     usb_speaker_microphone_duplex();
     current_packet_stereo();
     malformed_packets_are_discarded();

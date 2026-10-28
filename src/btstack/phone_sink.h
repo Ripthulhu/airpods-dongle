@@ -18,6 +18,7 @@ void phone_sink_resume_after_call(void);
 bool phone_sink_decoder_released(void);
 bool phone_sink_connected(void);
 bool phone_sink_active(void);
+bool phone_sink_start_pending(void);
 bool phone_sink_owns_controls(void);
 // Read-only version-2 snapshot: 4-byte header followed by fifteen LE uint32 fields.
 uint16_t phone_sink_diagnostics(uint8_t *out, uint16_t capacity);

@@ -312,7 +312,7 @@ static void test_roles_and_start_priming(void) {
     configure(false);opened();assert(opens==1 && !phone_sink_active());
     stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
     for(unsigned i=0;i<20;i++)phone_sink_poll();
-    assert(accepted==0 && claims==0 && phone.start_pending);
+    assert(accepted==0 && claims==0 && phone.start_pending && phone_sink_start_pending());
     output_ready=true;phone_sink_poll();assert(accepted==1 && claims==1 && phone.start_accepted);
     uint8_t packet[32];unsigned size=rtp(packet,1);
     media_handler(phone.seid,packet,size);assert(decode_calls==0);

@@ -25,7 +25,7 @@ def uac_sources(directory):
     declarations += source[start:end]
     functions = []
     for name in ["usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
-                 "usb_mic_requested", "usb_host_active", "tinyusb_task", "tinyusb_control_task",
+                 "usb_mic_requested", "usb_host_active", "usb_volume_set_revision", "usb_volume_set_generation", "tinyusb_task", "tinyusb_control_task",
                  "tud_mount_cb", "tud_umount_cb", "tud_suspend_cb", "tud_resume_cb",
                  "tud_audio_mic_clock_get_request", "tud_audio_clock_get_request",
                  "tud_audio_clock_set_request", "tud_audio_feature_unit_get_request",
@@ -33,7 +33,7 @@ def uac_sources(directory):
                  "tud_audio_set_req_entity_cb", "tud_audio_set_itf_close_EP_cb",
                  "tud_audio_set_itf_cb", "tud_audio_rx_done_post_read_cb",
                  "tud_audio_tx_done_pre_load_cb", "audio_task", "audio_control_task"]:
-        match = re.search(r"(?m)^\s*(?:static )?(?:void|bool) " + name + r"\([^;]*?\)\s*\{", source)
+        match = re.search(r"(?m)^\s*(?:static )?(?:void|bool|uint32_t) " + name + r"\([^;]*?\)\s*\{", source)
         if match is None:
             raise ValueError(f"Missing UAC function: {name}")
         start = match.start()
@@ -155,6 +155,16 @@ def playback_lifecycle_sources(directory):
     (directory / "playback_accept.inc").write_text(source[start:end])
 
 
+def playback_volume_sources(directory):
+    source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    start=source.index("static struct {\n    uint32_t generation, set_revision")
+    end=source.index("} usb_volume_relay;",start)+len("} usb_volume_relay;")
+    state=source[start:end]
+    start=source.index("static void bt_volume_relay_reset(")
+    end=source.index("bool bridge_phone_open(void)",start)
+    (directory/"playback_volume.inc").write_text(state+"\n"+source[start:end])
+
+
 def main_button_sources(directory):
     source = (ROOT / "src/main.c").read_text(encoding="utf-8")
     start=source.index("        if (aacp_mic_update_owner(usb_mic_take_request(&mic_wanted))) {")
@@ -163,6 +173,9 @@ def main_button_sources(directory):
         "static void main_mic_request(mic_decoder_lifecycle_t *state) {\n"
         "    mic_decoder_lifecycle_t decoder=*state; bool mic_wanted;\n"+
         source[start:end]+"\n    *state=decoder;\n}\n")
+    start=source.index("// Runtime BOOTSEL is deliberately separate")
+    end=source.index("\nint main()",start)
+    (directory/"main_bootsel.inc").write_text(source[start:end])
     loop = source.index("    mic_decoder_lifecycle_t decoder = {0};")
     start = source.index("        uint32_t now_ms =", loop)
     end = source.index("        bt_hci_phone_poll();", start)
@@ -218,6 +231,8 @@ def main():
         "uac": ["tests/uac_test.c"],
         "uac_s16": ["-DAIRPODS_USB_FLOAT=0", "tests/uac_test.c"],
         "volume_sync": ["tests/volume_sync_test.c"],
+        "playback_volume": ["tests/playback_volume_test.c"],
+        "bootsel_request": ["tests/bootsel_request_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],
         "dongle_rpc": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_rpc_test.c"],
@@ -235,6 +250,7 @@ def main():
     }
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:
         playback_lifecycle_sources(pathlib.Path(tmp))
+        playback_volume_sources(pathlib.Path(tmp))
         uac_sources(pathlib.Path(tmp))
         main_button_sources(pathlib.Path(tmp))
         for name, sources in tests.items():

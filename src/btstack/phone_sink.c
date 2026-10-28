@@ -796,6 +796,7 @@ bool phone_sink_decoder_released(void) { return phone_worker_released(); }
 
 bool phone_sink_connected(void) { return phone.cid != 0; }
 bool phone_sink_active(void) { return phone.started || phone.start_accepted; }
+bool phone_sink_start_pending(void) { return phone.start_pending; }
 bool phone_sink_owns_controls(void) { return phone.controls_owned; }
 
 uint16_t phone_sink_diagnostics(uint8_t *out, uint16_t capacity) {

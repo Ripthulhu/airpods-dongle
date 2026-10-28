@@ -88,6 +88,7 @@ static unsigned avdtp_source_suspend(unsigned cid, unsigned seid) { assert(cid =
 static unsigned avdtp_source_start_stream(unsigned cid, unsigned seid) { assert(cid == 10 && seid == 5); ++starts; return start_error; }
 static bool aaceld_encoder_init(void) { ++resets; return encoder_ready; }
 static bool usb_mic_requested(void) { return mic_requested; }
+static void usb_media_cancel_volume(void) {}
 static bool aacp_mic_requested(void) { return mic_requested || call_capture; }
 static bool aacp_mic_active(void) { return mic_active; }
 static uint8_t avdtp_subevent_signaling_accept_get_local_seid(const uint8_t *p) { return *p; }

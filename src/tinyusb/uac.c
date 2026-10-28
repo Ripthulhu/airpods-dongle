@@ -54,6 +54,9 @@
  uint32_t current_sample_rate  = 48000;
 
  static _Atomic bool need_change_bt_volume;
+ static _Atomic uint32_t volume_set_revision;
+ static _Atomic uint32_t volume_set_generation;
+ static _Atomic uint32_t volume_set_receipt;
 
  #define N_SAMPLE_RATES  TU_ARRAY_SIZE(sample_rates)
 
@@ -114,6 +117,7 @@
  static void usb_mic_update_request(void) {
    atomic_store_explicit(&usb_host_available, usb_mounted && !usb_suspended, memory_order_release);
    bool wanted = usb_mounted && !usb_suspended && mic_interface_open;
+   if (!wanted && !speaker_active) usb_media_cancel_volume();
    if (wanted != usb_mic_request_wanted(&mic_request)) aacp_mic_pcm_reset();
    usb_mic_request_set(&mic_request, wanted);
  }
@@ -128,6 +132,14 @@
 
  bool usb_host_active(void) {
    return atomic_load_explicit(&usb_host_available, memory_order_acquire);
+ }
+
+ uint32_t usb_volume_set_revision(void) {
+   return atomic_load_explicit(&volume_set_revision, memory_order_acquire);
+ }
+
+ uint32_t usb_volume_set_generation(void) {
+   return atomic_load_explicit(&volume_set_generation, memory_order_acquire);
  }
 
  // Buffer for speaker data
@@ -398,6 +410,9 @@ void tinyusb_control_task(void){
      int16_t requested_volume;
      TU_VERIFY(usb_audio_volume_value(buf, request->wLength, &requested_volume));
      atomic_store_explicit(&volume[request->bChannelNumber], requested_volume, memory_order_release);
+     atomic_store_explicit(&volume_set_generation, usb_media_generation(), memory_order_release);
+     atomic_store_explicit(&volume_set_receipt, usb_media_volume_sent(), memory_order_release);
+     atomic_fetch_add_explicit(&volume_set_revision, 1u, memory_order_release);
 
      TU_LOG1("Set channel %d volume: %d dB\r\n", request->bChannelNumber, volume[request->bChannelNumber]/256);
 
@@ -595,7 +610,7 @@ void tinyusb_control_task(void){
 
 void audio_control_task(void)
  {
-   if (*get_is_bt_sink_volume_changed_ptr() &&
+   if (*get_is_bt_sink_volume_changed_ptr() && bt_volume_usb_ready() &&
        !atomic_load_explicit(&need_change_bt_volume, memory_order_acquire))
    {
 
@@ -604,7 +619,7 @@ void audio_control_task(void)
 
     // A USB Set Volume may interrupt the Bluetooth readback above.
     uint32_t saved = save_and_disable_interrupts();
-    if (!atomic_load_explicit(&need_change_bt_volume, memory_order_acquire)) {
+    if (!atomic_load_explicit(&need_change_bt_volume, memory_order_acquire) && bt_volume_usb_ready()) {
       if (confirmed) {
         volume[0] = bt_volume_to_usb(bt_level);
         atomic_store_explicit(&volume_notification_pending, true, memory_order_release);
@@ -614,11 +629,15 @@ void audio_control_task(void)
     restore_interrupts(saved);
    }
 
-   if (atomic_exchange_explicit(&need_change_bt_volume, false, memory_order_acq_rel)){
-
+   uint32_t saved = save_and_disable_interrupts();
+   bool changed=atomic_exchange_explicit(&need_change_bt_volume, false, memory_order_acq_rel);
+   uint32_t revision=usb_volume_set_revision(), generation=usb_volume_set_generation();
+   uint32_t receipt=atomic_load_explicit(&volume_set_receipt, memory_order_acquire);
+   int16_t requested=atomic_load_explicit(&volume[0], memory_order_acquire);
+   restore_interrupts(saved);
+   if (changed && generation==usb_media_generation() && usb_host_active()) {
     // Mute is applied to PCM; AVRCP zero would erase the level on readback.
-    set_bt_volume(atomic_load_explicit(&volume[0], memory_order_acquire));
-
+    set_bt_volume_from_usb(requested,revision,generation,receipt);
     atomic_store_explicit(&volume_notification_pending, true, memory_order_release);
    }
 

@@ -61,6 +61,11 @@ static void reset(void) {
     connected_queries = 0;
     input_size = input_offset = read_calls = read_flush_calls = 0;
     atomic_store(&timing_requested, false);
+    atomic_store(&bootsel_requested, false);
+    atomic_store(&terminal_connected, false);
+    atomic_store(&terminal_generation, 0);
+    command_length = 0;
+    command_invalid = false;
     memset(output, 0, sizeof(output));
 }
 
@@ -72,6 +77,13 @@ static void drain(void) {
         assert(write_calls - before <= 1);
         assert(++ticks < 1000);
     }
+}
+
+static void receive(const char *text) {
+    input_size = (uint32_t)strlen(text);
+    input_offset = 0;
+    memcpy(input, text, input_size);
+    while (input_offset < input_size) debug_cdc_task();
 }
 
 int main(void) {
@@ -104,10 +116,10 @@ int main(void) {
     // Input is serviced with an empty output ring and cannot run old commands.
     reset();
     connected = true;
-    memcpy(input, "pdlr\r\nT", 7);
-    input_size = 7;
+    memcpy(input, "pdlr\r\nT\n", 8);
+    input_size = 8;
     debug_cdc_task();
-    assert(input_offset == 7u && !debug_cdc_take_timing_request());
+    assert(input_offset == 8u && !debug_cdc_take_timing_request());
     assert(output_size == 0u && write_calls == 0u);
     memset(input, 't', 128);
     input_offset = 0;
@@ -136,11 +148,71 @@ int main(void) {
     assert(!debug_cdc_take_timing_request());
     assert(output_size == 0u && write_calls == 0u);
 
+    // Only the complete lowercase command line publishes a reboot request.
+    // Every fragmentation point, including immediately before/after 't', works.
+    reset();
+    connected = true;
+    const char command[] = "bootsel\n";
+    for (unsigned split = 1; split < sizeof(command) - 1u; ++split) {
+        char fragment[sizeof(command)];
+        memcpy(fragment, command, split); fragment[split] = 0;
+        receive(fragment);
+        assert(!debug_cdc_take_bootsel_request() && !debug_cdc_take_timing_request());
+        receive(command + split);
+        assert(debug_cdc_take_bootsel_request() && !debug_cdc_take_bootsel_request());
+        assert(!debug_cdc_take_timing_request());
+    }
+    receive("bootsel\r");
+    assert(!debug_cdc_take_bootsel_request() && !debug_cdc_take_timing_request());
+    receive("\n");
+    assert(debug_cdc_take_bootsel_request() && !debug_cdc_take_timing_request());
+    receive("Bootsel\nxbootsel\nbootselx\nboot\nsel\nbootselt\nbootsel\rx\n");
+    assert(!debug_cdc_take_bootsel_request() && !debug_cdc_take_timing_request());
+    memset(input, 'x', sizeof(input));
+    input_offset = 0; input_size = sizeof(input);
+    while (input_offset < input_size) debug_cdc_task();
+    receive("bootsel\n"); // overlong/unknown line stays invalid until its terminator
+    assert(!debug_cdc_take_bootsel_request());
+    receive("t");
+    assert(debug_cdc_take_timing_request());
+    receive("bootsel\n");
+    assert(!debug_cdc_take_bootsel_request()); // embedded after bare t is not a command line
+    receive("boo");
+    uint32_t generation = debug_cdc_terminal_generation();
+    connected = false; debug_cdc_task();
+    assert(!debug_cdc_terminal_connected());
+    assert(debug_cdc_terminal_generation() == generation + 1u);
+    debug_cdc_task();
+    assert(debug_cdc_terminal_generation() == generation + 1u);
+    connected = true; receive("tsel\n");
+    assert(!debug_cdc_take_bootsel_request() && debug_cdc_take_timing_request());
+    receive("bootsel\n");
+    connected = false; debug_cdc_task();
+    assert(!debug_cdc_take_bootsel_request());
+
+    // A close/open pair dispatched inside one TinyUSB pass still revokes intent,
+    // including command bytes which were buffered before the close.
+    connected = true; debug_cdc_task();
+    receive("bootsel\n");
+    generation = debug_cdc_terminal_generation();
+    connected = false; tud_cdc_line_state_cb(0, false, false);
+    connected = true; tud_cdc_line_state_cb(0, true, false);
+    debug_cdc_task();
+    assert(!debug_cdc_take_bootsel_request());
+    assert(debug_cdc_terminal_generation() == generation + 1u);
+    memcpy(input, "bootsel\n", 8); input_size = 8; input_offset = 0;
+    connected = false; tud_cdc_line_state_cb(0, false, false);
+    connected = true; tud_cdc_line_state_cb(0, true, false);
+    debug_cdc_task();
+    assert(input_offset == input_size && !debug_cdc_take_bootsel_request());
+
     reset();
     connected = true;
     dbg_head = dbg_tail = DBG_BUF_SIZE - 3;
     registered->out_chars("one\ntwo", 7);
+    assert(debug_cdc_output_pending());
     drain();
+    assert(!debug_cdc_output_pending());
     assert(strcmp(output, "one\r\ntwo") == 0 && write_calls == 2);
 
     reset();
@@ -154,6 +226,6 @@ int main(void) {
     for (unsigned i = 0; i < DBG_BUF_SIZE - 1; ++i) assert(output[i] == 'x');
     assert(strcmp(output + DBG_BUF_SIZE - 1, "\r\n[log dropped 4 bytes]\r\n") == 0);
     assert(!interrupts_disabled);
-    puts("CDC bounded RX/TX, coalesced timing requests, DTR cleanup, partial writes, wrap, offline retention and overflow: passed");
+    puts("CDC bounded RX/TX, fragmented BOOTSEL commands, timing isolation, DTR cleanup, partial writes, wrap and overflow: passed");
     return 0;
 }

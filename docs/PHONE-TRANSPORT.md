@@ -56,7 +56,10 @@ Apple versions contain independent end-call and mute fields; do not flatten a
 newer or unknown report into one of these legacy values. Complete modern writes
 and physical call behavior through this dongle remain unverified.
 
-Confirmed AirPods volume is mirrored to both hosts. A host volume request remains
+Confirmed AirPods volume is mirrored to both hosts. USB hardware-volume hosts
+also receive stem gestures through the guarded [USB volume relay](USB-CONTROL.md#stem-volume)
+in 0.1.34; readback alone does not synchronize Android's media-volume UI.
+A host volume request remains
 an intent until the AirPods confirm it; temporary AVRCP busy states retain the
 latest request. A controls-only connection or input switch does not replay a
 reported level as a new request. New AirPods connections start with unknown

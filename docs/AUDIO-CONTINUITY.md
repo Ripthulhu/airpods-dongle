@@ -458,3 +458,25 @@ Local evidence: `float-playback-result-0.1.25-r1.json`,
 `mic-float-result-0.1.25-r1.json`, `mic-open-s16-0.1.25-r1.*`,
 `windows-float-migration-0.1.25.log`, `windows-formats-after-float-0.1.25.txt`
 and the matching capture files in the private bring-up output directory.
+
+## 0.1.33 Pixel USB baseline, 28 October 2026
+
+An initial listening check reported occasional USB hitches. The follow-up
+read-only capture sampled once per second for 299.45 seconds, with S16 alt 1,
+Game Mode confirmed on at 60 ms, and no Bluetooth phone input or microphone.
+The listener reported no hitches during this longer interval.
+
+The source produced 29,944 AAC-ELD units, averaging 99.9967 units/s, with two
+units per outgoing packet. No new active sample discard, zero-fill, scheduling
+debt discard, recovery, send failure, controller flush, malformed USB packet or
+short read occurred. The 42 ms send-wait, 49.876 ms send-gap and 47.240 ms
+packet-age maxima all predated the interval; they are not new stalls in it.
+This supports clean source pacing for this interval, without establishing RF
+delivery or completing the required 30-minute acceptance.
+
+A separate volume issue was reproduced: a stem swipe changed the AirPods gain
+and the host's ALSA hardware readback, while the Pixel's media-volume index
+stayed fixed. The phone volume button changed both the index and USB hardware
+volume. USB AudioControl readback alone therefore does not provide Android UI
+synchronization. Keep audio buffering, clock adaptation and packet pacing
+unchanged while correcting the control path.

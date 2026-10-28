@@ -77,6 +77,8 @@ bool get_allow_switch_slot();
 
 
 void increase_vol_by_key();
+bool bt_volume_usb_ready(void);
+void set_bt_volume_from_usb(int16_t db256, uint32_t revision, uint32_t generation, uint32_t receipt);
 
 void decrease_vol_by_key();
 

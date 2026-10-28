@@ -46,6 +46,7 @@
 #include "button_gesture.h"
 #include "pico/flash.h"
 #include "pico/multicore.h"
+#include "pico/bootrom.h"
 #include "radio_clock.h"
 #include "realtime_metrics.h"
 #include "runtime_watch.h"
@@ -312,6 +313,62 @@ static bool benchmark_idle(void) {
     return true;
 }
 
+// Runtime BOOTSEL is deliberately separate from the physical button gestures.
+typedef struct {
+    uint32_t requested_ms;
+    uint32_t terminal_generation;
+    bool pending;
+} bootsel_request_t;
+
+static bool bootsel_busy(void) {
+    return get_usb_streaming() || usb_mic_requested() || phone_sink_active() || phone_sink_start_pending() ||
+        phone_call_active() || aacp_mic_requested() || aacp_mic_active() ||
+        dongle_playback_transitioning();
+}
+
+// Called with the Bluetooth context locked. No waits or TinyUSB calls here:
+// the USB IRQ drains the acceptance reply while normal main-loop work continues.
+static bool bootsel_request_poll(bootsel_request_t *state, uint32_t now_ms) {
+    bool requested = debug_cdc_take_bootsel_request();
+    if (!state->pending && !requested) return false;
+    if (!debug_cdc_terminal_connected()) {
+        state->pending = false;
+        return false;
+    }
+    uint32_t generation = debug_cdc_terminal_generation();
+    if (state->pending && state->terminal_generation != generation) {
+        state->pending = false;
+        return false;
+    }
+    if (bootsel_busy()) {
+        state->pending = false;
+        printf("[BOOTSEL] busy\n");
+        return false;
+    }
+    if (!state->pending) {
+        state->pending = true;
+        state->requested_ms = now_ms;
+        state->terminal_generation = generation;
+        printf("[BOOTSEL] ready\n");
+        return false;
+    }
+    uint32_t elapsed = now_ms - state->requested_ms;
+    if (elapsed < 20u || (elapsed < 100u && debug_cdc_output_pending())) return false;
+    state->pending = false;
+    return true;
+}
+
+// Outside the Bluetooth lock and USB IRQ. Recheck atomically against a USB
+// capture/playback start before requesting the RP2350 ROM's USB bootloader.
+static void bootsel_enter_if_idle(uint32_t generation) {
+    uint32_t irq = save_and_disable_interrupts();
+    bool connected = debug_cdc_terminal_connected() &&
+        debug_cdc_terminal_generation() == generation;
+    if (connected && !bootsel_busy()) reset_usb_boot(0, 0);
+    restore_interrupts(irq);
+    if (connected) printf("[BOOTSEL] busy\n");
+}
+
 int main() {
 
     vreg_set_voltage(VREG_VOLTAGE_1_20);
@@ -418,6 +475,7 @@ int main() {
     watchdog_enable(8000, true);
 
     mic_decoder_lifecycle_t decoder = {0};
+    bootsel_request_t bootsel = {0};
     uint32_t button_sample_ms = to_ms_since_boot(get_absolute_time());
     while (1) {
         runtime_watch_set(WATCH_LOOP);
@@ -478,9 +536,11 @@ int main() {
         dongle_features_poll();
         phone_control_poll();
         if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report(); }
+        bool enter_bootsel = bootsel_request_poll(&bootsel, now_ms);
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
         runtime_watch_set(WATCH_UNLOCK);
         async_context_release_lock(ctx);
+        if (enter_bootsel) bootsel_enter_if_idle(bootsel.terminal_generation);
         runtime_watch_set(WATCH_IDLE);
         uint32_t idle_us = realtime_loop_idle_us(bluetooth_started, time_us_32());
         if (idle_us) sleep_us(idle_us);

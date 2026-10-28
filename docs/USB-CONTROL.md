@@ -8,6 +8,54 @@ NTPods uses a separate vendor HID collection on the same interface; opening it
 does not connect Bluetooth, start audio, or enable the microphone. CDC remains
 a debug console. No custom Windows kernel driver or Test Mode is required for USB.
 
+## Stem volume
+
+Firmware 0.1.34 forwards unsolicited AirPods volume changes as standard Consumer
+Volume Increment (`0x0C:0xE9`) or Volume Decrement (`0x0C:0xEA`) press/release pairs.
+It enables this relay only after a real USB Audio volume SET in the current bus
+session and while USB playback or recording owns audio. The host's next volume
+SET is authoritative. It does not restore an old AirPods gain or force a starting
+level.
+
+The temporary AirPods change is withheld from USB volume notifications while
+waiting for the host, preventing a hardware-volume notification and HID key from
+applying the same gesture twice. Initial AVRCP readback, unchanged notifications
+and feedback matching an outstanding volume command do not generate keys.
+The bounded queue keeps rapid gestures in order; USB reset,
+route or peer changes invalidate unsent volume keys. A sent press still receives
+its release. Expired keys are discarded. Missing host feedback falls back to the
+actual AirPods level and disables relaying for that USB session.
+
+This is independent of both companion apps and leaves the existing Bluetooth
+phone-volume path unchanged. Hosts that never send USB hardware-volume commands
+retain physical AirPods volume control; exact synchronization with their software
+volume is not available to a standard USB peripheral. AVRCP notifications also
+provide no additional gesture when the physical level is already at an endpoint.
+Hardware checks on Pixel and Windows remain pending for this candidate.
+
+The usage codes follow the [Android USB headset specification](https://source.android.com/docs/core/interaction/accessories/headset/usb-headset-spec).
+Android's [default mixer behavior](https://source.android.com/docs/core/audio/preferred-mixer-attr)
+can also apply software volume; a USB AudioControl interrupt alone does not
+establish that the phone's media-volume UI follows hardware changes.
+
+## USB bootloader entry
+
+From 0.1.34, open the USB CDC serial port with DTR asserted and send the exact
+lowercase line `bootsel` with LF or CRLF. Pause playback, close microphone use
+and finish calls first; allow the audio route to become idle. The USB callback
+only queues the request. Main context rejects active playback, capture, calls
+or output transitions with `[BOOTSEL] busy`.
+
+`[BOOTSEL] ready` means the request was accepted, not that boot ROM is already
+running. Firmware briefly allows the reply to drain, checks for new activity
+again, then calls the Pico SDK's `reset_usb_boot(0, 0)`. Verify that the same board
+serial reappears as `2E8A:000F` before using picotool. Firmware installation is a
+separate action; entering BOOTSEL does not erase flash or pairing storage.
+The first installation of this feature still requires physical BOOTSEL entry.
+The existing bare `t` diagnostics command remains available.
+
+## Companion collection
+
 Identify the collection by usage page `FF31`, usage `0001`, feature report length
 64 and the `APDG` version handshake. The development USB VID/PID is `CAFE:4015`;
 it is not sufficient identification by itself. Never open a consumer-keyboard
