@@ -167,6 +167,9 @@ def playback_volume_sources(directory):
 
 def main_button_sources(directory):
     source = (ROOT / "src/main.c").read_text(encoding="utf-8")
+    start=source.index("// Manual volume history")
+    end=source.index("// Runtime BOOTSEL",start)
+    (directory/"main_volume_trace.inc").write_text(source[start:end])
     start=source.index("        if (aacp_mic_update_owner(usb_mic_take_request(&mic_wanted))) {")
     end=source.index("\n        }",start)+10
     (directory / "main_mic_request.inc").write_text(
@@ -232,6 +235,8 @@ def main():
         "uac_s16": ["-DAIRPODS_USB_FLOAT=0", "tests/uac_test.c"],
         "volume_sync": ["tests/volume_sync_test.c"],
         "playback_volume": ["-Itests/media_stubs", "tests/playback_volume_test.c", "src/tinyusb/media_control.c"],
+        "volume_trace": ["tests/volume_trace_test.c"],
+        "volume_trace_console": ["tests/volume_trace_console_test.c"],
         "bootsel_request": ["tests/bootsel_request_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],

@@ -10,7 +10,21 @@ a debug console. No custom Windows kernel driver or Test Mode is required for US
 
 ## Stem volume
 
-Firmware 0.1.36 forwards unsolicited AirPods volume changes as standard Consumer
+Candidate 0.1.37 uses a fresh, transaction-matched AVRCP INTERIM readback after a
+CHANGED notification. The CHANGED payload itself no longer becomes a USB key.
+The pinned SDK patch exposes subsequent volume INTERIM replies and keeps their
+registration generations separate. Hardware testing must verify that the AirPods
+accept replacement registrations; rejected or timed-out refreshes must preserve
+native control instead of leaving an endless pending repair.
+
+The intentional 150 ms repair delay is removed. This shortens an avoidable part
+of the audible excursion; it does not prove that a local AirPods gain change can
+be undone seamlessly. A fresh absolute readback can coalesce rapid changes, so
+it also cannot establish an exact count of physical gestures. See the saved
+[Mac and Pixel evidence](VOLUME-EVIDENCE.md) before changing volume roles or
+adding guessed PCM gain compensation.
+
+The underlying relay introduced in 0.1.36 forwards unsolicited AirPods volume changes as standard Consumer
 Volume Increment (`0x0C:0xE9`) or Volume Decrement (`0x0C:0xEA`) press/release pairs.
 USB playback or recording must own audio and physical AirPods gain must be known.
 A genuine host USB Audio volume SET remains authoritative. Android may send that
@@ -20,7 +34,7 @@ absence of another SET no longer disables the relay.
 The temporary AirPods change is withheld from USB volume notifications while
 waiting for the host, preventing a hardware-volume notification and HID key from
 applying the same gesture twice. After all queued volume keys complete their USB
-transfers and 150 ms pass without a new gesture, the relay restores its confirmed hardware gain anchor if no newer host
+transfers, the relay restores its confirmed hardware gain anchor if no newer host
 SET superseded it. This avoids retaining both the phone's software attenuation
 and the AirPods' gesture attenuation. Initial AVRCP readback, unchanged notifications
 and feedback matching an outstanding volume command do not generate keys.
@@ -41,8 +55,14 @@ The 0.1.35 Pixel evidence showed two HID keys, 29 physical change reports and
 AirPods gain falling from 127 to 47, while the host SET revision stayed at 2.
 The old five-second timeout then disabled forwarding. This confirms double
 attenuation and an invalid hardware-feedback assumption in 0.1.34; moving the
-phone slider was not a successful fix. The 0.1.36 ownership correction still
-needs a Pixel listening check and a Windows native-UAC regression check.
+phone slider was not a successful fix. The 0.1.36 ownership correction also
+failed listening: the slider followed gestures, but levels could still diverge,
+and a down-swipe audibly dipped before the delayed hardware repair raised it
+slightly. Its deliberate 150 ms delay is not an accepted synchronization result.
+The counters stayed unchanged during a later quiet check, so a sustained feedback
+loop was not demonstrated on that hardware. Synthetic post-ACK stale/quantized
+notifications exposed further robustness gaps; do not label those sequences as
+captured AirPods behavior.
 
 Target-role absolute-volume requests are validated and counted separately from
 controller-role physical-gain notifications. They do not overwrite physical
@@ -75,6 +95,20 @@ pending AVRCP commands and valid volume-event counts. These counters do not
 change gain or print per packet. From 0.1.36, `sent` counts completed USB volume
 press transfers, rather than reports merely queued at the endpoint. The relay
 also exposes its hardware anchor, pending restoration and target-role SET count.
+
+From 0.1.37, bare lowercase `v` resets and arms a volume-only history for 60
+seconds; wait for `[VOLTRACE] armed` before the test gesture. Uppercase `V`
+freezes and dumps at most 16 chronological records. Keep DTR asserted throughout:
+closing the console cancels recording and dumping. Ordinary `t` does not arm it.
+The ring uses 256 bytes for records, never allocates and never prints from a
+Bluetooth callback. Main emits one short line at a time after earlier CDC output
+drains. A later arm clears the previous history.
+
+Each `[VOLTRACE]` row contains four hexadecimal 32-bit words: wrapping microsecond
+time; event/ctype/transaction-label/state/status metadata; incoming, previous,
+desired and sent level bytes; and low 16-bit completed/expected HID counters.
+The versioned header and `volume_trace.h` define the layout. This captures control
+ordering only, not audio, microphone payloads or full Bluetooth traffic.
 
 ## Companion collection
 

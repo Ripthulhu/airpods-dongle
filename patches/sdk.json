@@ -30,5 +30,19 @@
     "patched": {
       "src/classic/btstack_sbc_bluedroid.c": "3c112518620e35623c472af6d8e314c3a94b07c19b8223581cbb21632716902c"
     }
+  },
+  "btstack_volume": {
+    "library": "btstack",
+    "patch": "btstack-volume.patch",
+    "original": {
+      "src/classic/avrcp.h": "41f4c856959abaca0440e646aa6290148e98cb23f1940704b90f2757877dfdc0",
+      "src/classic/avrcp_controller.c": "94bc9a26680eb7105eb33bed44598ba7bd227366c0969795c5647ce9ac3d5488",
+      "src/classic/avrcp_controller.h": "218d134e849638a7eeddde2bf49ec177fb985851929bfae8e5a0630f59366555"
+    },
+    "patched": {
+      "src/classic/avrcp.h": "fbaa7dfa0d7fe82ac4d7f2c7ea62c4888e4394788a3652fe6ec5d63c02ecee6e",
+      "src/classic/avrcp_controller.c": "f0d295a419f27bb9f73adb1aebbdaa839d6db2fa389b746422af20b3fef9fa50",
+      "src/classic/avrcp_controller.h": "08d10f2e2e73bab064b96cf04fed02d31ad9392980d3070d69231304efae7bab"
+    }
   }
 }

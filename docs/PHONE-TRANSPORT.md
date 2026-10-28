@@ -61,9 +61,10 @@ newer or unknown report into one of these legacy values. Complete modern writes
 and physical call behavior through this dongle remain unverified.
 
 Confirmed AirPods volume is mirrored to both hosts. The
-[USB volume relay](USB-CONTROL.md#stem-volume) in candidate 0.1.36 separates
-relative host keys from retained hardware gain; 0.1.34's relay failed Android
-software-volume synchronization. Fresh Pixel and Windows checks remain required.
+[USB volume relay](USB-CONTROL.md#stem-volume) remains under revision in 0.1.37.
+Both 0.1.34 and 0.1.36 failed Android volume listening: the latter partly followed
+the phone UI but retained an audible second gain step and possible divergence.
+Fresh Pixel and Windows checks remain required.
 A host volume request remains
 an intent until the AirPods confirm it; temporary AVRCP busy states retain the
 latest request. A controls-only connection or input switch does not replay a

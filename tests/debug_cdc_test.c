@@ -61,6 +61,7 @@ static void reset(void) {
     connected_queries = 0;
     input_size = input_offset = read_calls = read_flush_calls = 0;
     atomic_store(&timing_requested, false);
+    atomic_store(&volume_trace_requested, 0);
     atomic_store(&bootsel_requested, false);
     atomic_store(&terminal_connected, false);
     atomic_store(&terminal_generation, 0);
@@ -131,6 +132,23 @@ int main(void) {
     debug_cdc_task();
     assert(input_offset == 128u && read_calls == 2u);
     assert(debug_cdc_take_timing_request() && !debug_cdc_take_timing_request());
+
+    // Manual volume capture commands remain separate from timing and BOOTSEL.
+    receive("\nv");
+    assert(debug_cdc_take_volume_trace_request() == DEBUG_CDC_VOLUME_TRACE_ARM);
+    assert(!debug_cdc_take_volume_trace_request() && !debug_cdc_take_timing_request());
+    receive("V");
+    assert(debug_cdc_take_volume_trace_request() == DEBUG_CDC_VOLUME_TRACE_DUMP);
+    receive("vV"); // Coalesced input keeps the latest explicit request.
+    assert(debug_cdc_take_volume_trace_request() == DEBUG_CDC_VOLUME_TRACE_DUMP);
+    receive("\nxvV\nbootselv\nbootselV\n");
+    assert(!debug_cdc_take_volume_trace_request() && !debug_cdc_take_bootsel_request());
+    receive("v");
+    connected = false; tud_cdc_line_state_cb(0, false, false);
+    assert(!debug_cdc_take_volume_trace_request());
+    connected = true; receive("V");
+    assert(debug_cdc_take_volume_trace_request() == DEBUG_CDC_VOLUME_TRACE_DUMP);
+    reset(); connected = true; memset(input, 't', 128);
 
     // A closed terminal discards both a pending request and unread old input.
     input_offset = 0;

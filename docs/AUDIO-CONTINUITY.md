@@ -2,7 +2,7 @@
 
 ## Acceptance status, 28 October 2026
 
-The 0.1.36 candidate fixes a reproduced waveform discontinuity in USB playback.
+Firmware 0.1.36 fixes a reproduced waveform discontinuity in USB playback.
 With a fractional clock phase, a 480-frame output unit can need 481 input frames.
 The old path fell back to unfiltered PCM when only 480 were available, then
 returned to the delayed FIR path on the next unit. A synthetic ramp jumped by
@@ -12,6 +12,14 @@ that same path, and counts the shortage. Production-ingress tests cover S16 and
 nonquantized float input. This reproduces a possible crackle mechanism, not the
 initiating event of every user-reported hitch. Steady Game Mode listening remains
 a separate acceptance check from the already accepted brief transition pitch ramp.
+
+The first 0.1.36 Pixel USB listening check was clean in both ears with Game Mode
+on, phase 3 and a reported 60 ms receiver delay. The phone selected S16 alternate
+1, not float. A short snapshot showed zero active dropped/zero-filled frames and
+no recoveries; the full encode unit maximum was 7,258 us at that point. This is
+an initial playback result, not extended acceptance. Its volume comparison
+failed: the listener heard the gain repair as a second step and could still
+desynchronize phone and stem volume. Keep that failure separate from playback.
 
 Two audit limits remain: sustained 10 ms work per AAC-ELD unit cannot support
 the temporary 9 ms buffer-fill schedule when leaving Game Mode; and the host

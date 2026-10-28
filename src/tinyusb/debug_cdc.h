@@ -28,6 +28,10 @@ void debug_cdc_task(void);
 // USB service clears pending input and requests when the terminal drops DTR.
 bool debug_cdc_take_timing_request(void);
 
+enum { DEBUG_CDC_VOLUME_TRACE_ARM = 1, DEBUG_CDC_VOLUME_TRACE_DUMP = 2 };
+// Bare v arms/reset a 60-second capture; V freezes/dumps. IRQ publishes only.
+uint8_t debug_cdc_take_volume_trace_request(void);
+
 // Exact lowercase "bootsel" followed by LF/CRLF; IRQ only publishes intent.
 // Main must check all audio/call owners, allow bounded reply drain, then recheck.
 bool debug_cdc_take_bootsel_request(void);

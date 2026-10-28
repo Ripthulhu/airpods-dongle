@@ -313,6 +313,59 @@ static bool benchmark_idle(void) {
     return true;
 }
 
+// Manual volume history: callbacks only store words; main drains one short row
+// after earlier CDC output, preserving the existing bounded USB drain.
+enum { VOLUME_CONSOLE_OFF, VOLUME_CONSOLE_ARM_REPLY, VOLUME_CONSOLE_ARMED,
+       VOLUME_CONSOLE_DUMP_HEADER, VOLUME_CONSOLE_DUMP_ROWS };
+typedef struct {
+    uint32_t terminal_generation, started_ms;
+    uint8_t mode;
+} volume_trace_console_t;
+
+static void volume_trace_console_poll(volume_trace_console_t *state, uint32_t now_ms) {
+    uint8_t request = debug_cdc_take_volume_trace_request();
+    if (!request && state->mode == VOLUME_CONSOLE_OFF) return;
+    uint32_t generation = debug_cdc_terminal_generation();
+    if (!debug_cdc_terminal_connected() ||
+        (state->mode != VOLUME_CONSOLE_OFF && state->terminal_generation != generation)) {
+        (void)bt_volume_trace_control(false);
+        state->mode = VOLUME_CONSOLE_OFF;
+        return;
+    }
+    if (request == DEBUG_CDC_VOLUME_TRACE_ARM) {
+        (void)bt_volume_trace_control(true);
+        state->terminal_generation = generation;
+        state->started_ms = now_ms;
+        state->mode = VOLUME_CONSOLE_ARM_REPLY;
+    } else if (request == DEBUG_CDC_VOLUME_TRACE_DUMP) {
+        (void)bt_volume_trace_control(false);
+        state->terminal_generation = generation;
+        state->mode = VOLUME_CONSOLE_DUMP_HEADER;
+    } else if ((state->mode == VOLUME_CONSOLE_ARMED || state->mode == VOLUME_CONSOLE_ARM_REPLY) &&
+               (uint32_t)(now_ms - state->started_ms) >= 60000u) {
+        (void)bt_volume_trace_control(false);
+        state->mode = VOLUME_CONSOLE_OFF;
+    }
+    if (state->mode == VOLUME_CONSOLE_OFF || state->mode == VOLUME_CONSOLE_ARMED ||
+        debug_cdc_output_pending()) return;
+    if (state->mode == VOLUME_CONSOLE_ARM_REPLY) {
+        printf("[VOLTRACE] armed 60s v=1\n");
+        state->mode = VOLUME_CONSOLE_ARMED;
+    } else if (state->mode == VOLUME_CONSOLE_DUMP_HEADER) {
+        printf("[VOLTRACE] v=1 total=%lu\n", (unsigned long)bt_volume_trace_control(false));
+        state->mode = VOLUME_CONSOLE_DUMP_ROWS;
+    } else {
+        uint32_t words[4];
+        if (bt_volume_trace_take(words))
+            printf("[VOLTRACE] %08lx %08lx %08lx %08lx\n", (unsigned long)words[0],
+                (unsigned long)words[1], (unsigned long)words[2], (unsigned long)words[3]);
+        else {
+            printf("[VOLTRACE] end\n");
+            state->mode = VOLUME_CONSOLE_OFF;
+        }
+    }
+}
+
 // Runtime BOOTSEL is deliberately separate from the physical button gestures.
 typedef struct {
     uint32_t requested_ms;
@@ -476,6 +529,7 @@ int main() {
 
     mic_decoder_lifecycle_t decoder = {0};
     bootsel_request_t bootsel = {0};
+    volume_trace_console_t volume_console = {0};
     uint32_t button_sample_ms = to_ms_since_boot(get_absolute_time());
     while (1) {
         runtime_watch_set(WATCH_LOOP);
@@ -536,6 +590,7 @@ int main() {
         dongle_features_poll();
         phone_control_poll();
         if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report();bt_volume_report(); }
+        volume_trace_console_poll(&volume_console, now_ms);
         bool enter_bootsel = bootsel_request_poll(&bootsel, now_ms);
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
         runtime_watch_set(WATCH_UNLOCK);

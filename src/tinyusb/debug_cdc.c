@@ -35,7 +35,7 @@ static volatile uint32_t dbg_tail = 0;     // consumer index (USB task only)
 static volatile uint32_t dbg_dropped = 0;  // bytes discarded while the ring was full
 static atomic_bool timing_requested;
 static atomic_bool bootsel_requested, terminal_connected;
-static atomic_uint terminal_generation;
+static atomic_uint terminal_generation, volume_trace_requested;
 static uint8_t command_length;
 static bool command_invalid;
 
@@ -52,9 +52,12 @@ static void command_byte(uint8_t c) {
     } else if (!command_invalid) {
         if (command_length == sizeof(command) - 1u && c == '\r') {
             ++command_length;
-        } else if ((command_length == 0 || command_length == UINT8_MAX) && c == 't') {
-            atomic_store_explicit(&timing_requested, true, memory_order_release);
-            command_length = UINT8_MAX; // bare 't' remains repeatable without LF
+        } else if ((command_length == 0 || command_length == UINT8_MAX) &&
+                   (c == 't' || c == 'v' || c == 'V')) {
+            if (c == 't') atomic_store_explicit(&timing_requested, true, memory_order_release);
+            else atomic_store_explicit(&volume_trace_requested,
+                c == 'v' ? DEBUG_CDC_VOLUME_TRACE_ARM : DEBUG_CDC_VOLUME_TRACE_DUMP, memory_order_release);
+            command_length = UINT8_MAX; // bare diagnostics remain repeatable without LF
         } else if (command_length < sizeof(command) - 1u && c == command[command_length]) {
             ++command_length;
         } else {
@@ -96,6 +99,7 @@ static stdio_driver_t debug_cdc_driver = {
 
 void debug_cdc_init(void) {
     atomic_store_explicit(&timing_requested, false, memory_order_relaxed);
+    atomic_store_explicit(&volume_trace_requested, 0, memory_order_relaxed);
     atomic_store_explicit(&bootsel_requested, false, memory_order_relaxed);
     atomic_store_explicit(&terminal_connected, false, memory_order_relaxed);
     atomic_store_explicit(&terminal_generation, 0, memory_order_relaxed);
@@ -106,6 +110,10 @@ void debug_cdc_init(void) {
 
 bool debug_cdc_take_timing_request(void) {
     return atomic_exchange_explicit(&timing_requested, false, memory_order_acq_rel);
+}
+
+uint8_t debug_cdc_take_volume_trace_request(void) {
+    return (uint8_t)atomic_exchange_explicit(&volume_trace_requested, 0, memory_order_acq_rel);
 }
 
 bool debug_cdc_take_bootsel_request(void) {
@@ -131,6 +139,7 @@ static void terminal_closed(void) {
     if (atomic_exchange_explicit(&terminal_connected, false, memory_order_acq_rel))
         atomic_fetch_add_explicit(&terminal_generation, 1, memory_order_release);
     atomic_store_explicit(&timing_requested, false, memory_order_release);
+    atomic_store_explicit(&volume_trace_requested, 0, memory_order_release);
     atomic_store_explicit(&bootsel_requested, false, memory_order_release);
     command_length = 0;
     command_invalid = false;

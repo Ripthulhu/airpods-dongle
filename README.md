@@ -12,10 +12,13 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.36** keeps USB resampling continuous across short
-input, corrects USB stem-volume ownership, and renews the phone-call retry budget
-when its authenticated phone returns. These changes need fresh hardware checks;
-they are not a claim that every reported Game Mode crackle is resolved.
+Development candidate **0.1.37** revises USB volume synchronization after
+**0.1.36** failed its listening check: phone and stem volume could still diverge,
+and the delayed hardware-gain repair produced an audible second step.
+Version **0.1.36** keeps USB resampling continuous across short input and renews
+the phone-call retry budget when its authenticated phone returns. Initial Pixel
+USB S16 playback with Game Mode on was clean in both ears; this is not a claim
+that every reported Game Mode crackle is resolved. Volume validation remains open.
 Version **0.1.35** adds manual volume-path diagnostics.
 The **0.1.34** USB stem-volume relay passed offline checks but did not synchronize
 the Pixel's volume in its live test. The earlier Windows UAC synchronization
@@ -207,11 +210,14 @@ Run native C and Python tests on Linux/WSL:
 
 ```sh
 python3 tools/test.py --sanitize
+python3 tools/test_volume_sdk.py --sdk .sdk/pico-sdk --sanitize
 python3 tools/test_phone_codecs.py --sdk .sdk/pico-sdk --sanitize
 python3 tools/lhdc_probe/run.py --sanitize
 ```
 
-The codec tests check LHDC/aptX/SBC, the actual worker, startup gate and BTstack
+The volume SDK test exercises the patched AVRCP parser and registration handling,
+including stale replies, status-only rejection and refresh cancellation. The
+codec tests check LHDC/aptX/SBC, the actual worker, startup gate and BTstack
 resampler. The LHDC probe compares decoded synthetic music with its original PCM
 and checks malformed input and allocation failure. Both accept `--arm` instead
 of `--sanitize` for an ARM32 functional check; it requires QEMU.
