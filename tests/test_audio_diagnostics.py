@@ -116,3 +116,38 @@ class AudioDiagnosticsTests(unittest.TestCase):
                 profile.main()
             self.assertEqual([call.args[1] for call in transact.call_args_list], [bytes((4, 0)), bytes((4, 1))])
             hid.return_value.close.assert_called_once()
+
+    def test_phone_counters_and_invalid_layouts(self):
+        data = bytearray((1, 3, 0xff, 12)) + bytearray(48)
+        values = list(range(12))
+        values[9] = 1
+        struct.pack_into('<12I', data, 4, *values)
+        decoded = diagnostics.decode_phone(data)
+        self.assertEqual(decoded['submit_failures'], 3)
+        self.assertEqual(decoded['queued_packets'], 8)
+        self.assertEqual(decoded['max_decode_us'], 11)
+        self.assertEqual(decoded['flags'], 0xff)
+        for bad in (data[:-1], bytes(52), bytearray((1, 4, 0, 12)) + data[4:]):
+            with self.assertRaises(RuntimeError):
+                diagnostics.decode_phone(bad)
+        struct.pack_into('<I', data, 40, 2)
+        with self.assertRaises(RuntimeError):
+            diagnostics.decode_phone(data)
+
+    def test_phone_feature_is_read_only(self):
+        with patch.object(diagnostics, '_transaction', return_value=b'phone') as transact:
+            self.assertEqual(diagnostics.feature(None, 15), b'phone')
+            transact.assert_called_once_with(None, b'\x0f')
+        with self.assertRaises(ValueError):
+            diagnostics.feature(None, 16)
+
+    def test_phone_capture_handles_older_firmware(self):
+        audio, perf = bytearray(20), bytearray(64)
+        audio[0] = perf[0] = 1
+        def read(_device, command):
+            if command == 15:
+                raise diagnostics.Unsupported('Old firmware')
+            return {9: audio, 5: perf}[command]
+        with patch.object(diagnostics, 'feature', side_effect=read):
+            result = diagnostics.sample(None, trace=False, phone=True)
+        self.assertIs(result['phone_supported'], False)

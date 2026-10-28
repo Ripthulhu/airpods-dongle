@@ -53,6 +53,11 @@ jobs:
             gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib qemu-system-arm
       - name: Prepare pinned Pico SDK and verified patches
         run: python3 tools/prepare_sdk.py --sdk .sdk/pico-sdk
+      - name: Test real phone decoders and jitter handling
+        if: matrix.variant == 'float'
+        run: |
+          python3 tools/test_phone_codecs.py --sdk .sdk/pico-sdk --sanitize
+          python3 tools/lhdc_probe/run.py --sanitize
       - name: Configure Release firmware
         run: |
           cmake -S . -B build -G Ninja \

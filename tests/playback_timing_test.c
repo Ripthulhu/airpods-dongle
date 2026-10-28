@@ -40,6 +40,13 @@ static struct { bool rate_mode; } playback_options;
 static uint16_t aaceld_frame_sequence;
 static uint32_t now, consumed, emitted, frame_size, sample_frames, send_failures;
 static bool send_requested, phone_opened, recovery_reset_encoder, suspend_recovery_pending;
+static bool phone_active, phone_output_recovery;
+static uint16_t phone_output_recovery_cid;
+static uint32_t phone_output_recovery_since;
+static uint8_t phone_output_recovery_peer[6], cur_active_device[6];
+static bool bridge_phone_ready(void) {return phone_active;}
+static bool profile_pending, a2dp_connect_pending;
+static bool aacp_mic_active(void) {return false;}
 static bool allow_recovery, synchronous_request;
 static unsigned request_depth;
 static unsigned scheduled_interval, source_consumed;
@@ -118,7 +125,7 @@ static playback_trace_t playback_trace;
 #define PB_MAX(stat,value) do {uint32_t v=(value);if(v>playback_trace.stats[stat])playback_trace.stats[stat]=v;}while(0)
 #define PB_EVENT(kind,a,b) playback_trace_record(&playback_trace,time_us_32(),kind,a,b)
 static unsigned playback_pcm_lock,usb_recovery_drops,pcm_frame_samples=480;
-static bool is_usb_streaming=true,phone_active,phone_buffer_started;
+static bool is_usb_streaming=true,phone_buffer_started;
 static struct { unsigned unused; } phone_clock;
 static unsigned phone_resampler;
 static bool pcm_locked;
@@ -226,7 +233,7 @@ static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigne
     memset(&media_tracker, 0, sizeof(media_tracker));
     memset(&playback_metrics, 0, sizeof(playback_metrics));
     now = consumed = emitted = send_failures = 0;
-    send_requested = false; phone_opened = false;
+    send_requested = false; phone_opened = phone_active = phone_output_recovery = false;
     allow_recovery = synchronous_request = false;
     suspend_recovery_pending=recovery_reset_encoder=false;
     request_depth = 0;

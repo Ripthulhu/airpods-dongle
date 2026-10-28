@@ -94,6 +94,56 @@ static void test_long_clock(uint32_t read_frames, int ppm, bool fixed_packets) {
                read_frames, ppm, fixed_packets, underflows, overflows);
     assert(started && underflows == 0 && overflows == 0);
 }
+
+static void test_phone_packet_jitter(unsigned phase, bool ingress_gap, bool encoder_stall) {
+    btstack_resample_t resampler;
+    phone_clock_t clock;
+    btstack_resample_init(&resampler, 2);
+    phone_clock_init(&clock, 480);
+    assert(playback_pcm_reset(&clock_pcm, PHONE_PCM_CAPACITY, false));
+    int16_t input[128 * 2], adjusted[130 * 2], output[480 * 2];
+    for (unsigned i = 0; i < 128; ++i) { input[2*i] = 12345; input[2*i+1] = -23456; }
+    unsigned packet = 0, next_read = phase, debt = 0, next_encoder = 0;
+    unsigned missing = 0, dropped = 0;
+    bool started = false;
+    // Real LHDC packets contain 720 frames / 15 ms, often delivered in 20 ms batches.
+    // Let clock feedback settle before the observed 72 ms gap and a 60 ms sender stall.
+    for (unsigned now = 0; now < 180000000u; now += 100) {
+        for (;;) {
+            unsigned arrival = (packet * 15000u + 19999u) / 20000u * 20000u;
+            if (ingress_gap && arrival > 120000000u && arrival < 120072000u)
+                arrival = 120072000u;
+            if (arrival > now) break;
+            unsigned frames = 720;
+            while (frames != 0) {
+                unsigned count = frames > 128 ? 128 : frames;
+                unsigned written = btstack_resample_block(&resampler, input, count, adjusted);
+                unsigned available = clock_pcm.capacity - clock_pcm.used;
+                if (written > available) dropped += written - available;
+                playback_pcm_push(&clock_pcm, adjusted, written);
+                frames -= count;
+            }
+            ++packet;
+        }
+        while (now >= next_read) { debt += 480; next_read += 10000; }
+        bool stalled = encoder_stall && now >= 140000100u && now < 140060100u;
+        if (stalled || now < next_encoder || debt < 480) continue;
+        debt -= 480;
+        next_encoder = now + 1700; // One encoding unit per main-loop pass.
+        if (!started && clock_pcm.used < phone_clock_prefill(480)) continue;
+        started = true;
+        unsigned copied = playback_pcm_read(&clock_pcm, output, 480);
+        missing += 480 - copied;
+        if (copied == 480) for (unsigned i = 0; i < 480; ++i) {
+            assert(output[2*i] == 12345 && output[2*i+1] == -23456);
+        }
+        btstack_resample_set_factor(&resampler, phone_clock_update(&clock, clock_pcm.used, 480));
+    }
+    if (missing || dropped)
+        printf("phone jitter phase=%u gap=%u stall=%u: missing=%u dropped=%u\n",
+               phase, ingress_gap, encoder_stall, missing, dropped);
+    assert(started && missing == 0 && dropped == 0);
+}
 #endif
 
 void test_phone_resampler(void) {
@@ -105,6 +155,11 @@ void test_phone_resampler(void) {
             test_long_clock(reads[i], ppm, false);
             test_long_clock(reads[i], ppm, true);
         }
+    for (unsigned phase = 0; phase < 10000; phase += 1000) {
+        test_phone_packet_jitter(phase, true, false);
+        test_phone_packet_jitter(phase, false, true);
+        test_phone_packet_jitter(phase, true, true);
+    }
 #endif
     puts("phone real resampler bounds, channel state and clock correction: passed");
 }

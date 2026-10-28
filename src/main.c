@@ -80,6 +80,15 @@ static void realtime_metrics_print(void) {
            (unsigned long)phone_worker_max_decode_us());
     printf("[XIP] hits=%lu accesses=%lu (read then cleared; counters saturate)\n",
            (unsigned long)hits, (unsigned long)accesses);
+    bt_hci_credit_diagnostics_t credits;
+    bool known = bt_hci_credit_diagnostics(&credits);
+    printf("[CREDITS] known=%u raw_acl=%lu acl_len=%lu limit=%lu free=%lu outstanding=%lu reserved=%lu airpods_events=%lu airpods_packets=%lu airpods_gap_ms=%lu phone_events=%lu phone_packets=%lu phone_gap_ms=%lu\n",
+        known ? 1u : 0u, (unsigned long)credits.raw_acl_count, (unsigned long)credits.raw_acl_length,
+        (unsigned long)credits.effective_acl_limit, (unsigned long)credits.free_acl_slots,
+        (unsigned long)credits.outstanding_acl_packets, (unsigned long)credits.packet_buffer_reserved,
+        (unsigned long)credits.airpods.events, (unsigned long)credits.airpods.packets,
+        (unsigned long)credits.airpods.max_active_gap_ms, (unsigned long)credits.phone.events,
+        (unsigned long)credits.phone.packets, (unsigned long)credits.phone.max_active_gap_ms);
 }
 
 void aacp_mic_dec_wake_worker(void) {

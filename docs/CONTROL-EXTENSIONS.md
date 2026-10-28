@@ -51,6 +51,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 10: settings workflow lease | action u8, token u32 | acquire: version u8=1, token u32; renew/release: empty |
 | 11: audio trace | none | read-only 512-byte version-1 snapshot; see audio continuity document |
 | 12: diagnostic BLE scan policy | enabled u8 (0/1) | empty; disabling expires after 120 seconds |
+| 15: phone input counters | none | read-only 52-byte version-1 queue/decoder snapshot |
 
 Cached report slot 6 also returns the settings snapshot. Format: version u8=1,
 count u8, then count records of control ID u8, age milliseconds u32, report
@@ -354,3 +355,28 @@ it on exit. Expiry also bounds overhead if the collector disappears. Feature 13
 itself remains read-only. Normal playback does not scan sample arrays or cache
 codec frames, and periodic BLE status printing and BTstack information-level logging are disabled; CDC timing prints
 occur only on an explicit diagnostic request.
+
+## Phone input counters (typed feature 15, firmware 0.1.27)
+
+Request is one byte, 15. Response is 52 bytes, little-endian. Header bytes 0..3
+are version 1; codec (0 none, 1 SBC, 2 aptX, 3 LHDCv5); state flags; field count
+12. Flags are signaling connected (1), configured (2), opened (4), started (8),
+Start pending (16), Start accepted (32), worker ready (64), and AirPods output
+ready (128).
+
+Twelve u32 values start at offset 4, in order: accepted packets, malformed
+packets, sequence gaps, worker submission failures, decoder failures, buffer
+resets, published stereo PCM frames, latest media-packet milliseconds, queued
+packets, decoded output waiting (0/1), latest decode microseconds and maximum
+decode microseconds.
+
+Packet/error/reset/frame totals wrap at 32 bits and persist until firmware
+initialization. Resets include ordinary start/stop transitions, so compare
+steady-playback deltas. Timing and queue values describe the current worker.
+In 0.1.27, queue-full submissions also incremented malformed/reset totals and
+cleared PCM. From 0.1.28, congestion increments only submission failures; valid
+queued work is retained and decoder history resets at the subsequent accepted
+packet boundary. That ordered codec reset does not clear PCM or increment the
+buffer-reset field. The wire layout is unchanged.
+The snapshot neither resets counters nor changes playback. The collector's
+`--phone` option requests it without enabling audio-payload inspection or logging.

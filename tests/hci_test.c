@@ -25,6 +25,9 @@ static bool phone_has_key, missing_acl, tlv_missing, tlv_fail, tlv_corrupt;
 static unsigned phone_writes;
 static unsigned busy_routes, disconnect_calls;
 static bool busy_during_key_read;
+static hci_connection_t credit_connections[3];
+static uint16_t credit_free_slots;
+static bool credit_packet_reserved;
 static phone_record_t stored_phone;
 static int stored_phone_length;
 static bd_addr_t phone_key_address;
@@ -98,6 +101,15 @@ hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t address[6], 
     static hci_connection_t connection = {.con_handle = 1};
     return missing_acl ? NULL : &connection;
 }
+hci_connection_t *hci_connection_for_handle(uint16_t handle) {
+    for (unsigned i=0;i<3;++i)
+        if (credit_connections[i].con_handle==handle) return &credit_connections[i];
+    return NULL;
+}
+uint16_t hci_number_free_acl_slots_for_connection_type(uint8_t address_type) {
+    assert(address_type==BD_ADDR_TYPE_ACL);return credit_free_slots;
+}
+bool hci_is_packet_buffer_reserved(void) { return credit_packet_reserved; }
 uint8_t gap_security_level(uint16_t handle) { assert(handle == 1); return security_level; }
 uint8_t gap_disconnect(uint16_t handle) { assert(handle == 1); ++disconnect_calls; return 0; }
 bool get_usb_streaming(void) { return (busy_routes & 1u) != 0; }
@@ -180,6 +192,8 @@ static void fixture(void) {
     phone_writes = 0;
     busy_routes = disconnect_calls = 0;
     busy_during_key_read = false;
+    memset(credit_connections,0,sizeof(credit_connections));
+    credit_free_slots=3;credit_packet_reserved=false;
     stored_phone_length = 0;
     memset(&stored_phone, 0, sizeof(stored_phone));
     memset(phone_key_address, 0, sizeof(phone_key_address));
@@ -511,6 +525,7 @@ static void test_phone_storage_rejects_unknown_and_failed_writes(void) {
 
 static void test_new_phone_pairing_requires_quiet_routes(void) {
     for (unsigned busy = 1; busy <= 16; busy <<= 1) {
+        if (busy == 2u) continue; // Idle output transitions have their own pairing-window test.
         fixture();
         bt_hci_init();
         busy_routes = busy;
@@ -549,6 +564,36 @@ static void test_new_phone_pairing_requires_quiet_routes(void) {
     }
 }
 
+static void test_phone_pairing_survives_idle_output_transitions(void) {
+    for (unsigned candidate_first = 0; candidate_first < 2; ++candidate_first) {
+        fixture();
+        bt_hci_init();
+        busy_routes = 2;
+        assert(bt_hci_phone_pairing_busy() && !bt_hci_phone_pairing_start());
+        busy_routes = 0;
+        assert(bt_hci_phone_pairing_start());
+        if (candidate_first) assert(allow(nearby, HCI_LINK_TYPE_ACL));
+        now = 500;
+        busy_routes = 2; // Automatic idle suspend/start carries no playback or recording demand.
+        bt_hci_phone_poll();
+        assert(phone_pairing && bt_hci_phone_pairing_active() && discoverable == 1);
+        if (!candidate_first) assert(allow(nearby, HCI_LINK_TYPE_ACL));
+        authentication_event(HCI_EVENT_USER_CONFIRMATION_REQUEST, nearby);
+        assert(confirmations == 1 && confirmation_rejections == 0);
+        memcpy(phone_key_address, nearby, 6);
+        phone_has_key = true;
+        assert(bt_hci_phone_peer_connected(nearby));
+        assert(phone_writes == 1 && phone_bonded && disconnect_calls == 0);
+    }
+    fixture();
+    bt_hci_init();
+    assert(bt_hci_phone_pairing_start() && allow(nearby, HCI_LINK_TYPE_ACL));
+    busy_routes = 2;
+    now = PHONE_PAIRING_MS;
+    bt_hci_phone_poll();
+    assert(!phone_pairing && discoverable == 0 && disconnect_calls == 1);
+}
+
 static void test_phone_candidate_timeout_and_busy_poll_close_only_candidate(void) {
     fixture();
     bt_hci_init();
@@ -579,7 +624,58 @@ static void test_phone_candidate_timeout_and_busy_poll_close_only_candidate(void
     assert(!phone_pairing && !phone_writes && !phone_bonded && disconnect_calls == 3);
 }
 
+static void credit_completion(uint16_t handle,uint16_t packets) {
+    uint8_t p[]={HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS,5,1,
+        (uint8_t)handle,(uint8_t)(handle>>8),(uint8_t)packets,(uint8_t)(packets>>8)};
+    hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void test_credit_diagnostics(void) {
+    fixture();memcpy(saved[0],first,6);has_key[0]=true;bt_hci_init();
+    bt_hci_credit_diagnostics_t data;
+    assert(!bt_hci_credit_diagnostics(NULL) && !bt_hci_credit_diagnostics(&data));
+    assert(data.raw_acl_count==0 && data.free_acl_slots==0);
+    uint8_t buffer[]={HCI_EVENT_COMMAND_COMPLETE,11,1,5,0x10,0,0xfd,3,0,12,0,0,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,buffer,sizeof(buffer));
+    assert(bt_hci_credit_diagnostics(&data));
+    assert(data.raw_acl_count==12 && data.raw_acl_length==1021 && data.effective_acl_limit==3);
+    credit_free_slots=1;credit_packet_reserved=true;bt_hci_credit_diagnostics(&data);
+    assert(data.free_acl_slots==1 && data.outstanding_acl_packets==2 && data.packet_buffer_reserved==1);
+    buffer[5]=1;buffer[9]=99;hci_packet_handler(HCI_EVENT_PACKET,0,buffer,sizeof(buffer));
+    buffer[5]=0;buffer[1]=10;hci_packet_handler(HCI_EVENT_PACKET,0,buffer,sizeof(buffer)-1);
+    bt_hci_credit_diagnostics(&data);assert(data.raw_acl_count==12); // Failed/truncated replies cannot replace metadata.
+    memcpy(phone_address,nearby,6);phone_bonded=true;
+    credit_connections[0].con_handle=0x11;memcpy(credit_connections[0].address,first,6);
+    credit_connections[1].con_handle=0x22;memcpy(credit_connections[1].address,nearby,6);
+    credit_connections[2].con_handle=0x33;memcpy(credit_connections[2].address,second,6);
+    busy_routes=1;now=100;
+    uint8_t both[]={HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS,9,2,0x11,0,1,0,0x22,0,2,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,both,sizeof(both));
+    now=120;credit_completion(0x11,1);credit_completion(0x22,1);
+    credit_completion(0x33,7);credit_completion(0x77,9);
+    uint8_t malformed[]={HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS,5,2,0x11,0,1,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,malformed,sizeof(malformed));
+    bt_hci_credit_diagnostics(&data);
+    assert(data.airpods.events==2 && data.airpods.packets==2 && data.airpods.max_active_gap_ms==20);
+    assert(data.phone.events==2 && data.phone.packets==3 && data.phone.max_active_gap_ms==20);
+    busy_routes=0;bt_hci_phone_poll();now=5000;credit_completion(0x11,1);
+    busy_routes=1;now=9000;credit_completion(0x11,1);now=9025;credit_completion(0x11,1);
+    bt_hci_credit_diagnostics(&data);assert(data.airpods.max_active_gap_ms==25); // Idle duration is excluded.
+    uint8_t disconnect[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnect,sizeof(disconnect));
+    now=20000;credit_completion(0x11,1);bt_hci_credit_diagnostics(&data);
+    assert(data.airpods.max_active_gap_ms==25); // Reconnection is a new gap epoch.
+    credit_connections[0].con_handle=0x44;now=30000;credit_completion(0x44,1);
+    bt_hci_credit_diagnostics(&data);assert(data.airpods.max_active_gap_ms==25);
+    busy_routes=0;bt_hci_phone_poll();busy_routes=1;
+    now=UINT32_MAX-9u;credit_completion(0x44,1);now=5;credit_completion(0x44,1);
+    bt_hci_credit_diagnostics(&data);assert(data.airpods.max_active_gap_ms==25);
+    credit_roles[0].totals.events=UINT32_MAX;credit_roles[0].totals.packets=UINT32_MAX-1u;
+    credit_completion(0x44,2);bt_hci_credit_diagnostics(&data);
+    assert(data.airpods.events==UINT32_MAX && data.airpods.packets==UINT32_MAX);
+}
+
 int main(void) {
+    test_credit_diagnostics();
     test_selected_bond_auto_connects();
     test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback();
     test_only_live_pairing_inquiry_can_select_a_peer();
@@ -590,8 +686,9 @@ int main(void) {
     test_phone_pairing_is_bounded_and_keeps_airpods_slots();
     test_phone_pairing_expiry_authentication_and_inquiry_roles();
     test_phone_storage_rejects_unknown_and_failed_writes();
+    test_phone_pairing_survives_idle_output_transitions();
     test_new_phone_pairing_requires_quiet_routes();
     test_phone_candidate_timeout_and_busy_poll_close_only_candidate();
-    puts("HCI selected-peer ownership, quiet phone pairing/authentication/storage and BLE coordination: 12 groups passed");
+    puts("HCI selected-peer ownership, quiet phone pairing/authentication/storage and BLE coordination: 14 groups passed");
     return 0;
 }

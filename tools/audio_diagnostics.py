@@ -225,7 +225,7 @@ def decode_trace(data):
 
 
 def _transaction(device, payload):
-    read = len(payload) == 1 and payload[0] in (5, 9, 11, 13)
+    read = len(payload) == 1 and payload[0] in (5, 9, 11, 13, 15)
     profile = len(payload) == 2 and payload[0] in (4, 12, 14) and payload[1] in (0, 1)
     if not (read or profile):
         raise ValueError('Only diagnostic reads and explicit audio profiling controls are allowed')
@@ -283,7 +283,7 @@ def _transaction(device, payload):
 
 
 def feature(device, command):
-    if command not in (5, 9, 11, 13):
+    if command not in (5, 9, 11, 13, 15):
         raise ValueError('Collector permits audio/performance/trace reads only')
     return _transaction(device, bytes((command,)))
 
@@ -306,7 +306,20 @@ def decode_inspect(data):
     return result
 
 
-def sample(device, trace=True, inspect=False):
+def decode_phone(data):
+    if len(data) != 52 or data[0] != 1 or data[1] > 3 or data[3] != 12:
+        raise RuntimeError('Unsupported phone diagnostic layout')
+    names = ('packets', 'malformed', 'sequence_gaps', 'submit_failures',
+             'decode_failures', 'buffer_resets', 'decoded_frames', 'last_packet_ms',
+             'queued_packets', 'output_ready', 'last_decode_us', 'max_decode_us')
+    result = dict(zip(names, struct.unpack_from('<12I', data, 4)))
+    if result['output_ready'] > 1:
+        raise RuntimeError('Invalid phone output state')
+    result.update(codec=data[1], flags=data[2])
+    return result
+
+
+def sample(device, trace=True, inspect=False, phone=False):
     audio, perf = feature(device, 9), feature(device, 5)
     if len(audio) != 20 or len(perf) != 64 or audio[0] != 1 or perf[0] != 1:
         raise RuntimeError('Unsupported audio/performance layout')
@@ -323,6 +336,11 @@ def sample(device, trace=True, inspect=False):
             result['trace_supported'] = False
     if inspect:
         result['inspect']=decode_inspect(feature(device,13))
+    if phone:
+        try:
+            result['phone']=decode_phone(feature(device,15))
+        except Unsupported:
+            result['phone_supported']=False
     return result
 
 
@@ -333,11 +351,12 @@ def main():
     parser.add_argument('--output', help='JSONL destination (default stdout)')
     parser.add_argument('--legacy', action='store_true', help='Only existing feature 5/9 snapshots')
     parser.add_argument('--inspect', action='store_true', help='Include signal levels and the latest submitted AAC-ELD frame')
+    parser.add_argument('--phone', action='store_true', help='Include phone input queue and decoder counters')
     args = parser.parse_args()
     if not 1 <= args.seconds <= 1800:
         parser.error('--seconds must be 1..1800')
-    if args.legacy and args.inspect:
-        parser.error('--legacy and --inspect cannot be combined')
+    if args.legacy and (args.inspect or args.phone):
+        parser.error('--legacy cannot be combined with --inspect or --phone')
     output = open(args.output, 'x', encoding='utf-8') if args.output else sys.stdout
     device = Hid(args.serial)
     inspecting=False
@@ -350,7 +369,7 @@ def main():
             started = time.monotonic()
             if inspecting and started-renewed>=10:
                 _transaction(device,bytes((14,1)));renewed=started
-            print(json.dumps(sample(device, not args.legacy, args.inspect)), file=output, flush=True)
+            print(json.dumps(sample(device, not args.legacy, args.inspect, args.phone)), file=output, flush=True)
             time.sleep(max(0, 1 - (time.monotonic() - started)))
     finally:
         if inspecting:

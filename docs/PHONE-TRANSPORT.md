@@ -1,7 +1,13 @@
 # Phone bridge
 
-Firmware 0.1.11 provides wireless stereo audio and a separate app control service.
-Both paths remain untested on Pico hardware.
+Firmware 0.1.26 pairs with the Pixel 10 Pro XL and plays LHDC through the Pico,
+but its phone buffering can lose samples. Version 0.1.27's larger PCM reserve
+did not fix the audible crackle: hardware counters exposed compressed-input
+queue overflow and repeated decoder/PCM resets. Version 0.1.28 stopped those
+losses in the initial capture and improved playback, but PCM overflow, crackle
+and eventual silence remain. Version 0.1.29 addresses phone-output accounting
+and recovery; hardware validation is pending.
+The separate app control service remains untested on Pico hardware.
 
 ```text
 Phone -- LHDC v5 / aptX / SBC --> Pico 2 W -- AAC-ELD / AAC / SBC --> AirPods
@@ -23,8 +29,9 @@ that explicit pairing window. A new phone must complete encrypted, bonded access
 before its identity is retained.
 
 Pause playback and close microphone use before pairing a new phone. Firmware
-rejects pairing while audio is active or changing state, and closes an unfinished
-pairing window if audio starts. Saved phones can reconnect during playback.
+rejects a new pairing request while audio is active or changing state. Once
+opened, the window survives idle output transitions, but playback/microphone
+demand or the original two-minute deadline closes it. Saved phones can reconnect during playback.
 An already in-flight BTstack link-key notification can still write flash before
 the application's cancellation check; this does not guarantee uninterrupted
 audio when a host starts playback during bonding.
@@ -68,8 +75,10 @@ revokes that ownership. Stored device ear detection is a separate AirPods settin
   endpoint and makes one reconnect attempt with the remaining codecs.
   A rejected Open or failed media-channel setup uses the same recovery. Three
   consecutive completed LHDC decode failures also withdraw LHDC; successful PCM
-  clears the count. Packet gaps, malformed RTP and input backpressure keep their
-  existing reset behavior and do not mark a codec unsupported.
+  clears the count. Packet gaps, malformed RTP and input backpressure do not
+  mark a codec unsupported. Malformed packets and RTP gaps clear stale work;
+  input congestion preserves already queued audio and resets decoder history
+  at the first accepted packet after the loss.
   Actual Open attempts have a three-second deadline. A peer that configures audio
   and waits before requesting Open remains connected.
 - Before Bluetooth starts, core 1 silently decodes 32 synthetic LHDC music frames
@@ -85,11 +94,19 @@ revokes that ownership. Stored device ear detection is a separate AirPods settin
   fragmented SBC, and resets on sequence gaps instead of playing stale PCM.
   LHDC uses RTP plus `[frame_count << 2, packet_sequence]`; fragmented packets,
   unsupported frame formats, mismatched frame counts and truncated tails are rejected.
-- Core 1 decodes into a 64 ms maximum PCM queue via a single completed-packet
-  mailbox. Two compressed packet slots bound the cross-core handoff; they have
-  no playout timer. Initial prefill is 30 ms
-  for AAC-ELD/SBC output and about 41 ms for AAC; it leaves a small reserve for
-  packet arrival phase and clock drift.
+- Core 1 publishes decoded packets through a single completed-packet
+  mailbox. Eight compressed packet slots bound the cross-core handoff; they have
+  no playout timer. The controller driver can deliver a batch before core 0
+  consumes the mailbox. The former two-slot queue rejected valid packets during
+  these batches. A full queue now drops only the arriving packet and marks the
+  next accepted packet for a decoder reset after the older queued work finishes.
+  It does not clear valid queued PCM or repeatedly reset for each rejected packet.
+  Decoded PCM uses the existing 8,192-frame pool as a 170.7 ms
+  transient bound, with an independent 80 ms phone-input jitter reserve. Initial
+  prefill is about 83 ms for SBC output, 90 ms for AAC-ELD and 101 ms for AAC.
+  The reserve adds 60 ms of phone buffering; USB thresholds and its allocation
+  are unchanged. Extra compressed slots provide burst capacity without a new
+  startup or playout delay.
   A bounded resampling correction follows queue fill to compensate for independent
   clocks. Saturation discards the oldest complete PCM frames. These are buffer
   thresholds, not measured acoustic delay.
@@ -118,7 +135,7 @@ to AAC-ELD is still a lossy transcode.
 
 Bluetooth, USB, playback encoding and PCM publication run on core 0. Core 1 owns
 phone LHDC/aptX/SBC decoding or USB microphone decoding; the two inputs are mutually
-exclusive. The phone worker allocates 9,780 bytes only during phone sessions or the
+exclusive. The phone worker allocates 15,972 bytes only during phone sessions or the
 silent startup check. The LHDC decoder's ARM32 preparation requests 11,264 bytes
 live and peaks at 13,792 bytes; its static state is included in the linked heap budget.
 An idle microphone decoder is detached by core 1
@@ -149,6 +166,47 @@ linked LHDC archive. Silent, scaled or swapped output cannot pass that gate.
 Firmware cross-compilation
 checks the pinned SDK API and RAM layout. These checks do not establish radio
 reliability, CPU headroom or acoustic latency on the Pico.
+
+The phone jitter regression also uses production PCM, clock feedback and the
+real resampler for three-frame/15 ms LHDC packets delivered in 20 ms batches.
+After two minutes of settling it injects a 72 ms ingress gap and a 60 ms encoder
+stall, separately and together, at ten encoder phases. The old buffer loses
+samples; the 80 ms reserve and full existing pool pass without loss. These tests
+and the real decoder safety checks run in the float CI job after SDK preparation.
+Typed feature 15 and `audio_diagnostics.py --phone` expose queue, decoder,
+sequence-gap and reset counters without enabling per-packet logging. On 0.1.27,
+an eleven-second hardware interval recorded 20 rejected submissions and 20
+resets, with no new PCM underflows, PCM drops, decode failures or RTP gaps.
+This distinguishes compressed-queue loss from the original PCM capacity issue.
+The worker regression replays a short relative-arrival excerpt from that capture
+with 7, 11 and 13.8 ms decode costs and 1 or 3.6 ms mailbox polling. It checks
+ordered stereo delivery through the burst and subsequent backlog drain. A
+separate saturation case verifies that older queued audio survives and decoder
+history resets once at the first post-loss packet. These are deterministic
+production-worker tests with a codec substitute, not on-device speed measurements.
+
+The remaining 0.1.28 failure was downstream: an approximately 101 ms send wait
+could silently discard phone scheduling debt above 60 ms while retaining its
+old PCM. Version 0.1.29 reconciles an overrun by skipping the same number of
+available PCM frames and owed frames, with explicit counters. If PCM is still
+being decoded, the unmatched debt remains until it can be reconciled.
+
+An AAC-ELD send gap longer than the receiver's current buffer window now enters
+confirmed output Suspend/Start recovery for phone input too. The phone connection
+is retained only for the same output connection and selected peer, for at most
+three seconds, without USB/microphone takeover or a profile change. The decoder
+can continue validated input during this scoped recovery. Start resets the
+phone ring, clock and resampler; the 4,800-frame encoded warm-up runs before
+the phone prefill gate. Normal readiness resumes only after that warm-up.
+
+The existing CDC `t` timing request also prints one `[CREDITS]` line: the
+controller's raw ACL count/length, the configured effective limit, current shared
+free/outstanding slots, reserved packet-buffer state, and AirPods/phone role
+completion counts and maximum active intervals since HCI initialization.
+The phone's completion counts describe
+outgoing control traffic, not incoming music acknowledgements. These counters
+do not enable packet logging. A long completion interval is cadence evidence;
+it does not by itself establish a radio stall or exhausted credits.
 
 Control tests cover fragmented/coalesced RFCOMM frames, encrypted saved-peer
 checks, per-client RPC ownership, replay protection, blocked writers and cleanup.

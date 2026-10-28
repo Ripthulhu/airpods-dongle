@@ -7,6 +7,7 @@
 #include "../src/btstack/playback_options.h"
 #include "../src/btstack/playback_adjust.h"
 #include "../src/btstack/playback_usb_clock.h"
+#include "../src/btstack/phone_clock.h"
 static playback_usb_clock_t usb_clock;
 static uint32_t usb_recovery_drops;
 static uint32_t media_last_sent_us,packet_oldest_us;
@@ -16,11 +17,20 @@ static playback_adjust_t playback_adjust;
 #define ERROR_CODE_SUCCESS 0
 #define PLAYBACK_IDLE_MS 1000u
 #define PLAYBACK_TRANSITION_MS 3000u
+#define SUSPEND_RECOVERY_TIMEOUT_MS 3000u
 #define AVDTP_SI_START 1
 #define AVDTP_SI_SUSPEND 2
 enum { PLAYBACK_RUNNING, PLAYBACK_SUSPENDING, PLAYBACK_SUSPENDED, PLAYBACK_STARTING };
 static uint8_t playback_idle_phase, cur_codec = 4;
 static bool playback_idle_counting, phone_opened, phone_active, phone_buffer_started;
+static bool phone_output_recovery;
+static uint16_t phone_output_recovery_cid;
+static uint32_t phone_output_recovery_since;
+static uint8_t phone_output_recovery_peer[6], cur_active_device[6], selected_peer[6];
+static phone_clock_t phone_clock;
+static unsigned phone_resampler, acc_num_simples=480;
+static void btstack_resample_init(void *resampler,unsigned channels) {(void)resampler;assert(channels==2);}
+static const uint8_t *get_device_addr(void) {return selected_peer;}
 static bool is_usb_streaming, is_streaming, a2dp_is_connected_flag, finish_scan_avdtp_codec;
 static bool profile_pending, a2dp_connect_pending;
 static bool recovery_reset_encoder, suspend_recovery_pending, mic_requested, mic_active;
@@ -34,6 +44,7 @@ static bool encoder_ready = true;
 static bool game_eligible;
 static playback_game_t playback_game;
 static bool playback_game_eligible(void) { return game_eligible; }
+static struct { unsigned recoveries; } playback_metrics;
 static void *handleAAC = (void *)1;
 static uint32_t aaceld_bitrate = 256000;
 static uint16_t pcm_frame_samples = 480, active_slot_count = 16;
@@ -72,6 +83,7 @@ static bool usb_mic_requested(void) { return mic_requested; }
 static bool aacp_mic_active(void) { return mic_active; }
 static uint8_t avdtp_subevent_signaling_accept_get_local_seid(const uint8_t *p) { return *p; }
 static void set_led_mode_on(void) { }
+bool bridge_phone_recovering(void);
 #include "playback_idle.inc"
 
 static void accept(unsigned signal, uint8_t seid) {
@@ -94,6 +106,8 @@ static void fixture(void) {
     recovery_reset_encoder = suspend_recovery_pending = false;
     profile_pending = a2dp_connect_pending = false;
     is_usb_streaming = phone_opened = phone_active = mic_requested = mic_active = false;
+    phone_output_recovery=false;
+    for(unsigned i=0;i<6;++i)selected_peer[i]=cur_active_device[i]=(uint8_t)(i+1);
     cur_codec = 4;
     game_eligible=false; playback_game=(playback_game_t){0};
 }
@@ -128,7 +142,74 @@ static void usb_onset_survives_restart(void) {
     assert(playback_pcm_read(&playback_pcm, output, 480) == 480);
     assert(memcmp(onset, output, sizeof(onset)) == 0);
 }
+static void phone_recovery_start(void) {
+    fixture(); phone_opened=phone_active=phone_buffer_started=true;
+    playback_transport_stale=true;
+    assert(!playback_phone_recovery_poll());
+    assert(suspends==1 && !media_tracker.streaming && bridge_phone_recovering());
+    playback_transport_recover(&media_tracker);
+    assert(suspends==1); // One confirmed boundary at a time.
+}
+
+static void phone_output_recovers_without_losing_input(void) {
+    phone_recovery_start();
+    assert(!playback_phone_recovery_poll());
+    accept(AVDTP_SI_SUSPEND,6); assert(!starts && bridge_phone_recovering());
+    now=10; accept(AVDTP_SI_SUSPEND,5);
+    assert(starts==1 && resets==1 && bridge_phone_recovering());
+    playback_pcm.used=777;
+    now=20; accept(AVDTP_SI_START,5);
+    assert(media_tracker.streaming && phone_active && bridge_phone_recovering());
+    assert(playback_pcm.capacity==PHONE_PCM_CAPACITY && !playback_pcm.used && !phone_buffer_started);
+    assert(playback_pcm.priming==4800 && !bridge_phone_ready());
+    int16_t output[960];
+    for(unsigned i=0;i<10;++i) {
+        assert(playback_pcm_read(&playback_pcm,output,480)==0);
+        playback_pcm_sent(&playback_pcm);
+    }
+    assert(bridge_phone_ready() && !playback_phone_recovery_poll() && !phone_output_recovery);
+    assert(phone_active && !closes);
+
+    phone_recovery_start(); now=2999;
+    assert(bridge_phone_recovering() && !playback_phone_recovery_poll());
+    now=3000; assert(!bridge_phone_recovering());
+    assert(playback_phone_recovery_poll() && closes==1 && !phone_output_recovery);
+
+    for(unsigned reason=0;reason<8;++reason) {
+        phone_recovery_start();
+        switch(reason) {
+            case 0: is_usb_streaming=true;break;
+            case 1: mic_requested=true;break;
+            case 2: mic_active=true;break;
+            case 3: profile_pending=true;break;
+            case 4: a2dp_connect_pending=true;break;
+            case 5: ++media_tracker.avdtp_cid;break;
+            case 6: ++selected_peer[0];break;
+            case 7: ++cur_active_device[0];break;
+        }
+        assert(!bridge_phone_recovering());
+        assert(!playback_phone_recovery_poll() && !phone_output_recovery && !closes);
+        if (reason>=5) {
+            assert(!suspend_recovery_pending && !suspend_recovery_timer.active);
+            suspend_recovery_handler(&suspend_recovery_timer);
+            assert(!closes); // A stale timer cannot release a replacement output.
+        } else assert(suspend_recovery_pending && suspend_recovery_timer.active);
+        if (reason==0) {
+            accept(AVDTP_SI_SUSPEND,5); accept(AVDTP_SI_START,5);
+            assert(media_tracker.streaming && starts==1 && !closes && !phone_output_recovery);
+        }
+    }
+    phone_recovery_start(); phone_output_recovery_since=UINT32_MAX-1000u;
+    now=1998; assert(bridge_phone_recovering());
+    now=1999; assert(!bridge_phone_recovering());
+
+    phone_recovery_start(); now=10;accept(AVDTP_SI_SUSPEND,5);accept(AVDTP_SI_START,5);
+    now=3000;assert(playback_phone_recovery_poll() && closes==1); // Warm-up is bounded too.
+    phone_recovery_start();bridge_phone_stop();assert(!phone_output_recovery);
+}
+
 int main(void) {
+    phone_output_recovers_without_losing_input();
     usb_onset_survives_restart();
     fixture(); suspend_recovery_pending=recovery_reset_encoder=true; is_usb_streaming=true;
     mic_recovery_pending=mic_recovery_started=true; mic_recovery_cid=10; mic_recovery_revision=4;

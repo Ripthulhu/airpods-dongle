@@ -24,5 +24,16 @@ bool bt_hci_phone_peer_allowed(const uint8_t address[6]);
 bool bt_hci_phone_peer_connected(const uint8_t address[6]);
 void bt_hci_phone_poll(void);
 
+typedef struct {
+    uint32_t events, packets, max_active_gap_ms;
+} bt_hci_credit_role_t;
+typedef struct {
+    uint32_t raw_acl_count, raw_acl_length, effective_acl_limit;
+    uint32_t free_acl_slots, outstanding_acl_packets, packet_buffer_reserved;
+    bt_hci_credit_role_t airpods, phone;
+} bt_hci_credit_diagnostics_t;
+// Read under the Bluetooth lock; false means Read Buffer Size has not succeeded.
+bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out);
+
 
 #endif //PICOW_USB_BT_AUDIO_BTSTACK_HCI_H

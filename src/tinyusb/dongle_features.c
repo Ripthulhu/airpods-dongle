@@ -5,6 +5,7 @@
 #include "../btstack/btstack_avdtp_source.h"
 #include "../btstack/dongle_finder.h"
 #include "../btstack/btstack_ble_scan.h"
+#include "../btstack/phone_sink.h"
 
 static uint8_t error(uint8_t result) {
     switch(result){
@@ -68,6 +69,9 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
         case 14:
             if(size!=2 || p[1]>1)return 1;
             dongle_playback_inspect_enable(p[1]!=0);return 0;
+        case 15:
+            if(size!=1)return 1;
+            *length=phone_sink_diagnostics(out,capacity);return *length?0:7;
         default:return 7;
     }
 }

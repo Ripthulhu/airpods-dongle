@@ -14,6 +14,8 @@ bool phone_worker_configure(phone_codec_t codec, const phone_sbc_config_t *sbc);
 phone_worker_status_t phone_worker_prepare(void);
 bool phone_worker_ready(void);
 void phone_worker_reset(void);
+// A full queue rejects only the new input. Reset at the next accepted packet's
+// decode boundary, after preserving the older queued audio.
 bool phone_worker_submit(const uint8_t *payload, size_t length, uint8_t sbc_frames);
 // Publishes a complete decoded packet on core0; false means decode failed.
 bool phone_worker_poll(phone_codec_pcm_callback callback, void *context);
@@ -21,6 +23,12 @@ bool phone_worker_poll(phone_codec_pcm_callback callback, void *context);
 uint32_t phone_worker_last_decode_us(void);
 // Maximum since this worker was prepared, including failed/cancelled decodes.
 uint32_t phone_worker_max_decode_us(void);
+typedef struct {
+    uint32_t queued_packets;
+    bool output_ready;
+} phone_worker_queue_snapshot_t;
+// Core0/main context only; uses atomic reads for core1's bounded queue/mailbox.
+phone_worker_queue_snapshot_t phone_worker_queue_snapshot(void);
 // Returns true only after core1 has detached and all phone memory is released.
 bool phone_worker_close(void);
 bool phone_worker_released(void);

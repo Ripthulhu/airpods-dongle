@@ -35,6 +35,14 @@ static bool selected_bonded;
 static bd_addr_t phone_address, phone_candidate;
 static bool phone_bonded, phone_pairing, phone_storage_supported;
 static uint32_t phone_pairing_since;
+static uint16_t credit_raw_acl_count, credit_raw_acl_length;
+static bool credit_buffer_known;
+static struct {
+    bt_hci_credit_role_t totals;
+    uint32_t last_ms;
+    uint16_t handle;
+    bool armed;
+} credit_roles[2];
 
 typedef struct {
     uint8_t version;
@@ -71,14 +79,80 @@ static void phone_load(void) {
     phone_bonded = gap_get_link_key_for_bd_addr(phone_address, key, &type);
 }
 
+static bool phone_pairing_audio_busy(void) {
+    return get_usb_streaming() || usb_mic_requested() || aacp_mic_active() || phone_sink_active();
+}
+
+static uint16_t credit_u16(const uint8_t *p) { return (uint16_t)p[0] | (uint16_t)p[1] << 8; }
+static uint32_t credit_add(uint32_t value, uint32_t added) {
+    return value > UINT32_MAX - added ? UINT32_MAX : value + added;
+}
+static void credit_event(const uint8_t *p, uint16_t size) {
+    if (p[0] == HCI_EVENT_COMMAND_COMPLETE && size >= 13 &&
+        credit_u16(p + 3) == HCI_OPCODE_HCI_READ_BUFFER_SIZE && p[5] == 0) {
+        credit_raw_acl_length = credit_u16(p + 6);
+        credit_raw_acl_count = credit_u16(p + 9);
+        credit_buffer_known = true;
+    } else if (p[0] == HCI_EVENT_DISCONNECTION_COMPLETE && size == 6 && p[2] == 0) {
+        uint16_t handle = credit_u16(p + 3) & 0x0fffu;
+        for (unsigned i = 0; i < 2; ++i)
+            if (credit_roles[i].handle == handle) credit_roles[i].armed = false;
+    } else if (p[0] == BTSTACK_EVENT_STATE && size >= 3 && p[2] != HCI_STATE_WORKING) {
+        credit_buffer_known = false;
+        credit_roles[0].armed = credit_roles[1].armed = false;
+    } else if (p[0] == HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS && size >= 3 && size == 3u + p[2] * 4u) {
+        uint32_t now = btstack_run_loop_get_time_ms();
+        bool active = phone_pairing_audio_busy();
+        for (unsigned offset = 3; offset < size; offset += 4) {
+            uint16_t handle = credit_u16(p + offset) & 0x0fffu;
+            hci_connection_t *connection = hci_connection_for_handle(handle);
+            if (connection == NULL) continue;
+            int role = memcmp(connection->address, device_addr, 6) == 0 ? 0 :
+                ((peer_address_valid(phone_address) && memcmp(connection->address, phone_address, 6) == 0) ||
+                 (peer_address_valid(phone_candidate) && memcmp(connection->address, phone_candidate, 6) == 0)) ? 1 : -1;
+            if (role < 0) continue;
+            uint16_t completed = credit_u16(p + offset + 2);
+            credit_roles[role].totals.events = credit_add(credit_roles[role].totals.events, 1);
+            credit_roles[role].totals.packets = credit_add(credit_roles[role].totals.packets, completed);
+            if (!completed) continue;
+            if (active && credit_roles[role].armed && credit_roles[role].handle == handle) {
+                uint32_t gap = now - credit_roles[role].last_ms;
+                if (gap > credit_roles[role].totals.max_active_gap_ms)
+                    credit_roles[role].totals.max_active_gap_ms = gap;
+            }
+            credit_roles[role].handle = handle;
+            credit_roles[role].last_ms = now;
+            credit_roles[role].armed = active;
+        }
+    }
+}
+
+bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out) {
+    if (out == NULL) return false;
+    memset(out, 0, sizeof(*out));
+    out->raw_acl_count = credit_raw_acl_count;
+    out->raw_acl_length = credit_raw_acl_length;
+    out->airpods = credit_roles[0].totals;
+    out->phone = credit_roles[1].totals;
+    if (credit_buffer_known) {
+        out->effective_acl_limit = credit_raw_acl_count < MAX_NR_CONTROLLER_ACL_BUFFERS ?
+            credit_raw_acl_count : MAX_NR_CONTROLLER_ACL_BUFFERS;
+        out->free_acl_slots = hci_number_free_acl_slots_for_connection_type(BD_ADDR_TYPE_ACL);
+        out->outstanding_acl_packets = out->free_acl_slots <= out->effective_acl_limit ?
+            out->effective_acl_limit - out->free_acl_slots : 0;
+        out->packet_buffer_reserved = hci_is_packet_buffer_reserved();
+    }
+    return credit_buffer_known;
+}
+
 bool bt_hci_phone_pairing_busy(void) {
-    return get_usb_streaming() || dongle_playback_transitioning() ||
-           usb_mic_requested() || aacp_mic_active() || phone_sink_active();
+    return phone_pairing_audio_busy() || dongle_playback_transitioning();
 }
 
 bool bt_hci_phone_pairing_active(void) {
     return phone_pairing &&
-        !bt_hci_phone_pairing_busy() &&
+        // An idle suspend/start must not revoke an already opened pairing window.
+        !phone_pairing_audio_busy() &&
         (uint32_t)(btstack_run_loop_get_time_ms() - phone_pairing_since) < PHONE_PAIRING_MS;
 }
 
@@ -97,6 +171,7 @@ static void phone_pairing_stop(void) {
 }
 
 void bt_hci_phone_poll(void) {
+    if (!phone_pairing_audio_busy()) credit_roles[0].armed = credit_roles[1].armed = false;
     if (phone_pairing && !bt_hci_phone_pairing_active()) phone_pairing_stop();
 }
 
@@ -201,6 +276,7 @@ bool gap_start_scanning(void){
 static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     UNUSED(channel);
     if (packet_type != HCI_EVENT_PACKET || size < 2 || (unsigned)packet[1] + 2 != size) return;
+    credit_event(packet, size);
     dongle_playback_controller_event(packet,size);
     uint8_t status;
     UNUSED(status);
@@ -357,6 +433,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 static btstack_packet_callback_registration_t hci_state_callback_registration;
 
 void bt_hci_init(void){
+    credit_buffer_known = false;
+    credit_raw_acl_count = credit_raw_acl_length = 0;
+    memset(credit_roles, 0, sizeof(credit_roles));
 
     // inform about BTstack state
     hci_state_callback_registration.callback = &packet_handler;

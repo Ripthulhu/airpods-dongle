@@ -15,6 +15,8 @@ bool phone_sink_decoder_released(void);
 bool phone_sink_connected(void);
 bool phone_sink_active(void);
 bool phone_sink_owns_controls(void);
+// Read-only version-1 snapshot: 4-byte header followed by twelve LE uint32 fields.
+uint16_t phone_sink_diagnostics(uint8_t *out, uint16_t capacity);
 
 // Shared AVRCP dispatchers call these first and skip their AirPods path if handled.
 bool phone_sink_handle_avrcp(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size);
@@ -27,6 +29,7 @@ void phone_sink_volume_invalidated(void);
 // AirPods/USB ownership boundary; only the selected phone input can publish PCM.
 bool bridge_phone_open(void);
 bool bridge_phone_ready(void);
+bool bridge_phone_recovering(void);
 bool bridge_phone_start(void);
 void bridge_phone_stop(void);
 void bridge_phone_pcm_push(const int16_t *stereo, uint16_t frames);

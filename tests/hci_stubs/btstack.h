@@ -13,8 +13,12 @@
 #define HCI_EVENT_USER_CONFIRMATION_REQUEST 0x33
 #define HCI_EVENT_USER_PASSKEY_REQUEST 0x34
 #define HCI_EVENT_COMMAND_STATUS 0x0f
+#define HCI_EVENT_COMMAND_COMPLETE 0x0e
+#define HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS 0x13
 #define HCI_EVENT_DISCONNECTION_COMPLETE 0x05
 #define HCI_OPCODE_HCI_INQUIRY 0x0401
+#define HCI_OPCODE_HCI_READ_BUFFER_SIZE 0x1005
+#define MAX_NR_CONTROLLER_ACL_BUFFERS 3
 #define GAP_EVENT_INQUIRY_RESULT 0xdc
 #define GAP_EVENT_INQUIRY_COMPLETE 0xdd
 #define INQUIRY_MODE_RSSI_AND_EIR 2
@@ -24,7 +28,7 @@
 #define SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING 4
 #define LEVEL_2 2
 typedef uint8_t hci_link_type_t;
-typedef struct { uint16_t con_handle; } hci_connection_t;
+typedef struct { uint16_t con_handle; uint8_t address[6]; } hci_connection_t;
 typedef uint8_t bd_addr_t[6];
 typedef uint8_t link_key_t[16];
 typedef uint8_t link_key_type_t;
@@ -56,6 +60,9 @@ int gap_ssp_confirmation_negative(const uint8_t address[6]);
 int gap_ssp_passkey_negative(const uint8_t address[6]);
 uint32_t btstack_run_loop_get_time_ms(void);
 hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t address[6], uint8_t type);
+hci_connection_t *hci_connection_for_handle(uint16_t handle);
+uint16_t hci_number_free_acl_slots_for_connection_type(uint8_t address_type);
+bool hci_is_packet_buffer_reserved(void);
 uint8_t gap_security_level(uint16_t handle);
 uint8_t gap_disconnect(uint16_t handle);
 const char *bd_addr_to_str(const uint8_t *address);

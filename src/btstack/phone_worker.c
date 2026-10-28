@@ -13,7 +13,8 @@
 #endif
 #endif
 
-#define INPUT_SLOTS 2u
+// Measured HCI bursts with 7–14 ms decodes need more slots, not a playout delay.
+#define INPUT_SLOTS 8u
 // A maximum SBC packet contains 15 * 128 stereo frames. aptX needs less.
 #define OUTPUT_FRAMES 1920u
 
@@ -21,6 +22,7 @@ typedef struct {
     uint32_t generation;
     uint16_t length;
     uint8_t sbc_frames;
+    bool reset_before;
     uint8_t payload[PHONE_CODEC_MAX_PAYLOAD];
 } input_slot_t;
 
@@ -32,6 +34,7 @@ typedef struct {
     uint32_t output_generation, worker_generation;
     uint16_t output_frames;
     bool output_ok;
+    bool input_gap_pending; // Core0 only; published to core1 in the next accepted slot.
 } worker_t;
 
 // The linked memory probe reads the actual ARM layout from this image.
@@ -107,6 +110,7 @@ bool phone_worker_ready(void) {
 
 void phone_worker_reset(void) {
     if (!phone_worker_ready()) return;
+    owned->input_gap_pending = false;
     atomic_fetch_add_explicit(&owned->generation, 1u, memory_order_acq_rel);
     phone_worker_wake();
 }
@@ -116,11 +120,16 @@ bool phone_worker_submit(const uint8_t *payload, size_t length, uint8_t sbc_fram
         return false;
     unsigned written = atomic_load_explicit(&owned->input_written, memory_order_relaxed);
     unsigned read = atomic_load_explicit(&owned->input_read, memory_order_acquire);
-    if (written - read >= INPUT_SLOTS) return false;
+    if (written - read >= INPUT_SLOTS) {
+        owned->input_gap_pending = true;
+        return false;
+    }
     input_slot_t *slot = &owned->input[written % INPUT_SLOTS];
     slot->generation = atomic_load_explicit(&owned->generation, memory_order_acquire);
     slot->length = (uint16_t)length;
     slot->sbc_frames = sbc_frames;
+    slot->reset_before = owned->input_gap_pending;
+    owned->input_gap_pending = false;
     memcpy(slot->payload, payload, length);
     atomic_store_explicit(&owned->input_written, written + 1u, memory_order_release);
     phone_worker_wake();
@@ -147,6 +156,17 @@ uint32_t phone_worker_last_decode_us(void) {
 
 uint32_t phone_worker_max_decode_us(void) {
     return phone_worker_ready() ? atomic_load_explicit(&owned->max_decode_us, memory_order_acquire) : 0u;
+}
+
+phone_worker_queue_snapshot_t phone_worker_queue_snapshot(void) {
+    phone_worker_queue_snapshot_t result = {0};
+    if (!phone_worker_ready()) return result;
+    // Core0 owns input_written; core1 can only advance input_read toward it.
+    unsigned written = atomic_load_explicit(&owned->input_written, memory_order_relaxed);
+    unsigned read = atomic_load_explicit(&owned->input_read, memory_order_acquire);
+    result.queued_packets = written - read;
+    result.output_ready = atomic_load_explicit(&owned->output_ready, memory_order_acquire);
+    return result;
 }
 
 bool phone_worker_close(void) {
@@ -186,6 +206,8 @@ bool phone_worker_step(void) {
         worker->worker_generation = generation;
     }
     if (slot->generation == generation) {
+        // Keep valid queued audio; reset only where a rejected input left a gap.
+        if (slot->reset_before) phone_codec_reset();
         worker->output_frames = 0;
         worker->output_ok = true;
         worker->output_generation = generation;

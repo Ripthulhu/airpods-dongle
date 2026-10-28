@@ -12,7 +12,8 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.25** has passed short Windows S16 and genuine IEEE
+Development candidate **0.1.29** includes phone-input queue and output-recovery
+corrections; its hardware validation is pending. Version **0.1.25** passed short Windows S16 and genuine IEEE
 float32 USB listening checks, including microphone open/close with normal stereo
 afterward. Windows' device format and the Pico's selected alt 2 confirm float
 transport; volume and mute were unchanged. The listener accepted the remaining
@@ -25,8 +26,10 @@ case-return reconnect have been exercised with Pro 3 firmware 9A348. Game Mode
 defaults on, and a prior visual/listening test measured approximately 60 ms total
 speaker latency. Double-pressing BOOTSEL toggles it: two LED pulses on enable,
 three seconds dark on disable. Live switching retains the accepted brief pitch
-change while latency adjusts. Wireless phone bridging still needs hardware
-validation. See [audio continuity](docs/AUDIO-CONTINUITY.md) for evidence and checks.
+change while latency adjusts. Pixel Bluetooth pairing and LHDC playback work,
+but wireless playback on 0.1.28 still crackled and could become silent. See
+[phone bridge](docs/PHONE-TRANSPORT.md) for that investigation and
+[audio continuity](docs/AUDIO-CONTINUITY.md) for the accepted USB checks.
 
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
 - S16 USB compatibility plus IEEE float32 input; float processing quantizes once at the integer encoder boundary.

@@ -41,7 +41,7 @@ reference file hashes used for these changes.
 | BLE | BLE is linked but no scan lifecycle or receiver is implemented | Run a bounded passive receiver alongside stereo playback; pause during Classic inquiry, microphone demand/drain and USB inactivity without a phone connection |
 | Build | Missing SDK patches can still produce a crashing or incompatible binary | Pin revisions and verify complete patched-file hashes before compilation |
 | Radio clock | CPU overclock also raises the CYW43 SPI clock | Set a rounded-up PIO divider before radio initialization, capping SPI at 31.25 MHz |
-| New phone pairing | Bond storage can overlap active audio | Require idle playback/microphone paths and cancel new pairing when they become busy; saved phones still reconnect |
+| New phone pairing | Bond storage can overlap active audio | Require quiet routes to open pairing; preserve its window across idle output transitions, but cancel for playback/microphone demand or expiry; saved phones still reconnect |
 
 ## Hardware use
 
@@ -171,11 +171,16 @@ it. No core 1 allocation/free occurs. USB microphone takeover waits for the phon
 worker to detach, then frees its codec and queue before initializing a fresh
 microphone decoder. Stale output remains generation-tagged. The aptX context adds
 4,404 bytes while selected, and SBC uses 1,636 bytes of static decoder state/workspace.
-The phone-only worker allocation is 9,780 bytes: two bounded compressed packet
+The phone-only worker allocation is 15,972 bytes: eight bounded compressed packet
 slots and one complete-packet PCM mailbox. Malformed partial output is discarded.
+The slots absorb HCI arrival batches while core 0 is busy and the completed
+mailbox blocks further decoding. Congestion drops only the arriving packet;
+the first later accepted slot resets decoder history after older valid work.
+It does not invalidate the queue generation or clear buffered PCM. Explicit
+cancellation, malformed input and RTP gaps retain their generation cleanup.
 The LHDC adapter requests 11,264 live heap bytes on ARM32 and prewarms transform
 tables on core 0. No decode allocation or second decoder worker is introduced.
-LHDC plus AAC-ELD and the phone worker peak at 90,816 allocator bytes in the linked
+LHDC plus AAC-ELD and the phone worker peak at 94,912 allocator bytes in the linked
 memory probe. Fixed-profile entropy histories and scratch buffers remove 4,740
 bytes of retained decoder RAM before allocator rounding; decoder static state is
 1,241 bytes. Compiling out disabled tracing reduces the channel decoder's ARM
@@ -215,6 +220,22 @@ No cache contents or code placement change. Selective SRAM placement and bounded
 HCI batching require measured contention and callback fairness first.
 
 ## Protocol choices
+
+Phone codec proposals are validated before the pinned BTstack acceptor assigns
+the remote stream endpoint. That proposal callback can therefore contain remote
+SEID zero even when the phone's wire configuration is valid. Version 0.1.26
+permits this unbound ID only in the proposal validator; committed configuration
+events still require an ID from 1 through 62. Codec fields, peer ownership and
+security checks remain unchanged. A harness using the real SDK event builder
+reproduced rejection 0x29 before the fix and acceptance after it for LHDC, aptX
+and SBC.
+
+The explicit 120-second phone pairing window survives automatic idle output
+suspend/start transitions. Starting a new window still requires quiet routes.
+USB playback, microphone use, phone-audio demand and the original deadline still
+revoke an open window. Previously an idle transition could silently close the
+window early, leading to an ACL security rejection that Android reports as an
+incorrect PIN even though no PIN exchange occurred.
 
 Boot enables saved-peer connection intent and requests Game Mode by default;
 the firmware poller runs without a HID or companion client. Existing model,

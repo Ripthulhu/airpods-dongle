@@ -130,6 +130,9 @@ def playback_lifecycle_sources(directory):
                       "static int playback_encoder_failed(",
                       "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
                       "static void playback_idle_poll(", "bool bridge_phone_ready(void)",
+                      "static bool phone_output_recovery_owned(", "bool bridge_phone_recovering(void)",
+                      "static void suspend_recovery_handler(",
+                      "static void playback_transport_recover(", "static bool playback_phone_recovery_poll(",
                       "void set_usb_streaming(bool flag)", "void bridge_phone_stop(void)"]:
         start = source.index("\n" + signature) + 1
         end = source.index("\n}", start) + 2
