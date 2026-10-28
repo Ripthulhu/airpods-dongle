@@ -139,7 +139,7 @@ def playback_lifecycle_sources(directory):
                       "static int playback_encoder_failed(",
                       "static void call_clock_init(",
                       "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
-                      "static void playback_idle_poll(", "bool bridge_phone_ready(void)",
+                      "static void playback_idle_poll(", "void dongle_playback_ownership_changed(bool owned)", "bool bridge_phone_ready(void)",
                       "static bool phone_output_recovery_owned(", "bool bridge_phone_recovering(void)",
                       "static void suspend_recovery_handler(",
                       "static void playback_transport_recover(", "static bool playback_phone_recovery_poll(",
@@ -167,6 +167,9 @@ def playback_volume_sources(directory):
 
 def main_button_sources(directory):
     source = (ROOT / "src/main.c").read_text(encoding="utf-8")
+    start=source.index("// Keep Bluetooth actions in thread context")
+    end=source.index("// ---------- parameters",start)
+    (directory/"main_button_actions.inc").write_text(source[start:end])
     start=source.index("// Manual volume history")
     end=source.index("// Runtime BOOTSEL",start)
     (directory/"main_volume_trace.inc").write_text(source[start:end])
@@ -228,6 +231,7 @@ def main():
         "playback_pipeline": ["-Wno-unused-function", "tests/playback_pipeline_test.c"],
         "playback_idle": ["tests/playback_idle_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],
+        "aacp_routing": ["tests/aacp_routing_test.c"],
         "dongle_settings": ["tests/dongle_settings_test.c"],
         "att": ["-Itests/aacp_stubs", "-Wno-unused-function", "tests/att_test.c"],
         "usb_control": ["tests/usb_control_test.c"],
@@ -237,6 +241,7 @@ def main():
         "playback_volume": ["-Itests/media_stubs", "tests/playback_volume_test.c", "src/tinyusb/media_control.c"],
         "volume_trace": ["tests/volume_trace_test.c"],
         "volume_trace_console": ["tests/volume_trace_console_test.c"],
+        "main_button_actions": ["tests/main_button_actions_test.c"],
         "bootsel_request": ["tests/bootsel_request_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],

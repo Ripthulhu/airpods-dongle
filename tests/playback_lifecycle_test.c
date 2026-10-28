@@ -48,6 +48,7 @@ static void btstack_run_loop_add_timer(btstack_timer_source_t *timer) { (void)ti
 static unsigned connects, disconnects, scans, keys_dropped;
 static bool slot_write_ok, inquiry_ok, slot_cleared;
 static bool game_ready, game_eligible, send_synchronously;
+static bool aacp_audio_owned(void) {return true;}
 static bool model_known=true;
 static uint32_t control_session=1;
 static unsigned game_feedback_count;

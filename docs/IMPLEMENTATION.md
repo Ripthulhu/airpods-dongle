@@ -285,8 +285,22 @@ demand requests AVDTP Suspend. Only its acknowledgement marks playback stopped.
 Fresh input restarts this locally suspended stream; AAC-ELD resets its encoder
 and sends 100 ms of priming before source PCM. Start/Suspend have three-second
 deadlines, and pending transitions block in-case self-checks. An unsolicited peer
-suspension is not automatically reclaimed. Board checks must verify restart
-timing, radio savings and diagnostics after idle.
+suspension is not reclaimed while the same input activity continues. A new USB
+playback-start edge may restart it through the existing bounded Start/priming
+path, provided AACP still confirms local audio ownership. The monotonic input
+revision preserves a stop/start pair even if both occur between polls. Board
+checks must verify restart timing, radio savings and diagnostics after idle.
+
+From 0.1.38, AACP ownership gates Start, microphone acquisition, receiver-buffer
+changes and volume forwarding. Unknown ownership remains passive until an owner,
+local source, or sole-local connected-device report establishes authority. A
+paired BOOTSEL single press requests ownership and, if another host is known,
+sends LibrePods' media/hijack sequence. Local send completion is not ownership
+confirmation. The request expires after ten seconds without an automatic retry.
+On confirmed loss, the dongle pauses its previously active music host once,
+suspends media and keeps signaling/AACP connected. It does not answer or end a
+call. Relinquished ownership remains latched across same-pair reconnects until
+an explicitly requested takeover is confirmed. See [routing](PHONE-TRANSPORT.md#audio-ownership-and-takeover).
 
 The microphone ASC is `F8 E6 30 00`: AAC-ELD, mono, a signalled 48 kHz coding rate
 and 480 samples per frame. USB still presents the inherited 64 kHz clock.

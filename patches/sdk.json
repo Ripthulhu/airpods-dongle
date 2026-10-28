@@ -40,9 +40,9 @@
       "src/classic/avrcp_controller.h": "218d134e849638a7eeddde2bf49ec177fb985851929bfae8e5a0630f59366555"
     },
     "patched": {
-      "src/classic/avrcp.h": "fbaa7dfa0d7fe82ac4d7f2c7ea62c4888e4394788a3652fe6ec5d63c02ecee6e",
-      "src/classic/avrcp_controller.c": "f0d295a419f27bb9f73adb1aebbdaa839d6db2fa389b746422af20b3fef9fa50",
-      "src/classic/avrcp_controller.h": "08d10f2e2e73bab064b96cf04fed02d31ad9392980d3070d69231304efae7bab"
+      "src/classic/avrcp.h": "c7fffcc019bb2abd418241d22afe70a687f00600af0e0e900cd77421e89a057f",
+      "src/classic/avrcp_controller.c": "51eb5986b718fd3ac21a52c65e6d8608d6c80d4c3108352f2bbece3078c4d11c",
+      "src/classic/avrcp_controller.h": "433d7a3f5a48b38786d757a43a357f6b581e8727fb9a100be5f076323afb709b"
     }
   }
 }

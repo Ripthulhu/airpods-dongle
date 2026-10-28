@@ -31,13 +31,12 @@ def main():
             raise ValueError("Unknown volume SDK source: " + name)
     source = (base / "src/classic/avrcp_controller.c").read_text()
     header = (base / "src/classic/avrcp.h").read_text()
-    start = header.index("    // Volume readbacks are correlated")
-    end = header.index("    bool     controller_volume_refresh_unsupported;", start) + len("    bool     controller_volume_refresh_unsupported;")
+    start = header.index("    // Volume notifications are correlated")
+    end = header.index("    bool     controller_volume_interim;", start) + len("    bool     controller_volume_interim;")
     fields = header[start:end]
     functions = [function(source, name) for name in (
         "avrcp_controller_calc_next_transaction_label", "avrcp_controller_get_next_transaction_label",
-        "avrcp_controller_restore_volume_registration", "avrcp_send_register_notification", "avrcp_controller_register_notification",
-        "avrcp_controller_refresh_volume_notification", "avrcp_controller_cancel_volume_refresh", "avrcp_controller_volume_registration_generation",
+        "avrcp_send_register_notification", "avrcp_controller_register_notification",
         "avrcp_controller_volume_event_generation", "avrcp_controller_handle_notification")]
     start = source.index("        case AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED:")
     end = source.index("        case AVRCP_NOTIFICATION_EVENT_UIDS_CHANGED:", start)

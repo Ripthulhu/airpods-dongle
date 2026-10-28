@@ -35,6 +35,16 @@ void aacp_poll(void);
 // True once the channel is open (handshake may still be in flight).
 bool aacp_is_connected(void);
 
+// Audio authority is separate from the retained control connection. Unknown or
+// relinquished ownership cannot start media or change physical volume.
+bool aacp_audio_owned(void);
+// Explicit physical-button intent, bound to the selected saved AirPods peer.
+// Bounded transmission is not a remote acknowledgment; repeated presses coalesce.
+bool aacp_takeover_request(const uint8_t peer[6]);
+void aacp_routing_report(void);
+// Cancel only unsent receiver-buffer changes when another host owns audio.
+void aacp_receive_buffer_cancel(void);
+
 // --- Hi-res mic stream ---
 typedef enum { AACP_MIC_NONE, AACP_MIC_USB, AACP_MIC_CALL } aacp_mic_owner_t;
 bool aacp_mic_requested(void);

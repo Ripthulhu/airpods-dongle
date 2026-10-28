@@ -23,6 +23,8 @@ static playback_adjust_t playback_adjust;
 enum { PLAYBACK_RUNNING, PLAYBACK_SUSPENDING, PLAYBACK_SUSPENDED, PLAYBACK_STARTING };
 static uint8_t playback_idle_phase, cur_codec = 4;
 static bool playback_idle_counting, phone_opened, phone_active, phone_buffer_started;
+static bool playback_peer_suspended;
+static uint32_t usb_playback_revision, playback_peer_suspend_revision;
 static bool call_active, call_opened, call_capture;
 static bool phone_output_recovery;
 static uint16_t phone_output_recovery_cid;
@@ -43,6 +45,19 @@ static bool is_usb_streaming, is_streaming, a2dp_is_connected_flag, finish_scan_
 static bool profile_pending, a2dp_connect_pending;
 static bool recovery_reset_encoder, suspend_recovery_pending, mic_requested, mic_active;
 static bool mic_recovery_pending, mic_recovery_started;
+static bool mic_prepare_open;
+static bool audio_owned=true, call_in_progress;
+static bool aacp_audio_owned(void) {return audio_owned;}
+static bool phone_call_active(void) {return call_in_progress;}
+static unsigned buffer_cancels, usb_pauses, phone_pauses;
+static void aacp_receive_buffer_cancel(void) {++buffer_cancels;}
+#define USB_MEDIA_PAUSE 1
+#define AVRCP_OPERATION_ID_PAUSE 0x46
+static bool usb_media_enqueue(unsigned command) {assert(command==USB_MEDIA_PAUSE);++usb_pauses;return true;}
+static bool phone_sink_media_control(uint8_t operation) {assert(operation==AVRCP_OPERATION_ID_PAUSE);++phone_pauses;return true;}
+typedef struct { unsigned l2cap_media_cid; } test_endpoint_t;
+static test_endpoint_t endpoint;
+static struct { test_endpoint_t *local_stream_endpoint; } sc={&endpoint};
 static uint16_t mic_recovery_cid;
 static uint32_t mic_recovery_revision;
 static uint32_t playback_idle_since, playback_idle_transition_since, now;
@@ -117,6 +132,10 @@ static void fixture(void) {
     profile_pending = a2dp_connect_pending = false;
     is_usb_streaming = phone_opened = phone_active = mic_requested = mic_active = false;
     call_active = call_opened = call_capture = false;
+    audio_owned=true;call_in_progress=false;endpoint.l2cap_media_cid=0x40;
+    buffer_cancels=usb_pauses=phone_pauses=0;
+    playback_peer_suspended=false;
+    usb_playback_revision=playback_peer_suspend_revision=0;
     phone_yields=0;
     phone_output_recovery=false;
     for(unsigned i=0;i<6;++i)selected_peer[i]=cur_active_device[i]=(uint8_t)(i+1);
@@ -153,6 +172,112 @@ static void usb_onset_survives_restart(void) {
     }
     assert(playback_pcm_read(&playback_pcm, output, 480) == 480);
     assert(memcmp(onset, output, sizeof(onset)) == 0);
+}
+static void fresh_usb_start_reclaims_peer_suspend(void) {
+    fixture();set_usb_streaming(true);
+    accept(AVDTP_SI_SUSPEND,5);
+    assert(!media_tracker.streaming && !is_streaming);
+    playback_idle_poll(++now);playback_idle_poll(now+=10000);
+    assert(!starts && !closes); // Keep the peer's stop authoritative for this activity.
+    int16_t onset[960],output[960];
+    for(unsigned i=0;i<960;++i)onset[i]=(int16_t)(i+1);
+    // The USB IRQ may publish both edges before main gets another pass.
+    set_usb_streaming(false);set_usb_streaming(true);
+    playback_pcm_push(&playback_pcm,onset,480);
+    playback_idle_poll(++now);
+    assert(starts==1 && !media_tracker.streaming && playback_idle_phase==PLAYBACK_STARTING);
+    for(unsigned i=0;i<10;++i)playback_idle_poll(++now);
+    assert(starts==1 && !closes);
+    accept(AVDTP_SI_START,6);assert(!media_tracker.streaming);
+    accept(AVDTP_SI_START,5);
+    assert(media_tracker.streaming && is_streaming && playback_pcm.used==480);
+    assert(playback_pcm.priming==4800);
+    for(unsigned i=0;i<10;++i)assert(playback_pcm_read(&playback_pcm,output,480)==0);
+    assert(playback_pcm_read(&playback_pcm,output,480)==480);
+    assert(!memcmp(onset,output,sizeof(onset)));
+    playback_idle_poll(++now);assert(starts==1);
+
+    // A later peer stop wins over a host restart which already happened.
+    fixture();set_usb_streaming(true);set_usb_streaming(false);set_usb_streaming(true);
+    accept(AVDTP_SI_SUSPEND,5);playback_idle_poll(++now);assert(!starts);
+    set_usb_streaming(true);playback_idle_poll(++now);assert(!starts); // Not another edge.
+    set_usb_streaming(false);playback_idle_poll(++now);assert(!starts);
+    set_usb_streaming(true);playback_idle_poll(++now);assert(starts==1);
+    accept(AVDTP_SI_SUSPEND,5);playback_idle_poll(++now);
+    assert(starts==1 && !media_tracker.streaming); // No repeated Start against the peer.
+
+    // A genuinely idle USB host can start after the peer has already suspended.
+    fixture();accept(AVDTP_SI_SUSPEND,5);
+    set_usb_streaming(true);playback_idle_poll(++now);assert(starts==1);
+    // Revision wrap still denotes a fresh edge.
+    fixture();usb_playback_revision=UINT32_MAX;accept(AVDTP_SI_SUSPEND,5);
+    set_usb_streaming(true);playback_idle_poll(++now);assert(starts==1);
+
+    // A normal teardown invalidates the latch; never Start a closed/replaced stream.
+    fixture();set_usb_streaming(true);accept(AVDTP_SI_SUSPEND,5);
+    a2dp_demo_timer_stop(&media_tracker);
+    set_usb_streaming(false);set_usb_streaming(true);playback_idle_poll(++now);
+    assert(!starts && !closes);
+    // Wrong-SEID signaling does not arm the restart permission.
+    fixture();set_usb_streaming(true);accept(AVDTP_SI_SUSPEND,6);
+    set_usb_streaming(false);set_usb_streaming(true);playback_idle_poll(++now);
+    assert(media_tracker.streaming && !starts);
+
+    // Missing/rejected admission stays bounded by the existing transition deadline.
+    fixture();set_usb_streaming(true);accept(AVDTP_SI_SUSPEND,5);
+    set_usb_streaming(false);set_usb_streaming(true);playback_idle_poll(++now);
+    now+=3000;playback_idle_poll(now);assert(closes==1 && starts==1);
+    set_usb_streaming(false);set_usb_streaming(true);playback_idle_poll(++now);
+    assert(closes==1 && starts==1 && !finish_scan_avdtp_codec);
+    fixture();set_usb_streaming(true);accept(AVDTP_SI_SUSPEND,5);
+    set_usb_streaming(false);set_usb_streaming(true);start_error=1;
+    playback_idle_poll(++now);assert(closes==1 && starts==1);
+    playback_idle_poll(++now);assert(closes==1 && starts==1);
+}
+static void ownership_loss_is_passive_until_explicit_claim(void) {
+    fixture();set_usb_streaming(true);audio_owned=false;
+    dongle_playback_ownership_changed(false);
+    assert(!media_tracker.streaming && !is_streaming && suspends==1 && usb_pauses==1);
+    accept(AVDTP_SI_SUSPEND,5);assert(playback_idle_phase==PLAYBACK_SUSPENDED);
+    for(unsigned i=0;i<100;++i){now+=10;playback_idle_poll(now);}
+    set_usb_streaming(false);set_usb_streaming(true);playback_idle_poll(++now);
+    assert(!starts && !closes && suspends==1 && usb_pauses==1);
+    audio_owned=true;dongle_playback_ownership_changed(true);playback_idle_poll(++now);
+    assert(starts==1 && playback_idle_phase==PLAYBACK_STARTING);
+    accept(AVDTP_SI_START,5);assert(media_tracker.streaming);
+
+    // Both powered hosts can keep USB packets arriving without an initial claim.
+    fixture();a2dp_demo_timer_stop(&media_tracker);audio_owned=false;set_usb_streaming(true);
+    for(unsigned i=0;i<100;++i)playback_idle_poll(now+=100);
+    assert(!starts && !suspends && !closes);
+    audio_owned=true;dongle_playback_ownership_changed(true);playback_idle_poll(++now);
+    assert(starts==1);
+    // A closed transport cannot be restarted merely by an ownership report.
+    fixture();a2dp_demo_timer_stop(&media_tracker);endpoint.l2cap_media_cid=0;
+    dongle_playback_ownership_changed(true);set_usb_streaming(true);playback_idle_poll(++now);
+    assert(!starts);
+
+    // Ownership loss during Start waits for that command, then stops without encoding.
+    fixture();suspend_idle();set_usb_streaming(true);playback_idle_poll(++now);
+    audio_owned=false;dongle_playback_ownership_changed(false);
+    accept(AVDTP_SI_START,5);
+    assert(!media_tracker.streaming && playback_idle_phase==PLAYBACK_SUSPENDING && suspends==2);
+    accept(AVDTP_SI_SUSPEND,5);playback_idle_poll(++now);assert(starts==1);
+    // Claiming while the old Suspend ACK is pending does not race a second command.
+    fixture();set_usb_streaming(true);audio_owned=false;dongle_playback_ownership_changed(false);
+    audio_owned=true;dongle_playback_ownership_changed(true);playback_idle_poll(++now);assert(!starts);
+    accept(AVDTP_SI_SUSPEND,5);playback_idle_poll(++now);assert(starts==1);
+
+    fixture();set_usb_streaming(true);call_in_progress=true;audio_owned=false;
+    dongle_playback_ownership_changed(false);assert(!usb_pauses && !phone_pauses);
+    fixture();set_usb_streaming(true);mic_requested=true;audio_owned=false;
+    dongle_playback_ownership_changed(false);assert(!usb_pauses && !phone_pauses);
+    fixture();phone_active=true;audio_owned=false;
+    dongle_playback_ownership_changed(false);assert(phone_pauses==1 && !usb_pauses);
+    // An explicit successful same-owner claim resumes a peer-suspended transport.
+    fixture();set_usb_streaming(true);accept(AVDTP_SI_SUSPEND,5);
+    playback_idle_poll(++now);assert(!starts);
+    dongle_playback_ownership_changed(true);playback_idle_poll(++now);assert(starts==1);
 }
 static void phone_recovery_start(void) {
     fixture(); phone_opened=phone_active=phone_buffer_started=true;
@@ -246,6 +371,8 @@ int main(void) {
     call_output_ownership();
     phone_output_recovers_without_losing_input();
     usb_onset_survives_restart();
+    fresh_usb_start_reclaims_peer_suspend();
+    ownership_loss_is_passive_until_explicit_claim();
     fixture(); suspend_recovery_pending=recovery_reset_encoder=true; is_usb_streaming=true;
     mic_recovery_pending=mic_recovery_started=true; mic_recovery_cid=10; mic_recovery_revision=4;
     accept(AVDTP_SI_SUSPEND,5);

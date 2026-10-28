@@ -21,6 +21,16 @@ an initial playback result, not extended acceptance. Its volume comparison
 failed: the listener heard the gain repair as a second step and could still
 desynchronize phone and stem volume. Keep that failure separate from playback.
 
+The first 0.1.37 Pixel USB attempt was silent in both ears. USB S16 frames arrived
+and were trimmed as startup input while encoded units stayed at 853 and the
+Bluetooth streaming flag was clear. All eight controller credits were free.
+A case return restored clean stereo. Source regression reproduced an unsolicited
+peer SUSPEND leaving the idle phase RUNNING with streaming false, so even a fresh
+USB stop/start did not issue Start. The initial peer SUSPEND was not captured on
+hardware; it remains a candidate explanation for this observed stopped state.
+The later stem-volume test caused a repeatable left/right imbalance that cleared
+on pause/resume; see [volume evidence](VOLUME-EVIDENCE.md).
+
 Two audit limits remain: sustained 10 ms work per AAC-ELD unit cannot support
 the temporary 9 ms buffer-fill schedule when leaving Game Mode; and the host
 pipeline model treats successful HCI submission as immediate receiver delivery.

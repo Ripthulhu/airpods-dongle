@@ -27,7 +27,7 @@ typedef struct {
 } avrcp_connection_t;
 static avrcp_connection_t connection;
 static uint8_t wire[18],last_event[7];
-static unsigned emitted,enabled_events,requests,failed_events,completed_events;
+static unsigned emitted,enabled_events,requests,failed_events,completed_events,wire_sends;
 static uint8_t completed_event,completed_status;
 static uint32_t received_epoch;
 static int send_status;
@@ -43,7 +43,7 @@ static void little_endian_store_16(uint8_t *p,unsigned i,uint16_t v){p[i]=(uint8
 static void big_endian_store_16(uint8_t *p,unsigned i,uint16_t v){p[i]=(uint8_t)(v>>8);p[i+1]=(uint8_t)v;}
 static void big_endian_store_24(uint8_t *p,unsigned i,uint32_t v){p[i]=(uint8_t)(v>>16);p[i+1]=(uint8_t)(v>>8);p[i+2]=(uint8_t)v;}
 static void big_endian_store_32(uint8_t *p,unsigned i,uint32_t v){for(unsigned b=0;b<4;++b)p[i+b]=(uint8_t)(v>>(24-8*b));}
-static int l2cap_send(uint16_t cid,const uint8_t *p,uint16_t n){assert(cid==9 && n==18);memcpy(wire,p,n);return send_status;}
+static int l2cap_send(uint16_t cid,const uint8_t *p,uint16_t n){assert(cid==9 && n==18);memcpy(wire,p,n);++wire_sends;return send_status;}
 static void avrcp_request_can_send_now(avrcp_connection_t *c,uint16_t cid){assert(c==&connection && cid==9);++requests;}
 static void avrcp_controller_get_capabilities_for_connection(avrcp_connection_t *c,uint8_t id){(void)c;(void)id;}
 static void avrcp_controller_emit_notification_complete(avrcp_connection_t *c,uint8_t status,uint8_t event,bool enabled){
@@ -61,7 +61,7 @@ static void reset(void){
  connection.avrcp_cid=7;connection.l2cap_signaling_cid=9;
  connection.remote_capabilities_state=AVRCP_REMOTE_CAPABILITIES_KNOWN;
  connection.notifications_supported_by_target=VOLUME_MASK|OTHER_MASK;
- emitted=enabled_events=requests=failed_events=completed_events=0;
+ emitted=enabled_events=requests=failed_events=completed_events=wire_sends=0;
  received_epoch=0;send_status=0;
 }
 static uint32_t register_volume(void){
@@ -69,7 +69,7 @@ static uint32_t register_volume(void){
  connection.controller_notifications_to_register &= (uint16_t)~VOLUME_MASK;
  assert(avrcp_send_register_notification(&connection,13)==0);
  assert(wire[0]>>4==connection.controller_volume_label && wire[13]==13);
- return avrcp_controller_volume_registration_generation(7);
+ return connection.controller_volume_generation;
 }
 static void notify(uint8_t label,uint8_t type,uint8_t level){
  uint8_t payload[]={13,level};connection.controller_last_confirmed_transaction_id=label;
@@ -80,30 +80,28 @@ static void reject(uint8_t label){
  connection.controller_last_confirmed_transaction_id=label;
  avrcp_controller_handle_notification(&connection,10,payload,1);
 }
-static void initial_and_fresh_interim(void){
+static void native_registration_flow(void){
  reset();uint32_t first=register_volume();uint8_t old=connection.controller_volume_label;
+ assert(wire_sends==1 && !emitted);
+ // A second normal request cannot replace one still awaiting INTERIM.
+ assert(avrcp_send_register_notification(&connection,13)==ERROR_CODE_COMMAND_DISALLOWED && wire_sends==1);
+ notify(old,13,37);assert(!emitted); // CHANGED before INTERIM is invalid.
  notify(old,15,47);assert(emitted==1 && enabled_events==1 && received_epoch==first && last_event[5]==15 && last_event[6]==47);
  notify(old,15,47);assert(emitted==1);
- notify(old,13,37);assert(emitted==2 && requests==1);
- notify(old,13,37);assert(emitted==2);
+ notify(old,13,37);assert(emitted==2 && requests==1 && (connection.controller_notifications_to_register&VOLUME_MASK));
+ notify(old,13,37);notify(old,15,47);assert(emitted==2);
  uint32_t second=register_volume();uint8_t current=connection.controller_volume_label;
- notify(old,13,17);notify(old,15,17);assert(emitted==2);
- notify(current,15,37);assert(emitted==3 && enabled_events==1 && received_epoch==second);
- assert(avrcp_controller_refresh_volume_notification(7)==0);
- uint32_t third=register_volume();uint8_t fresh=connection.controller_volume_label;
- assert(avrcp_controller_refresh_volume_notification(7)==ERROR_CODE_COMMAND_DISALLOWED);
- notify(current,15,17);assert(emitted==3); // Old INTERIM is never a fresh query result.
- notify(fresh,15,47);assert(emitted==4 && received_epoch==third && last_event[6]==47);
- notify(current,13,27);assert(emitted==4); // Accepted replacement retires old label.
- notify(fresh,15,47);assert(emitted==4);
- notify(fresh,13,57);assert(emitted==5);
- register_volume();current=connection.controller_volume_label;
- notify(current,13,67);assert(emitted==5);
+ notify(old,13,17);notify(old,15,17);notify(current,13,27);assert(emitted==2);
  uint8_t malformed[]={13};connection.controller_last_confirmed_transaction_id=current;
- avrcp_controller_handle_notification(&connection,15,malformed,1);assert(emitted==5);
- avrcp_controller_handle_notification(&connection,15,malformed,0);assert(emitted==5);
- notify(current,7,90);assert(emitted==5 && !connection.controller_volume_interim);
- notify(current,15,57);assert(emitted==6);
+ avrcp_controller_handle_notification(&connection,15,malformed,1);
+ avrcp_controller_handle_notification(&connection,15,malformed,0);
+ notify(current,7,90);assert(emitted==2 && !connection.controller_volume_interim);
+ // Initial-report suppression must not hide the re-registration's current value.
+ notify(current,15,37);assert(emitted==3 && enabled_events==1 && received_epoch==second && last_event[6]==37);
+ notify(current,15,37);assert(emitted==3);
+ notify(current,13,27);assert(emitted==4 && received_epoch==second);
+ uint32_t third=register_volume();notify(connection.controller_volume_label,15,27);
+ assert(emitted==5 && received_epoch==third && wire_sends==3);
 }
 static void status_only_rejection(void){
  reset();register_volume();uint8_t current=connection.controller_volume_label;
@@ -121,100 +119,33 @@ static void status_only_rejection(void){
  assert(connection.controller_notifications_to_register==OTHER_MASK && connection.controller_notifications_to_deregister==OTHER_MASK);
  assert(connection.controller_initial_status_reported==OTHER_MASK);
  reject(current);notify(current,15,47);assert(failed_events==1 && !emitted);
+ // A stale rejected label cannot retire a newer normal registration.
+ register_volume();uint8_t next=connection.controller_volume_label;
+ reject(current);assert(failed_events==1 && connection.controller_volume_active);
+ notify(next,15,47);assert(emitted==1);
+ reject(next);assert(failed_events==1 && connection.controller_volume_active); // Already-armed registration is not a pending command.
 }
-static void rejected_replacement_keeps_old(bool consume_old){
- reset();uint32_t old_generation=register_volume();uint8_t old=connection.controller_volume_label;notify(old,15,47);
- assert(avrcp_controller_refresh_volume_notification(7)==0);
- uint32_t attempt=register_volume();uint8_t fresh=connection.controller_volume_label;
- connection.notifications_enabled|=OTHER_MASK;
- connection.controller_notifications_to_register|=OTHER_MASK;
- connection.controller_notifications_to_deregister|=OTHER_MASK;
- connection.controller_initial_status_reported|=OTHER_MASK;
- if(consume_old){notify(old,13,37);assert(emitted==2 && received_epoch==old_generation && !connection.controller_volume_previous_active);}
- reject(fresh);
- assert(failed_events==1 && connection.controller_volume_refresh_unsupported);
- assert(avrcp_controller_volume_registration_generation(7)==attempt);
- assert(avrcp_controller_refresh_volume_notification(7)==ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE);
- assert((connection.notifications_enabled&OTHER_MASK)==OTHER_MASK && (connection.controller_notifications_to_register&OTHER_MASK)==OTHER_MASK);
- assert((connection.controller_notifications_to_deregister&OTHER_MASK)==OTHER_MASK && (connection.controller_initial_status_reported&OTHER_MASK)==OTHER_MASK);
- notify(fresh,15,90);assert(emitted==(consume_old?2u:1u));
- if(!consume_old){
-  assert(connection.controller_volume_active && connection.controller_volume_interim && connection.controller_volume_label==old);
-  assert(connection.notifications_enabled&VOLUME_MASK);
-  notify(old,13,37);assert(emitted==2 && received_epoch==old_generation);
- }else{
-  assert(!connection.controller_volume_active);
- }
- assert(connection.controller_notifications_to_register&VOLUME_MASK); // Normal native registration can still continue.
- avrcp_controller_cancel_volume_refresh(7);
- assert(connection.controller_notifications_to_register&VOLUME_MASK); // Cancel cannot eat a native re-register queued by rejection/CHANGED.
- uint32_t normal=register_volume();unsigned count=emitted;
- notify(connection.controller_volume_label,13,37);assert(emitted==count); // Rejection alone never weakens normal INTERIM validation.
- notify(connection.controller_volume_label,15,37);
- assert(received_epoch==normal && connection.controller_volume_active && connection.controller_volume_interim);
-}
-static void canceled_refresh_keeps_native(unsigned response){
- reset();uint32_t old_generation=register_volume();uint8_t old=connection.controller_volume_label;notify(old,15,47);
- assert(avrcp_controller_refresh_volume_notification(7)==0);uint32_t fresh_generation=register_volume();uint8_t fresh=connection.controller_volume_label;
- avrcp_controller_cancel_volume_refresh(7);
- assert(connection.controller_volume_refresh_unsupported && connection.controller_volume_previous_active);
- assert(avrcp_controller_refresh_volume_notification(7)==ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE);
- if(response==0){ // Peer retained the old registration: its change starts a normal subscription.
-  notify(old,13,37);assert(emitted==2 && received_epoch==old_generation);
-  assert(!connection.controller_volume_active && !connection.controller_volume_previous_active);
-  notify(fresh,15,90);assert(emitted==2); // Retired query cannot replace native re-registration.
- }else{ // Peer accepted replacement before timeout, but INTERIM was late or lost.
-  if(response==1){notify(fresh,15,47);assert(emitted==2 && received_epoch==fresh_generation);}
-  notify(fresh,13,37);assert(emitted==(response==1?3u:2u) && received_epoch==fresh_generation);
-  notify(old,13,17);assert(emitted==(response==1?3u:2u));
- }
- assert(connection.controller_notifications_to_register&VOLUME_MASK);
- uint32_t normal=register_volume();notify(connection.controller_volume_label,15,37);
- assert(received_epoch==normal && connection.controller_volume_active && connection.controller_volume_interim);
- // Cancellation after fallback cannot kill a native armed subscription.
- uint8_t armed=connection.controller_volume_label;avrcp_controller_cancel_volume_refresh(7);
- assert(connection.controller_volume_active && connection.controller_volume_label==armed);
-}
-static void old_consumed_then_timeout(void){
- reset();uint32_t old_generation=register_volume();uint8_t old=connection.controller_volume_label;notify(old,15,47);
- assert(avrcp_controller_refresh_volume_notification(7)==0);uint32_t fresh_generation=register_volume();uint8_t fresh=connection.controller_volume_label;
- notify(old,13,37);assert(emitted==2 && received_epoch==old_generation);
- avrcp_controller_cancel_volume_refresh(7);
- notify(fresh,15,37);notify(fresh,13,27);assert(emitted==4 && received_epoch==fresh_generation);
- assert(connection.controller_notifications_to_register&VOLUME_MASK && !connection.controller_volume_previous_active);
-}
-static void send_failures_and_wrap(void){
- reset();register_volume();uint8_t old=connection.controller_volume_label;notify(old,15,47);
- connection.controller_volume_generation=UINT32_MAX;
- assert(avrcp_controller_refresh_volume_notification(7)==0);assert(register_volume()==1);
- notify(connection.controller_volume_label,15,57);assert(received_epoch==1);
- // A fresh query must not reuse the still-armed label even after unrelated label wrap.
- old=connection.controller_volume_label;
- connection.transaction_id_counter=(uint8_t)(old==1?15:old-1);
- assert(avrcp_controller_refresh_volume_notification(7)==0);register_volume();
- assert(connection.controller_volume_label!=old);
- notify(connection.controller_volume_label,15,57);
- // A failed replacement send preserves the live old registration and its generation.
- old=connection.controller_volume_label;uint32_t armed=connection.controller_volume_active_generation;
+static void send_failure_and_wrap(void){
+ reset();connection.controller_volume_generation=UINT32_MAX;
+ assert(register_volume()==1);notify(connection.controller_volume_label,15,57);assert(received_epoch==1);
+ notify(connection.controller_volume_label,13,47);
  send_status=0x0c;
  assert(avrcp_send_register_notification(&connection,13)==0x0c);
- uint8_t failed_label=(uint8_t)(wire[0]>>4);
- assert(connection.controller_volume_active && connection.controller_volume_label==old);
- notify(failed_label,15,90);assert(emitted==3);
- notify(old,13,37);assert(emitted==4 && received_epoch==armed);
+ uint8_t failed=connection.controller_volume_label;
+ notify(failed,15,90);assert(emitted==2 && !connection.controller_volume_active);
  send_status=0;
  for(unsigned i=0;i<40;++i){
   uint8_t previous=connection.transaction_id_counter;
-  register_volume();assert(connection.controller_volume_label>=1 && connection.controller_volume_label<=15);
+  uint32_t epoch=register_volume();
   assert(connection.controller_volume_label==(previous==15?1:previous+1));
-  uint8_t label=connection.controller_volume_label;notify(label,15,47);notify(label,13,37);
+  uint8_t label=connection.controller_volume_label;notify(label,15,47);assert(received_epoch==epoch);
+  notify(label,13,37);notify(label,13,37); // Duplicate consumed response remains inert across wrap.
  }
- reset();send_status=0x0c;assert(avrcp_send_register_notification(&connection,13)==0x0c);
- notify((uint8_t)(wire[0]>>4),15,90);assert(!emitted && !connection.controller_volume_active);
+ assert(emitted==82);
+ assert(!avrcp_controller_volume_event_generation(8));
 }
-static void unrelated_and_timeout(void){
- reset();
- uint8_t payload[]={1,0}; // Playback-status notification follows the unchanged SDK path.
+static void unrelated_notifications(void){
+ reset();uint8_t payload[]={1,0};
  connection.controller_last_confirmed_transaction_id=9;
  avrcp_controller_handle_notification(&connection,15,payload,2);
  assert(enabled_events==1 && completed_event==1 && connection.notifications_enabled==(1u<<1));
@@ -223,27 +154,17 @@ static void unrelated_and_timeout(void){
  assert(!(connection.notifications_enabled&(1u<<1)) && (connection.controller_notifications_to_register&(1u<<1)) && requests==1);
  uint16_t queued=connection.controller_notifications_to_register;
  reject(9);assert(!failed_events && queued==connection.controller_notifications_to_register);
- register_volume();uint8_t pending=connection.controller_volume_label;
- avrcp_controller_cancel_volume_refresh(7);notify(pending,15,47);
- assert(connection.controller_volume_active && connection.controller_volume_interim && emitted==1 && (connection.controller_notifications_to_register&(1u<<1)));
- assert(avrcp_controller_refresh_volume_notification(7)==ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE);
- assert(avrcp_controller_refresh_volume_notification(8)==ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER);
- avrcp_controller_cancel_volume_refresh(8);
- assert(!avrcp_controller_volume_registration_generation(8) && !avrcp_controller_volume_event_generation(8));
- // A first queued query without an armed subscription stays queued as native fallback.
- reset();assert(avrcp_controller_refresh_volume_notification(7)==0);avrcp_controller_cancel_volume_refresh(7);
- assert(connection.controller_notifications_to_register&VOLUME_MASK);
- register_volume();notify(connection.controller_volume_label,15,47);assert(emitted==1);
- // Canceling a queued-but-unsent refresh also leaves the original armed registration intact.
- reset();register_volume();pending=connection.controller_volume_label;notify(pending,15,47);
- assert(avrcp_controller_refresh_volume_notification(7)==0);avrcp_controller_cancel_volume_refresh(7);
- assert(connection.controller_volume_active && connection.controller_volume_label==pending && !(connection.controller_notifications_to_register&VOLUME_MASK));
- notify(pending,13,37);assert(emitted==2);
+ register_volume();uint8_t current=connection.controller_volume_label;
+ reject((uint8_t)(current+1));assert(!failed_events && queued==connection.controller_notifications_to_register);
+ reject(current);assert(failed_events==1 && queued==connection.controller_notifications_to_register);
+ // Normal explicit disable behavior remains unchanged after CHANGED.
+ reset();register_volume();current=connection.controller_volume_label;notify(current,15,47);
+ connection.controller_notifications_to_deregister=VOLUME_MASK;
+ notify(current,13,37);
+ assert(!connection.notifications_enabled && !connection.controller_notifications_to_deregister && !connection.controller_notifications_to_register);
+ assert(completed_event==13 && completed_status==0 && !requests);
 }
 int main(void){
- initial_and_fresh_interim();status_only_rejection();
- rejected_replacement_keeps_old(false);rejected_replacement_keeps_old(true);
- canceled_refresh_keeps_native(0);canceled_refresh_keeps_native(1);canceled_refresh_keeps_native(2);old_consumed_then_timeout();
- send_failures_and_wrap();unrelated_and_timeout();
- puts("Pinned AVRCP SDK: fresh readbacks, status-only reject, preserved native subscriptions, timeout, labels/generations and send failure passed");
+ native_registration_flow();status_only_rejection();send_failure_and_wrap();unrelated_notifications();
+ puts("Pinned AVRCP SDK: normal CHANGED/re-registration, fresh INTERIM, real reject, stale labels, send failure, wrap and unrelated events passed");
 }

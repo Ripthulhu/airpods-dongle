@@ -61,7 +61,7 @@ newer or unknown report into one of these legacy values. Complete modern writes
 and physical call behavior through this dongle remain unverified.
 
 Confirmed AirPods volume is mirrored to both hosts. The
-[USB volume relay](USB-CONTROL.md#stem-volume) remains under revision in 0.1.37.
+[USB volume relay](USB-CONTROL.md#stem-volume) remains under revision in 0.1.38.
 Both 0.1.34 and 0.1.36 failed Android volume listening: the latter partly followed
 the phone UI but retained an audible second gain step and possible divergence.
 Fresh Pixel and Windows checks remain required.
@@ -70,6 +70,43 @@ an intent until the AirPods confirm it; temporary AVRCP busy states retain the
 latest request. A controls-only connection or input switch does not replay a
 reported level as a new request. New AirPods connections start with unknown
 volume until fresh readback arrives. USB mute preserves volume and silences PCM.
+
+## Audio ownership and takeover
+
+The dongle already advertises Apple's Bluetooth Device ID (`004C:0000:0000`).
+Version 0.1.38 adds the separate ownership exchange used by LibrePods; spoofing
+the Device ID alone did not implement switching. Two concurrent host connections
+are a protocol capability, not a claim that this candidate has passed a
+two-dongle listening test.
+
+With a saved AirPods pair, a single BOOTSEL press requests takeover. A double
+press still toggles Game Mode, and the existing long holds still open pairing.
+The button claims the audio route; it does not send Play to a paused player.
+Already-playing input can resume once ownership and the stream are confirmed.
+The routing exchange uses Control Command `0x09`, property `0x06` (ownership),
+Audio Source `0x0E`, Connected Devices `0x2E`, and targeted routing messages
+`0x10`/`0x11`. The builders and address order come from LibrePods' `AACPManager.kt`
+and its `AirPodsService.kt` takeover path. Exact wire fixtures and malformed
+length/address cases are covered in `aacp_routing_test.c`.
+
+The request sends ownership, then the captured media and Hijackv2 messages when
+another host is known. It waits up to ten seconds for positive remote ownership
+evidence. It does not treat a locally queued or transmitted request as success.
+Unknown routing stays passive, including at startup; standalone automatic start
+therefore needs a valid local-owner/source or sole-local device report. Older
+models and cold standalone startup require hardware verification.
+
+A confirmed competing owner pauses this dongle's active music host once and
+suspends its outgoing media while retaining the control connection. Fresh USB
+input cannot override that loss. Volume, microphone acquisition and Game Mode's
+receiver-buffer writes also stay passive. A takeover invalidates stale gain:
+only a new host volume SET deferred during standby or a fresh native AVRCP
+readback can establish the next baseline. Active calls are not answered or ended
+as a side effect. A standby dongle does not automatically claim ownership for an
+incoming Bluetooth call; existing preparation timeouts release an unusable voice
+link. Physical takeover is blocked while local capture is requested. Call handoff
+remains unverified. Manual `t` diagnostics include
+a bounded `[ROUTING]` state line without printing routing traffic continuously.
 
 LibrePods connects to the saved phone's encrypted, bonded RFCOMM service for
 device settings, hearing profiles, saved checks, audio profiles, performance

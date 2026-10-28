@@ -71,6 +71,31 @@ command or passthrough currently provides a separate, gain-free gesture path.
 
 ## Consequences for the next implementation
 
+The 0.1.37 Pixel check also failed. On its first USB start the Bluetooth stream
+remained stopped; a case return restored clean stereo. On that fresh connection,
+the first relayed stem change completed one HID key, restored the AirPods to
+126, received ACK126, and queued a replacement volume registration. A second
+attempt about 500 ms later returned `0x0C` (command disallowed). No replacement
+INTERIM completed before fallback. Subsequent native CHANGED/INTERIM pairs
+continued, but HID remained at one and the relay stayed disabled. The initial
+successful API return proves queuing, not transmission; this is not evidence of
+an explicit peer rejection. Ordinary CDC contained no matching volume-disabled
+notification. The 16-entry trace retained 16 of 19 events in this window, so its
+first three events are unavailable.
+
+The listener reported a repeatable left/right imbalance after the first stem
+change, cleared by pausing and resuming playback, and no working phone-volume
+synchronization. Removing the former 150 ms correction wait is a possible cause
+of that new balance problem, not a proven one. Do not describe faster repair as
+accepted or restore that delay and call the result seamless. Firmware gain
+readback is a single value and does not establish equal audible gain in both ears.
+
+Local evidence: `volume-trace-0.1.37-case-return-extended.txt` and
+`silent-state-0.1.37.txt` under the bring-up artifact directory. The listener
+described the fault as repeatable; seven CHANGED reports are not seven
+independently marked gestures. No further gesture test was requested after the
+listener reported the imbalance.
+
 - Keep native UAC hardware-volume hosts separate from Android's observed
   software-volume path. Do not turn their confirmed readback into a second HID
   adjustment.

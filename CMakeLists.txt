@@ -6,7 +6,7 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 set(PICOTOOL_GIT_BRANCH 2041936441b48a3cc53ae3da9e805229fe8f4e18)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.37 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.38 LANGUAGES C CXX ASM)
 option(AIRPODS_USB_FLOAT "Expose IEEE float USB input alongside S16 compatibility" ON)
 pico_sdk_init()
 

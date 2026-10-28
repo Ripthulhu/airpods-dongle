@@ -10,16 +10,19 @@ a debug console. No custom Windows kernel driver or Test Mode is required for US
 
 ## Stem volume
 
-Candidate 0.1.37 uses a fresh, transaction-matched AVRCP INTERIM readback after a
+Candidate 0.1.38 uses a fresh, transaction-matched native AVRCP INTERIM readback after a
 CHANGED notification. The CHANGED payload itself no longer becomes a USB key.
 The pinned SDK patch exposes subsequent volume INTERIM replies and keeps their
-registration generations separate. Hardware testing must verify that the AirPods
-accept replacement registrations; rejected or timed-out refreshes must preserve
-native control instead of leaving an endless pending repair.
+registration generations separate. The extra post-SET registration introduced in
+0.1.37 is removed: it did not complete in the failed Pixel check, while ordinary
+native notifications continued. A SET acknowledgement updates the known physical
+level; it does not prove equal gain in both buds.
 
-The intentional 150 ms repair delay is removed. This shortens an avoidable part
-of the audible excursion; it does not prove that a local AirPods gain change can
-be undone seamlessly. A fresh absolute readback can coalesce rapid changes, so
+The previous 150 ms quiet period before hardware-gain repair is restored as a
+mitigation for the repeatable 0.1.37 balance failure. Verified changes and completed
+USB keys restart that period; a genuine host SET remains immediate. This is not
+an accepted seamless-volume fix: 0.1.36 already had an audible second step.
+A fresh absolute readback can coalesce rapid changes, so
 it also cannot establish an exact count of physical gestures. See the saved
 [Mac and Pixel evidence](VOLUME-EVIDENCE.md) before changing volume roles or
 adding guessed PCM gain compensation.
@@ -42,6 +45,10 @@ The bounded queue keeps rapid gestures in order; USB reset,
 route or peer changes invalidate unsent volume keys. A sent press still receives
 its release. Expired or rejected keys retain the actual physical gain instead of
 restoring it. Reset, route loss and peer changes cancel pending restoration.
+Losing AACP audio ownership also invalidates the physical baseline. Only a new,
+genuine host SET received while standing by is deferred for the next confirmed
+takeover. Otherwise, a fresh native readback must establish the new baseline;
+the dongle does not replay the old owner's gain.
 
 This is independent of both companion apps and leaves the existing Bluetooth
 phone-volume path unchanged. A known maximum anchor can move one step quieter

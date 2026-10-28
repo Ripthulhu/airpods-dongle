@@ -31,11 +31,18 @@
 #include "../tinyusb/dongle_rpc.h"
 #include "../tinyusb/uac.h"
 #include "phone_call.h"
+#include "peer_address.h"
+#include "aacp_routing.h"
+
+static atomic_bool audio_authority;
+
+bool aacp_audio_owned(void) { return atomic_load_explicit(&audio_authority, memory_order_acquire); }
 
 static _Atomic aacp_mic_owner_t mic_owner;
 static atomic_flag mic_reader = ATOMIC_FLAG_INIT;
 
 static aacp_mic_owner_t requested_mic_owner(void) {
+    if (!aacp_audio_owned()) return AACP_MIC_NONE;
     if (usb_mic_requested()) return AACP_MIC_USB;
     return phone_call_mic_requested() ? AACP_MIC_CALL : AACP_MIC_NONE;
 }
@@ -62,10 +69,12 @@ bool aacp_mic_update_owner(bool fresh_usb_request) {
 static uint32_t mic_read(aacp_mic_owner_t owner, int16_t *pcm, uint32_t frames) {
     if (atomic_flag_test_and_set_explicit(&mic_reader, memory_order_acquire)) return 0;
     uint32_t copied = 0;
-    bool allowed = owner == AACP_MIC_USB ? usb_mic_requested() : phone_call_mic_requested() && !usb_mic_requested();
+    bool allowed = aacp_audio_owned() &&
+        (owner == AACP_MIC_USB ? usb_mic_requested() : phone_call_mic_requested() && !usb_mic_requested());
     if (owner == atomic_load_explicit(&mic_owner, memory_order_acquire) && allowed) {
         copied = aacp_mic_pcm_read(pcm, frames);
-        allowed = owner == AACP_MIC_USB ? usb_mic_requested() : phone_call_mic_requested() && !usb_mic_requested();
+        allowed = aacp_audio_owned() &&
+            (owner == AACP_MIC_USB ? usb_mic_requested() : phone_call_mic_requested() && !usb_mic_requested());
         if (owner != atomic_load_explicit(&mic_owner, memory_order_acquire) || !allowed) copied = 0;
     }
     atomic_flag_clear_explicit(&mic_reader, memory_order_release);
@@ -161,6 +170,18 @@ static uint16_t receive_buffer_last;
 static uint8_t pair_irk[16], pair_advertising_key[16], pair_key_address[6];
 static bool pair_irk_known, pair_case_supported;
 static uint32_t control_session;
+// One immutable queued packet at a time, not a new packet queue or audio buffer.
+static struct {
+    uint8_t peer[6], other[6];
+    uint8_t tx[144], stage, introduction, tx_kind;
+    bool have_other, known, relinquished, pending, queued, confirmed;
+    uint32_t since;
+} routing;
+#define AACP_TAKEOVER_MS 10000u
+static void routing_poll(uint32_t now);
+static void routing_packet(const uint8_t *packet, uint16_t size);
+static void routing_cancel(void);
+static void routing_authority(bool allowed);
 // Static entries stay valid until their queued transmission completes.
 static const uint8_t control_anc[] = {4,0,4,0,9,0,0x0d,2,0,0,0};
 static const uint8_t control_transparency[] = {4,0,4,0,9,0,0x0d,3,0,0,0};
@@ -168,6 +189,9 @@ static void control_reset(void) {
     ++control_session;
     dongle_readback_clear(&control_readback);
     settings_reset(&settings);
+    routing.queued = routing.confirmed = routing.known = routing.have_other = false;
+    routing.introduction = routing.stage = 0;
+    routing_authority(false);
     for (unsigned i = 0; i < sizeof(reports) / sizeof(reports[0]); ++i) {
         reports[i].length = 0;
         reports[i].revision = 0;
@@ -228,6 +252,7 @@ void aacp_disconnect(void) {
     if (aacp_mic_restore_required && aacp_mic_restore_started)
         aacp_mic_recovery_failed();
     control_reset();
+    routing_cancel();
     uint16_t cid = aacp_cid;
     aacp_session = false;
     aacp_cid = 0;
@@ -242,6 +267,8 @@ void aacp_disconnect(void) {
 }
 
 void aacp_init(void) {
+    memset(&routing, 0, sizeof(routing));
+    atomic_store_explicit(&audio_authority, false, memory_order_release);
     pair_irk_known=false;
     pair_case_supported=false;
     memset(pair_irk,0,sizeof(pair_irk));
@@ -277,7 +304,17 @@ static void aacp_schedule_retry(void) {
 
 void aacp_connect(bd_addr_t addr) {
     if (aacp_session && memcmp(aacp_addr, addr, sizeof(bd_addr_t)) == 0) return;
+    bool requested = routing.pending && !memcmp(routing.peer, addr, 6);
+    uint32_t requested_since = routing.since;
     aacp_disconnect();
+    if (memcmp(routing.peer, addr, 6)) {
+        memset(&routing, 0, sizeof(routing));
+        memcpy(routing.peer, addr, 6);
+    }
+    routing.pending = requested;
+    routing.since = requested_since;
+    // A new media signaling connection must resolve who owns the buds before Start.
+    atomic_store_explicit(&audio_authority, false, memory_order_release);
     if (memcmp(pair_key_address,addr,sizeof(pair_key_address))) {
         pair_irk_known=false;
         pair_case_supported=false;
@@ -310,6 +347,149 @@ static bool aacp_tx_enqueue(const uint8_t *data, uint16_t len) {
     return true;
 }
 
+static void routing_cancel(void) {
+    unsigned kept = 0;
+    for (unsigned i = 0; i < aacp_tx_count; ++i) {
+        aacp_pkt_t packet = aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN];
+        if (packet.data != routing.tx)
+            aacp_tx_queue[(aacp_tx_head + kept++) % AACP_TX_QUEUE_LEN] = packet;
+    }
+    aacp_tx_count = (uint8_t)kept;
+    routing.pending = routing.queued = routing.confirmed = false;
+    routing.stage = 0;
+}
+
+void aacp_receive_buffer_cancel(void) {
+    unsigned kept = 0;
+    for (unsigned i = 0; i < aacp_tx_count; ++i) {
+        aacp_pkt_t packet = aacp_tx_queue[(aacp_tx_head + i) % AACP_TX_QUEUE_LEN];
+        if (packet.data != receive_buffer_tx)
+            aacp_tx_queue[(aacp_tx_head + kept++) % AACP_TX_QUEUE_LEN] = packet;
+    }
+    aacp_tx_count = (uint8_t)kept;
+}
+
+static void routing_authority(bool allowed) {
+    if (allowed) routing.introduction = 0;
+    bool previous = atomic_exchange_explicit(&audio_authority, allowed, memory_order_acq_rel);
+    if (previous != allowed) dongle_playback_ownership_changed(allowed);
+}
+
+bool aacp_takeover_request(const uint8_t peer[6]) {
+    if (!peer || !peer_address_valid(peer) || usb_mic_requested() ||
+        phone_call_mic_requested() || aacp_mic_active()) return false;
+    if (routing.pending) return !memcmp(peer, routing.peer, 6);
+    if (memcmp(peer, routing.peer, 6)) {
+        routing_cancel();
+        memset(&routing, 0, sizeof(routing));
+        memcpy(routing.peer, peer, 6);
+        atomic_store_explicit(&audio_authority, false, memory_order_release);
+    }
+    routing.pending = true;
+    routing.introduction = 0;
+    routing.confirmed = false;
+    routing.stage = 0;
+    routing.since = btstack_run_loop_get_time_ms();
+    return true;
+}
+
+static void routing_poll(uint32_t now) {
+    if (routing.pending && (uint32_t)(now - routing.since) >= AACP_TAKEOVER_MS) {
+        if (!aacp_audio_owned()) routing.relinquished = true;
+        routing_cancel();
+        return;
+    }
+    if (!aacp_control_ready() || routing.queued || memcmp(routing.peer, aacp_addr, 6)) return;
+    if (routing.pending && routing.stage >= 3) {
+        if (routing.confirmed || aacp_audio_owned()) {
+            routing.pending = routing.relinquished = false;
+            bool already_owned = aacp_audio_owned();
+            routing_authority(true);
+            if (already_owned) dongle_playback_ownership_changed(true);
+        }
+        return;
+    }
+    uint8_t local[6];
+    gap_local_bd_addr(local);
+    if (!aacp_route_address_valid(local) || aacp_tx_count >= AACP_TX_QUEUE_LEN - 2u) return;
+    aacp_route_kind_t kind;
+    if (routing.pending) {
+        if (routing.stage && !routing.have_other) { routing.stage = 3; return; }
+        kind = routing.stage == 0 ? AACP_ROUTE_OWN :
+               routing.stage == 1 ? AACP_ROUTE_MEDIA : AACP_ROUTE_HIJACK;
+    } else if (routing.have_other && routing.introduction && !aacp_audio_owned()) {
+        kind = (routing.introduction & 1u) ? AACP_ROUTE_NEW_INFO : AACP_ROUTE_TIPI;
+    } else return;
+    uint16_t length = (uint16_t)aacp_route_build(routing.tx, sizeof(routing.tx), kind, local, routing.other);
+    if (!length) return;
+    if (length > l2cap_get_remote_mtu_for_local_cid(aacp_cid)) {
+        if (routing.pending && !aacp_audio_owned()) routing.relinquished = true;
+        routing_cancel();
+        routing.introduction = 0;
+        return;
+    }
+    // Enqueue may dispatch CAN_SEND synchronously: publish immutable buffer state first.
+    routing.queued = true;
+    routing.tx_kind = (uint8_t)kind;
+    if (!aacp_tx_enqueue(routing.tx, length)) routing.queued = false;
+}
+
+static void routing_packet(const uint8_t *packet, uint16_t size) {
+    uint8_t local[6], other[6], source[6], type;
+    bool owned, sole;
+    gap_local_bd_addr(local);
+    if (aacp_route_ownership(packet, size, &owned)) {
+        routing.known = true;
+        if (owned) {
+            if (routing.pending) routing.confirmed = routing.stage != 0;
+            else if (!routing.relinquished) routing_authority(true);
+        } else {
+            if (routing.pending && routing.stage) routing_cancel();
+            routing.confirmed = false;
+            routing.relinquished = true;
+            routing_authority(false);
+        }
+    } else if (aacp_route_devices(packet, size, local, other, &sole)) {
+        bool changed = memcmp(other, routing.other, 6) != 0;
+        bool sole_claim = sole && routing.pending && routing.stage;
+        if (changed && routing.have_other && routing.pending) {
+            if (!sole_claim && !aacp_audio_owned()) routing.relinquished = true;
+            routing_cancel(); // Drop any packet still addressed to the vanished/replaced host.
+            if (sole_claim) {
+                routing.pending = routing.confirmed = true;
+                routing.stage = 3; // The transmitted OWN now has positive exclusive-host evidence.
+            }
+        }
+        memcpy(routing.other, other, 6);
+        routing.have_other = aacp_route_address_valid(other);
+        if (changed) routing.introduction = routing.have_other && !routing.pending && !aacp_audio_owned() ? 3 : 0;
+        if (sole && !routing.relinquished && !routing.pending) routing_authority(true);
+        if (sole && routing.pending && routing.stage) routing.confirmed = true;
+    } else if (aacp_route_source(packet, size, source, &type) && type) {
+        routing.known = true;
+        if (!memcmp(source, local, 6)) {
+            if (routing.pending) routing.confirmed = routing.stage != 0;
+            else if (!routing.relinquished) routing_authority(true);
+        } else {
+            if (routing.pending && routing.stage) routing_cancel();
+            routing.confirmed = false;
+            routing.relinquished = true;
+            routing_authority(false);
+        }
+    } else if (routing.have_other && aacp_route_hijack(packet, size, routing.other)) {
+        routing.known = routing.relinquished = true;
+        routing_cancel(); // The other host's explicit newer intent wins; do not fight it.
+        routing_authority(false);
+    }
+}
+
+void aacp_routing_report(void) {
+    printf("[ROUTING] known=%u owned=%u yielded=%u other=%u pending=%u stage=%u queued=%u confirmed=%u age_ms=%lu\n",
+        routing.known, aacp_audio_owned(), routing.relinquished, routing.have_other,
+        routing.pending, routing.stage, routing.queued, routing.confirmed,
+        (unsigned long)(routing.pending ? btstack_run_loop_get_time_ms() - routing.since : 0));
+}
+
 uint32_t aacp_control_session(void) { return control_session; }
 bool aacp_control_ready(void) { return aacp_connected && aacp_got_control && aacp_init_sent; }
 bool aacp_control_address(bd_addr_t address) {
@@ -327,6 +507,7 @@ uint16_t aacp_receive_buffer_last(void) { return receive_buffer_last; }
 uint8_t aacp_receive_buffer(uint16_t milliseconds) {
     if (milliseconds!=60 && milliseconds!=150) return DONGLE_MALFORMED;
     if (!aacp_control_ready()) return DONGLE_DISCONNECTED;
+    if (!aacp_audio_owned()) return DONGLE_BUSY;
     if (!aacp_model_game_supported()) return DONGLE_UNSUPPORTED;
     if ((milliseconds==60 && (aacp_mic_requested() || aacp_mic_active())) ||
         aacp_tx_count>=AACP_TX_QUEUE_LEN-2) return DONGLE_BUSY;
@@ -696,6 +877,14 @@ static void aacp_handle_can_send_now(void) {
         if (++receive_buffer_serial==0) ++receive_buffer_serial;
         dongle_playback_receive_buffer_sent(now);
     }
+    if (p.data == routing.tx) {
+        routing.queued = false;
+        if (routing.tx_kind == AACP_ROUTE_OWN) routing.stage = 1;
+        else if (routing.tx_kind == AACP_ROUTE_MEDIA) routing.stage = 2;
+        else if (routing.tx_kind == AACP_ROUTE_HIJACK) routing.stage = 3;
+        else if (routing.tx_kind == AACP_ROUTE_NEW_INFO) routing.introduction &= (uint8_t)~1u;
+        else if (routing.tx_kind == AACP_ROUTE_TIPI) routing.introduction &= (uint8_t)~2u;
+    }
     aacp_tx_since_ms = btstack_run_loop_get_time_ms();
     if (p.data == research_tx) { research_pending = false; research_result = 1; }
     if (p.data == aacp_request_notifications) aacp_init_sent = true;
@@ -732,6 +921,7 @@ void aacp_poll(void) {
             l2cap_request_can_send_now_event(aacp_cid);
     }
     uint32_t now = btstack_run_loop_get_time_ms();
+    routing_poll(now);
     if (research_pending && (uint32_t)(now - research_since) >= 3000u) {
         aacp_research_cancel();
         research_result = 2;
@@ -767,6 +957,10 @@ void aacp_poll(void) {
         }
     }
     if (aacp_mic_restore_required && !aacp_mic_remote_active && !aacp_mic_stopping) {
+        if (!aacp_audio_owned()) {
+            aacp_mic_restore_required = aacp_mic_restore_started = aacp_mic_restore_complete = false;
+            return; // The active host owns receiver preparation; never restart its output.
+        }
         if (!aacp_mic_restore_started) {
             aacp_mic_restore_revision=dongle_playback_mic_recovery_revision();
             aacp_mic_restore_started=dongle_playback_mic_recover();
@@ -856,6 +1050,7 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
         if (little_endian_read_16(packet, 4) == 0x58) {
             aacp_handle_audio_sdu(packet, size);
         } else {
+            routing_packet(packet, size);
             settings_packet(&settings,packet,size,btstack_run_loop_get_time_ms());
             if (packet[4]==0x1d)
                 pair_case_supported=!packet[5] && settings.profile && settings.profile->models[0]==3063 && settings.firmware_major;

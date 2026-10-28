@@ -12,9 +12,14 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.37** revises USB volume synchronization after
-**0.1.36** failed its listening check: phone and stem volume could still diverge,
-and the delayed hardware-gain repair produced an audible second step.
+Development candidate **0.1.38** removes the unsuccessful extra AVRCP volume
+refresh, restores a short settling delay, and adds AACP audio ownership and a
+paired BOOTSEL single-press takeover request. It also allows a fresh USB playback
+start to restart a peer-suspended stream while this dongle owns audio. These
+changes require hardware acceptance. **0.1.37** failed: initial playback was
+silent until case-return reconnect, then a stem swipe disturbed left/right
+balance and failed to synchronize the phone. **0.1.36** also failed its volume
+check: phone and stem volume could diverge, with an audible second gain step.
 Version **0.1.36** keeps USB resampling continuous across short input and renews
 the phone-call retry budget when its authenticated phone returns. Initial Pixel
 USB S16 playback with Game Mode on was clean in both ears; this is not a claim
@@ -41,7 +46,8 @@ Android/Symfonium checks remain open.
 Standalone Windows and Pixel USB playback, stem pause/resume and saved-pair/
 case-return reconnect have been exercised with Pro 3 firmware 9A348. Game Mode
 defaults on, and a prior visual/listening test measured approximately 60 ms total
-speaker latency. Double-pressing BOOTSEL toggles it: two LED pulses on enable,
+speaker latency. With a saved AirPods pair, a single BOOTSEL press requests audio
+takeover; without one, it starts discovery. Double-pressing BOOTSEL toggles Game Mode: two LED pulses on enable,
 three seconds dark on disable. Live switching retains the accepted brief pitch
 change while latency adjusts. Pixel Bluetooth pairing and LHDC playback work,
 but wireless playback on 0.1.28 still crackled and could become silent. See
@@ -73,7 +79,9 @@ NTPods uses the [USB control interface](docs/USB-CONTROL.md); LibrePods uses the
 [phone control service](docs/CONTROL-EXTENSIONS.md). Both expose device settings
 and readback without acquiring audio. USB uses Windows' built-in HID driver;
 USB audio and microphone also work independently of the app. There are no
-PC/phone handoff commands. Sensor streaming and case ringing are not implemented.
+companion handoff commands. The physical single-press takeover request uses the
+LibrePods AACP routing exchange; two-dongle handoff remains unverified.
+Sensor streaming and case ringing are not implemented.
 The serial port remains a diagnostic console.
 Send `t` to read USB service and main-loop Bluetooth timing maxima, the current
 phone decoder maximum and flash-cache counters. Repeated requests are coalesced;

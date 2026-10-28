@@ -23,6 +23,8 @@ typedef uint8_t avrcp_operation_id_t;
 static struct {uint16_t avrcp_cid;} media_tracker={7};
 static struct {unsigned song_length_ms,song_position_ms,status;} play_info;
 static bool is_usb_streaming=true,phone_controls,mic;
+static bool audio_owned=true;
+static bool aacp_audio_owned(void) {return audio_owned;}
 static unsigned usb_events,phone_events;
 static uint32_t volume_operations_up,volume_operations_down;
 static unsigned target_requests;
@@ -80,5 +82,11 @@ int main(void) {
     uint8_t volume[]={HCI_EVENT_AVRCP_META,5,AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED,7,0,3,47};
     avrcp_target_packet_handler(HCI_EVENT_PACKET,0,volume,7);assert(target_requests==1 && usb_events==4);
     volume[3]=8;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,volume,7);assert(target_requests==1);
+    audio_owned=false;event[3]=7;event[5]=AVRCP_OPERATION_ID_PLAY;
+    avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(usb_events==4 && call_events==1);
+    is_usb_streaming=false;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);
+    assert(phone_events==1 && call_events==1);
+    event[5]=AVRCP_OPERATION_ID_VOLUME_DOWN;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);
+    assert(volume_operations_down==1);
     puts("stem buttons: actual SDK callback length, press/release, stale CID and USB/phone/call ownership passed");
 }

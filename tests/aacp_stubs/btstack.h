@@ -24,6 +24,7 @@ void btstack_run_loop_set_timer_handler(btstack_timer_source_t *timer,
 void btstack_run_loop_set_timer(btstack_timer_source_t *timer, uint32_t delay);
 void btstack_run_loop_add_timer(btstack_timer_source_t *timer);
 uint32_t btstack_run_loop_get_time_ms(void);
+void gap_local_bd_addr(bd_addr_t address);
 uint8_t l2cap_create_channel(btstack_packet_handler_t handler, bd_addr_t addr,
                              uint16_t psm, uint16_t mtu, uint16_t *cid);
 void l2cap_disconnect(uint16_t cid);

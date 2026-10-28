@@ -64,6 +64,8 @@ void dongle_playback_usb_packet(uint32_t us, uint16_t frames, uint8_t format, ui
 void dongle_playback_usb_format(uint8_t format);
 void dongle_playback_controller_event(const uint8_t *packet, uint16_t size);
 void dongle_playback_poll(void);
+// AACP routing callback under the Bluetooth lock; retain signaling/control.
+void dongle_playback_ownership_changed(bool owned);
 
 void a2dp_source_reconnect();
 

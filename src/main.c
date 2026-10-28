@@ -189,10 +189,12 @@ static void process_button_actions(void){
         runtime_watch_set(WATCH_BUTTON_ACTION_LOCK);
         async_context_acquire_lock_blocking(ctx);
         runtime_watch_set(WATCH_BUTTON_ACTION);
-        if (! get_a2dp_connected_flag()) {
-            a2dp_source_reconnect();
+        const uint8_t *peer = (const uint8_t *)get_device_addr();
+        if (peer && (peer[0] || peer[1] || peer[2] || peer[3] || peer[4] || peer[5])) {
+            if (aacp_takeover_request(peer))
+                a2dp_source_reconnect();
         } else {
-            increase_vol_by_key();
+            gap_start_scanning();
         }
         runtime_watch_set(WATCH_BUTTON_ACTION_UNLOCK);
         async_context_release_lock(ctx);
@@ -589,7 +591,7 @@ int main() {
         runtime_watch_set(WATCH_FEATURES);
         dongle_features_poll();
         phone_control_poll();
-        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report();bt_volume_report(); }
+        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report();bt_volume_report();aacp_routing_report(); }
         volume_trace_console_poll(&volume_console, now_ms);
         bool enter_bootsel = bootsel_request_poll(&bootsel, now_ms);
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);

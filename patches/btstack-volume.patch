@@ -1,48 +1,24 @@
 --- a/src/classic/avrcp.h
 +++ b/src/classic/avrcp.h
-@@ -747,6 +747,20 @@
+@@ -747,6 +747,13 @@
      uint16_t controller_notifications_to_register;
      uint16_t controller_notifications_to_deregister;
  
-+    // Volume readbacks are correlated with the active RegisterNotification.
++    // Volume notifications are correlated with their native registration.
 +    uint32_t controller_volume_generation;
-+    uint32_t controller_volume_active_generation;
 +    uint32_t controller_volume_event_generation;
-+    uint32_t controller_volume_previous_generation;
 +    uint8_t  controller_volume_label;
-+    uint8_t  controller_volume_previous_label;
 +    bool     controller_volume_active;
 +    bool     controller_volume_interim;
-+    bool     controller_volume_previous_active;
-+    bool     controller_volume_replacing;
-+    bool     controller_volume_query_canceled;
-+    bool     controller_volume_refresh_unsupported;
 +
      // used for avrcp_controller_get_element_attributes
      uint16_t controller_element_attributes;
  
 --- a/src/classic/avrcp_controller.c
 +++ b/src/classic/avrcp_controller.c
-@@ -693,11 +693,33 @@
-     l2cap_send_prepared(connection->l2cap_signaling_cid, pos);
+@@ -694,6 +694,9 @@
  }
  
-+static void avrcp_controller_restore_volume_registration(avrcp_connection_t *connection){
-+    uint16_t mask = (uint16_t)(1u << AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-+    connection->controller_volume_active = connection->controller_volume_previous_active;
-+    connection->controller_volume_interim = connection->controller_volume_previous_active;
-+    if (connection->controller_volume_previous_active){
-+        connection->controller_volume_label = connection->controller_volume_previous_label;
-+        connection->controller_volume_active_generation = connection->controller_volume_previous_generation;
-+        connection->notifications_enabled |= mask;
-+    } else {
-+        connection->notifications_enabled &= (uint16_t)~mask;
-+    }
-+    connection->controller_volume_previous_active = false;
-+    connection->controller_volume_replacing = false;
-+    connection->controller_volume_query_canceled = false;
-+}
-+
  static int avrcp_send_register_notification(avrcp_connection_t * connection, uint8_t event_id){
 +    if (event_id == AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED &&
 +        connection->controller_volume_active && !connection->controller_volume_interim)
@@ -50,75 +26,28 @@
      uint8_t command[18];
      uint16_t pos = 0; 
      // transport header : transaction label | Packet_type | C/R | IPID (1 == invalid profile identifier)
-     connection->transaction_id = avrcp_controller_get_next_transaction_label(connection);
-+    if (event_id == AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED && connection->controller_volume_active &&
-+        connection->transaction_id == connection->controller_volume_label)
-+        connection->transaction_id = avrcp_controller_get_next_transaction_label(connection);
-     command[pos++] = (connection->transaction_id << 4) | (AVRCP_SINGLE_PACKET << 2) | (AVRCP_COMMAND_FRAME << 1) | 0;
-     
-     command[pos++] = BLUETOOTH_SERVICE_CLASS_AV_REMOTE_CONTROL >> 8;
-@@ -715,7 +737,24 @@
+@@ -715,7 +718,16 @@
      command[pos++] = event_id; 
      big_endian_store_32(command, pos, 1);     // send notification on playback position every second, for other notifications it is ignored
      pos += 4;
 -    return l2cap_send(connection->l2cap_signaling_cid, command, pos);
 +    if (event_id == AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED){
-+        connection->controller_volume_previous_active = connection->controller_volume_active && connection->controller_volume_interim;
-+        if (connection->controller_volume_previous_active){
-+            connection->controller_volume_previous_label = connection->controller_volume_label;
-+            connection->controller_volume_previous_generation = connection->controller_volume_active_generation;
-+        }
-+        connection->controller_volume_replacing = connection->controller_volume_previous_active;
-+        connection->controller_volume_query_canceled = false;
 +        if (++connection->controller_volume_generation == 0) ++connection->controller_volume_generation;
-+        connection->controller_volume_active_generation = connection->controller_volume_generation;
 +        connection->controller_volume_label = connection->transaction_id;
 +        connection->controller_volume_active = true;
 +        connection->controller_volume_interim = false;
 +    }
 +    int status = l2cap_send(connection->l2cap_signaling_cid, command, pos);
 +    if (status != ERROR_CODE_SUCCESS && event_id == AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED)
-+        avrcp_controller_restore_volume_registration(connection);
++        connection->controller_volume_active = false;
 +    return status;
  }
  
  static void avrcp_press_and_hold_timeout_handler(btstack_timer_source_t * timer){
-@@ -853,6 +892,43 @@
+@@ -853,6 +865,11 @@
      return ERROR_CODE_SUCCESS;
  }
  
-+uint8_t avrcp_controller_refresh_volume_notification(uint16_t avrcp_cid){
-+    avrcp_connection_t *connection = avrcp_get_connection_for_avrcp_cid_for_role(AVRCP_CONTROLLER, avrcp_cid);
-+    if (connection == NULL) return ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER;
-+    if (connection->controller_volume_refresh_unsupported) return ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE;
-+    uint16_t mask = (uint16_t)(1u << AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-+    if ((connection->controller_volume_active && !connection->controller_volume_interim) ||
-+        (connection->controller_notifications_to_register & mask) != 0) return ERROR_CODE_COMMAND_DISALLOWED;
-+    connection->notifications_enabled &= (uint16_t)~mask;
-+    uint8_t status = avrcp_controller_register_notification(connection, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-+    if (status != ERROR_CODE_SUCCESS && connection->controller_volume_active && connection->controller_volume_interim)
-+        connection->notifications_enabled |= mask;
-+    return status;
-+}
-+
-+void avrcp_controller_cancel_volume_refresh(uint16_t avrcp_cid){
-+    avrcp_connection_t *connection = avrcp_get_connection_for_avrcp_cid_for_role(AVRCP_CONTROLLER, avrcp_cid);
-+    if (connection == NULL) return;
-+    uint16_t mask = (uint16_t)(1u << AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-+    if (connection->controller_volume_active && connection->controller_volume_interim){
-+        connection->controller_notifications_to_register &= (uint16_t)~mask;
-+        connection->notifications_enabled |= mask;
-+    }
-+    // A silent peer may have replaced the old subscription; retain both labels for native-only fallback.
-+    connection->controller_volume_query_canceled = connection->controller_volume_active && !connection->controller_volume_interim;
-+    connection->controller_volume_refresh_unsupported = true;
-+}
-+
-+uint32_t avrcp_controller_volume_registration_generation(uint16_t avrcp_cid){
-+    avrcp_connection_t *connection = avrcp_get_connection_for_avrcp_cid_for_role(AVRCP_CONTROLLER, avrcp_cid);
-+    return connection != NULL ? connection->controller_volume_generation : 0;
-+}
-+
 +uint32_t avrcp_controller_volume_event_generation(uint16_t avrcp_cid){
 +    avrcp_connection_t *connection = avrcp_get_connection_for_avrcp_cid_for_role(AVRCP_CONTROLLER, avrcp_cid);
 +    return connection != NULL ? connection->controller_volume_event_generation : 0;
@@ -127,25 +56,23 @@
  static uint8_t avrcp_controller_request_continuation(avrcp_connection_t * connection, avrcp_pdu_id_t pdu_id){
      connection->state = AVCTP_W2_SEND_COMMAND;
      avrcp_controller_vendor_dependent_command_data_init(connection, AVRCP_CTYPE_CONTROL, pdu_id, false);
-@@ -875,29 +951,79 @@
+@@ -875,29 +892,55 @@
  
  static void avrcp_controller_handle_notification(avrcp_connection_t *connection, avrcp_command_type_t ctype, uint8_t *payload, uint16_t size) {
      if (size < 1) return;
-+    // REJECTED has a status byte, not an event ID; only the tracked volume label is known here.
++    // REJECTED contains status, not an event ID; unmatched one-byte rejects are ignored.
 +    if (ctype == AVRCP_CTYPE_RESPONSE_REJECTED){
 +        if (size != 1 || !connection->controller_volume_active || connection->controller_volume_interim ||
 +            connection->controller_last_confirmed_transaction_id != connection->controller_volume_label) return;
-+        uint16_t mask = (uint16_t)(1u << AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-+        connection->controller_volume_event_generation = connection->controller_volume_active_generation;
-+        bool rearm = connection->controller_volume_replacing && !connection->controller_volume_previous_active;
-+        if (connection->controller_volume_replacing) connection->controller_volume_refresh_unsupported = true;
-+        avrcp_controller_restore_volume_registration(connection);
-+        connection->controller_notifications_to_deregister &= (uint16_t)~mask;
-+        connection->controller_notifications_to_register &= (uint16_t)~mask;
-+        if (!connection->controller_volume_active) connection->controller_initial_status_reported &= (uint16_t)~mask;
++        uint16_t reset_mask = (uint16_t)~(1u << AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
++        connection->controller_volume_active = false;
++        connection->controller_volume_event_generation = connection->controller_volume_generation;
++        connection->notifications_enabled &= reset_mask;
++        connection->controller_notifications_to_deregister &= reset_mask;
++        connection->controller_notifications_to_register &= reset_mask;
++        connection->controller_initial_status_reported &= reset_mask;
 +        avrcp_controller_emit_notification_complete(connection, ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE,
 +                                                    AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED, false);
-+        if (rearm) avrcp_controller_register_notification(connection, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
 +        return;
 +    }
      uint16_t pos = 0;
@@ -156,41 +83,19 @@
  
 +    bool volume = event_id == AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED;
 +    if (volume){
-+        if (size != 2) return;
-+        if (connection->controller_volume_previous_active &&
-+            connection->controller_last_confirmed_transaction_id == connection->controller_volume_previous_label){
-+            if (ctype != AVRCP_CTYPE_RESPONSE_CHANGED_STABLE) return;
-+            connection->controller_volume_previous_active = false;
-+            connection->controller_volume_event_generation = connection->controller_volume_previous_generation;
-+            if (connection->controller_volume_query_canceled){
-+                connection->controller_volume_query_canceled = false;
-+                connection->controller_volume_active = false;
-+                connection->controller_volume_replacing = false;
-+                connection->notifications_enabled &= (uint16_t)~(1u << AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-+                avrcp_controller_register_notification(connection, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
-+            }
-+            avrcp_controller_emit_notification_for_event_id(connection->avrcp_cid, event_id, ctype, payload + pos, size - pos);
-+            return; // During a live query keep waiting; native-only fallback starts a normal registration.
-+        }
-+        if (!connection->controller_volume_active ||
++        if (size != 2 || !connection->controller_volume_active ||
 +            connection->controller_last_confirmed_transaction_id != connection->controller_volume_label) return;
 +        if (ctype == AVRCP_CTYPE_RESPONSE_INTERIM){
 +            if (connection->controller_volume_interim) return;
 +            connection->controller_volume_interim = true;
-+            connection->controller_volume_query_canceled = false;
-+            connection->controller_volume_previous_active = false;
-+            connection->controller_volume_replacing = false;
 +        } else if (ctype == AVRCP_CTYPE_RESPONSE_CHANGED_STABLE){
-+            if (!connection->controller_volume_interim && !connection->controller_volume_query_canceled) return;
-+            connection->controller_volume_query_canceled = false;
-+            connection->controller_volume_previous_active = false;
-+            connection->controller_volume_replacing = false;
++            if (!connection->controller_volume_interim) return;
 +            connection->controller_volume_active = false;
 +            connection->controller_volume_interim = false;
 +        } else {
 +            return;
 +        }
-+        connection->controller_volume_event_generation = connection->controller_volume_active_generation;
++        connection->controller_volume_event_generation = connection->controller_volume_generation;
 +    }
 +
      uint16_t event_mask = (1 << event_id);
@@ -210,21 +115,17 @@
              
              // check if initial value is already sent
              if ((connection->controller_initial_status_reported & event_mask) != 0 ){
-+                if (volume) break; // Every fresh volume INTERIM is a current readback.
++                if (volume) break; // Each normal re-registration provides the current readback.
                  return;
              }
              // emit event only once, initially
 --- a/src/classic/avrcp_controller.h
 +++ b/src/classic/avrcp_controller.h
-@@ -451,6 +451,13 @@
+@@ -451,6 +451,9 @@
   */
  void avrcp_controller_deinit(void);
  
-+// AirPods bridge: receive a fresh volume INTERIM, retaining an armed subscription on failure.
-+uint8_t avrcp_controller_refresh_volume_notification(uint16_t avrcp_cid);
-+// Stop forced refresh after timeout; retained late replies serve native notifications only. The caller must disable its HID relay.
-+void avrcp_controller_cancel_volume_refresh(uint16_t avrcp_cid);
-+uint32_t avrcp_controller_volume_registration_generation(uint16_t avrcp_cid);
++// AirPods bridge: identify the native registration that emitted the last volume report.
 +uint32_t avrcp_controller_volume_event_generation(uint16_t avrcp_cid);
 +
  /* API_END */
