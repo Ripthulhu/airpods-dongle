@@ -573,3 +573,17 @@ Local evidence: `pc-hitch-ipc-20261028-182002.json`,
 `pc-hitch-loopback-game-on.log` in the bring-up artifact directory. The 0.1.39
 checks add `pc-0.1.39-boot-state.json`, `pc-0.1.39-normal-playing.json`,
 `pc-0.1.39-game-case-return.json`, and the matching `pc-startup-0.1.39-*.log`.
+
+The second Pico was then updated over the Pixel's root ADB connection using
+guarded remote BOOTSEL. Full-flash backup, verified image loading and unchanged
+pairing storage were checked before reboot. Its idle snapshot reported Game
+Mode OFF, no encoded audio and unresolved/passive ownership. After a manual
+single-press takeover, the listener confirmed clean stereo through the custom
+USB cable. The playback snapshot showed normal mode, a fresh 150 ms report,
+USB S16 alt 1 and confirmed ownership. Active PCM discard/zero-fill, underflows,
+send failures and recoveries were zero; startup drops and 18 controller-flush
+events were nonzero. These are short-run observations, not extended acceptance
+or proof of uninterrupted radio delivery. Evidence is in
+`phone-0.1.39-flash-receipt.json`, `phone-0.1.39-boot-state.jsonl`,
+`phone-0.1.39-boot-routing.log`, `phone-0.1.39-normal-playing.jsonl` and
+`phone-0.1.39-normal-routing.log` in the bring-up artifact directory.

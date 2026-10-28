@@ -19,8 +19,10 @@ Start, then miss the live timing adjustment after its 100 ms priming. A PC hitch
 investigation found continuous host/USB/encoder data and clean playback after a
 manual off/on retune. The original PC Pico now passes short normal-mode,
 double-press Game Mode and automatic case-return checks on 0.1.39. Its startup
-trace confirms the fresh post-prime request and completed adjustment. Extended
-playback, microphone and phone-call checks remain open. The 60 ms target and
+trace confirms the fresh post-prime request and completed adjustment. The second
+Pico also runs verified 0.1.39 and passed short Pixel USB S16 stereo playback in
+normal mode after manual takeover. Extended playback, microphone and phone-call
+checks remain open. The 60 ms target and
 packet grouping are unchanged.
 
 Version **0.1.38** removes the unsuccessful extra AVRCP volume
