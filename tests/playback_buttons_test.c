@@ -9,18 +9,23 @@
 #define HCI_EVENT_AVRCP_META 0xc0
 #define AVRCP_SUBEVENT_PLAY_STATUS_QUERY 3
 #define AVRCP_SUBEVENT_OPERATION 4
+#define AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED 5
 #define AVRCP_MAX_COMMAND_PARAMETER_LENGTH 11
 #define AVRCP_OPERATION_ID_PLAY 0x44
 #define AVRCP_OPERATION_ID_PAUSE 0x46
 #define AVRCP_OPERATION_ID_FORWARD 0x4b
 #define AVRCP_OPERATION_ID_BACKWARD 0x4c
 #define AVRCP_OPERATION_ID_STOP 0x45
+#define AVRCP_OPERATION_ID_VOLUME_UP 0x41
+#define AVRCP_OPERATION_ID_VOLUME_DOWN 0x42
 #define UNUSED(x) (void)(x)
 typedef uint8_t avrcp_operation_id_t;
 static struct {uint16_t avrcp_cid;} media_tracker={7};
 static struct {unsigned song_length_ms,song_position_ms,status;} play_info;
 static bool is_usb_streaming=true,phone_controls,mic;
 static unsigned usb_events,phone_events;
+static uint32_t volume_operations_up,volume_operations_down;
+static unsigned target_requests;
 static enum usb_media_command last;
 static bool phone_sink_handle_target(uint8_t type,uint16_t channel,uint8_t *p,uint16_t size) {(void)type;(void)channel;(void)p;(void)size;return false;}
 static uint8_t hci_event_packet_get_type(const uint8_t *p) {return p[0];}
@@ -36,6 +41,11 @@ static bool call_controls;
 static unsigned call_events;
 static bool phone_call_media_control(uint8_t operation) {(void)operation;if(call_controls)++call_events;return call_controls;}
 static void phone_sink_media_control(uint8_t operation) {(void)operation;++phone_events;}
+static void bt_volume_select_peer(void) {}
+static bool bt_volume_target_event(const uint8_t *packet,uint16_t size) {
+    if(size!=7 || packet[5]!=3 || packet[6]>127)return false;
+    ++target_requests;return true;
+}
 bool usb_media_enqueue(enum usb_media_command command) {last=command;++usb_events;return true;}
 #include "playback_buttons.inc"
 int main(void) {
@@ -60,5 +70,15 @@ int main(void) {
     event[3]=8;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(call_events==1);
     event[3]=7;is_usb_streaming=true;
     avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(call_events==1 && usb_events==4);
+    event[5]=AVRCP_OPERATION_ID_VOLUME_UP;event[6]=0;
+    avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(!volume_operations_up);
+    event[6]=1;event[3]=8;
+    avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(!volume_operations_up);
+    event[3]=7;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(volume_operations_up==1);
+    event[5]=AVRCP_OPERATION_ID_VOLUME_DOWN;
+    avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);assert(volume_operations_down==1 && usb_events==4);
+    uint8_t volume[]={HCI_EVENT_AVRCP_META,5,AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED,7,0,3,47};
+    avrcp_target_packet_handler(HCI_EVENT_PACKET,0,volume,7);assert(target_requests==1 && usb_events==4);
+    volume[3]=8;avrcp_target_packet_handler(HCI_EVENT_PACKET,0,volume,7);assert(target_requests==1);
     puts("stem buttons: actual SDK callback length, press/release, stale CID and USB/phone/call ownership passed");
 }

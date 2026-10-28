@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include "tusb.h"
 #include "../src/tinyusb/media_control.h"
 
@@ -20,6 +21,10 @@ static uint16_t reports[128];
 static unsigned count;
 static unsigned ready_queries;
 static uint32_t test_time_us;
+static bool transfer_pending;
+static uint8_t transfer_report[3];
+void tud_hid_report_complete_cb(uint8_t, uint8_t const *, uint16_t);
+void tud_hid_report_failed_cb(uint8_t, hid_report_type_t, uint8_t const *, uint16_t);
 uint32_t time_us_32(void) { return test_time_us; }
 
 bool tud_hid_ready(void) { ready_queries++; return ready; }
@@ -29,12 +34,24 @@ bool tud_hid_report(uint8_t report_id, const void *report, uint16_t length) {
     const uint8_t *bytes = report;
     assert(count < sizeof(reports) / sizeof(reports[0]));
     reports[count++] = bytes[0] | (uint16_t)(bytes[1] << 8);
+    transfer_report[0] = report_id;
+    transfer_report[1] = bytes[0];
+    transfer_report[2] = bytes[1];
+    transfer_pending = true;
     ready = false;
     return true;
 }
 uint16_t tud_hid_get_report_cb(uint8_t, uint8_t, hid_report_type_t, uint8_t *, uint16_t);
 
-static void tick(void) { ready = true; usb_media_task(); }
+static void complete_transfer(bool success) {
+    if (transfer_pending) {
+        transfer_pending = false;
+        if (success) tud_hid_report_complete_cb(0, transfer_report, sizeof(transfer_report));
+        else tud_hid_report_failed_cb(0, HID_REPORT_TYPE_INPUT, transfer_report, 0);
+    }
+    ready = true;
+}
+static void tick(void) { complete_transfer(true); usb_media_task(); }
 
 static void fresh_host(void) {
     usb_media_set_available(false);
@@ -42,9 +59,11 @@ static void fresh_host(void) {
     usb_media_set_available(true);
     assert(usb_media_generation() & 1u);
     reject_report = false;
+    transfer_pending = false;
     count = 0;
     tick();
     assert(count == 1 && reports[0] == 0);
+    complete_transfer(true);
     count = 0;
 }
 
@@ -54,7 +73,7 @@ static void test_volume_queue(void) {
     assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
     assert(usb_media_volume_sent()==sent); // Enqueue is not a delivered key.
     reject_report=true;tick();assert(!count && usb_media_volume_sent()==sent);
-    reject_report=false;tick();assert(count==1 && reports[0]==0xe9 && usb_media_volume_sent()==sent+1);
+    reject_report=false;tick();assert(count==1 && reports[0]==0xe9 && usb_media_volume_sent()==sent);
     tick();assert(count==2 && reports[1]==0 && usb_media_volume_sent()==sent+1);
     assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));tick();tick();
     assert(reports[2]==0xea && reports[3]==0 && usb_media_volume_sent()==sent+2);
@@ -75,7 +94,7 @@ static void test_volume_queue(void) {
     fresh_host();sent=usb_media_volume_sent();
     assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
     assert(usb_media_enqueue(USB_MEDIA_PLAY));tick();
-    assert(count==1 && reports[0]==0xe9 && usb_media_volume_sent()==sent+1);
+    assert(count==1 && reports[0]==0xe9 && usb_media_volume_sent()==sent);
     usb_media_cancel_volume();reject_report=true;tick();assert(count==1);
     reject_report=false;tick();assert(count==2 && reports[1]==0);
     tick();tick();assert(count==4 && reports[2]==0xcd && reports[3]==0);
@@ -120,7 +139,60 @@ static void test_volume_queue(void) {
     assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));tick();assert(reports[0]==0xe9);
     usb_media_set_available(false);tick();assert(count==1);
     usb_media_set_available(true);tick();
-    assert(count==2 && reports[1]==0 && usb_media_volume_sent()==sent+1);
+    assert(count==2 && reports[1]==0 && usb_media_volume_sent()==sent);
+}
+
+static void test_volume_completion(void) {
+    fresh_host();uint32_t sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));tick();
+    assert(count==1 && reports[0]==0xea && usb_media_volume_sent()==sent);
+    // A queued/stalled IN report must never authorize physical gain restoration.
+    test_time_us+=200000u;usb_media_task();
+    assert(count==1 && usb_media_volume_sent()==sent);
+    const uint8_t wrong[]={1,0xe9,0};
+    tud_hid_report_complete_cb(1,transfer_report,3);
+    tud_hid_report_complete_cb(0,transfer_report,2);
+    tud_hid_report_complete_cb(0,wrong,3);
+    assert(usb_media_volume_sent()==sent);
+    complete_transfer(false);usb_media_task();
+    assert(count==2 && reports[1]==0 && usb_media_volume_sent()==sent);
+    tick();assert(usb_media_enqueue(USB_MEDIA_PLAY));tick();tick();
+    assert(reports[2]==0xcd && reports[3]==0 && usb_media_volume_sent()==sent);
+
+    fresh_host();sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));tick();
+    uint8_t old_report[3];memcpy(old_report,transfer_report,sizeof(old_report));
+    usb_media_set_available(false);usb_media_set_available(true);
+    tud_hid_report_complete_cb(0,old_report,3);
+    assert(usb_media_volume_sent()==sent);
+    transfer_pending=false;tick();complete_transfer(true);
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));tick();
+    tud_hid_report_complete_cb(0,old_report,3);
+    assert(usb_media_volume_sent()==sent);
+    complete_transfer(true);assert(usb_media_volume_sent()==sent+1);
+    tud_hid_report_complete_cb(0,transfer_report,3);
+    assert(usb_media_volume_sent()==sent+1); // Duplicate completion is not another key.
+    usb_media_task();assert(reports[count-1]==0);tick();
+
+    // The RP2350 DCD queues old completions before reset/setup; no new HID
+    // transfer can overtake that queue. Repeat the same usage across reset.
+    fresh_host();sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));tick();
+    memcpy(old_report,transfer_report,sizeof(old_report));
+    usb_media_set_available(false);usb_media_set_available(true);
+    tud_hid_report_complete_cb(0,old_report,3);
+    assert(usb_media_volume_sent()==sent);
+    transfer_pending=false;tick();complete_transfer(true);
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));tick();
+    assert(usb_media_volume_sent()==sent);
+    complete_transfer(true);assert(usb_media_volume_sent()==sent+1);
+    usb_media_task();tick();
+
+    fresh_host();sent=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));tick();
+    usb_media_cancel_volume();complete_transfer(true);usb_media_task();
+    assert(usb_media_volume_sent()==sent && reports[1]==0);
+    tick();
 }
 
 int main(void) {
@@ -187,5 +259,6 @@ int main(void) {
     tick();
     assert(reports[count - 1] == 0);
     test_volume_queue();
-    puts("media controls: bounded queue, ordered releases, volume receipts/epochs/expiry, suspend/reset and retry passed");
+    test_volume_completion();
+    puts("media controls: bounded queue, ordered releases, completed volume receipts/epochs/expiry, suspend/reset and retry passed");
 }

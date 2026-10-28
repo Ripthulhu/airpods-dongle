@@ -24,6 +24,12 @@ static _Atomic uint32_t volume_epoch;
 static _Atomic uint32_t volume_sent;
 static bool release_pending;
 static uint16_t last_usage;
+// One HID IN transfer at a time; these fields belong to the USB task/callbacks.
+// RP2350 queues completions before reset/setup; tud_task drains them before
+// usb_media_task can submit a report in the next configuration.
+static bool volume_pending;
+static uint16_t volume_usage;
+static uint32_t volume_generation, volume_transfer_epoch;
 
 bool usb_media_enqueue(enum usb_media_command command) {
     uint16_t usage;
@@ -68,6 +74,7 @@ void usb_media_set_available(bool available) {
     uint32_t next = ((old + 2u) & ~1u) | (uint32_t)available;
     atomic_store_explicit(&host_state, next, memory_order_release);
     usb_media_cancel_volume();
+    volume_pending = false;
     atomic_store_explicit(&read, atomic_load_explicit(&written, memory_order_acquire),
                           memory_order_release);
     last_usage = 0;
@@ -77,9 +84,34 @@ void usb_media_set_available(bool available) {
 
 static bool send_usage(uint16_t usage) {
     const uint8_t report[] = {(uint8_t)usage, (uint8_t)(usage >> 8)};
-    if (!tud_hid_report(1, report, sizeof(report))) return false;
+    volume_pending = usage == 0x00e9 || usage == 0x00ea;
+    volume_usage = usage;
+    volume_generation = usb_media_generation();
+    volume_transfer_epoch = atomic_load_explicit(&volume_epoch, memory_order_acquire);
+    if (!tud_hid_report(1, report, sizeof(report))) {
+        volume_pending = false;
+        return false;
+    }
     last_usage = usage;
     return true;
+}
+
+void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t length) {
+    // TinyUSB includes the report ID in its completed endpoint buffer.
+    if (instance != 0 || report == NULL || length != 3 || report[0] != 1 ||
+        !volume_pending || (uint16_t)(report[1] | (uint16_t)report[2] << 8) != volume_usage) return;
+    volume_pending = false;
+    if (volume_generation == usb_media_generation() &&
+        volume_transfer_epoch == atomic_load_explicit(&volume_epoch, memory_order_acquire))
+        atomic_fetch_add_explicit(&volume_sent, 1u, memory_order_release);
+}
+
+void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t type,
+                              uint8_t const *report, uint16_t length) {
+    (void)report;
+    (void)length;
+    if (instance == 0 && type == HID_REPORT_TYPE_INPUT) volume_pending = false;
+    // An accepted press still gets a release before any later queued key.
 }
 
 void usb_media_task(void) {
@@ -103,7 +135,6 @@ void usb_media_task(void) {
             continue;
         }
         if (tud_hid_ready() && send_usage(event.usage)) {
-            if (volume) atomic_fetch_add_explicit(&volume_sent, 1u, memory_order_release);
             release_pending = true;
             atomic_store_explicit(&read, r + 1u, memory_order_release);
         }

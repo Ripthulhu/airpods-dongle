@@ -14,5 +14,6 @@ bool usb_mic_requested(void);
 bool usb_host_active(void);
 uint32_t usb_volume_set_revision(void);
 uint32_t usb_volume_set_generation(void);
+uint32_t usb_volume_set_receipt(void);
 
 #endif

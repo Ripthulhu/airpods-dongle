@@ -22,8 +22,8 @@ static uint8_t call_sdp[150];
 // Mandatory HFP narrowband codec; wideband contexts exceed the guarded RAM budget.
 static const uint8_t call_codecs[] = {HFP_CODEC_CVSD};
 static struct {
-    bd_addr_t peer;
-    uint16_t acl, sco;
+    bd_addr_t peer, retry_peer;
+    uint16_t acl, sco, retry_acl;
     uint8_t codec, attempts, speaker_gain, microphone_gain, send_failures;
     bool initialized, connecting, retry_wait, ringing, in_call, setup;
     bool send_requested, output_open, cleanup, command_pending;
@@ -31,7 +31,8 @@ static struct {
     uint32_t received, sent, malformed, bad_frames;
     uint8_t pending[CALL_SCO_PAYLOAD_MAX];
     uint8_t pending_length;
-} call = {.acl = HCI_CON_HANDLE_INVALID, .sco = HCI_CON_HANDLE_INVALID};
+} call = {.acl = HCI_CON_HANDLE_INVALID, .sco = HCI_CON_HANDLE_INVALID,
+          .retry_acl = HCI_CON_HANDLE_INVALID};
 
 static bool usb_priority(void) { return get_usb_streaming() || usb_mic_requested(); }
 
@@ -175,6 +176,8 @@ static void hfp_packet(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t
         }
         memcpy(call.peer, peer, 6);
         call.acl = acl;
+        memcpy(call.retry_peer, peer, 6);
+        call.retry_acl = acl;
         call.attempts = 0;
         call.retry_wait = false;
         call.speaker_gain = call.microphone_gain = 15;
@@ -326,7 +329,22 @@ void phone_call_poll(void) {
             hci_request_sco_can_send_now_event_for_con_handle(call.sco);
         }
     }
-    if (call.acl != HCI_CON_HANDLE_INVALID || usb_priority()) return;
+    if (call.acl != HCI_CON_HANDLE_INVALID) return;
+    bd_addr_t peer;
+    bool have_peer = bt_hci_phone_address(peer);
+    hci_connection_t *connection = have_peer ?
+        hci_connection_for_bd_addr_and_type(peer, BD_ADDR_TYPE_ACL) : NULL;
+    uint16_t retry_acl = connection != NULL && bt_hci_phone_peer_connected(peer) ?
+        connection->con_handle : HCI_CON_HANDLE_INVALID;
+    // Offline attempts must not exhaust a later phone/ACL connection's budget.
+    if (have_peer && (memcmp(call.retry_peer, peer, 6) != 0 ||
+        (retry_acl != HCI_CON_HANDLE_INVALID && retry_acl != call.retry_acl))) {
+        call.attempts = 0;
+        call.retry_wait = false;
+        memcpy(call.retry_peer, peer, 6);
+    }
+    call.retry_acl = retry_acl;
+    if (usb_priority()) return;
     if (call.connecting) {
         if ((uint32_t)(now - call.connecting_at) < CALL_CONNECT_MS) return;
         // Cancel a timed-out outgoing SLC using its authenticated ACL handle.
@@ -337,8 +355,7 @@ void phone_call_poll(void) {
         call.retry_at = now;
     }
     if (call.attempts >= 3 || (call.retry_wait && (uint32_t)(now - call.retry_at) < CALL_RETRY_MS)) return;
-    bd_addr_t peer;
-    if (!bt_hci_phone_address(peer)) return;
+    if (!have_peer) return;
     memcpy(call.peer, peer, 6);
     ++call.attempts;
     if (hfp_hf_establish_service_level_connection(peer) == ERROR_CODE_SUCCESS) {

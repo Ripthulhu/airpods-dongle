@@ -19,6 +19,7 @@ enum usb_media_command {
 // False means the USB host is unavailable or the eight-command queue is full.
 bool usb_media_enqueue(enum usb_media_command command);
 uint32_t usb_media_generation(void);
+// Completed current-session volume presses, not queued reports or OS application.
 uint32_t usb_media_volume_sent(void);
 void usb_media_cancel_volume(void);
 

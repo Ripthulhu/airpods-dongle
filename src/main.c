@@ -535,7 +535,7 @@ int main() {
         runtime_watch_set(WATCH_FEATURES);
         dongle_features_poll();
         phone_control_poll();
-        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report(); }
+        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report();bt_volume_report(); }
         bool enter_bootsel = bootsel_request_poll(&bootsel, now_ms);
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
         runtime_watch_set(WATCH_UNLOCK);

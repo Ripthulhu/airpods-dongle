@@ -10,28 +10,44 @@ a debug console. No custom Windows kernel driver or Test Mode is required for US
 
 ## Stem volume
 
-Firmware 0.1.34 forwards unsolicited AirPods volume changes as standard Consumer
+Firmware 0.1.36 forwards unsolicited AirPods volume changes as standard Consumer
 Volume Increment (`0x0C:0xE9`) or Volume Decrement (`0x0C:0xEA`) press/release pairs.
-It enables this relay only after a real USB Audio volume SET in the current bus
-session and while USB playback or recording owns audio. The host's next volume
-SET is authoritative. It does not restore an old AirPods gain or force a starting
-level.
+USB playback or recording must own audio and physical AirPods gain must be known.
+A genuine host USB Audio volume SET remains authoritative. Android may send that
+SET only during initialization, then change software volume for all user actions;
+absence of another SET no longer disables the relay.
 
 The temporary AirPods change is withheld from USB volume notifications while
 waiting for the host, preventing a hardware-volume notification and HID key from
-applying the same gesture twice. Initial AVRCP readback, unchanged notifications
+applying the same gesture twice. After all queued volume keys complete their USB
+transfers and 150 ms pass without a new gesture, the relay restores its confirmed hardware gain anchor if no newer host
+SET superseded it. This avoids retaining both the phone's software attenuation
+and the AirPods' gesture attenuation. Initial AVRCP readback, unchanged notifications
 and feedback matching an outstanding volume command do not generate keys.
 The bounded queue keeps rapid gestures in order; USB reset,
 route or peer changes invalidate unsent volume keys. A sent press still receives
-its release. Expired keys are discarded. Missing host feedback falls back to the
-actual AirPods level and disables relaying for that USB session.
+its release. Expired or rejected keys retain the actual physical gain instead of
+restoring it. Reset, route loss and peer changes cancel pending restoration.
 
 This is independent of both companion apps and leaves the existing Bluetooth
-phone-volume path unchanged. Hosts that never send USB hardware-volume commands
-retain physical AirPods volume control; exact synchronization with their software
-volume is not available to a standard USB peripheral. AVRCP notifications also
-provide no additional gesture when the physical level is already at an endpoint.
-Hardware checks on Pixel and Windows remain pending for this candidate.
+phone-volume path unchanged. A known maximum anchor can move one step quieter
+to leave observable upward-gesture headroom; zero or unknown gain is never
+automatically raised. A clamped or rejected headroom adjustment is not retried
+indefinitely. A completed USB HID transfer does not prove the host applied the
+key. Endpoint behavior, rapid gestures and ignored host keys therefore require
+real-host checks before claiming full slider-range synchronization.
+
+The 0.1.35 Pixel evidence showed two HID keys, 29 physical change reports and
+AirPods gain falling from 127 to 47, while the host SET revision stayed at 2.
+The old five-second timeout then disabled forwarding. This confirms double
+attenuation and an invalid hardware-feedback assumption in 0.1.34; moving the
+phone slider was not a successful fix. The 0.1.36 ownership correction still
+needs a Pixel listening check and a Windows native-UAC regression check.
+
+Target-role absolute-volume requests are validated and counted separately from
+controller-role physical-gain notifications. They do not overwrite physical
+readback or independently emit a second key for a possibly identical gesture.
+Marked target-event/endpoint evidence is required before enabling another relay.
 
 The usage codes follow the [Android USB headset specification](https://source.android.com/docs/core/interaction/accessories/headset/usb-headset-spec).
 Android's [default mixer behavior](https://source.android.com/docs/core/audio/preferred-mixer-attr)
@@ -53,6 +69,12 @@ serial reappears as `2E8A:000F` before using picotool. Firmware installation is 
 separate action; entering BOOTSEL does not erase flash or pairing storage.
 The first installation of this feature still requires physical BOOTSEL entry.
 The existing bare `t` diagnostics command remains available.
+Version 0.1.35 adds two manual `[VOLUME]` status lines to `t`: actual host SET
+revisions/session, HID receipts, relay state, physical readback,
+pending AVRCP commands and valid volume-event counts. These counters do not
+change gain or print per packet. From 0.1.36, `sent` counts completed USB volume
+press transfers, rather than reports merely queued at the endpoint. The relay
+also exposes its hardware anchor, pending restoration and target-role SET count.
 
 ## Companion collection
 
@@ -213,5 +235,7 @@ single-byte ATT Write Request (`12`, value `31`) used by the self-check command.
 Cancellation stops waiting only. Model-specific guards match NTPods; raw
 calibration data is not a calibrated hearing test.
 
-USB audio and microphone remain available without NTPods. Hardware validation
-is pending the Pico 2 W.
+USB audio, microphone and stem controls have worked on Pico 2 W without NTPods.
+The current candidate's remaining hardware checks are recorded in
+[audio continuity](AUDIO-CONTINUITY.md); prior listening results do not validate
+every later firmware change.

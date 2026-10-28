@@ -2,6 +2,24 @@
 
 ## Acceptance status, 28 October 2026
 
+The 0.1.36 candidate fixes a reproduced waveform discontinuity in USB playback.
+With a fractional clock phase, a 480-frame output unit can need 481 input frames.
+The old path fell back to unfiltered PCM when only 480 were available, then
+returned to the delayed FIR path on the next unit. A synthetic ramp jumped by
+115 sample units at that boundary while both underflow counters remained zero.
+The new path preserves FIR history and fractional phase, pads missing input in
+that same path, and counts the shortage. Production-ingress tests cover S16 and
+nonquantized float input. This reproduces a possible crackle mechanism, not the
+initiating event of every user-reported hitch. Steady Game Mode listening remains
+a separate acceptance check from the already accepted brief transition pitch ramp.
+
+Two audit limits remain: sustained 10 ms work per AAC-ELD unit cannot support
+the temporary 9 ms buffer-fill schedule when leaving Game Mode; and the host
+pipeline model treats successful HCI submission as immediate receiver delivery.
+Do not fix the first by increasing clock or discarding audio, or claim the
+second proves the 60 ms receiver buffer cannot underrun. A complete busy-ramp
+admission policy and a controller-credit/delivery replay need separate validation.
+
 Full acceptance remains open. The 0.1.25-r1 Windows S16 and actual IEEE float32
 USB checks passed the listener's short playback/microphone comparison. Stereo
 returned normally, and the float mic result was rated the same or better than

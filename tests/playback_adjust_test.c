@@ -5,6 +5,42 @@
 #include "../src/btstack/playback_pcm.h"
 static playback_pcm_t pcm;
 
+static void padded_window_boundaries(void) {
+    playback_resample_t work;
+    int16_t input[864],output[960];
+    for(unsigned i=0;i<432;++i) {
+        input[2*i]=(int16_t)(4*(i+1));input[2*i+1]=-input[2*i];
+    }
+    assert(playback_pcm_reset(&pcm,600,false));
+    pcm.read=590;pcm.fraction=634880; // A USB-reachable phase, then a 0.9 ramp.
+    playback_pcm_push(&pcm,input,432);
+    assert(!playback_pcm_prepare_resample(&pcm,&work,480,9u*65536u));
+    assert(pcm.used==432 && pcm.read==590 && pcm.fraction==634880);
+    uint32_t missing=99;
+    assert(playback_pcm_prepare_resample_fill(&pcm,&work,480,9u*65536u,&missing));
+    assert(missing==1 && pcm.used==0 && pcm.read==422 && pcm.fraction==634880);
+    assert(work.samples[2*(PLAYBACK_FILTER_TAPS+432)]==0); // Unconsumed lookahead.
+    for(unsigned i=0;i<PLAYBACK_FILTER_TAPS;++i) {
+        float expected=(float)input[2*(432-PLAYBACK_FILTER_TAPS+i)]/32768.0f;
+        assert(pcm.history[2*i]==expected && pcm.history[2*i+1]==-expected);
+    }
+    playback_pcm_render(&work,output);
+    for(unsigned i=0;i<480;++i)assert(output[2*i+1]==-output[2*i]);
+
+    // Empty input still advances only fractional time, retaining the FIR delay.
+    assert(playback_pcm_reset(&pcm,600,false));
+    pcm.read=590;pcm.fraction=634880;
+    assert(playback_pcm_prepare_resample_fill(&pcm,&work,480,655360u,&missing));
+    assert(missing==480 && pcm.used==0 && pcm.read==590 && pcm.fraction==634880);
+    playback_pcm_render(&work,output);
+    for(unsigned i=0;i<960;++i)assert(output[i]==0);
+    for(unsigned i=0;i<2*PLAYBACK_FILTER_TAPS;++i)assert(pcm.history[i]==0);
+
+    assert(playback_pcm_reset(&pcm,7680,true));
+    assert(!playback_pcm_prepare_resample_fill(&pcm,&work,480,655360u,&missing));
+    assert(pcm.priming==PLAYBACK_PRIMING_FRAMES); // Never bypass encoded startup priming.
+}
+
 static void interpolation(void) {
     int16_t input[1400], output[1400];
     for (unsigned i=0;i<700;++i) { input[i*2]=(int16_t)(i*10); input[i*2+1]=(int16_t)-(int)(i*10); }
@@ -52,6 +88,7 @@ static void live_transition(uint16_t report, uint16_t target) {
     assert(playback_adjust_interval(&s)==10 && pcm.used<PLAYBACK_USB_MIN_FRAMES);
 }
 int main(void) {
+    padded_window_boundaries();
     interpolation();
     live_transition(1590,60); live_transition(900,150);
     playback_adjust_t s={0};

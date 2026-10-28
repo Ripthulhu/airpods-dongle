@@ -194,6 +194,59 @@ static void startup_keeps_one_filter_phase(void) {
         assert(!playback_metrics.pcm_underflows);
     }
 }
+static void fractional_shortage_keeps_filter(void) {
+    static playback_pcm_t reference;
+    static playback_resample_t work;
+    for(unsigned floating=0;floating<2;++floating) {
+        fixture(0);
+        playback_pcm_clear(&playback_pcm,7680);
+        playback_pcm.primed_on_wire=true;
+        // This phase is reached after twelve 480-frame +976 ppm reads.
+        playback_pcm.fraction=409600;
+        usb_clock.rate_q16=65600;
+        for(unsigned i=0;i<PLAYBACK_FILTER_TAPS;++i) {
+            float value=(float)(1000+8*((int)i-(int)PLAYBACK_FILTER_TAPS))/32768.0f;
+            playback_pcm.history[2*i]=value;playback_pcm.history[2*i+1]=-value;
+        }
+        int16_t integer[1000],expected[960],last;
+        float real[1000];
+        for(unsigned i=0;i<480;++i) {
+            integer[2*i]=(int16_t)(1000+8*i);integer[2*i+1]=-integer[2*i];
+            real[2*i]=((float)integer[2*i]+0.375f)/32768.0f;real[2*i+1]=-real[2*i];
+        }
+        if(floating)audio_slot_push_float(real,480);
+        else audio_slot_push_samples(integer,480);
+        reference=playback_pcm;
+        // Independent shortage oracle: insert one explicitly counted zero input
+        // frame, then use the existing strict (enough-input) FIR path.
+        const int16_t zero[2]={0};
+        playback_pcm_push(&reference,zero,1);
+        assert(playback_pcm_prepare_resample(&reference,&work,480,65600u*10u));
+        playback_pcm_render(&work,expected);
+        audio_pcm_read(480);
+        assert(memcmp(encoder_pcm,expected,sizeof(expected))==0);
+        assert(encoder_pcm[0]>=876 && encoder_pcm[0]<=878); // Raw fallback began at 1000.
+        assert(playback_pcm.used==0 && playback_pcm.fraction==reference.fraction);
+        assert(memcmp(playback_pcm.history,reference.history,sizeof(reference.history))==0);
+        assert(playback_metrics.pcm_underflows==1 && playback_trace.stats[TRACE_ACTIVE_ZERO]==1);
+        last=encoder_pcm[958];
+        for(unsigned i=0;i<500;++i) {
+            integer[2*i]=(int16_t)(1000+8*(480+i));integer[2*i+1]=-integer[2*i];
+            real[2*i]=((float)integer[2*i]+0.375f)/32768.0f;real[2*i+1]=-real[2*i];
+        }
+        if(floating) {
+            audio_slot_push_float(real,500);playback_pcm_push_float(&reference,real,500);
+        } else {
+            audio_slot_push_samples(integer,500);playback_pcm_push(&reference,integer,500);
+        }
+        assert(playback_pcm_prepare_resample(&reference,&work,480,usb_clock.rate_q16*10u));
+        playback_pcm_render(&work,expected);
+        audio_pcm_read(480);
+        assert(memcmp(encoder_pcm,expected,sizeof(expected))==0);
+        assert(encoder_pcm[0]-last>=4 && encoder_pcm[0]-last<=12); // Former raw→FIR jump was -115.
+        assert(playback_metrics.pcm_underflows==1 && playback_trace.stats[TRACE_ACTIVE_ZERO]==1);
+    }
+}
 static void measured_cpu_budget(void) {
     fixture(0);
     // Hardware reached 7.9 ms encode and 9.6 ms including PCM/other work.
@@ -412,6 +465,7 @@ static void call_prefill_uses_call_clock(void) {
 int main(void) {
     call_prefill_uses_call_clock();
     startup_keeps_one_filter_phase();
+    fractional_shortage_keeps_filter();
     steady_and_stalls();clock_drift();delayed_timer_clock();send_wait_after_encoding();excessive_stall();stale_receiver_window();jitter_and_live_changes();measured_cpu_budget();
     phone_send_wait_keeps_source_time();
     phone_late_decode_keeps_unmatched_debt();

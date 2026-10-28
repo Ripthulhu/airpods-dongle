@@ -7,7 +7,8 @@
 static const bd_addr_t phone_address = {1,2,3,4,5,6};
 static hci_connection_t phone_connection = {0x20};
 static uint32_t now, configured_features;
-static bool authorized, usb_playing, usb_recording, output_ready, mic_active, can_send, reserved;
+static bool authorized, acl_connected, usb_playing, usb_recording, output_ready, mic_active, can_send, reserved;
+static bd_addr_t saved_phone_address;
 static unsigned connects, slc_releases, sco_releases, answers, hangs, opens, stops, polls;
 static unsigned media_resume_polls;
 static unsigned uplinks, downlinks, requests, sends, call_changes;
@@ -22,10 +23,10 @@ static btstack_packet_handler_t hfp_handler, sco_handler;
 
 uint32_t btstack_run_loop_get_time_ms(void) { return now; }
 void gap_set_security_level(int level) { assert(level==LEVEL_2); }
-bool bt_hci_phone_address(uint8_t out[6]) { memcpy(out,phone_address,6);return true; }
+bool bt_hci_phone_address(uint8_t out[6]) { memcpy(out,saved_phone_address,6);return true; }
 bool bt_hci_phone_peer_connected(const uint8_t address[6]) {return authorized && !memcmp(address,phone_address,6);}
 hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t *address,int type) {
-    assert(type==BD_ADDR_TYPE_ACL);return !memcmp(address,phone_address,6)?&phone_connection:NULL;
+    assert(type==BD_ADDR_TYPE_ACL);return acl_connected&&!memcmp(address,phone_address,6)?&phone_connection:NULL;
 }
 bool get_usb_streaming(void) {return usb_playing;}
 bool usb_mic_requested(void) {return usb_recording;}
@@ -61,7 +62,7 @@ uint32_t sdp_create_service_record_handle(void) {return 0x10009;}
 uint8_t sdp_register_service(uint8_t *record) {(void)record;return 0;}
 void hci_set_sco_voice_setting(uint16_t setting) {assert(setting==0x60);}
 void hci_register_sco_packet_handler(btstack_packet_handler_t handler) {sco_handler=handler;}
-uint8_t hfp_hf_establish_service_level_connection(uint8_t *address) {assert(!memcmp(address,phone_address,6));++connects;return 0;}
+uint8_t hfp_hf_establish_service_level_connection(uint8_t *address) {assert(!memcmp(address,saved_phone_address,6));++connects;return 0;}
 uint8_t hfp_hf_release_service_level_connection(uint16_t handle) {assert(handle==0x20||handle==0x21);++slc_releases;return 0;}
 uint8_t hfp_hf_release_audio_connection(uint16_t handle) {assert(handle==0x20);++sco_releases;return 0;}
 uint8_t hfp_hf_answer_incoming_call(uint16_t handle) {assert(handle==0x20);++answers;return command_result;}
@@ -73,8 +74,10 @@ uint8_t *hci_get_outgoing_packet_buffer(void) {assert(reserved);return outgoing;
 uint8_t hci_send_sco_packet_buffer(int length) {assert(reserved&&length==sco_length);reserved=false;++sends;memcpy(last_sent,outgoing,(unsigned)length);return send_result;}
 void hci_request_sco_can_send_now_event_for_con_handle(uint16_t handle) {assert(handle==0x30);++requests;}
 static void reset(void) {
-    memset(&call,0,sizeof(call));call.acl=call.sco=HCI_CON_HANDLE_INVALID;
-    now=0;authorized=can_send=output_ready=true;usb_playing=usb_recording=mic_active=reserved=false;
+    memset(&call,0,sizeof(call));call.acl=call.sco=call.retry_acl=HCI_CON_HANDLE_INVALID;
+    now=0;authorized=acl_connected=can_send=output_ready=true;usb_playing=usb_recording=mic_active=reserved=false;
+    memcpy(saved_phone_address,phone_address,6);
+    phone_connection.con_handle=0x20;
     connects=slc_releases=sco_releases=answers=hangs=opens=stops=polls=media_resume_polls=0;
     uplinks=downlinks=requests=sends=call_changes=0;microphone_samples=0;
     init_result=send_result=command_result=0;sdp_length=140;sco_length=63;
@@ -176,5 +179,39 @@ int main(void) {
     now+=10000;phone_call_poll();assert(slc_releases==1&&connects==1);
     for(unsigned i=0;i<2;++i){now+=30000;phone_call_poll();now+=10000;phone_call_poll();}
     now+=30000;phone_call_poll();assert(connects==3);
+    // A normal SLC release retains the reconnect backoff for the same live ACL.
+    reset();slc(0x20,phone_address);
+    meta(HFP_SUBEVENT_SERVICE_LEVEL_CONNECTION_RELEASED,0x20);
+    phone_call_poll();assert(connects==0);
+    now=29999;phone_call_poll();assert(connects==0);
+    now=30000;phone_call_poll();assert(connects==1);
+    // A saved phone can be away at boot. Its later authenticated ACL starts a
+    // fresh bounded retry epoch, even if the controller reused its handle.
+    reset();authorized=acl_connected=false;
+    for(unsigned i=0;i<3;++i){phone_call_poll();now+=10000;phone_call_poll();now+=30000;}
+    phone_call_poll();assert(connects==3);
+    authorized=acl_connected=true;phone_call_poll();assert(connects==4);
+    now+=10000;phone_call_poll();
+    for(unsigned i=0;i<2;++i){now+=30000;phone_call_poll();now+=10000;phone_call_poll();}
+    now+=30000;phone_call_poll();assert(connects==6);
+    authorized=acl_connected=false;phone_call_poll();
+    authorized=acl_connected=true;phone_call_poll();assert(connects==7);
+    // USB ownership prevents dialing, but must not hide the ACL epoch change.
+    reset();authorized=acl_connected=false;
+    for(unsigned i=0;i<3;++i){phone_call_poll();now+=10000;phone_call_poll();now+=30000;}
+    usb_playing=authorized=acl_connected=true;phone_call_poll();assert(connects==3);
+    usb_playing=false;phone_call_poll();assert(connects==4);
+    // A different authenticated handle also renews retries without requiring an
+    // observed disconnected pass; repeated polls cannot keep renewing it.
+    reset();
+    for(unsigned i=0;i<3;++i){phone_call_poll();now+=10000;phone_call_poll();now+=30000;}
+    phone_connection.con_handle=0x21;phone_call_poll();assert(connects==4);
+    phone_call_poll();assert(connects==4);
+    // Selecting another saved phone also renews the budget; it cannot inherit
+    // the previous phone's permanent lockout or reconnect backoff.
+    reset();authorized=acl_connected=false;
+    for(unsigned i=0;i<3;++i){phone_call_poll();now+=10000;phone_call_poll();now+=30000;}
+    phone_call_poll();assert(connects==3);
+    saved_phone_address[0]=9;phone_call_poll();assert(connects==4);
     puts("phone calls: authenticated HFP/CVSD, explicit stems, bounded SCO, microphone progress, USB priority and cleanup passed");
 }

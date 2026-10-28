@@ -525,7 +525,7 @@ static void host_volume_proof_and_hold(void) {
     assert(usb_volume_set_revision()==0);
     media_sent=1;host_volume(-6400);assert(usb_volume_set_revision()==1 && usb_volume_set_generation()==session);
     media_sent=2; // A second key transmitted after SET IRQ but before the main task.
-    tinyusb_control_task();assert(bt_sets==1 && seen_set_revision==1 && seen_receipt==1);
+    tinyusb_control_task();assert(bt_sets==1 && seen_set_revision==1 && seen_receipt==1 && usb_volume_set_receipt()==1);
     volume_ready=false;bt_known=true;bt_volume=80;bt_changed=true;
     tinyusb_control_task();assert(bt_changed && read_volume()==-6400);
     volume_ready=true;tinyusb_control_task();

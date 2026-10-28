@@ -158,25 +158,39 @@ typedef struct {
     float samples[(PLAYBACK_RESAMPLE_WINDOW+PLAYBACK_FILTER_TAPS)*2];
     uint32_t frames,rate,fraction;
 } playback_resample_t;
-static inline bool playback_pcm_prepare_resample(playback_pcm_t *pcm,playback_resample_t *work,
-                                                 uint32_t frames,uint32_t rate) {
+// With missing!=NULL, preserve the FIR timeline through an input shortage.
+// missing counts padded required-window frames, including a possible single
+// lookahead frame which is not consumed into the next history yet.
+static inline bool playback_pcm_prepare_resample_fill(playback_pcm_t *pcm,playback_resample_t *work,
+                                                 uint32_t frames,uint32_t rate,uint32_t *missing) {
     const uint32_t denominator=655360u;
-    if(!frames || frames>1024 || !rate || rate>denominator*11u/10u || pcm->priming)return false;
+    if(!frames || frames>1024 || !rate || rate>denominator*11u/10u || pcm->priming ||
+       !pcm->capacity)return false;
     uint32_t end=pcm->fraction+frames*rate,last=end-rate;
     uint32_t consumed=end/denominator,needed=last/denominator+1u;
     if(needed<consumed)needed=consumed;
-    if(needed>PLAYBACK_RESAMPLE_WINDOW || pcm->used<needed)return false;
+    if(needed>PLAYBACK_RESAMPLE_WINDOW || (!missing && pcm->used<needed))return false;
+    uint32_t available=pcm->used<needed?pcm->used:needed;
+    if(missing)*missing=needed-available;
     work->frames=frames;work->rate=rate;work->fraction=pcm->fraction;
     memcpy(work->samples,pcm->history,sizeof(pcm->history));
     uint32_t first=pcm->capacity-pcm->read;
-    if(first>needed)first=needed;
+    if(first>available)first=available;
     memcpy(work->samples+PLAYBACK_FILTER_TAPS*2,pcm->samples+pcm->read*2,first*2*sizeof(float));
-    if(needed>first)memcpy(work->samples+(PLAYBACK_FILTER_TAPS+first)*2,pcm->samples,(needed-first)*2*sizeof(float));
-    playback_pcm_history(pcm,consumed);
-    pcm->read+=consumed;
+    if(available>first)memcpy(work->samples+(PLAYBACK_FILTER_TAPS+first)*2,pcm->samples,(available-first)*2*sizeof(float));
+    if(needed>available)memset(work->samples+(PLAYBACK_FILTER_TAPS+available)*2,0,(needed-available)*2*sizeof(float));
+    // Keep the same FIR delay and fractional phase even at an input shortage.
+    // The copied window contains history followed by actual/zero-filled input.
+    memcpy(pcm->history,work->samples+consumed*2,sizeof(pcm->history));
+    uint32_t copied=consumed<pcm->used?consumed:pcm->used;
+    pcm->read+=copied;
     if(pcm->read>=pcm->capacity)pcm->read-=pcm->capacity;
-    pcm->used-=consumed;pcm->fraction=end%denominator;
+    pcm->used-=copied;pcm->fraction=end%denominator;
     return true;
+}
+static inline bool playback_pcm_prepare_resample(playback_pcm_t *pcm,playback_resample_t *work,
+                                                 uint32_t frames,uint32_t rate) {
+    return playback_pcm_prepare_resample_fill(pcm,work,frames,rate,NULL);
 }
 static inline void playback_pcm_render(const playback_resample_t *work,int16_t *dst) {
     const uint32_t denominator=655360u;

@@ -25,7 +25,7 @@ def uac_sources(directory):
     declarations += source[start:end]
     functions = []
     for name in ["usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
-                 "usb_mic_requested", "usb_host_active", "usb_volume_set_revision", "usb_volume_set_generation", "tinyusb_task", "tinyusb_control_task",
+                 "usb_mic_requested", "usb_host_active", "usb_volume_set_revision", "usb_volume_set_generation", "usb_volume_set_receipt", "tinyusb_task", "tinyusb_control_task",
                  "tud_mount_cb", "tud_umount_cb", "tud_suspend_cb", "tud_resume_cb",
                  "tud_audio_mic_clock_get_request", "tud_audio_clock_get_request",
                  "tud_audio_clock_set_request", "tud_audio_feature_unit_get_request",
@@ -231,7 +231,7 @@ def main():
         "uac": ["tests/uac_test.c"],
         "uac_s16": ["-DAIRPODS_USB_FLOAT=0", "tests/uac_test.c"],
         "volume_sync": ["tests/volume_sync_test.c"],
-        "playback_volume": ["tests/playback_volume_test.c"],
+        "playback_volume": ["-Itests/media_stubs", "tests/playback_volume_test.c", "src/tinyusb/media_control.c"],
         "bootsel_request": ["tests/bootsel_request_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],

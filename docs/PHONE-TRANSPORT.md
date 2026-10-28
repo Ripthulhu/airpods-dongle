@@ -13,7 +13,11 @@ two AAC-ELD units per phone-output packet. Send waits fell to 8 ms, but small
 hitches remained. Version 0.1.32 adds input timing diagnostics and a replay-tested
 90 ms jitter reserve; its hardware validation is pending.
 Version 0.1.33 adds a phone-call bridge; its bidirectional voice path is also
-awaiting a physical call test.
+awaiting a physical call test. Candidate 0.1.36 renews the bounded HFP retry
+budget when the saved phone changes or an authenticated phone connection
+returns, including changes observed while USB owns audio. A normal HFP release
+on the same connection retains its backoff. This fixes the permanent lockout
+after three attempts while the phone was away; it does not validate voice timing.
 The separate app control service remains untested on Pico hardware.
 
 ```text
@@ -56,9 +60,10 @@ Apple versions contain independent end-call and mute fields; do not flatten a
 newer or unknown report into one of these legacy values. Complete modern writes
 and physical call behavior through this dongle remain unverified.
 
-Confirmed AirPods volume is mirrored to both hosts. USB hardware-volume hosts
-also receive stem gestures through the guarded [USB volume relay](USB-CONTROL.md#stem-volume)
-in 0.1.34; readback alone does not synchronize Android's media-volume UI.
+Confirmed AirPods volume is mirrored to both hosts. The
+[USB volume relay](USB-CONTROL.md#stem-volume) in candidate 0.1.36 separates
+relative host keys from retained hardware gain; 0.1.34's relay failed Android
+software-volume synchronization. Fresh Pixel and Windows checks remain required.
 A host volume request remains
 an intent until the AirPods confirm it; temporary AVRCP busy states retain the
 latest request. A controls-only connection or input switch does not replay a

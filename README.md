@@ -12,7 +12,14 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.34** addresses USB stem-volume synchronization.
+Development candidate **0.1.36** keeps USB resampling continuous across short
+input, corrects USB stem-volume ownership, and renews the phone-call retry budget
+when its authenticated phone returns. These changes need fresh hardware checks;
+they are not a claim that every reported Game Mode crackle is resolved.
+Version **0.1.35** adds manual volume-path diagnostics.
+The **0.1.34** USB stem-volume relay passed offline checks but did not synchronize
+the Pixel's volume in its live test. The earlier Windows UAC synchronization
+worked; preserve that path while investigating Android's software-volume behavior.
 Version **0.1.33** adds an HFP phone-call bridge with CVSD
 voice audio, retaining **0.1.32**'s 90 ms phone jitter reserve and new
 arrival/delivery timing counters. Bluetooth calls and the phone jitter reserve

@@ -142,6 +142,10 @@
    return atomic_load_explicit(&volume_set_generation, memory_order_acquire);
  }
 
+ uint32_t usb_volume_set_receipt(void) {
+   return atomic_load_explicit(&volume_set_receipt, memory_order_acquire);
+ }
+
  // Buffer for speaker data
  // One receive callback carries at most one descriptor-sized USB packet.
  static union {
