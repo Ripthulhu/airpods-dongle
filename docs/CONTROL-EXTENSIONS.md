@@ -152,8 +152,13 @@ configuration, not an acoustic quality or latency measurement.
 
 ## Game Mode
 
-Game Mode is requested by default at boot. It does not require a companion
-command, and a session override is reset at the next power cycle.
+From 0.1.39, Game Mode starts off at boot. Double-press BOOTSEL or use typed
+feature 4 to enable it. The runtime choice survives same-peer reconnects and
+resets to normal mode at the next power cycle; a companion is not required.
+For a supported, owned output, normal startup also requests a fresh 150 ms
+preparation once per control/ownership epoch. This clears a low-buffer setting
+left by an earlier host or boot. Admission and receipt are bounded; unsupported
+headsets and standby dongles do not receive this write.
 
 The current gate requires a recognized Pro 3, firmware major at least 8,
 negotiated AAC-ELD and that endpoint's advertised delay-reporting support.
@@ -173,6 +178,13 @@ and requests restoration rather than claiming completion. Pauses, microphone
 use, peer/session changes and transport stops cancel the temporary rate.
 Gaming ELD packets hold at most two access units, versus three normally.
 The phone input still prepares while suspended; its live clock is separate.
+Candidate 0.1.39 also verifies a prepared USB target after the 100 ms startup
+prime has been sent. The pre-Start delay can prepare the transport, but cannot
+describe its post-prime fill. An unmet USB verification uses one fresh request
+and the existing successful-send, fresh-report and finite live-adjustment path.
+It does not reuse the pre-Start report or poll continuously. Peer/session,
+ownership and input changes invalidate old proof. An ordinary live request can
+satisfy the verification; completed verification does not repeat on a warm pause.
 Resume waits for the preparation's report or bounded failure. Ordinary pauses
 retain the target; microphone use or disable restores 150 ms. A same-pair AACP
 reconnect retains the restore obligation. Missing confirmations time out rather
@@ -347,7 +359,7 @@ Double-pressing BOOTSEL now requests the opposite Game Mode through the same
 live control path as typed feature 4. On acceptance, enabling displays two finite
 LED pulses; disabling displays three seconds off, then restores the underlying
 connected/off state. It does not block the audio worker or write pairing flash.
-Game Mode continues to default on at power-up.
+From 0.1.39, power-up starts in normal mode; a double press enables Game Mode.
 
 Typed feature 14 takes two bytes, 14 and enabled (0/1), and returns no payload.
 Detailed inspection starts disabled. Enable/renew grants a 120-second capture

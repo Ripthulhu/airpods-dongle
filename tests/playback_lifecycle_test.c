@@ -5,6 +5,10 @@
 #include "../src/btstack/playback_options.h"
 #include "../src/btstack/playback_adjust.h"
 static playback_adjust_t playback_adjust;
+static playback_usb_verification_t usb_game_verification;
+static void playback_usb_verify_cancel(void) {memset(&usb_game_verification,0,sizeof(usb_game_verification));}
+static bool playback_usb_verify_poll(uint32_t time) {(void)time;return false;}
+static void playback_usb_verify_sent(void) {}
 #include "../src/tinyusb/dongle_protocol.h"
 
 #define ERROR_CODE_SUCCESS 0
@@ -78,7 +82,7 @@ static int avdtp_source_connect(uint8_t *peer, uint16_t *cid) {
     ++connects; memcpy(connected_address, peer, 6); *cid = 20; return 0;
 }
 static void a2dp_demo_timer_stop(void *p) { (void)p; media_tracker.streaming = false; }
-static void aacp_disconnect(void) {}
+static void aacp_disconnect(void) {game_ready=false;}
 static void aacp_mic_recovery_failed(void) {}
 static uint32_t aacp_control_session(void) { return control_session; }
 static uint32_t aacp_receive_buffer_serial(void) { return buffer_serial; }
@@ -182,6 +186,7 @@ static void game_receipts_follow_actual_send(void) {
     for (unsigned synchronous=0; synchronous<2; ++synchronous) {
         playback_game=(playback_game_t){0};
         profile_pending=profile_reconnect=a2dp_connect_pending=false;
+        a2dp_is_connected_flag=true;
         game_ready=game_eligible=is_usb_streaming=true; media_tracker.streaming=false;
         memcpy(game_peer,address,6); game_session=1;
         buffer_serial=delay_revision=0; reported_delay=1500; buffer_result=0;
@@ -265,14 +270,19 @@ static void saved_pair_reconnects_with_backoff(void) {
     }
 }
 
-static void standalone_boot_connects_and_enables_game(void) {
-    assert(a2dp_accept_incoming && playback_game.requested && playback_game.phase==GAME_PENDING);
+static void standalone_boot_connects_in_normal_mode(void) {
+    assert(a2dp_accept_incoming && !playback_game.requested && playback_game.phase==GAME_OFF);
     address[0]=1; now=1000;
     dongle_playback_poll();
     assert(connects==1 && a2dp_connect_pending);
     a2dp_is_connected_flag=game_ready=game_eligible=send_synchronously=true;
     a2dp_connect_pending=false; now+=1000;
     dongle_playback_poll();
+    assert(!playback_game.requested && playback_game.waiting_report && buffer_target==150);
+    ++delay_revision;reported_delay=1500;++now;dongle_playback_poll();
+    assert(!playback_game.changed && !playback_game.waiting_report && playback_game.phase==GAME_OFF);
+    assert(dongle_playback_game_mode(true)==DONGLE_ACCEPTED);
+    now+=500;dongle_playback_poll();
     assert(playback_game.waiting_report && buffer_target==60);
     ++delay_revision; reported_delay=600; ++now; dongle_playback_poll();
     assert(playback_game.phase==GAME_CONFIRMED);
@@ -417,7 +427,7 @@ static void microphone_prepares_normal_buffer_and_binds_repair(bool call) {
 }
 
 int main(void) {
-    standalone_boot_connects_and_enables_game();
+    standalone_boot_connects_in_normal_mode();
     profile_then_pair(true, true);
     profile_then_pair(false, true);
     profile_then_pair(true, false);

@@ -165,6 +165,30 @@ def playback_volume_sources(directory):
     (directory/"playback_volume.inc").write_text(state+"\n"+source[start:end])
 
 
+def usb_game_verification_sources(directory):
+    source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    functions=[]
+    for signature in ["static void playback_media_sent(void)", "static bool playback_usb_verify_scope(",
+                      "static void playback_usb_verify_cancel(", "static void playback_usb_verify_started(",
+                      "static bool playback_usb_verify_poll(", "static void playback_usb_verify_sent("]:
+        match=re.search(r"(?m)^"+re.escape(signature)+r"[^;]*?\{",source)
+        if match is None:
+            raise ValueError("Missing USB verification function: "+signature)
+        start=match.start()
+        end=source.index("\n}",start)+2
+        functions.append(source[start:end])
+    start=source.index("    // USB/Game Mode receive-buffer policy")
+    end=source.index("    playback_idle_poll(now);",start)+len("    playback_idle_poll(now);")
+    # Keep the actual pre-worker invalidation, not a test-only policy substitute.
+    begin=source.index("void dongle_playback_poll(void)")
+    gate=source.index("    (void)playback_usb_verify_poll(now);",begin)
+    gate_end=source.index("\n",gate)
+    functions.append("static void production_game_poll(void) {\n"
+                     "    uint32_t now=btstack_run_loop_get_time_ms();\n"+
+                     source[gate:gate_end]+"\n"+source[start:end]+"\n}\n")
+    (directory/"usb_game_verification.inc").write_text("\n".join(functions))
+
+
 def main_button_sources(directory):
     source = (ROOT / "src/main.c").read_text(encoding="utf-8")
     start=source.index("// Keep Bluetooth actions in thread context")
@@ -230,6 +254,7 @@ def main():
         "playback_float": ["tests/playback_float_test.c", "-lm"],
         "playback_pipeline": ["-Wno-unused-function", "tests/playback_pipeline_test.c"],
         "playback_idle": ["tests/playback_idle_test.c"],
+        "usb_game_verification": ["tests/usb_game_verification_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],
         "aacp_routing": ["tests/aacp_routing_test.c"],
         "dongle_settings": ["tests/dongle_settings_test.c"],
@@ -261,6 +286,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:
         playback_lifecycle_sources(pathlib.Path(tmp))
         playback_volume_sources(pathlib.Path(tmp))
+        usb_game_verification_sources(pathlib.Path(tmp))
         uac_sources(pathlib.Path(tmp))
         main_button_sources(pathlib.Path(tmp))
         for name, sources in tests.items():

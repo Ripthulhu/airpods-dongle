@@ -516,3 +516,42 @@ stayed fixed. The phone volume button changed both the index and USB hardware
 volume. USB AudioControl readback alone therefore does not provide Android UI
 synchronization. Keep audio buffering, clock adaptation and packet pacing
 unchanged while correcting the control path.
+
+## 0.1.38 PC hitch investigation and 0.1.39 candidate
+
+After successful two-dongle handoff and short stereo/volume checks, the listener
+reported PC hitches. Removing the standby dongle made no clear difference.
+NTPods' native Bluetooth state was disconnected, and fixed volume counters
+excluded ongoing gain writes during the observed steady playback. Closing the
+companion helped somewhat by the listener's report, but did not remove the issue.
+
+The companion-closed 31.27-second float-alt-2 sample received 1,500,912 USB frames
+and encoded 3,126 AAC-ELD units. It added no active discard, zero-fill, short read,
+bad packet, scheduling-debt discard, recovery or controller flush. One recovery
+and its discarded samples predated that interval; lifetime counters were not
+zero. A simultaneous later Windows loopback sample had no non-startup
+discontinuity, timestamp error, position gap, zero or nonfinite sample. These
+observations do not prove deadline delivery over the air.
+
+Game Mode off was clean; switching it back on also remained clean. The off/on
+retune cleared the current state, so this does not establish that the 60 ms
+target itself is unreliable. Both mode captures kept continuous source cadence.
+The displayed 92/69/165 ms reports were pre-adjustment estimates; they are not
+measurements of the final receiver buffer.
+
+Production ordering exposes a missed adjustment: ownership gating leaves the
+transport stopped while Game Mode obtains its initial fresh delay report. That
+report permits Start, but USB's live adjustment is unavailable until the 100 ms
+prime has been sent. Once priming completes, the consumed report and confirmed
+mode prevent a new adjustment. Candidate 0.1.39 adds a bounded post-priming USB
+verification through the existing send/report/live-adjustment path. Its hardware
+effect on hitches remains to be tested; codec, bitrate, packet grouping and target
+latency are unchanged.
+Game Mode now starts off by user request. A supported owned output receives a
+fresh normal-buffer preparation, so a prior low-buffer setting is not mistaken
+for the new default merely because the preference flag is off.
+
+Local evidence: `pc-hitch-ipc-20261028-182002.json`,
+`pc-hitch-hid-20261028-182427.json`, `pc-hitch-hid-20261028-182745.json`,
+`pc-hitch-hid-20261028-183546.json`, and
+`pc-hitch-loopback-game-on.log` in the bring-up artifact directory.

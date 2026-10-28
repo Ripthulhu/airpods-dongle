@@ -50,7 +50,15 @@ static bool audio_owned=true, call_in_progress;
 static bool aacp_audio_owned(void) {return audio_owned;}
 static bool phone_call_active(void) {return call_in_progress;}
 static unsigned buffer_cancels, usb_pauses, phone_pauses;
-static void aacp_receive_buffer_cancel(void) {++buffer_cancels;}
+#ifdef USB_GAME_VERIFICATION_TEST
+static void verification_test_buffer_cancel(void);
+#endif
+static void aacp_receive_buffer_cancel(void) {
+    ++buffer_cancels;
+#ifdef USB_GAME_VERIFICATION_TEST
+    verification_test_buffer_cancel();
+#endif
+}
 #define USB_MEDIA_PAUSE 1
 #define AVRCP_OPERATION_ID_PAUSE 0x46
 static bool usb_media_enqueue(unsigned command) {assert(command==USB_MEDIA_PAUSE);++usb_pauses;return true;}
@@ -87,6 +95,17 @@ typedef struct {
     btstack_timer_source_t audio_timer;
 } a2dp_media_sending_context_t;
 static a2dp_media_sending_context_t media_tracker;
+#ifdef USB_GAME_VERIFICATION_TEST
+static playback_usb_verification_t usb_game_verification;
+static bool playback_usb_verify_scope(bool activity);
+static void playback_usb_verify_cancel(void);
+static void playback_usb_verify_started(a2dp_media_sending_context_t *context);
+static bool playback_usb_verify_poll(uint32_t time);
+static void playback_usb_verify_sent(void);
+#else
+static void playback_usb_verify_cancel(void) {}
+static void playback_usb_verify_started(a2dp_media_sending_context_t *context) {(void)context;}
+#endif
 static void critical_section_enter_blocking(void *p) { (void)p; }
 static void critical_section_exit(void *p) { (void)p; }
 static uint32_t btstack_run_loop_get_time_ms(void) {return now;}
@@ -447,4 +466,5 @@ int main(void) {
     playback_idle_poll(++now); assert(!starts);
     fixture(); now = UINT32_MAX - 500; suspend_idle(); assert(!closes);
     puts("idle playback: confirmed suspend/start, onset priming, preparation/mic fences, timeouts and stale accepts passed");
+    return 0; // Also compiled under a renamed entry point by the USB verification suite.
 }

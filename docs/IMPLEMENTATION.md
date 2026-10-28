@@ -238,7 +238,8 @@ revoke an open window. Previously an idle transition could silently close the
 window early, leading to an ACL security rejection that Android reports as an
 incorrect PIN even though no PIN exchange occurred.
 
-Boot enables saved-peer connection intent and requests Game Mode by default;
+Boot enables saved-peer connection intent and starts in normal mode. Double-press
+BOOTSEL to enable Game Mode;
 the firmware poller runs without a HID or companion client. Existing model,
 firmware, codec and delay-report gates still apply. Unsupported headsets retain
 normal audio. Pairing cancellation still disarms retries for the old peer.

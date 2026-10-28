@@ -56,6 +56,35 @@ static void test_game_confirmation_and_restore(void) {
     playback_game_request(&s,false);
     assert(playback_game_step(&s,true,true,true,1302,14,600)==150);
 }
+static void test_normal_boot_preparation(void) {
+    playback_game_t s={.requested=false,.phase=GAME_OFF};
+    assert(!playback_game_step(&s,false,true,true,0,0,600)); // No authority/readiness.
+    assert(!playback_game_step(&s,true,false,true,0,0,600)); // Unsupported peer.
+    assert(playback_game_step(&s,true,true,true,100,0,600)==150);
+    assert(!s.changed && s.target==0 && s.phase==GAME_RESTORING); // No invented old60.
+    playback_game_queued(&s,150,100,7);
+    assert(!playback_game_step(&s,true,true,true,101,1,1500) && s.waiting_tx);
+    playback_game_observe_send(&s,102,8,150,1);
+    assert(!playback_game_step(&s,true,true,true,103,1,1500) && s.waiting_report);
+    assert(!playback_game_step(&s,true,true,true,104,2,1500) && !s.changed && s.phase==GAME_OFF);
+    for(unsigned i=0;i<100;++i)assert(!playback_game_step(&s,true,true,true,200+i,2,1500));
+    playback_game_session_lost(&s);assert(s.target==0 && !s.requested);
+    assert(playback_game_step(&s,true,true,true,400,2,1500)==150);
+    // Busy before enqueue is bounded too, rather than retrying forever.
+    s=(playback_game_t){0};
+    assert(playback_game_step(&s,true,true,true,UINT32_MAX-999,0,600)==150);
+    assert(playback_game_step(&s,true,true,true,999,0,600)==150);
+    assert(!playback_game_step(&s,true,true,true,1000,0,600) && s.failed && s.restore_failed);
+    for(unsigned i=0;i<100;++i)assert(!playback_game_step(&s,true,true,true,2000+i,1,1500));
+    s=(playback_game_t){0};
+    assert(playback_game_step(&s,true,true,true,0,0,600)==150);
+    playback_game_queued(&s,150,0,0);playback_game_observe_send(&s,1,1,150,0);
+    assert(!playback_game_step(&s,true,true,true,2001,0,1500) && s.restore_failed);
+    playback_game_request(&s,true);
+    assert(s.requested && playback_game_step(&s,true,true,true,2002,0,1500)==150);
+    playback_game_queued(&s,150,2002,1);playback_game_observe_send(&s,2003,2,150,0);
+    assert(playback_game_step(&s,true,true,true,2004,1,1500)==60 && !s.changed && s.requested);
+}
 static void test_catalog_preflight(void) {
     playback_options_t automatic={0,0,0}, aac={2,0,220000}, eld={3,1,174000};
     // Unknown/partial catalogs never turn the absence of a matching entry into
@@ -104,5 +133,6 @@ static void test_game_faults_wrap_and_session_loss(void) {
 }
 int main(void) {
     test_profiles(); test_catalog_preflight(); test_game_confirmation_and_restore(); test_game_faults_wrap_and_session_loss();
+    test_normal_boot_preparation();
     puts("playback options: explicit codec/rate bounds, VBR negotiation, fresh Game Mode reports and restoration passed");
 }

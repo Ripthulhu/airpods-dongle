@@ -12,11 +12,24 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Development candidate **0.1.38** removes the unsuccessful extra AVRCP volume
+Development candidate **0.1.39** verifies USB Game Mode timing after startup
+priming and starts in normal mode; double-press BOOTSEL to enable Game Mode.
+Version **0.1.38** can confirm the receiver-buffer preparation before
+Start, then miss the live timing adjustment after its 100 ms priming. A PC hitch
+investigation found continuous host/USB/encoder data and clean playback after a
+manual off/on retune. That supports correcting the missed adjustment; hardware
+validation of the candidate remains pending. The 60 ms target and packet grouping
+are unchanged.
+
+Version **0.1.38** removes the unsuccessful extra AVRCP volume
 refresh, restores a short settling delay, and adds AACP audio ownership and a
 paired BOOTSEL single-press takeover request. It also allows a fresh USB playback
 start to restart a peer-suspended stream while this dongle owns audio. These
-changes require hardware acceptance. **0.1.37** failed: initial playback was
+changes passed short Pixel and Windows stereo/relative-volume checks. Single-press
+takeover passed in both directions without reconnect sounds, and genuine float32
+USB input was verified. Android's premature maximum-volume cues remain unresolved;
+the software slider and physical gain do not yet share one absolute authority.
+Extended playback and call acceptance remain open. **0.1.37** failed: initial playback was
 silent until case-return reconnect, then a stem swipe disturbed left/right
 balance and failed to synchronize the phone. **0.1.36** also failed its volume
 check: phone and stem volume could diverge, with an audible second gain step.
@@ -45,8 +58,8 @@ Android/Symfonium checks remain open.
 
 Standalone Windows and Pixel USB playback, stem pause/resume and saved-pair/
 case-return reconnect have been exercised with Pro 3 firmware 9A348. Game Mode
-defaults on, and a prior visual/listening test measured approximately 60 ms total
-speaker latency. With a saved AirPods pair, a single BOOTSEL press requests audio
+starts off at power-up. A prior visual/listening test with it enabled measured
+approximately 60 ms total speaker latency. With a saved AirPods pair, a single BOOTSEL press requests audio
 takeover; without one, it starts discovery. Double-pressing BOOTSEL toggles Game Mode: two LED pulses on enable,
 three seconds dark on disable. Live switching retains the accepted brief pitch
 change while latency adjusts. Pixel Bluetooth pairing and LHDC playback work,

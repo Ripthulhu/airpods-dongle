@@ -64,13 +64,24 @@ typedef struct {
     uint16_t target;
     uint32_t active_since, sent_since, tx_revision, report_revision;
 } playback_game_t;
+// One post-priming USB check; TX/report/adjustment remain in playback_game_t.
+typedef struct {
+    uint32_t session, usb_revision, tx_revision, since;
+    uint16_t cid;
+    uint8_t seid, peer[6];
+    bool needed, queued, unverified;
+} playback_usb_verification_t;
 static inline void playback_game_request(playback_game_t *s, bool enabled) {
     if (s->requested==enabled) {
         if (!enabled && s->restore_failed) { s->restore_failed=false; s->waiting_tx=s->waiting_report=false; }
         return;
     }
     s->requested=enabled;
-    if (enabled) { s->failed=s->restore_failed=false; }
+    if (enabled) {
+        bool retry_restore=s->restore_failed && s->changed;
+        s->failed=s->restore_failed=false;
+        if (retry_restore) { s->waiting_tx=s->waiting_report=false; s->phase=GAME_RESTORING; }
+    }
     else if (s->restore_failed) { s->restore_failed=false; s->waiting_tx=s->waiting_report=false; }
     if (!s->changed) s->phase=enabled ? GAME_PENDING : GAME_OFF;
 }
@@ -91,6 +102,7 @@ static inline void playback_game_observe_send(playback_game_t *s, uint32_t now,
 static inline void playback_game_session_lost(playback_game_t *s) {
     s->waiting_tx=s->waiting_report=false;
     if (s->changed) s->phase=GAME_RESTORING;
+    else { s->target=0; s->phase=s->requested ? GAME_PENDING : GAME_OFF; }
 }
 // Returns a bounded 60/150-ms command; transport acceptance is recorded separately.
 static inline uint16_t playback_game_step(playback_game_t *s, bool available,
@@ -117,7 +129,17 @@ static inline uint16_t playback_game_step(playback_game_t *s, bool available,
         return available && !s->waiting_tx && !s->waiting_report ? 150 : 0;
     }
     if (s->changed || s->waiting_tx || s->waiting_report || s->failed) return 0;
-    if (!s->requested) { s->phase=GAME_OFF; return 0; }
+    if (!s->requested) {
+        if (s->target==0 && available && eligible && active) {
+            // Establish normal buffering once per fresh control epoch; no fake prior60.
+            if (s->phase!=GAME_RESTORING) { s->phase=GAME_RESTORING; s->sent_since=now; }
+            if ((uint32_t)(now-s->sent_since)>=2000u) {
+                s->failed=s->restore_failed=true; s->phase=GAME_FAILED; return 0;
+            }
+            return 150;
+        }
+        s->phase=GAME_OFF; return 0;
+    }
     if (!eligible) { s->phase=GAME_UNSUPPORTED; return 0; }
     s->phase=GAME_PENDING;
     return available && active && (uint32_t)(now-s->active_since)>=500 ? 60 : 0;

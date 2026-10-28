@@ -199,7 +199,8 @@ static btstack_resample_t phone_resampler;
 static void playback_media_sent(void);
 static uint8_t cur_codec = 0;
 static playback_options_t playback_options;
-static playback_game_t playback_game = {.requested = true, .phase = GAME_PENDING};
+static playback_game_t playback_game = {.requested = false, .phase = GAME_OFF};
+static playback_usb_verification_t usb_game_verification;
 static playback_adjust_t playback_adjust;
 static playback_usb_clock_t usb_clock={.fill_q8=PLAYBACK_USB_RESERVE*256,.rate_q16=65536};
 static playback_trace_t playback_trace={.stats={[TRACE_PCM_MIN]=UINT32_MAX}};
@@ -507,6 +508,125 @@ static bool playback_pcm_warm(void) {
     bool warm = playback_pcm.primed_on_wire;
     critical_section_exit(&playback_pcm_lock);
     return warm;
+}
+static bool playback_usb_verify_scope(bool activity) {
+    const uint8_t *peer = (const uint8_t *)get_device_addr();
+    bool valid = cur_codec == 4 && a2dp_is_connected_flag && media_tracker.streaming &&
+        playback_idle_phase == PLAYBACK_RUNNING && !profile_pending && !a2dp_connect_pending &&
+        !phone_opened && !phone_active && !call_opened && !call_active &&
+        !aacp_mic_requested() && !aacp_mic_active() && aacp_audio_owned() && aacp_control_ready() &&
+        playback_game.requested && playback_game.target == 60 && !playback_game.failed &&
+        !playback_game.restore_failed && usb_game_verification.session == aacp_control_session() &&
+        usb_game_verification.cid == media_tracker.avdtp_cid &&
+        usb_game_verification.seid == media_tracker.local_seid && peer &&
+        !memcmp(peer, usb_game_verification.peer, 6) && !memcmp(cur_active_device, peer, 6);
+    if (!valid || !activity) return valid;
+    critical_section_enter_blocking(&playback_pcm_lock);
+    valid = is_usb_streaming && usb_game_verification.usb_revision == usb_playback_revision;
+    critical_section_exit(&playback_pcm_lock);
+    return valid;
+}
+static void playback_usb_verify_cancel(void) {
+    if (usb_game_verification.queued && usb_game_verification.session == aacp_control_session() &&
+        usb_game_verification.cid == media_tracker.avdtp_cid && playback_game.target == 60 &&
+        playback_game.tx_revision == usb_game_verification.tx_revision) {
+        if (playback_game.waiting_tx) aacp_receive_buffer_cancel();
+        playback_game.waiting_tx = playback_game.waiting_report = false;
+        playback_game.phase = playback_game.requested ? GAME_CONFIRMED : GAME_RESTORING;
+        playback_adjust_cancel_stream(&media_tracker, btstack_run_loop_get_time_ms(),
+                                      playback_adjust_interval(&playback_adjust));
+    }
+    usb_game_verification.needed = usb_game_verification.queued = usb_game_verification.unverified = false;
+}
+static void playback_usb_verify_started(a2dp_media_sending_context_t *context) {
+    playback_usb_verify_cancel();
+    if (!playback_game.requested || !playback_game.changed || playback_game.target != 60 ||
+        playback_game.failed || playback_game.restore_failed ||
+        (playback_game.phase != GAME_CONFIRMED && !playback_game.waiting_tx && !playback_game.waiting_report))
+        return;
+    usb_game_verification.unverified = true;
+    usb_game_verification.session = aacp_control_session();
+    usb_game_verification.cid = context->avdtp_cid;
+    usb_game_verification.seid = context->local_seid;
+    memcpy(usb_game_verification.peer, cur_active_device, 6);
+    if (!is_usb_streaming || phone_opened || phone_active || call_opened || call_active) return;
+    critical_section_enter_blocking(&playback_pcm_lock);
+    usb_game_verification.usb_revision = usb_playback_revision;
+    critical_section_exit(&playback_pcm_lock);
+    usb_game_verification.since = btstack_run_loop_get_time_ms();
+    usb_game_verification.needed = true;
+}
+static bool playback_usb_verify_poll(uint32_t now) {
+    if (!usb_game_verification.needed && !usb_game_verification.queued) {
+        if (usb_game_verification.unverified &&
+            (usb_game_verification.session != aacp_control_session() ||
+             usb_game_verification.cid != media_tracker.avdtp_cid ||
+             memcmp(usb_game_verification.peer, cur_active_device, 6))) {
+            playback_usb_verify_cancel();
+            return false;
+        }
+        // A warm phone-to-USB handoff need not produce a new AVDTP Start.
+        if (usb_game_verification.unverified && is_usb_streaming && !phone_opened && !phone_active &&
+            !call_opened && !call_active && media_tracker.streaming &&
+            (playback_game.phase == GAME_CONFIRMED || playback_game.waiting_tx || playback_game.waiting_report))
+            playback_usb_verify_started(&media_tracker);
+        if (!usb_game_verification.needed) return false;
+    }
+    if (usb_game_verification.queued && !playback_game.waiting_tx && !playback_game.waiting_report &&
+        !playback_adjust_busy(&playback_adjust) && playback_game.phase == GAME_CONFIRMED &&
+        playback_usb_verify_scope(false)) {
+        usb_game_verification.queued = false;
+        usb_game_verification.unverified = false;
+        return false;
+    }
+    if (!playback_usb_verify_scope(false)) {
+        bool external = (phone_opened || phone_active || call_opened || call_active) &&
+            playback_game.requested && playback_game.changed && playback_game.target == 60 &&
+            !playback_game.failed && aacp_audio_owned();
+        playback_usb_verify_cancel();
+        usb_game_verification.unverified = external;
+        return false;
+    }
+    if (!playback_usb_verify_scope(true)) {
+        // Preserve an unfinished need across USB pause/resume, never its old queued proof.
+        playback_usb_verify_cancel();
+        usb_game_verification.needed = usb_game_verification.unverified = true;
+        critical_section_enter_blocking(&playback_pcm_lock);
+        usb_game_verification.usb_revision = usb_playback_revision;
+        bool active = is_usb_streaming;
+        critical_section_exit(&playback_pcm_lock);
+        usb_game_verification.since = now;
+        if (!active) return false;
+    }
+    if (!usb_game_verification.needed) return false;
+    if ((uint32_t)(now - usb_game_verification.since) >= 2000u) {
+        usb_game_verification.needed = usb_game_verification.unverified = false;
+        return false;
+    }
+    return playback_pcm_warm() && !playback_game.waiting_tx && !playback_game.waiting_report &&
+        !playback_adjust_busy(&playback_adjust);
+}
+static void playback_usb_verify_sent(void) {
+    if (aacp_receive_buffer_last() != 60) {
+        if (aacp_receive_buffer_last() == 150) playback_usb_verify_cancel();
+        return;
+    }
+    bool live = is_usb_streaming && !phone_opened && !phone_active && !call_opened && !call_active &&
+        media_tracker.streaming && playback_pcm_warm() && !aacp_mic_requested() && !aacp_mic_active();
+    if (!live) {
+        usb_game_verification.unverified = true;
+        usb_game_verification.session = aacp_control_session();
+        usb_game_verification.cid = media_tracker.avdtp_cid;
+        usb_game_verification.seid = media_tracker.local_seid;
+        memcpy(usb_game_verification.peer, cur_active_device, 6);
+        return;
+    }
+    if (usb_game_verification.needed || usb_game_verification.queued) {
+        if (!playback_usb_verify_scope(true)) { (void)playback_usb_verify_poll(btstack_run_loop_get_time_ms()); return; }
+        usb_game_verification.needed = false;
+        usb_game_verification.queued = true;
+        usb_game_verification.tx_revision = playback_game.tx_revision;
+    } else usb_game_verification.unverified = false; // Ordinary live ON already does this check.
 }
 static void playback_pcm_push_measured(const int16_t *src, uint32_t frames) {
     if (playback_pcm.capacity && src && frames) {
@@ -1679,6 +1799,7 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
     context->codec_storage_count = 0;
     context->codec_ready_to_send = 0;
     context->streaming = 1;
+    playback_usb_verify_started(context);
     media_last_sent_us=packet_oldest_us=0;
     btstack_run_loop_remove_timer(&context->audio_timer);
     btstack_run_loop_set_timer_handler(&context->audio_timer, avdtp_audio_timeout_handler);
@@ -1689,6 +1810,7 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
 }
 
 static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){
+    playback_usb_verify_cancel();
     phone_output_recovery = false;
     playback_transport_stale=false;
     playback_adjust_cancel(&playback_adjust);
@@ -1736,9 +1858,11 @@ static void playback_idle_poll(uint32_t now) {
     bool wanted = is_usb_streaming || phone_opened || phone_active || call_opened || call_active || aacp_mic_requested() || aacp_mic_active();
     if (playback_idle_phase == PLAYBACK_SUSPENDED) {
         if (!wanted) return;
-        if (playback_game.requested && playback_game_eligible() &&
-            !aacp_mic_requested() && !aacp_mic_active() && !playback_game.failed &&
-            playback_game.phase != GAME_CONFIRMED) return;
+        if (playback_game_eligible() && !aacp_mic_requested() && !aacp_mic_active() && !playback_game.failed) {
+            if (playback_game.requested && playback_game.phase != GAME_CONFIRMED) return;
+            if (!playback_game.requested && (playback_game.target != 150 || playback_game.changed ||
+                playback_game.waiting_tx || playback_game.waiting_report)) return;
+        }
         playback_idle_phase = PLAYBACK_STARTING;
         playback_idle_transition_since = now;
         if ((cur_codec == 4 && !aaceld_encoder_init()) ||
@@ -3035,6 +3159,7 @@ void dongle_playback_mic_recovery_abort(void) {
 
 uint8_t dongle_playback_game_mode(bool enabled) {
     if (enabled && !playback_game_eligible()) return DONGLE_UNSUPPORTED;
+    if (playback_game.requested != enabled) playback_usb_verify_cancel();
     if (playback_game.requested != enabled)
         playback_adjust_cancel_stream(&media_tracker,btstack_run_loop_get_time_ms(),
                                       playback_adjust_interval(&playback_adjust));
@@ -3051,6 +3176,7 @@ void dongle_playback_receive_buffer_sent(uint32_t now) {
     printf("[GAME] receive buffer sent: %u ms\n", aacp_receive_buffer_last());
     playback_game_observe_send(&playback_game, now, aacp_receive_buffer_serial(),
                               aacp_receive_buffer_last(), delay_revision);
+    playback_usb_verify_sent();
 }
 static void playback_reconnect_poll(uint32_t now) {
     const uint8_t *peer = (const uint8_t *)get_device_addr();
@@ -3068,6 +3194,7 @@ static void playback_reconnect_poll(uint32_t now) {
 void dongle_playback_poll(void) {
     const uint8_t *peer=(const uint8_t *)get_device_addr();
     uint32_t now=btstack_run_loop_get_time_ms();
+    (void)playback_usb_verify_poll(now); // Revoke a stale verification before worker callbacks.
     if(inspect_enabled && (int32_t)(now-inspect_deadline)>=0)inspect_enabled=false;
     playback_audio_work(now);
     if (playback_phone_recovery_poll()) return;
@@ -3120,6 +3247,7 @@ void dongle_playback_poll(void) {
         playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
         playback_game_session_lost(&playback_game); game_session=session;
     }
+    // USB/Game Mode receive-buffer policy; suspended preparation remains unchanged.
     bool live=is_usb_streaming && !phone_active && !call_active && media_tracker.streaming && playback_pcm_warm() &&
         playback_game_eligible() && aacp_control_ready() && !aacp_mic_requested() && !aacp_mic_active();
     if (!live) playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
@@ -3129,14 +3257,18 @@ void dongle_playback_poll(void) {
         playback_adjust_cancel_stream(&media_tracker,now,previous_interval);
         playback_game.failed=true;
     }
-    if (live && playback_game.waiting_report &&
+    if (live && !usb_game_verification.needed && playback_game.waiting_report &&
         (uint32_t)(now-playback_game.sent_since)<2000 &&
         delay_revision!=playback_game.report_revision && reported_delay && reported_delay!=UINT16_MAX)
         playback_adjust_request(&playback_adjust,reported_delay,playback_game.target);
     // USB can adjust live; a phone source still prepares while suspended.
     bool active=!aacp_mic_requested() && !aacp_mic_active() &&
         (!media_tracker.streaming || playback_game.changed || live);
-    uint16_t target=playback_game_step(&playback_game,aacp_control_ready() && aacp_audio_owned(),playback_game_eligible(),active,now,delay_revision,reported_delay);
+    bool available=!profile_pending && !a2dp_connect_pending &&
+        aacp_control_ready() && aacp_audio_owned();
+    uint16_t target=playback_game_step(&playback_game,available,playback_game_eligible(),active,now,delay_revision,reported_delay);
+    bool verify_usb = playback_usb_verify_poll(now);
+    if (!target && verify_usb) target = 60;
     // A capture opened before Game Mode ever ran still needs a fresh normal-buffer receipt.
     if (mic_prepare_open && playback_game_eligible() && aacp_control_ready() &&
         !aacp_mic_uplink_active() && !playback_game.changed &&
@@ -3147,7 +3279,18 @@ void dongle_playback_poll(void) {
         playback_game_t previous=playback_game;
         // BTstack can send synchronously; arm the receipt before enqueueing.
         playback_game_queued(&playback_game,target,now,aacp_receive_buffer_serial());
-        if (aacp_receive_buffer(target)!=DONGLE_ACCEPTED) playback_game=previous;
+        if (verify_usb && target == 60) {
+            usb_game_verification.needed = false;
+            usb_game_verification.queued = true;
+            usb_game_verification.tx_revision = playback_game.tx_revision;
+        }
+        if (aacp_receive_buffer(target)!=DONGLE_ACCEPTED) {
+            playback_game=previous;
+            if (verify_usb && target == 60) {
+                usb_game_verification.needed = true;
+                usb_game_verification.queued = false;
+            }
+        }
     }
     if (playback_adjust_busy(&playback_adjust))
         playback_game.phase=playback_adjust.target==60 ? GAME_PENDING : GAME_RESTORING;
