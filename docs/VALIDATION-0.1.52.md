@@ -45,7 +45,39 @@ This is not an observer-off experiment. RSSI/link-quality reads updated in
 88/89 intervals, so two-second collection cannot separate their timing from
 faults. Controller-side observation overhead remains unmeasured.
 
-This corrects the demonstrated adaptation blind spot. It does not establish that
-reducing bitrate cures the audible problem. Test the same Game Mode passage,
-record actual bitrate decisions and source/radio counters, then repeat the
-outdoor phone-case test before claiming improved reliability.
+## Deployment and listening result
+
+Both the PC and Pixel-connected Picos received the same checked float-capable
+image. Full flash backups, firmware readback and byte-exact pairing-tail
+preservation passed. The phone itself was not rebooted and no companion APK was
+installed. [CI for the firmware commit also passed](https://github.com/Ripthulhu/airpods-dongle/actions/runs/40937984338).
+
+The PC Game Mode run lasted 180.313 seconds with 90 radio snapshots. Adaptation
+visited 256, 220, 192, 174 and 128 kbps; six changes completed with no encoder
+errors and without changing the selected AirPods ACL epoch. The final snapshot
+was 128 kbps. The user reported that, after about a minute at 128 kbps, the sound
+was still about as bad. This is a failed listening result, despite the policy
+now responding to recurring losses.
+
+| Measurement over the capture | Result |
+| --- | --- |
+| Active PCM discarded / zero-filled | 0 / 0 frames |
+| Discarded scheduling debt / timeline recoveries | 0 / 0 |
+| Malformed USB packets / short reads | 0 / 0 |
+| Selected-link controller flush events | 15 |
+| Maximum measured encoding unit | 6,150 microseconds |
+| Maximum send wait / send gap | 8,000 / 41,156 microseconds |
+
+The source used the genuine float USB alternative. Radio observations remained
+valid without query errors; the controller reported current and maximum transmit
+power of 12 dBm. Neither completed-packet credits nor a flush-event count proves
+exact receiver delivery or identifies the moment of an audible hitch. Clean
+source counters also do not exclude Bluetooth servicing delayed by encoding.
+
+Evidence is retained as `pc-game-radio-0.1.52.jsonl`,
+`pc-game-before-0.1.52.json`, `pc-game-after-0.1.52.json` and
+`pc-game-summary-0.1.52.json` under the local bring-up output directory and lab
+`reports/diagnostics-0.1.52/`. Game Mode was restored off afterward, confirmed
+with phase zero; no capture remains running. There is no new outdoor acceptance
+result. See [the upstream comparison](UPSTREAM-AUDIO-COMPARISON-2026-10-29.md)
+for the next discriminating tests.
