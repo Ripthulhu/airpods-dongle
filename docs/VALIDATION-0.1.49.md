@@ -42,5 +42,20 @@ Verified UF2:
 
 The original PC Pico was backed up, flashed and verified as 0.1.49. Its pairing
 storage matched byte for byte. Startup confirmed the normal 200 ms timeout with
-no pending or failed command. The phone Pico remains on 0.1.46. The controlled
-listening comparison is pending; this diagnostic is not a verified hitch fix.
+no pending or failed command. The phone Pico remains on 0.1.46.
+
+## Controlled comparison result
+
+The live 60/200/60 ms comparison completed on the same ACL, with each timeout
+controller-confirmed. The 60.25-second first interval recorded one Flush Occurred
+event; the 90.27-second 200 ms interval recorded none; the final 60.27-second
+interval recorded five. All three had zero active PCM drops, inserted silence,
+underflows, send failures and recoveries. The listener reported **clean throughout**.
+The previous reported hitch therefore did not reproduce in this short comparison.
+Controller discards alone cannot be equated with audible faults or exact packet
+loss. No host builds ran during the comparison.
+
+Cleanup cleared the diagnostic override and restored Game Mode off; a subsequent
+status read confirmed 200 ms, no pending/failing command, the same ACL, and the
+unchanged native gain of 103. The test collector is closed. This is useful
+transport evidence, not a verified hitch fix.

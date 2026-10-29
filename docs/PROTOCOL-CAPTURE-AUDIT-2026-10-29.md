@@ -19,6 +19,38 @@ Raw captures, hardware identifiers and private pairing records remain outside Gi
 
 ## Missing setup and feedback messages
 
+### Game Mode packet permissions
+
+The working native Game transition also changes the selected link's permitted
+ACL packet types. In `20261014T210429Z-75985976`, frame 2720 sends HCI opcode
+`040F` with mask `EE1C`; Command Status 2725 succeeds and Packet Type Changed
+2729 confirms it. On exit, frames 6934/6941/6944 restore `CC18` successfully.
+Game entry is 14.538 ms after the AACP 60 ms target request, with confirmation
+at 20.564 ms and the first two-AU packet at 22.691 ms. A second capture,
+`20261014T204519Z-28986bc6`, repeats `EE1C` with successful confirmation at
+frames 7177/7179/7183, while media is suspended.
+
+The wire difference `2204` prohibits 3-DH1, 3-DH3 and 3-DH5; EDR packet-mask
+bits have negative polarity. The SDK's positive internal EDR3 flags and wire
+conversion (`XOR 3306`) confirm that interpretation. This permits 2-Mbit/s EDR
+while retaining the other original permissions. It does not identify the actual
+baseband packet chosen by the controller. See the Bluetooth Core
+[HCI specification](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core_v6.3/out/en/host-controller-interface/host-controller-interface-functional-specification.html).
+
+Through 0.1.49, the Pico application does not issue this per-link Game Mode
+change. Its full-capability SDK default would produce `CC18`, but the current
+Pico mask has not been measured; do not present that source-derived expectation
+as a captured value. The next comparison should confirm the changed mask on the
+selected AirPods handle while holding timeout, bitrate, packet grouping and
+PCM policy fixed. Phone ACLs must retain their own policy.
+
+The 0.1.49 timeout-only comparison was acoustically clean at both timeouts despite
+one/five discard events in the two 60 ms intervals and none at 200 ms. It does
+not establish a fix or eliminate this packet-policy difference. See
+[the measured result](VALIDATION-0.1.49.md).
+
+### Other setup messages
+
 The Pico sends the handshake, its supported-feature envelope, notifications and
 key request. Compared with macOS/NTPods it omits:
 
