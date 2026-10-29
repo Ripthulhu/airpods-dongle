@@ -79,12 +79,55 @@ The checked UF2 is 3632640 bytes, SHA256:
 The build receipt is `build-receipt-0.1.53-r2.json` in the lab project
 `airpods-pico-bringup-20261027`; outputs are in `release-0.1.53-float-r2`.
 
-The image and serial-pinned update guards are staged for both Picos. Neither
-device has been updated to 0.1.53 at this checkpoint; readiness for a brief
-playback interruption is pending. Keep the 0.1.52 rollback and compare the saved
-pairing tail after flashing.
+GitHub CI also passed on source commit
+`fd5eeb6b21bd23aef1e92c9c7c96901fdb26a8ce`:
+https://github.com/Ripthulhu/airpods-dongle/actions/runs/40949527778.
 
-No 0.1.53 hardware acceptance result is recorded yet. Keep volume and radio
-policy unchanged, compare normal/Game playback, then repeat the phone-case
-outdoor test. Do not claim the hitches fixed from host tests or successful
-negotiation alone.
+## Installation and listening checkpoint
+
+With the user's playback/microphone pause confirmed, both Picos were remotely
+placed in BOOTSEL, fully backed up, programmed with the checked image, verified
+as 0.1.53 and restarted. Each board's 64-KiB pairing tail matched its original
+exactly. Private full-flash backups were also verified locally; they are not
+part of the published evidence.
+
+- PC: `8B39F1F49316A397`.
+- Pixel-connected Pico: `DC1F379C3B1EFCA5`.
+- Both startup snapshots report AAC-ELD, local CBR 255200 and Game Mode off.
+- The PC startup console captured accepted configuration
+  `4c 00 00 00 01 80 00 80 00 84 00 83 e8 00`, confirming the variable permission
+  and 256000 wire ceiling independently of the local budget.
+- Actual PC playback used USB alternate setting 2 (IEEE float), not merely a
+  float-capable descriptor or mixer setting.
+
+The user confirmed clean stereo initially and **clean throughout** the full
+three-minute Game Mode comparison. Same familiar PC material, volume unchanged,
+phone playback paused, no packet logging, one cached radio snapshot every two
+seconds; full source counters were read only at each interval's boundaries.
+
+| Interval | Duration | Active drops / inserted zeros / discarded debt / recoveries | Controller flushes |
+| --- | ---: | --- | ---: |
+| Normal mode | 60.22 s | 0 / 0 / 0 / 0 | 0 |
+| Game Mode | 180.27 s | 0 / 0 / 0 / 0 | 12 |
+
+Neither interval added malformed/short USB packets. Both remained on ACL epoch
+3, handle 11. Game Mode retained local CBR while the adaptive budget went from
+255200 through 220000/192000/174000 to 128000, then recovered to 174000; all five
+changes completed without encoder error. The Game capture began after the first
+downshift. Boot-wide maxima at its end were 8485 us per encode unit (including
+preparation), 7956 us inside the encoder, 2000 us send wait and 40226 us send gap;
+these maxima include earlier playback and transitions, not just the interval.
+
+The live entry report was 159 ms and remained cached after the finite clock
+adjustment, consistent with previously documented live-transition behavior.
+Native and prior Pico captures do not establish equality between the requested
+buffer and the immediate reported delay. No new acoustic latency measurement
+was made. Game Mode was restored off after the comparison, with playback still
+active and no disconnect, volume or profile changes requested.
+
+Evidence: `deployment-0.1.53.json`, startup snapshots/console, normal/Game
+before/after snapshots, radio JSONL and summaries, and
+`pc-normal-restored-0.1.53.json`. The controller flushes remain real radio evidence;
+clean listening in this short run does not prove loss-free delivery. Longer
+listening, the phone's audio path, and its in-case outdoor test remain unverified.
+Keep the 0.1.52 rollback until those comparisons pass.
