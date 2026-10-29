@@ -10,76 +10,39 @@ a debug console. No custom Windows kernel driver or Test Mode is required for US
 
 ## Stem volume
 
-Candidate 0.1.38 uses a fresh, transaction-matched native AVRCP INTERIM readback after a
-CHANGED notification. The CHANGED payload itself no longer becomes a USB key.
-The pinned SDK patch exposes subsequent volume INTERIM replies and keeps their
-registration generations separate. The extra post-SET registration introduced in
-0.1.37 is removed: it did not complete in the failed Pixel check, while ordinary
-native notifications continued. A SET acknowledgement updates the known physical
-level; it does not prove equal gain in both buds.
+From 0.1.48, native AirPods gain is retained. A fresh, transaction-matched AVRCP
+INTERIM after CHANGED becomes the physical volume report. USB's master Feature
+Unit publishes that report through its AudioControl interrupt endpoint. Host
+UAC SET requests remain absolute AirPods commands; the host's finer dB request
+is retained when the AirPods confirm its coarser mapping. A real clamp is still
+reported. A pending older registration cannot replace a newer accepted SET.
 
-The previous 150 ms quiet period before hardware-gain repair is restored as a
-mitigation for the repeatable 0.1.37 balance failure. Verified changes and completed
-USB keys restart that period; a genuine host SET remains immediate. This is not
-an accepted seamless-volume fix: 0.1.36 already had an audible second step.
-A fresh absolute readback can coalesce rapid changes, so
-it also cannot establish an exact count of physical gestures. See the saved
-[Mac and Pixel evidence](VOLUME-EVIDENCE.md) before changing volume roles or
-adding guessed PCM gain compensation.
+A stem change no longer generates a USB volume key or a later gain restoration.
+There is no artificial near-maximum anchor. Native 0–127 gain and the buds' own
+step size remain intact; pausing, resuming and refreshing readback do not move
+volume. Unknown gain is never guessed. Unsent work from a previous USB session,
+peer or ownership epoch is cancelled. A genuine host SET received while standing
+by can be deferred to the next confirmed takeover; an old owner's gain is not
+replayed merely because a connection returns.
 
-The underlying relay introduced in 0.1.36 forwards unsolicited AirPods volume changes as standard Consumer
-Volume Increment (`0x0C:0xE9`) or Volume Decrement (`0x0C:0xEA`) press/release pairs.
-USB playback or recording must own audio and physical AirPods gain must be known.
-A genuine host USB Audio volume SET remains authoritative. Android may send that
-SET only during initialization, then change software volume for all user actions;
-absence of another SET no longer disables the relay.
+The dongle does not scale USB PCM by volume. Explicit USB mute zeros samples and
+retains the gain for unmute. Windows uses the advertised hardware master control;
+player/session volume controls may still alter their own audio. Android's normal
+USB mixer can apply an additional software gain, so full native synchronization
+requires the privileged [host bridge](HOST-VOLUME.md). Standalone native stems
+remain usable without that bridge, but the firmware does not claim to disable
+Android's mixer or synchronize its software slider by itself.
 
-The temporary AirPods change is withheld from USB volume notifications while
-waiting for the host, preventing a hardware-volume notification and HID key from
-applying the same gesture twice. After all queued volume keys complete their USB
-transfers, the relay restores its confirmed hardware gain anchor if no newer host
-SET superseded it. This avoids retaining both the phone's software attenuation
-and the AirPods' gesture attenuation. Initial AVRCP readback, unchanged notifications
-and feedback matching an outstanding volume command do not generate keys.
-The bounded queue keeps rapid gestures in order; USB reset,
-route or peer changes invalidate unsent volume keys. A sent press still receives
-its release. Expired or rejected keys retain the actual physical gain instead of
-restoring it. Reset, route loss and peer changes cancel pending restoration.
-Losing AACP audio ownership also invalidates the physical baseline. Only a new,
-genuine host SET received while standing by is deferred for the next confirmed
-takeover. Otherwise, a fresh native readback must establish the new baseline;
-the dongle does not replay the old owner's gain.
+The previous HID-relative/anchor scheme, its audible dip/rebound and premature
+maximum cues are recorded in [volume evidence](VOLUME-EVIDENCE.md). The captured
+Mac gain changes remained at the new level and did not restore an anchor. The
+captured AACP manual-volume feedback remains a separate unverified difference;
+it is not treated as an enable command or guessed compensation.
 
-This is independent of both companion apps and leaves the existing Bluetooth
-phone-volume path unchanged. A known maximum anchor can move one step quieter
-to leave observable upward-gesture headroom; zero or unknown gain is never
-automatically raised. A clamped or rejected headroom adjustment is not retried
-indefinitely. A completed USB HID transfer does not prove the host applied the
-key. Endpoint behavior, rapid gestures and ignored host keys therefore require
-real-host checks before claiming full slider-range synchronization.
-
-The 0.1.35 Pixel evidence showed two HID keys, 29 physical change reports and
-AirPods gain falling from 127 to 47, while the host SET revision stayed at 2.
-The old five-second timeout then disabled forwarding. This confirms double
-attenuation and an invalid hardware-feedback assumption in 0.1.34; moving the
-phone slider was not a successful fix. The 0.1.36 ownership correction also
-failed listening: the slider followed gestures, but levels could still diverge,
-and a down-swipe audibly dipped before the delayed hardware repair raised it
-slightly. Its deliberate 150 ms delay is not an accepted synchronization result.
-The counters stayed unchanged during a later quiet check, so a sustained feedback
-loop was not demonstrated on that hardware. Synthetic post-ACK stale/quantized
-notifications exposed further robustness gaps; do not label those sequences as
-captured AirPods behavior.
-
-Target-role absolute-volume requests are validated and counted separately from
-controller-role physical-gain notifications. They do not overwrite physical
-readback or independently emit a second key for a possibly identical gesture.
-Marked target-event/endpoint evidence is required before enabling another relay.
-
-The usage codes follow the [Android USB headset specification](https://source.android.com/docs/core/interaction/accessories/headset/usb-headset-spec).
-Android's [default mixer behavior](https://source.android.com/docs/core/audio/preferred-mixer-attr)
-can also apply software volume; a USB AudioControl interrupt alone does not
-establish that the phone's media-volume UI follows hardware changes.
+Target-role volume requests are counted separately from controller-role
+physical-gain notifications. They do not replace physical readback or emit a
+second key. The existing HID media collection continues to carry playback and
+track controls.
 
 ## USB bootloader entry
 
@@ -106,8 +69,10 @@ Version 0.1.35 adds two manual `[VOLUME]` status lines to `t`: actual host SET
 revisions/session, HID receipts, relay state, physical readback,
 pending AVRCP commands and valid volume-event counts. These counters do not
 change gain or print per packet. From 0.1.36, `sent` counts completed USB volume
-press transfers, rather than reports merely queued at the endpoint. The relay
-also exposes its hardware anchor, pending restoration and target-role SET count.
+press transfers, rather than reports merely queued at the endpoint. Historical
+relay fields (`relay`, `waiting`, `anchor`, `restoring`) remain as zero from
+0.1.48; their behavior is removed. Native readback and target-role SET counts
+remain live.
 
 From 0.1.37, bare lowercase `v` resets and arms a volume-only history for 60
 seconds; wait for `[VOLTRACE] armed` before the test gesture. Uppercase `V`

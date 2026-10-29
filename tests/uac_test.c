@@ -64,6 +64,7 @@ static int16_t mic_pcm[USB_MIC_SAMPLE_RATE / 1000], host_mic[USB_MIC_SAMPLE_RATE
 static size_t mic_available;
 static uint8_t control_reply[64];
 static size_t control_reply_size;
+static uint8_t interrupt_reply[6];
 
 void audio_task(void);
 void audio_control_task(void);
@@ -136,6 +137,8 @@ static bool tud_audio_int_write(const audio_interrupt_data_t *data) {
     assert(data->wIndex_ep_or_int == 0 && data->wIndex_entity_id == UAC2_ENTITY_SPK_FEATURE_UNIT);
     ++int_attempts;
     if (int_busy) return false;
+    _Static_assert(sizeof(audio_interrupt_data_t) == sizeof(interrupt_reply), "UAC2 interrupt wire size");
+    memcpy(interrupt_reply, data, sizeof(interrupt_reply));
     ++notifications;
     return true;
 }
@@ -281,22 +284,36 @@ static void malformed_packets_are_discarded(void) {
     assert(packet(NULL, 0, 0, 1) && pushes == 1);
 }
 static void mute_preserves_volume_and_stereo(void) {
-    fixture(); open_speaker();
-    host_volume(-15 * 256); tinyusb_control_task();
-    assert(bt_sets == 1 && last_bt_db256 == -15 * 256 && read_volume() == -15 * 256);
-    uint8_t value = 1;
-    assert(feature_set(AUDIO_FU_CTRL_MUTE, 0, &value, 1));
-    tinyusb_control_task();
-    const int16_t pcm[] = {32767, -32768, 1000, -1000};
-    assert(packet(pcm, sizeof(pcm), sizeof(pcm), 1));
-    expect_silence(played, TU_ARRAY_SIZE(pcm));
-    value = 0;
-    assert(feature_set(AUDIO_FU_CTRL_MUTE, 0, &value, 1));
-    tinyusb_control_task();
-    assert(bt_sets == 1 && read_volume() == -15 * 256);
-    assert(packet(pcm, sizeof(pcm), sizeof(pcm), 1));
-    assert(memcmp(played + TU_ARRAY_SIZE(pcm), pcm, sizeof(pcm)) == 0);
-    value = 2;
+    const int16_t levels[] = {-50 * 256, -25 * 256, 0};
+    const int16_t pcm[] = {32767, -32768, 1000, -1000, 17, -777};
+    const float floating[] = {.12345678f, -.23456789f, .99999f, -.99999f, .0000001f, -.0000002f};
+    for (unsigned alt = 1; alt <= (AIRPODS_USB_FLOAT ? 2u : 1u); ++alt) {
+        fixture(); open_speaker(); interface_alt(ITF_NUM_AUDIO_STREAMING_SPK, (uint16_t)alt, false);
+        for (unsigned level = 0; level < TU_ARRAY_SIZE(levels); ++level) {
+            host_volume(levels[level]); tinyusb_control_task();
+            assert(bt_sets == level + 1u && last_bt_db256 == levels[level] && read_volume() == levels[level]);
+            for (unsigned phase = 0; phase < 3; ++phase) {
+                uint8_t muted = phase == 1;
+                assert(feature_set(AUDIO_FU_CTRL_MUTE, 0, &muted, 1));
+                tinyusb_control_task();
+                // Master volume is a device control, never another PCM attenuation stage.
+                size_t offset = alt == 1 ? played_samples : played_float_samples;
+                if (alt == 1) {
+                    assert(packet(pcm, sizeof(pcm), sizeof(pcm), 1));
+                    assert(played_samples == offset + TU_ARRAY_SIZE(pcm));
+                    if (muted) expect_silence(played + offset, TU_ARRAY_SIZE(pcm));
+                    else assert(memcmp(played + offset, pcm, sizeof(pcm)) == 0);
+                } else {
+                    assert(packet(floating, sizeof(floating), sizeof(floating), 2));
+                    assert(played_float_samples == offset + TU_ARRAY_SIZE(floating));
+                    if (muted) for (unsigned i = 0; i < TU_ARRAY_SIZE(floating); ++i) assert(played_float[offset + i] == 0);
+                    else assert(memcmp(played_float + offset, floating, sizeof(floating)) == 0);
+                }
+                assert(bt_sets == level + 1u && read_volume() == levels[level]);
+            }
+        }
+    }
+    uint8_t value = 2;
     assert(!feature_set(AUDIO_FU_CTRL_MUTE, 0, &value, 1));
     assert(!feature_set(AUDIO_FU_CTRL_MUTE, 1, &value, 1));
 }
@@ -401,6 +418,9 @@ static void volume_notifications_coalesce_and_retry(void) {
     assert(read_volume() == -50 * 256 && int_attempts == 2);
     int_busy = false; service();
     assert(int_attempts == 3 && notifications == 1);
+    const uint8_t expected_interrupt[] = {0, 1, 0, 2, 0, 2};
+    assert(memcmp(interrupt_reply, expected_interrupt, sizeof(expected_interrupt)) == 0);
+    assert(read_volume() == bt_volume_to_usb(0)); // Host GET_CUR sees the latest coalesced native level.
     for (unsigned i = 0; i < 100; ++i) service();
     assert(int_attempts == 3);
     host_volume(-30 * 256); host_volume(-20 * 256); host_volume(-10 * 256);

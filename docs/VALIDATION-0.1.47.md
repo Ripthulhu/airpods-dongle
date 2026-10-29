@@ -58,6 +58,9 @@ timeout, with no pending or failed command. Playback diagnostics subsequently
 confirmed USB float alternative 2 with no active PCM loss or zero insertion;
 Windows volume read 78.00%, below the former 85% sticking point.
 
-Listener confirmation, pause/resume, the 60-ms controller transition and a long
-Game Mode listening run remain pending. The phone board remains on 0.1.46.
+The listener still reported a dip followed by a rebound during stem changes,
+and requested native AirPods gain with host sliders acting only as controls.
+The HID/anchor relay is therefore not accepted; 0.1.48 removes it. Pause/resume,
+the 60-ms controller transition and a long Game Mode listening run remain
+pending. The phone board remains on 0.1.46.
 See the [additional capture audit](PROTOCOL-CAPTURE-AUDIT-2026-10-29.md).

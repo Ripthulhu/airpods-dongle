@@ -12,20 +12,33 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.48** preserves native AirPods volume steps and publishes the
+confirmed level through USB hardware volume. It removes the relative HID key
+and gain-restoration round trip that caused an audible dip and rebound. Android
+needs its privileged host bridge to remove the separate software attenuation;
+firmware alone cannot set Android's mixer policy. Full regression, codec,
+firmware and linked-memory checks pass. The PC board is updated with pairing
+preserved; the listener accepted the native-volume comparison as much better.
+Android and extended lifecycle checks remain pending.
+See [validation](docs/VALIDATION-0.1.48.md) and
+[native gain and host integration](docs/HOST-VOLUME.md).
+
 Candidate **0.1.47** preserves fine USB volume requests when the AirPods confirm
 their coarser volume step, and rejects older pending volume readback after a
 newer accepted write. Game Mode now requests the captured 60-ms controller flush
 timeout on the selected AirPods connection, restoring 200 ms outside that mode.
 Build and regression checks pass. The PC board is updated with pairing preserved;
-normal controller timeout is confirmed, and listening validation is pending.
+normal controller timeout is confirmed. The listener still reported the
+stem-volume dip/rebound; 0.1.48 replaces that underlying relay. Game Mode
+listening validation remains pending.
 See [validation](docs/VALIDATION-0.1.47.md).
 
 Candidate **0.1.46** allows an explicit runtime BOOTSEL request during playback,
 recording, calls or audio transitions. It interrupts audio through the SDK's
 chip reset after a bounded reply delay, retaining DTR/session fencing and board
 identity checks. It does not wait for Android to release USB audio. Older firmware
-may need one physical BOOTSEL update before this works. Both boards now run
-0.1.46, with pairing storage verified unchanged. The Pixel's USB playback was
+may need one physical BOOTSEL update before this works. Both boards were tested
+on 0.1.46, with pairing storage verified unchanged. The Pixel's USB playback was
 active when remote BOOTSEL entry passed; the board restarted and the listener
 confirmed music returned in both ears. See [validation](docs/VALIDATION-0.1.46.md)
 and the [runtime update protocol](docs/USB-CONTROL.md#usb-bootloader-entry).

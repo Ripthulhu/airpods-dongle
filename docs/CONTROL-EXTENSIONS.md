@@ -56,10 +56,11 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 17: USB host volume authority | action u8, token u32, level u8 | 24-byte status; USB client only; capability 128 |
 
 The explicit [host volume authority contract](HOST-VOLUME.md) coordinates a host
-that actually delegates its mixer volume to the AirPods. It suppresses the legacy
-HID/anchor relay while leased; simply moving the phone's slider is not proof of
-delegated gain. It uses a separate five-second lease and does not hold the ATT
-settings workflow lease.
+that actually delegates its mixer volume to the AirPods. It suppresses standalone
+UAC gain requests and feedback while leased; simply moving the phone's slider is
+not proof of delegated gain. From 0.1.48 the legacy HID/anchor relay is removed
+entirely. The host extension uses a separate five-second lease and does not hold
+the ATT settings workflow lease.
 
 Cached report slot 6 also returns the settings snapshot. Format: version u8=1,
 count u8, then count records of control ID u8, age milliseconds u32, report

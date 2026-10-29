@@ -81,6 +81,9 @@ static void notifications_and_same_level(void) {
     assert(!state.pending && volume_sync_get(&state, &level) && level == 40);
     assert(!volume_sync_request(&state, 128, false, 30));
     assert(volume_sync_get(&state, &level) && level == 40);
+    state.request_revision = UINT32_MAX;
+    assert(volume_sync_request(&state, 40, false, 31) && state.request_revision == 1);
+    assert(!state.pending); // Even a same-level explicit intent has a fresh ordering revision.
 }
 
 static void relative_bursts_use_latest_intent(void) {

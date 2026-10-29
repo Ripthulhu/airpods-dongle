@@ -9,7 +9,7 @@
 #define BT_VOLUME_ATTEMPTS 3u
 
 typedef struct {
-    uint32_t requested_at, sent_at, attempted_at;
+    uint32_t requested_at, sent_at, attempted_at, request_revision;
     uint8_t peer[6], desired, confirmed, sent, label, attempts;
     uint16_t cid;
     bool selected, known, pending, inflight, phone_request, attempted, waiting_for_connection;
@@ -46,6 +46,7 @@ static inline void volume_sync_connection(volume_sync_t *s, uint16_t cid, uint32
 
 static inline bool volume_sync_request(volume_sync_t *s, uint8_t level, bool phone, uint32_t now) {
     if (!s->selected || level > 127) return false;
+    if (!++s->request_revision) ++s->request_revision;
     s->desired = level;
     s->phone_request = phone;
     s->pending = s->inflight || !s->known || s->confirmed != level;

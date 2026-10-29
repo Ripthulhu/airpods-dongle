@@ -1,4 +1,28 @@
-# USB host volume authority — candidate 0.1.45
+# USB host volume authority
+
+## Native-gain policy from 0.1.48
+
+AirPods gain is the rendering volume. The USB firmware preserves native stem
+steps, publishes confirmed gain through the existing UAC master Feature Unit,
+and forwards explicit host UAC changes as absolute AirPods requests. It does not
+generate a relative HID volume key, restore an anchor, or reserve artificial
+headroom. Pause, resume and readback alone must not send a gain adjustment.
+USB PCM remains unscaled in the dongle except for explicit mute.
+
+Windows advertises hardware volume and mute for this endpoint. On the PC test
+host, `IAudioEndpointVolume::QueryHardwareSupport` returned 3. This identifies
+the hardware-control path; it is not a measurement of arbitrary application
+gain or received PCM amplitude. The existing UAC interrupt reports a changed
+master Volume CUR without generating another user gesture.
+
+Android's ordinary USB mixer can still attenuate PCM locally. Native gain in
+firmware does not change that host policy. The privileged bridge described below
+must establish unity media gain and reflect the exact observed 0–127 AirPods
+level into the phone UI. Acquisition must not quantize the current AirPods gain
+to the phone's coarser volume index. Without a capable host bridge, native stems
+still control the buds but Android's software slider remains independent.
+
+## Origin of the host extension
 
 Android's normal USB path can attenuate the PCM in software while the AirPods
 change physical gain locally. Relaying a stem change as HID Up/Down and then
@@ -50,7 +74,7 @@ little-endian, level u8. All successful actions return the same snapshot.
 
 Only the USB client may manage authority. Acquisition requires a connected,
 selected, owned headset and an available USB audio route, known gain, and no
-pending volume write, native readback or legacy HID relay. Retry busy without
+pending volume write or native readback. Retry busy without
 replaying stale desired values. All malformed values are rejected before mutation.
 
 The lease lasts five seconds; renew at most every two seconds. It is scoped to
@@ -70,7 +94,7 @@ echoing another adjustment back to the dongle.
 
 Release or uncertain loss cancels unsent authority writes and retains actual
 gain. An already transmitted AVRCP command may finish; it must not be retried
-after revocation. Legacy HID/repair/UAC feedback remains quiet for the rest of
+after revocation. UAC feedback remains quiet for the rest of
 that USB session because the firmware cannot know whether the host restored its
 software mixer. A new valid lease may adopt fresh gain; a new USB session returns
 to the standalone policy. Expiry never raises gain or restores an old anchor.

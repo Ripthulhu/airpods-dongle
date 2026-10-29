@@ -167,16 +167,15 @@ static uint32_t volume_operations_up, volume_operations_down;
 static uint32_t volume_changed_reports, volume_interim_reports, volume_ack_reports;
 static uint32_t volume_target_requests;
 static struct {
-    uint32_t generation, set_revision, sent, expected, since;
+    uint32_t generation, set_revision;
     uint32_t readback_after, readback_since, physical_generation, acknowledged_generation;
+    uint32_t changed_generation, change_revision, change_epoch;
     uint16_t cid;
-    uint8_t anchor, target_level, host_level;
-    bool enabled, waiting, owned, delivered, restoring, host_pending, target_known;
-    bool headroom_attempted, readback_pending, readback_baseline;
+    uint8_t target_level, host_level;
+    bool host_pending, target_known, readback_pending;
     bool host_deferred, host_exact;
-    uint32_t deferred_epoch;
-    uint8_t deferred_level, deferred_label;
-    bool deferred_interim;
+    uint8_t change_level, change_ack_level;
+    bool change_pending, change_interim, change_wait_ack, change_accepted;
 } usb_volume_relay;
 static volume_authority_t usb_host_volume;
 static uint32_t volume_observation_revision;
@@ -688,20 +687,18 @@ static void bt_volume_observed(void) {
 static void bt_volume_relay_reset(bool peer_changed) {
     uint32_t generation=usb_media_generation();
     if (peer_changed || usb_volume_relay.generation!=generation || usb_volume_relay.cid!=sink_volume.cid) {
-        bool deferred=!peer_changed && usb_volume_relay.generation==generation && usb_volume_relay.host_deferred &&
+        bool deferred=!peer_changed && usb_volume_relay.generation==generation && usb_volume_relay.host_pending &&
+            (aacp_audio_owned() || usb_volume_relay.host_deferred) &&
             usb_volume_relay.set_revision==usb_volume_set_revision() && usb_volume_set_generation()==generation;
         uint8_t host_level=usb_volume_relay.host_level;
         usb_media_cancel_volume();
-        // A repair belongs to the old AVRCP session; an explicit host SET can await a new channel.
-        if (!sink_volume.phone_request && (usb_volume_relay.generation!=generation ||
-            (usb_volume_relay.cid!=sink_volume.cid && usb_volume_relay.restoring && !usb_volume_relay.host_pending)))
+        // Only a current explicit host request can await a replacement channel.
+        if (!sink_volume.phone_request && !deferred)
             sink_volume.pending=false;
         memset(&usb_volume_relay,0,sizeof(usb_volume_relay));
         usb_volume_relay.generation=generation;
         usb_volume_relay.cid=sink_volume.cid;
         usb_volume_relay.set_revision=usb_volume_set_revision();
-        usb_volume_relay.sent=usb_media_volume_sent();
-        usb_volume_relay.expected=usb_volume_relay.sent;
         if (deferred) {
             usb_volume_relay.host_level=host_level;
             usb_volume_relay.host_pending=usb_volume_relay.host_deferred=true;
@@ -757,7 +754,7 @@ uint8_t dongle_volume_request(uint8_t client,const uint8_t *p,uint16_t size,
     volume_authority_scope_t scope=bt_volume_authority_scope();
     if (!volume_authority_scope_ready(&scope)) return DONGLE_DISCONNECTED;
     if (!p[1] && (sink_volume.pending || sink_volume.inflight || !sink_volume.known ||
-                  usb_volume_relay.waiting || usb_volume_relay.readback_pending)) return DONGLE_BUSY;
+                  usb_volume_relay.readback_pending)) return DONGLE_BUSY;
     uint8_t result=volume_authority_manage(&usb_host_volume,client,&scope,p[1],
         dongle_u32(p+2),p[6],btstack_run_loop_get_time_ms());
     if (result!=DONGLE_ACCEPTED) return result;
@@ -788,14 +785,12 @@ bool bt_volume_trace_take(uint32_t out[4]) {
 }
 static void bt_volume_trace(uint8_t kind,uint8_t ctype,uint8_t label,uint8_t level,uint8_t before,uint8_t status) {
     if (!volume_history.armed) return;
-    uint32_t flags=(unsigned)usb_volume_relay.owned | (unsigned)usb_volume_relay.waiting<<1 |
-        (unsigned)usb_volume_relay.restoring<<2 | (unsigned)usb_volume_relay.host_pending<<3 |
-        (unsigned)usb_volume_relay.readback_pending<<4 | (unsigned)usb_volume_relay.enabled<<5 |
-        (unsigned)usb_volume_relay.readback_baseline<<6;
+    uint32_t flags=(unsigned)usb_volume_relay.host_pending<<3 |
+        (unsigned)usb_volume_relay.readback_pending<<4;
     volume_trace_record(&volume_history,time_us_32(),kind | (uint32_t)(ctype&15)<<4 |
         (uint32_t)(label&15)<<8 | flags<<12 | (uint32_t)status<<24,
         level | (uint32_t)before<<8 | (uint32_t)sink_volume.desired<<16 | (uint32_t)sink_volume.sent<<24,
-        (usb_media_volume_sent()&0xffffu) | (usb_volume_relay.expected&0xffffu)<<16);
+        usb_media_volume_sent()&0xffffu);
 }
 static void bt_volume_select_peer(void) {
     bool changed=volume_sync_select(&sink_volume, (const uint8_t *)get_device_addr());
@@ -804,21 +799,18 @@ static void bt_volume_select_peer(void) {
     bt_volume_relay_reset(changed);
 }
 static bool bt_volume_usb_owned(void) {
-    // Pausing PCM does not transfer volume authority or turn temporary bud gain into a baseline.
-    return aacp_audio_owned() && usb_host_active() &&
-        (is_usb_streaming || usb_mic_requested() || (usb_volume_relay.owned && !phone_sink_owns_controls()));
+    return aacp_audio_owned() && usb_host_active() && !phone_sink_owns_controls();
 }
 bool bt_volume_usb_ready(void) {
-    return !bt_volume_host_managed() && aacp_audio_owned() && !usb_volume_relay.waiting && !usb_volume_relay.restoring && !usb_volume_relay.readback_pending &&
+    return !bt_volume_host_managed() && bt_volume_usb_owned() && !usb_volume_relay.readback_pending &&
         usb_volume_relay.set_revision==usb_volume_set_revision();
 }
 void bt_volume_report(void) {
-    printf("[VOLUME] usb=%lu active=%u playback=%u mic=%u set=%lu session=%lu receipt=%lu sent=%lu relay=%u waiting=%u owned=%u anchor=%u restoring=%u readback=%u epoch=%lu\n",
+    printf("[VOLUME] usb=%lu active=%u playback=%u mic=%u set=%lu session=%lu receipt=%lu sent=%lu relay=0 waiting=0 owned=%u anchor=0 restoring=0 readback=%u epoch=%lu\n",
         (unsigned long)usb_media_generation(),(unsigned)usb_host_active(),(unsigned)is_usb_streaming,
         (unsigned)usb_mic_requested(),(unsigned long)usb_volume_set_revision(),(unsigned long)usb_volume_set_generation(),
-        (unsigned long)usb_volume_set_receipt(),(unsigned long)usb_media_volume_sent(),(unsigned)usb_volume_relay.enabled,
-        (unsigned)usb_volume_relay.waiting,(unsigned)bt_volume_usb_owned(),(unsigned)usb_volume_relay.anchor,
-        (unsigned)usb_volume_relay.restoring,(unsigned)usb_volume_relay.readback_pending,
+        (unsigned long)usb_volume_set_receipt(),(unsigned long)usb_media_volume_sent(),
+        (unsigned)bt_volume_usb_owned(),(unsigned)usb_volume_relay.readback_pending,
         (unsigned long)usb_volume_relay.physical_generation);
     printf("[VOLUME] cid=%04x selected=%u known=%u confirmed=%u pending=%u inflight=%u desired=%u attempts=%u target_up=%lu target_down=%lu changed=%lu interim=%lu ack=%lu target_set=%lu target_known=%u target_level=%u\n",
         (unsigned)sink_volume.cid,(unsigned)sink_volume.selected,(unsigned)sink_volume.known,(unsigned)sink_volume.confirmed,
@@ -853,6 +845,7 @@ void set_bt_volume(int16_t db256) {
         bt_volume_publish();
 }
 void set_bt_volume_from_usb(int16_t db256,uint32_t revision,uint32_t generation,uint32_t receipt) {
+    (void)receipt; // Retained in the USB callback contract; volume no longer emits relative HID keys.
     if (revision!=usb_volume_set_revision() || generation!=usb_media_generation() || !usb_host_active()) return;
     bt_volume_select_peer();
     bt_volume_authority_poll();
@@ -862,51 +855,51 @@ void set_bt_volume_from_usb(int16_t db256,uint32_t revision,uint32_t generation,
     }
     bt_volume_trace(VOLUME_TRACE_HOST,0,0,usb_volume_to_bt(db256),sink_volume.confirmed,0);
     usb_volume_relay.set_revision=revision;
-    usb_volume_relay.sent=usb_media_volume_sent();
-    usb_volume_relay.waiting=usb_volume_relay.expected!=receipt;
-    usb_volume_relay.delivered=usb_volume_relay.waiting && usb_volume_relay.sent==usb_volume_relay.expected;
-    usb_volume_relay.restoring=false;
     usb_volume_relay.host_pending=true;
     usb_volume_relay.host_exact=true;
     _bt_sink_volume_changed=false;
-    usb_volume_relay.headroom_attempted=false;
     usb_volume_relay.readback_pending=false;
-    usb_volume_relay.deferred_interim=false;
-    usb_volume_relay.since=btstack_run_loop_get_time_ms();
     usb_volume_relay.host_level=usb_volume_to_bt(db256);
     usb_volume_relay.host_deferred=!aacp_audio_owned();
     if (!usb_volume_relay.host_deferred) set_bt_volume(db256);
 }
-static void bt_volume_readback(bool baseline,uint32_t after,uint32_t now) {
+static void bt_volume_readback(uint32_t after,uint32_t now) {
     usb_volume_relay.readback_pending=true;
-    usb_volume_relay.readback_baseline=baseline;
     usb_volume_relay.readback_after=after;
     usb_volume_relay.readback_since=now;
 }
 static void bt_volume_command_done(void) {
-    if (sink_volume.pending || sink_volume.inflight || usb_volume_relay.host_deferred ||
-        (!usb_volume_relay.restoring && !usb_volume_relay.host_pending)) return;
+    if (sink_volume.pending || sink_volume.inflight || usb_volume_relay.host_deferred) return;
     // A SET response contains the actually applied gain. It does not consume
     // the native volume notification subscription; replacing that subscription
     // after every SET stranded AirPods readback. Only CHANGED re-registers it.
-    if (sink_volume.known) {
-        usb_volume_relay.anchor=sink_volume.confirmed;
-        usb_volume_relay.enabled=aacp_audio_owned();
-    }
-    usb_volume_relay.restoring=usb_volume_relay.host_pending=false;
+    usb_volume_relay.host_pending=false;
 }
-static void bt_volume_restore(uint8_t level,uint32_t now) {
-    usb_volume_relay.waiting=usb_volume_relay.delivered=false;
-    usb_volume_relay.expected=usb_media_volume_sent();
-    if (sink_volume.confirmed==level) return;
-    if (volume_sync_request(&sink_volume,level,false,now)) {
-        bt_volume_trace(VOLUME_TRACE_REPAIR,0,0,level,sink_volume.confirmed,0);
-        usb_volume_relay.restoring=true;
-        if (usb_volume_relay.anchor==127 && level==126) usb_volume_relay.headroom_attempted=true;
-        _bt_sink_volume_changed=false;
-    }
+static void bt_volume_retire_older_request(void) {
+    if (sink_volume.request_revision!=usb_volume_relay.change_revision) return;
+    sink_volume.pending=false;
+    usb_volume_relay.host_pending=usb_volume_relay.host_deferred=usb_volume_relay.host_exact=false;
+    host_volume_write=false;
+}
+static bool bt_volume_change_resolve(void) {
+    if (!usb_volume_relay.change_pending || usb_volume_relay.change_wait_ack || !usb_volume_relay.change_interim) return false;
+    // A clamped SET echo is not a later gesture; a differing accessory observation is.
+    if (!usb_volume_relay.change_accepted || usb_volume_relay.change_level!=usb_volume_relay.change_ack_level)
+        bt_volume_retire_older_request();
+    sink_volume.confirmed=usb_volume_relay.change_level;
+    sink_volume.known=true;
+    usb_volume_relay.change_pending=false;
+    bt_volume_command_done();
+    bt_volume_publish();
+    return true;
 }
 static void bt_volume_relay_poll(uint32_t now) {
+    if (usb_volume_relay.change_pending && (uint32_t)(now-usb_volume_relay.readback_since)>=1000u) {
+        bt_volume_retire_older_request();
+        usb_volume_relay.change_pending=false;
+        usb_volume_relay.readback_pending=false;
+        sink_volume.known=false;
+    }
     if (bt_volume_host_managed()) return;
     if (!aacp_audio_owned()) {
         usb_media_cancel_volume();
@@ -914,10 +907,8 @@ static void bt_volume_relay_poll(uint32_t now) {
         // while an older owned SET awaits ACK must not turn it into a new intent.
         if (!usb_volume_relay.host_deferred) usb_volume_relay.host_pending=false;
         sink_volume.pending=false; // An already-sent command may finish, but must never retry after yield.
-        usb_volume_relay.waiting=usb_volume_relay.delivered=usb_volume_relay.restoring=false;
-        usb_volume_relay.readback_pending=usb_volume_relay.enabled=usb_volume_relay.owned=false;
-        usb_volume_relay.deferred_interim=false;
-        usb_volume_relay.expected=usb_volume_relay.sent=usb_media_volume_sent();
+        usb_volume_relay.readback_pending=false;
+        usb_volume_relay.change_pending=false;
         sink_volume.known=false;
         _bt_sink_volume_changed=false;
         return;
@@ -933,171 +924,68 @@ static void bt_volume_relay_poll(uint32_t now) {
     }
     bt_volume_command_done();
     if (usb_volume_relay.readback_pending && (uint32_t)(now-usb_volume_relay.readback_since)>=500u &&
-        !sink_volume.pending && !sink_volume.inflight) {
-        // Do not derive a key or raise gain without the normal fresh INTERIM.
-        // A late native reply can establish a new baseline; no forced query or
-        // permanent session disable is needed.
-        usb_volume_relay.waiting=usb_volume_relay.delivered=usb_volume_relay.enabled=false;
-        usb_volume_relay.restoring=usb_volume_relay.host_pending=usb_volume_relay.readback_pending=false;
-        usb_volume_relay.expected=usb_media_volume_sent();
+        !usb_volume_relay.change_pending && !sink_volume.pending && !sink_volume.inflight) {
+        // An absent fresh INTERIM cannot justify restoring an older physical gain.
+        usb_volume_relay.host_pending=usb_volume_relay.readback_pending=false;
         sink_volume.known=false;
-        usb_media_cancel_volume();
     }
-    bool owned=bt_volume_usb_owned();
-    if (!owned) {
-        if (usb_volume_relay.owned || usb_volume_relay.waiting || usb_volume_relay.restoring) {
-            usb_media_cancel_volume();
-            if (usb_volume_relay.restoring && !sink_volume.phone_request) sink_volume.pending=false;
-            usb_volume_relay.waiting=usb_volume_relay.delivered=usb_volume_relay.restoring=false;
-            usb_volume_relay.readback_pending=false;
-            bt_volume_publish();
-        }
-        usb_volume_relay.enabled=false;
-        usb_volume_relay.sent=usb_media_volume_sent();
-        usb_volume_relay.expected=usb_volume_relay.sent;
-    } else {
-        if (!usb_volume_relay.owned) {
-            usb_volume_relay.sent=usb_media_volume_sent();
-            usb_volume_relay.expected=usb_volume_relay.sent;
-            usb_volume_relay.enabled=volume_sync_get(&sink_volume,&usb_volume_relay.anchor);
-        } else if (!usb_volume_relay.enabled && !usb_volume_relay.waiting && !usb_volume_relay.restoring && !usb_volume_relay.readback_pending) {
-            usb_volume_relay.enabled=volume_sync_get(&sink_volume,&usb_volume_relay.anchor);
-        }
-        uint32_t sent=usb_media_volume_sent();
-        if (sent!=usb_volume_relay.sent) {
-            bt_volume_trace(VOLUME_TRACE_HID,0,0,0,sink_volume.confirmed,0);
-            usb_volume_relay.sent=sent;
-            if (usb_volume_relay.waiting) {
-                usb_volume_relay.delivered=sent==usb_volume_relay.expected;
-                usb_volume_relay.since=now;
-            }
-        }
-        if (usb_volume_relay.waiting && !usb_volume_relay.delivered && (uint32_t)(now-usb_volume_relay.since)>=5000u &&
-            usb_volume_relay.set_revision==usb_volume_set_revision()) {
-            usb_media_cancel_volume();
-            usb_volume_relay.waiting=false;
-            usb_volume_relay.expected=sent;
-            usb_volume_relay.enabled=volume_sync_get(&sink_volume,&usb_volume_relay.anchor);
-            bt_volume_publish();
-        }
-        if (usb_volume_relay.enabled && !usb_volume_relay.host_pending && !usb_volume_relay.readback_pending &&
-            !sink_volume.pending && !sink_volume.inflight && usb_volume_relay.set_revision==usb_volume_set_revision()) {
-            if (usb_volume_relay.waiting && usb_volume_relay.delivered && (uint32_t)(now-usb_volume_relay.since)>=150u) {
-                // shortcut: completed USB transport cannot acknowledge OS gain handling.
-                // Temporary rollback of 0.1.37's immediate-repair regression:
-                // keep 0.1.36's quiet debounce after all keys complete. This is
-                // not a per-bud application acknowledgement or seamless gain.
-                bt_volume_restore(usb_volume_relay.anchor==127?126:usb_volume_relay.anchor,now);
-            } else if (!usb_volume_relay.waiting && usb_volume_relay.anchor==127 && !usb_volume_relay.headroom_attempted) {
-                bt_volume_restore(126,now);
-            }
-        }
-    }
-    usb_volume_relay.owned=owned;
 }
-static void bt_volume_notification(uint16_t cid,uint8_t ctype,uint8_t level,uint32_t epoch,uint8_t label,bool deferred) {
+static void bt_volume_notification(uint16_t cid,uint8_t ctype,uint8_t level,uint32_t epoch,uint8_t label) {
     uint32_t now=btstack_run_loop_get_time_ms();
-    if (!deferred) bt_volume_trace(VOLUME_TRACE_NOTIFY,ctype,label,level,sink_volume.confirmed,(uint8_t)epoch);
+    bt_volume_trace(VOLUME_TRACE_NOTIFY,ctype,label,level,sink_volume.confirmed,(uint8_t)epoch);
     if (!epoch || level>127 || cid!=sink_volume.cid) return;
     if (!aacp_audio_owned()) {
         if (ctype==AVRCP_CTYPE_RESPONSE_CHANGED_STABLE) ++volume_changed_reports;
-        else if (!deferred) ++volume_interim_reports;
+        else ++volume_interim_reports;
         sink_volume.known=false;
         return; // Standby observations cannot authorize gain or host-key changes.
     }
     if (ctype==AVRCP_CTYPE_RESPONSE_CHANGED_STABLE) {
         ++volume_changed_reports;
         if (usb_volume_relay.physical_generation && (int32_t)(epoch-usb_volume_relay.physical_generation)<0) return;
-        if (usb_volume_relay.readback_pending && usb_volume_relay.readback_baseline) return;
-        if (usb_volume_relay.restoring && !sink_volume.inflight) {
-            sink_volume.pending=false;
-            usb_volume_relay.restoring=false;
+        if (usb_volume_relay.changed_generation && (int32_t)(epoch-usb_volume_relay.changed_generation)<=0) return;
+        usb_volume_relay.changed_generation=epoch;
+        if (sink_volume.pending || sink_volume.inflight || usb_volume_relay.change_pending) {
+            usb_volume_relay.change_pending=true;
+            usb_volume_relay.change_interim=false;
+            usb_volume_relay.change_wait_ack=sink_volume.inflight;
+            usb_volume_relay.change_accepted=!sink_volume.inflight && sink_volume.known;
+            usb_volume_relay.change_ack_level=sink_volume.confirmed;
+            usb_volume_relay.change_revision=sink_volume.request_revision;
+            usb_volume_relay.change_epoch=epoch;
         }
-        bt_volume_readback(usb_volume_relay.host_pending,epoch,now);
+        bt_volume_readback(epoch,now);
         return; // AOSP model: CHANGED triggers a fresh INTERIM; its payload is not a gesture.
     }
-    if (!deferred) ++volume_interim_reports;
+    ++volume_interim_reports;
     // A registration sent before a newer SET ACK may still contain the old gain.
     if (usb_volume_relay.acknowledged_generation &&
         (int32_t)(epoch-usb_volume_relay.acknowledged_generation)<=0) return;
     if ((usb_volume_relay.physical_generation && (int32_t)(epoch-usb_volume_relay.physical_generation)<=0) ||
         (usb_volume_relay.readback_pending && (int32_t)(epoch-usb_volume_relay.readback_after)<=0)) return;
-    // Managed observations keep receive order; a later SET ACK supersedes an earlier INTERIM.
-    if ((sink_volume.pending || sink_volume.inflight) && !bt_volume_host_managed()) {
-        // Preserve the normal registration's current value across SET ACK. Do
-        // not replace its subscription or mistake an initial report for a key.
-        if (usb_volume_relay.readback_pending && !usb_volume_relay.host_pending) {
-            usb_volume_relay.deferred_interim=true;
-            usb_volume_relay.deferred_epoch=epoch;
-            usb_volume_relay.deferred_level=level;
-            usb_volume_relay.deferred_label=label;
-        }
-        return;
-    }
-    bool baseline=!usb_volume_relay.readback_pending || usb_volume_relay.readback_baseline;
-    bool internal=usb_volume_relay.restoring && !usb_volume_relay.host_pending;
+    // Keep receive order: a later accepted SET ACK supersedes this observation.
     bool known=sink_volume.known;
     uint8_t previous=sink_volume.confirmed;
     if (!volume_sync_notification(&sink_volume,cid,level)) return;
     bt_volume_observed();
     usb_volume_relay.physical_generation=epoch;
     usb_volume_relay.readback_pending=false;
-    usb_volume_relay.restoring=false;
-    usb_volume_relay.host_pending=false;
+    if (usb_volume_relay.change_pending && (int32_t)(epoch-usb_volume_relay.change_epoch)>0) {
+        usb_volume_relay.change_interim=true;
+        usb_volume_relay.change_level=level;
+        if (bt_volume_change_resolve()) return;
+    }
+    bt_volume_command_done();
     if (bt_volume_host_managed()) {
         _bt_sink_volume_changed=false;
         return; // Raw readback reaches the host bridge without a duplicate HID step or gain repair.
     }
-    if (baseline || !known) {
-        usb_volume_relay.anchor=level;
-        usb_volume_relay.enabled=aacp_audio_owned();
-        if (internal) _bt_sink_volume_changed=false;
-        else bt_volume_publish();
-        return;
-    }
-    if (known && previous!=level && bt_volume_usb_owned() &&
-        usb_volume_relay.set_revision==usb_volume_set_revision()) {
-        if (!usb_volume_relay.owned) {
-            usb_volume_relay.owned=true;
-            usb_volume_relay.sent=usb_media_volume_sent();
-            usb_volume_relay.expected=usb_volume_relay.sent;
-            usb_volume_relay.anchor=previous;
-            usb_volume_relay.enabled=true;
-        }
-        if (!usb_volume_relay.enabled) {
-            usb_volume_relay.anchor=previous;
-            usb_volume_relay.enabled=true;
-        }
-        if (!usb_volume_relay.anchor && level>previous) usb_volume_relay.anchor=level;
-        uint32_t expected=usb_volume_relay.waiting?usb_volume_relay.expected:usb_media_volume_sent();
-        if (usb_media_enqueue(level>previous?USB_MEDIA_VOLUME_UP:USB_MEDIA_VOLUME_DOWN)) {
-            bt_volume_trace(VOLUME_TRACE_HID,ctype,label,level,previous,1);
-            if (!bt_volume_usb_owned() || usb_volume_relay.generation!=usb_media_generation()) {
-                usb_media_cancel_volume();
-                return;
-            }
-            usb_volume_relay.since=now;
-            usb_volume_relay.expected=expected+1u;
-            usb_volume_relay.delivered=usb_media_volume_sent()==usb_volume_relay.expected;
-            usb_volume_relay.waiting=true;
-            return;
-        }
-        usb_media_cancel_volume();
-        usb_volume_relay.waiting=usb_volume_relay.delivered=false;
-        usb_volume_relay.expected=usb_media_volume_sent();
-        usb_volume_relay.anchor=level;
-        usb_volume_relay.enabled=true;
-    }
+    // Preserve the accessory's native step; the UAC hardware-volume notification updates the host.
     if (!known || previous!=level) bt_volume_publish();
 }
 void bt_volume_poll(void) {
     bt_volume_select_peer();
     bt_volume_authority_poll();
-    if (usb_volume_relay.deferred_interim && !sink_volume.pending && !sink_volume.inflight && aacp_audio_owned()) {
-        usb_volume_relay.deferred_interim=false;
-        bt_volume_notification(sink_volume.cid,AVRCP_CTYPE_RESPONSE_INTERIM,usb_volume_relay.deferred_level,
-            usb_volume_relay.deferred_epoch,usb_volume_relay.deferred_label,true);
-    }
     bt_volume_relay_poll(btstack_run_loop_get_time_ms());
     if (!aacp_audio_owned()) {
         uint8_t unused;
@@ -1108,7 +996,13 @@ void bt_volume_poll(void) {
     bool active=sink_volume.pending || sink_volume.inflight;
     uint32_t now=btstack_run_loop_get_time_ms();
     uint8_t level;
-    if (aacp_audio_owned() && volume_sync_due(&sink_volume,now,&level)) {
+    bool due=volume_sync_due(&sink_volume,now,&level);
+    if (usb_volume_relay.change_pending && usb_volume_relay.change_wait_ack && !sink_volume.inflight) {
+        usb_volume_relay.change_wait_ack=false;
+        usb_volume_relay.change_accepted=false;
+        (void)bt_volume_change_resolve();
+    }
+    if (aacp_audio_owned() && due && sink_volume.pending && !usb_volume_relay.change_pending) {
         uint8_t status=avrcp_controller_set_absolute_volume(sink_volume.cid,level);
         avrcp_connection_t *connection=avrcp_get_connection_for_avrcp_cid_for_role(AVRCP_CONTROLLER,sink_volume.cid);
         volume_sync_send(&sink_volume,now,status==ERROR_CODE_SUCCESS && connection!=NULL,connection?connection->transaction_id:0);
@@ -1116,9 +1010,8 @@ void bt_volume_poll(void) {
     }
     if (active && !sink_volume.pending && !sink_volume.inflight) {
         host_volume_write=false;
-        bool internal=usb_volume_relay.restoring && !usb_volume_relay.host_pending;
         bt_volume_command_done();
-        if (!internal) bt_volume_publish();
+        bt_volume_publish();
     }
 }
 static bool bt_volume_controller_event(const uint8_t *packet,uint16_t size) {
@@ -1128,37 +1021,41 @@ static bool bt_volume_controller_event(const uint8_t *packet,uint16_t size) {
         case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:
             if (size!=7 || packet[6]>127 || (packet[5]!=AVRCP_CTYPE_RESPONSE_INTERIM && packet[5]!=AVRCP_CTYPE_RESPONSE_CHANGED_STABLE)) break;
             if (connection) bt_volume_notification(sink_volume.cid,packet[5],packet[6],
-                avrcp_controller_volume_event_generation(sink_volume.cid),connection->controller_last_confirmed_transaction_id,false);
+                avrcp_controller_volume_event_generation(sink_volume.cid),connection->controller_last_confirmed_transaction_id);
             break;
         case AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE:
             if (size!=7 || (packet[5]!=AVRCP_CTYPE_RESPONSE_ACCEPTED && packet[5]!=AVRCP_CTYPE_RESPONSE_REJECTED &&
                 packet[5]!=AVRCP_CTYPE_RESPONSE_NOT_IMPLEMENTED)) break;
             bt_volume_trace(VOLUME_TRACE_ACK,packet[5],connection?connection->controller_last_confirmed_transaction_id:0,
                 packet[6],sink_volume.confirmed,0);
-            bool internal=usb_volume_relay.restoring && !usb_volume_relay.host_pending;
+            bool overlap=usb_volume_relay.change_pending && usb_volume_relay.change_wait_ack;
             if (connection && volume_sync_response(&sink_volume,sink_volume.cid,connection->controller_last_confirmed_transaction_id,
                     packet[5]==AVRCP_CTYPE_RESPONSE_ACCEPTED,packet[6])) {
+                if (overlap) {
+                    usb_volume_relay.change_wait_ack=false;
+                    usb_volume_relay.change_accepted=packet[5]==AVRCP_CTYPE_RESPONSE_ACCEPTED;
+                    usb_volume_relay.change_ack_level=packet[6];
+                    sink_volume.known=usb_volume_relay.change_interim;
+                    if (sink_volume.known) sink_volume.confirmed=usb_volume_relay.change_level;
+                }
                 if (packet[5]==AVRCP_CTYPE_RESPONSE_ACCEPTED) {
-                    bt_volume_observed();
+                    if (!overlap) bt_volume_observed();
                     // Fence only an INTERIM still in transit; an already observed gesture keeps its ordering.
-                    if (connection->controller_volume_active && !connection->controller_volume_interim) {
+                    if (!overlap && connection->controller_volume_active && !connection->controller_volume_interim) {
                         usb_volume_relay.acknowledged_generation=connection->controller_volume_generation;
-                        if (usb_volume_relay.deferred_interim &&
-                            (int32_t)(usb_volume_relay.deferred_epoch-usb_volume_relay.acknowledged_generation)<=0)
-                            usb_volume_relay.deferred_interim=false;
                         if (usb_volume_relay.readback_pending &&
                             (int32_t)(usb_volume_relay.acknowledged_generation-usb_volume_relay.readback_after)>0)
                             usb_volume_relay.readback_pending=false;
                     }
-                    if (bt_volume_host_managed()) {
+                    if (bt_volume_host_managed() && (!overlap || usb_volume_relay.change_interim)) {
                         usb_volume_relay.readback_pending=false;
-                        usb_volume_relay.deferred_interim=false;
                     }
                 }
                 if (!sink_volume.pending && !sink_volume.inflight) host_volume_write=false;
                 ++volume_ack_reports;bt_volume_command_done();
                 if (!aacp_audio_owned()) sink_volume.known=false;
-                if (!internal) bt_volume_publish();
+                if (bt_volume_change_resolve()) break;
+                bt_volume_publish();
             }
             break;
         default:return false;
