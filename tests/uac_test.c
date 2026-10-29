@@ -8,6 +8,7 @@
 #include "../src/tinyusb/audio_control_validation.h"
 #include "../src/btstack/volume_scale.h"
 #include "../src/btstack/playback_pcm.h"
+#include "../src/realtime_metrics.h"
 
 // TinyUSB's full-speed endpoint sizing and public control wire layouts.
 #define CFG_TUSB_MCU 1
@@ -44,6 +45,7 @@ typedef struct {
 static uint32_t now;
 static unsigned disconnects, connects, descriptor_changes;
 static bool presented_audio;
+static bool terminal_connected;
 static bool mounted, usb_context, media_available, bt_changed, int_busy, interrupts_disabled;
 static bool inject_volume_set, bt_known;
 static bool volume_ready=true;
@@ -126,6 +128,7 @@ static uint32_t usb_media_volume_sent(void) {return media_sent;}
 static void usb_media_cancel_volume(void) {++volume_cancels;}
 static void usb_media_task(void) { assert(usb_context); ++media_tasks; }
 static void debug_cdc_task(void) { assert(usb_context); ++debug_tasks; }
+static bool debug_cdc_terminal_connected(void) { return terminal_connected; }
 static bool tud_audio_int_write(const audio_interrupt_data_t *data) {
     assert(usb_context);
     assert(data->bInfo == 0 && data->bAttribute == AUDIO_CS_REQ_CUR);
@@ -178,6 +181,7 @@ static void fixture(void) {
     atomic_store(&usb_bluetooth_requested,false);atomic_store(&usb_audio_present,true);
     usb_descriptor_audio=presented_audio=true;usb_mode_reconnecting=false;usb_reconnect_at=0;
     disconnects=connects=descriptor_changes=0;
+    terminal_connected=false;
     volume_ready=true;media_generation=volume_cancels=seen_set_revision=media_sent=seen_receipt=0;
     atomic_store(&volume_set_revision,0);atomic_store(&volume_set_generation,0);
     atomic_store(&need_change_bt_volume, false);
@@ -597,7 +601,49 @@ static void usb_mode_coalesces_and_wraps(void) {
     assert(disconnects==1); // No detach for an intent that never reaches USB service.
 }
 
+static void service_cadence_preserves_open_endpoints(void) {
+    fixture();
+    assert(tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
+    mount_host();
+    assert(tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,1,false);
+    assert(!speaker_active && tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+    tud_suspend_cb(false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+    tud_resume_cb();
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,0,false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
+    interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,1,false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+    tud_suspend_cb(false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+    tud_resume_cb();
+    interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,0,false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
+#if AIRPODS_USB_FLOAT
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,2,false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+#else
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,1,false);
+#endif
+    mounted=false;service(); // Bus reset clears both raw alternate settings.
+    assert(tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
+    terminal_connected=true;
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+    terminal_connected=false;
+    mount_host();usb_audio_set_bluetooth(true);service();
+    assert(usb_mode_reconnecting && tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
+    now+=USB_REENUMERATE_US;service();
+    assert(!presented_audio && tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
+    usb_audio_set_bluetooth(false);service();
+    now+=USB_REENUMERATE_US;service();mount_host();
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,1,false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+}
+
 int main(void) {
+    service_cadence_preserves_open_endpoints();
     bluetooth_removes_audio_preserves_control();
     usb_mode_coalesces_and_wraps();
     host_volume_proof_and_hold();

@@ -13,6 +13,7 @@ enum usb_media_command {
     USB_MEDIA_STOP,
     USB_MEDIA_VOLUME_UP,
     USB_MEDIA_VOLUME_DOWN,
+    USB_MEDIA_PAUSE_ONLY,
 };
 
 // Called on the Bluetooth press event. The USB task supplies the release.
@@ -22,6 +23,8 @@ uint32_t usb_media_generation(void);
 // Completed current-session volume presses, not queued reports or OS application.
 uint32_t usb_media_volume_sent(void);
 void usb_media_cancel_volume(void);
+// Supersede only an unsent automatic takeover Pause, preserving stem commands.
+void usb_media_cancel_pause(void);
 
 // USB callbacks/task only; never call TinyUSB from the Bluetooth run loop.
 void usb_media_set_available(bool available);

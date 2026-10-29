@@ -3,13 +3,17 @@
 #define AIRPODS_REALTIME_METRICS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define REALTIME_USB_SERVICE_BUDGET_US 500u
+#define REALTIME_USB_IDLE_INTERVAL_US 4000u
 
 // Pace idle passes without adding a millisecond to an already busy codec pass.
-static inline uint32_t realtime_loop_idle_us(uint32_t started_us, uint32_t now_us) {
+static inline uint32_t realtime_loop_idle_us(uint32_t started_us, uint32_t now_us,
+                                            bool fully_idle) {
     uint32_t elapsed = now_us - started_us;
-    return elapsed < 1000u ? 1000u - elapsed : 0u;
+    uint32_t interval = fully_idle ? 5000u : 1000u;
+    return elapsed < interval ? interval - elapsed : 0u;
 }
 
 // Single-writer counters. Read on the owner thread, or copy while that writer

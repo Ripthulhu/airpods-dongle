@@ -154,7 +154,7 @@ static void step(void) {
     playback_audio_work(now);
     assert(encode_calls-encoded_before<=1); // Can-send callbacks cannot recursively encode.
     advance(loop_cost);
-    advance(realtime_loop_idle_us(started,now*1000u)/1000u);
+    advance(realtime_loop_idle_us(started,now*1000u,false)/1000u);
 }
 static void startup_keeps_one_filter_phase(void) {
     for(unsigned floating=0;floating<2;++floating) {

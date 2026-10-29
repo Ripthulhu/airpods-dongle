@@ -206,6 +206,34 @@ static inline bool playback_pcm_prepare_resample(playback_pcm_t *pcm,playback_re
 }
 static inline void playback_pcm_render(const playback_resample_t *work,int16_t *dst) {
     const uint32_t denominator=655360u;
+    // At unity rate the fractional phase and its filter are constant for the block.
+    if(work->rate==denominator) {
+        if(!work->fraction) {
+            for(uint32_t frame=0;frame<work->frames;++frame) {
+                uint32_t index=PLAYBACK_FILTER_TAPS+frame-PLAYBACK_FILTER_DELAY;
+                dst[2*frame]=playback_pcm_quantize(work->samples[2*index]);
+                dst[2*frame+1]=playback_pcm_quantize(work->samples[2*index+1]);
+            }
+        } else {
+            uint32_t phase=work->fraction*PLAYBACK_FILTER_PHASES;
+            unsigned bin=phase/denominator;
+            float blend=(float)(phase%denominator)/(float)denominator;
+            float coefficients[PLAYBACK_FILTER_TAPS];
+            for(unsigned tap=0;tap<PLAYBACK_FILTER_TAPS;++tap)
+                coefficients[tap]=playback_filter[0][bin][tap]+blend*
+                    (playback_filter[0][bin+1][tap]-playback_filter[0][bin][tap]);
+            for(uint32_t frame=0;frame<work->frames;++frame) {
+                uint32_t center=PLAYBACK_FILTER_TAPS+frame;
+                float left=0,right=0;
+                for(unsigned tap=0;tap<PLAYBACK_FILTER_TAPS;++tap) {
+                    left+=coefficients[tap]*work->samples[2*(center-tap)];
+                    right+=coefficients[tap]*work->samples[2*(center-tap)+1];
+                }
+                dst[2*frame]=playback_pcm_quantize(left);dst[2*frame+1]=playback_pcm_quantize(right);
+            }
+        }
+        return;
+    }
     unsigned filter=work->rate>denominator+denominator/20u?1:0;
     for(uint32_t frame=0;frame<work->frames;++frame) {
         uint32_t position=work->fraction+frame*work->rate;

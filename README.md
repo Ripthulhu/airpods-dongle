@@ -12,6 +12,17 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.43** adds the renewed audit fixes: bounded, cancelable takeover
+Pause; explicit automatic USB Pause without changing stem toggles; and rejection
+of an SBC payload too small for a frame. A sample-equivalent unity-rate resampler
+optimisation reduces that render path's emulated instruction work by 26–29%.
+Idle USB service drops from 2,000 to 250 calls per second when audio endpoints
+and the diagnostic terminal are closed; the fully idle main-loop target drops
+from 1,000 to 200 passes per second. Audio and transition paths retain their fast
+cadence. See the [0.1.42 re-audit and 0.1.43 changes](docs/AUDIT-0.1.42.md)
+for evidence, host limits and power-measurement requirements. These are offline
+results; 0.1.43 is not flashed or listening/power accepted.
+
 Candidate **0.1.42** corrects an overflow-accounting feedback loop reproduced
 with perfectly timed phone input: cancelling healthy output deadlines kept the
 full buffer from draining. It also detects accumulated output timing loss across

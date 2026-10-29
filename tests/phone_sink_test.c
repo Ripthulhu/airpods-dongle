@@ -11,6 +11,8 @@ static avdtp_stream_endpoint_t endpoints[3];
 static unsigned endpoint_count, finalized, framework_calls, accepted, rejected, disconnected;
 static unsigned opens, claims, stops, pcm_frames, pcm_drops, codec_resets, decode_calls, start_requests;
 static unsigned prepares, closes, controls_sent, volume_updates;
+static unsigned control_disconnects;
+static uint16_t control_disconnect_cid;
 static unsigned lhdc_selections, aptx_selections, sbc_selections, reconnects;
 static uint8_t selected_remote;
 static bool lhdc_select_ok, aptx_select_ok, lhdc_create_ok;
@@ -19,6 +21,7 @@ static uint32_t now;
 static uint32_t phone_session;
 static bool output_ready, output_recovering, open_allowed, claim_allowed, secure_peer;
 static bool call_busy, usb_busy, usb_capture_busy, mic_cleanup, saved_phone_valid;
+static bool audio_owned;
 static uint8_t establish_result;
 static bool lhdc_available, aptx_available, prepare_ok, codec_ready, decode_ok, control_busy;
 static bool prepare_waiting, close_waiting;
@@ -90,6 +93,7 @@ bool phone_call_active(void) {return call_busy;}
 bool get_usb_streaming(void) {return usb_busy;}
 bool usb_mic_requested(void) {return usb_capture_busy;}
 bool aacp_mic_active(void) {return mic_cleanup;}
+bool aacp_audio_owned(void) {return audio_owned;}
 bool phone_codec_available(phone_codec_t codec) {return codec==PHONE_CODEC_SBC ||
     (codec==PHONE_CODEC_APTX && aptx_available) || (codec==PHONE_CODEC_LHDCV5 && lhdc_available);}
 bool phone_worker_configure(phone_codec_t codec,const phone_sbc_config_t*sbc) {desired=codec;codec_ready=false;if(codec==PHONE_CODEC_SBC)assert(sbc&&sbc->blocks==16&&sbc->subbands==8&&sbc->channel_mode==2);return true;}
@@ -148,6 +152,7 @@ void bt_volume_cancel_phone(void) {volume_cancels++;}
 static uint8_t send(uint16_t cid,uint8_t operation) {assert(cid==phone.avrcp_cid);if(control_busy)return 0x0c;controls_sent++;last_control=operation;return 0;}
 uint8_t avrcp_controller_play(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_PLAY);}
 uint8_t avrcp_controller_pause(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_PAUSE);}
+uint8_t avrcp_disconnect(uint16_t cid) {++control_disconnects;control_disconnect_cid=cid;return 0;}
 uint8_t avrcp_controller_stop(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_STOP);}
 uint8_t avrcp_controller_forward(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_FORWARD);}
 uint8_t avrcp_controller_backward(uint16_t cid) {return send(cid,AVRCP_OPERATION_ID_BACKWARD);}
@@ -180,9 +185,10 @@ static void fixture_codecs(bool lhdc,bool aptx,bool create_lhdc) {
     initialized=lhdc_disabled=aptx_disabled=retry_codec=false;lhdc_endpoint=aptx_endpoint=sbc_endpoint=NULL;
     lhdc_seid=aptx_seid=sbc_seid=0;
     endpoint_count=finalized=framework_calls=accepted=rejected=disconnected=0;
+    control_disconnects=control_disconnect_cid=0;
     opens=claims=stops=pcm_frames=pcm_drops=codec_resets=decode_calls=prepares=closes=controls_sent=volume_updates=start_requests=0;
     now=0;output_ready=output_recovering=false;open_allowed=claim_allowed=secure_peer=prepare_ok=decode_ok=true;
-    call_busy=usb_busy=usb_capture_busy=mic_cleanup=false;saved_phone_valid=true;establish_result=0;
+    call_busy=usb_busy=usb_capture_busy=mic_cleanup=false;saved_phone_valid=audio_owned=true;establish_result=0;
     codec_ready=control_busy=false;lhdc_available=lhdc;aptx_available=aptx;desired=PHONE_CODEC_NONE;
     prepare_waiting=close_waiting=false;
     async_worker=worker_pending=false;submit_ok=true;
@@ -921,6 +927,103 @@ static void test_avrcp_ownership_controls_and_volume(void) {
     uint8_t release[5]={HCI_EVENT_AVRCP_META,3,AVRCP_SUBEVENT_CONNECTION_RELEASED,0x50,0};
     assert(phone_sink_handle_avrcp(HCI_EVENT_PACKET,0,release,5));assert(phone.control_count==0 && phone.avrcp_cid==0);
 }
+static void takeover_fixture(void) {
+    fixture(true);playing(false);phone_avrcp_connected(0x50);audio_owned=false;
+}
+static void pause_complete(uint16_t cid,uint8_t operation,uint8_t status) {
+    uint8_t packet[]={HCI_EVENT_AVRCP_META,8,AVRCP_SUBEVENT_OPERATION_COMPLETE,
+        (uint8_t)cid,(uint8_t)(cid>>8),9,AVRCP_CMD_OPCODE_PASS_THROUGH,0xff,operation,status};
+    phone_sink_handle_controller(HCI_EVENT_PACKET,0,packet,sizeof(packet));
+}
+static void test_takeover_pause_precedes_teardown(void) {
+    takeover_fixture();
+    for(unsigned i=0;i<PHONE_CONTROL_QUEUE;i++)assert(phone_sink_media_control(AVRCP_OPERATION_ID_PLAY));
+    control_busy=true;phone_sink_pause_for_takeover();
+    assert(!phone.started && !phone.controls_owned && !phone.control_count && !controls_sent);
+    unsigned prepare_count=prepares;
+    output_ready=false;phone_sink_poll();
+    assert(phone.takeover_pause_pending && !disconnected && !codec_ready && prepares==prepare_count);
+    assert(phone_sink_media_control(AVRCP_OPERATION_ID_PLAY) && !phone.control_count);
+    pause_complete(0x50,AVRCP_OPERATION_ID_PAUSE,0); // An old operation cannot complete an unsent Pause.
+    assert(!phone.takeover_pause_done);
+    now=10;control_busy=false;phone_sink_poll();
+    assert(controls_sent==1 && last_control==AVRCP_OPERATION_ID_PAUSE && !disconnected);
+    now=20;phone_sink_poll();assert(controls_sent==1 && !disconnected);
+    pause_complete(0x51,AVRCP_OPERATION_ID_PAUSE,0);
+    pause_complete(0x50,AVRCP_OPERATION_ID_PLAY,0);
+    assert(!phone.takeover_pause_done);
+    pause_complete(0x50,AVRCP_OPERATION_ID_PAUSE,0);phone_sink_poll();
+    assert(disconnected==1 && !phone.takeover_pause_pending && !phone.started && controls_sent==1);
+    assert(!control_disconnects); // A completed press/release leaves the healthy control channel alone.
+    phone_sink_poll();assert(disconnected==1 && controls_sent==1);
+
+    for(unsigned sent=0;sent<2;++sent) {
+        takeover_fixture();now=UINT32_MAX-1000u;control_busy=!sent;
+        phone_sink_pause_for_takeover();uint32_t original=now;phone_sink_poll();
+        now+=1999u;phone_sink_pause_for_takeover();phone_sink_poll();
+        assert(!disconnected && phone.takeover_since_ms==original);
+        ++now;phone_sink_poll();assert(disconnected==1 && !phone.takeover_pause_pending);
+        assert(controls_sent==sent); // Busy SDK and missing ACK both have the original deadline.
+        assert(control_disconnects==sent); // Only the accepted, unresolved SDK command needs cancellation.
+    }
+    takeover_fixture();phone_sink_pause_for_takeover();phone_sink_poll();
+    pause_complete(0x50,AVRCP_OPERATION_ID_PAUSE,8);phone_sink_poll();
+    assert(disconnected==1 && controls_sent==1); // Failed/timeout operation terminates without a loop.
+}
+static void test_queued_takeover_pause_cannot_reach_fresh_media(void) {
+    for(unsigned reason=0;reason<4;++reason) {
+        takeover_fixture();phone_sink_pause_for_takeover();phone_sink_poll();
+        assert(controls_sent==1 && takeover_pause_inflight() && !disconnected);
+        switch(reason) {
+            case 0:audio_owned=true;phone_sink_poll();break;
+            case 1:now=PHONE_CONTROL_TIMEOUT_MS;phone_sink_poll();break;
+            case 2:phone_sink_yield();break;
+            case 3:release_signaling();break;
+        }
+        assert(control_disconnects==1 && control_disconnect_cid==0x50 && !phone.takeover_pause_pending);
+        if(phone.cid)release_signaling();
+        signaling(0x41,phone_address);configure(false);opened();audio_owned=true;output_ready=true;
+        stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+        assert(!phone.start_pending && !phone.start_accepted && !phone.started); // Old AVRCP is still closing.
+        uint8_t close[]={HCI_EVENT_AVRCP_META,3,AVRCP_SUBEVENT_CONNECTION_RELEASED,0x50,0};
+        assert(phone_sink_handle_avrcp(HCI_EVENT_PACKET,0,close,sizeof(close)));
+        phone_avrcp_connected(0x51);
+        stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+        assert(phone.start_accepted && controls_sent==1 && control_disconnects==1);
+    }
+    for(unsigned reason=0;reason<2;++reason) {
+        takeover_fixture();phone_sink_pause_for_takeover();phone_sink_poll();
+        if(reason==0)++phone_session;else phone.avrcp_cid=0x51;
+        phone_sink_yield();
+        assert(!control_disconnects); // Never cancel a reused ACL session or a replacement control channel.
+    }
+}
+static void test_takeover_pause_session_cancellation(void) {
+    for(unsigned reason=0;reason<6;++reason) {
+        takeover_fixture();control_busy=true;phone_sink_pause_for_takeover();
+        switch(reason) {
+            case 0:++phone_session;break;
+            case 1:phone.avrcp_cid=0x51;break;
+            case 2:secure_peer=false;break;
+            case 3:phone.cid=0x41;break;
+            case 4:audio_owned=true;break;
+            case 5:saved_phone_valid=false;break;
+        }
+        control_busy=false;phone_sink_poll();
+        assert(!phone.takeover_pause_pending && !controls_sent);
+        if(reason!=1 && reason!=4)assert(!disconnected); // Never tear down a new media/ACL session.
+    }
+    takeover_fixture();phone_sink_pause_for_takeover();phone_sink_yield();phone_sink_poll();
+    assert(!phone.takeover_pause_pending && disconnected==1 && !controls_sent); // USB mic/call preemption stays immediate.
+    takeover_fixture();phone_sink_pause_for_takeover();release_signaling();phone_sink_poll();
+    assert(!phone.takeover_pause_pending && !controls_sent);
+    takeover_fixture();phone_sink_pause_for_takeover();phone_sink_poll();++phone_session;
+    pause_complete(0x50,AVRCP_OPERATION_ID_PAUSE,0);
+    assert(!phone.takeover_pause_done); // Same-CID stale completion after ACL reuse is ignored.
+    takeover_fixture();phone_sink_pause_for_takeover();
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
+    assert(!phone.start_pending && rejected==1);
+}
 static void test_unknown_phone_volume_is_not_intent(void) {
     fixture(true);confirmed_volume_known=false;
     phone_avrcp_connected(0x50);
@@ -1221,6 +1324,9 @@ static void test_closed_microphone_drain_keeps_new_route(void) {
 }
 
 int main(void) {
+    test_queued_takeover_pause_cannot_reach_fresh_media();
+    test_takeover_pause_precedes_teardown();
+    test_takeover_pause_session_cancellation();
     test_bluetooth_route_lasts_for_phone_acl_session();
     test_closed_microphone_drain_keeps_new_route();
     test_bluetooth_route_excludes_usb_audio();

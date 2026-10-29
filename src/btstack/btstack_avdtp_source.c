@@ -1820,6 +1820,15 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
     }
     int ceiling = cur_codec == 4 ? PLAYBACK_ELD_PAYLOAD_CEILING : 0x290;
     context->max_media_payload_size = (mtu > 0 && mtu < ceiling) ? mtu : ceiling;
+    if (cur_codec == 1) {
+        int frame_bytes = btstack_sbc_encoder_sbc_buffer_length();
+        // SBC also needs its one-byte packet header; an undersized link never drains.
+        if (frame_bytes <= 0 || frame_bytes >= context->max_media_payload_size) {
+            aacp_disconnect();
+            a2dp_source_disconnect(context->avdtp_cid);
+            return false;
+        }
+    }
     if (cur_codec == 4 && (handleAAC == NULL || context->max_media_payload_size <
                           (int)((aaceld_bitrate + 799) / 800 + 4))) {
         aacp_disconnect();
@@ -1937,6 +1946,7 @@ static void playback_idle_poll(uint32_t now) {
 
 void dongle_playback_ownership_changed(bool owned) {
     if (owned) {
+        usb_media_cancel_pause();
         // A passive media transport may already be open while control was resolved.
         if (a2dp_is_connected_flag && finish_scan_avdtp_codec && media_tracker.local_seid &&
             sc.local_stream_endpoint && sc.local_stream_endpoint->l2cap_media_cid &&
@@ -1954,8 +1964,8 @@ void dongle_playback_ownership_changed(bool owned) {
     uint32_t transition_since = playback_idle_transition_since;
     bool running = media_tracker.streaming;
     if (running && !call_active && !phone_call_active() && !usb_mic_requested()) {
-        if (is_usb_streaming) (void)usb_media_enqueue(USB_MEDIA_PAUSE);
-        else if (phone_active) (void)phone_sink_media_control(AVRCP_OPERATION_ID_PAUSE);
+        if (is_usb_streaming) (void)usb_media_enqueue(USB_MEDIA_PAUSE_ONLY);
+        else if (phone_active) phone_sink_pause_for_takeover();
     }
     a2dp_demo_timer_stop(&media_tracker);
     critical_section_enter_blocking(&playback_pcm_lock);

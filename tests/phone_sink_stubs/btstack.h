@@ -11,6 +11,7 @@
 #define HCI_EVENT_AVDTP_META 0xf1
 #define HCI_EVENT_AVRCP_META 0xf2
 #define ERROR_CODE_SUCCESS 0
+#define ERROR_CODE_COMMAND_DISALLOWED 0x0c
 #define ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE 0x11
 #define AVDTP_AUDIO 0
 #define AVDTP_CODEC_SBC 0
@@ -58,6 +59,8 @@
 #define AVRCP_SUBEVENT_CONNECTION_ESTABLISHED 1
 #define AVRCP_SUBEVENT_CONNECTION_RELEASED 2
 #define AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED 3
+#define AVRCP_SUBEVENT_OPERATION_COMPLETE 4
+#define AVRCP_CMD_OPCODE_PASS_THROUGH 0x7c
 #define AVRCP_OPERATION_ID_PLAY 0x44
 #define AVRCP_OPERATION_ID_STOP 0x45
 #define AVRCP_OPERATION_ID_PAUSE 0x46
@@ -105,6 +108,7 @@ uint8_t a2dp_sink_set_config_sbc(uint16_t cid,uint8_t local,uint8_t remote,const
 uint32_t btstack_run_loop_get_time_ms(void);
 uint8_t avrcp_controller_play(uint16_t cid);
 uint8_t avrcp_controller_pause(uint16_t cid);
+uint8_t avrcp_disconnect(uint16_t cid);
 uint8_t avrcp_controller_stop(uint16_t cid);
 uint8_t avrcp_controller_forward(uint16_t cid);
 uint8_t avrcp_controller_backward(uint16_t cid);

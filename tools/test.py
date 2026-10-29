@@ -25,6 +25,7 @@ def uac_sources(directory):
     declarations += source[start:end]
     functions = []
     for name in ["usb_audio_set_bluetooth", "usb_audio_available", "usb_audio_mode_task", "usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
+                 "tinyusb_service_interval_us",
                  "usb_mic_requested", "usb_host_active", "usb_volume_set_revision", "usb_volume_set_generation", "usb_volume_set_receipt", "tinyusb_task", "tinyusb_control_task",
                  "tud_mount_cb", "tud_umount_cb", "tud_suspend_cb", "tud_resume_cb",
                  "tud_audio_mic_clock_get_request", "tud_audio_clock_get_request",
@@ -199,6 +200,18 @@ def usb_game_verification_sources(directory):
 
 def main_button_sources(directory):
     source = (ROOT / "src/main.c").read_text(encoding="utf-8")
+    start=source.index("bool usb_timer_callback(")
+    end=source.index("\n}",start)+2
+    (directory/"main_usb_timer.inc").write_text(source[start:end])
+    start=source.index("static bool bootsel_busy(void)")
+    end=source.index("\n}",start)+2
+    busy=source[start:end]
+    start=source.index("        bool fully_idle =")
+    end=source.index(";",start)+1
+    if source.rfind("async_context_acquire_lock_blocking(ctx);",0,start) < source.rfind("async_context_release_lock(ctx);",0,start):
+        raise ValueError("Idle policy must be sampled while the Bluetooth lock is held")
+    (directory/"main_idle_policy.inc").write_text(busy+"\nstatic bool main_fully_idle(mic_decoder_lifecycle_t decoder) {\n"+
+        source[start:end]+"\n    return fully_idle;\n}\n")
     start=source.index("// Keep Bluetooth actions in thread context")
     end=source.index("// ---------- parameters",start)
     (directory/"main_button_actions.inc").write_text(source[start:end])
@@ -283,6 +296,8 @@ def main():
         "volume_trace": ["tests/volume_trace_test.c"],
         "volume_trace_console": ["tests/volume_trace_console_test.c"],
         "main_button_actions": ["tests/main_button_actions_test.c"],
+        "main_usb_timer": ["tests/main_usb_timer_test.c"],
+        "main_idle": ["tests/main_idle_test.c"],
         "bootsel_request": ["tests/bootsel_request_test.c"],
         "dongle_protocol": ["tests/dongle_protocol_test.c"],
         "dongle_control": ["-Itests/aacp_stubs", "-Itests/cdc_stubs", "-Wno-unused-function", "tests/dongle_control_test.c"],

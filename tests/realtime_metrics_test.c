@@ -4,11 +4,16 @@
 #include "../src/realtime_metrics.h"
 
 int main(void) {
-    assert(realtime_loop_idle_us(100u,100u)==1000u);
-    assert(realtime_loop_idle_us(100u,1099u)==1u);
-    assert(realtime_loop_idle_us(100u,1100u)==0u);
-    assert(realtime_loop_idle_us(100u,10000u)==0u);
-    assert(realtime_loop_idle_us(UINT32_MAX-249u,250u)==500u);
+    assert(realtime_loop_idle_us(100u,100u,false)==1000u);
+    assert(realtime_loop_idle_us(100u,1099u,false)==1u);
+    assert(realtime_loop_idle_us(100u,1100u,false)==0u);
+    assert(realtime_loop_idle_us(100u,10000u,false)==0u);
+    assert(realtime_loop_idle_us(UINT32_MAX-249u,250u,false)==500u);
+    assert(realtime_loop_idle_us(100u,100u,true)==5000u);
+    assert(realtime_loop_idle_us(100u,5099u,true)==1u);
+    assert(realtime_loop_idle_us(100u,5100u,true)==0u);
+    assert(realtime_loop_idle_us(100u,10000u,true)==0u);
+    assert(realtime_loop_idle_us(UINT32_MAX-249u,250u,true)==4500u);
     _Static_assert(sizeof(realtime_metric_t) == 20u, "Timing counters must remain bounded");
     realtime_metric_t metric = {0};
     realtime_metric_record(&metric, 0u, 0u, REALTIME_USB_SERVICE_BUDGET_US);

@@ -12,7 +12,7 @@
 
 typedef struct {
     uint32_t generation;
-    uint32_t volume_epoch, deadline;
+    uint32_t intent_epoch, deadline;
     uint16_t usage;
 } media_event_t;
 
@@ -21,6 +21,7 @@ static _Atomic uint32_t written;
 static _Atomic uint32_t read;
 static _Atomic uint32_t host_state;
 static _Atomic uint32_t volume_epoch;
+static _Atomic uint32_t pause_epoch;
 static _Atomic uint32_t volume_sent;
 static bool release_pending;
 static uint16_t last_usage;
@@ -35,6 +36,8 @@ bool usb_media_enqueue(enum usb_media_command command) {
     uint16_t usage;
     switch (command) {
         case USB_MEDIA_PLAY: case USB_MEDIA_PAUSE: usage = 0x00cd; break;
+        // shortcut: Android may map Pause to BREAK; universal auto-pause needs host support, never a toggle fallback.
+        case USB_MEDIA_PAUSE_ONLY: usage = 0x00b1; break;
         case USB_MEDIA_NEXT: usage = 0x00b5; break;
         case USB_MEDIA_PREVIOUS: usage = 0x00b6; break;
         case USB_MEDIA_STOP: usage = 0x00b7; break;
@@ -49,7 +52,8 @@ bool usb_media_enqueue(enum usb_media_command command) {
     if (w - r >= MEDIA_QUEUE_LENGTH) return false;
     queue[w % MEDIA_QUEUE_LENGTH] = (media_event_t){
         .generation=state, .usage=usage,
-        .volume_epoch=atomic_load_explicit(&volume_epoch, memory_order_acquire),
+        .intent_epoch=atomic_load_explicit(command==USB_MEDIA_PAUSE_ONLY ? &pause_epoch : &volume_epoch,
+                                         memory_order_acquire),
         .deadline=time_us_32()+5000000u};
     atomic_store_explicit(&written, w + 1u, memory_order_release);
     return atomic_load_explicit(&host_state, memory_order_acquire) == state;
@@ -65,6 +69,10 @@ uint32_t usb_media_volume_sent(void) {
 
 void usb_media_cancel_volume(void) {
     atomic_fetch_add_explicit(&volume_epoch, 1u, memory_order_acq_rel);
+}
+
+void usb_media_cancel_pause(void) {
+    atomic_fetch_add_explicit(&pause_epoch, 1u, memory_order_acq_rel);
 }
 
 void usb_media_set_available(bool available) {
@@ -128,8 +136,10 @@ void usb_media_task(void) {
         if (r == w) return;
         media_event_t event = queue[r % MEDIA_QUEUE_LENGTH];
         bool volume = event.usage==0x00e9 || event.usage==0x00ea;
-        if (event.generation != state || (volume &&
-            (event.volume_epoch != atomic_load_explicit(&volume_epoch, memory_order_acquire) ||
+        bool automatic_pause = event.usage==0x00b1;
+        if (event.generation != state || ((volume || automatic_pause) &&
+            (event.intent_epoch != atomic_load_explicit(automatic_pause ? &pause_epoch : &volume_epoch,
+                                                       memory_order_acquire) ||
              (int32_t)(time_us_32()-event.deadline)>=0))) {
             atomic_store_explicit(&read, r + 1u, memory_order_release);
             continue;

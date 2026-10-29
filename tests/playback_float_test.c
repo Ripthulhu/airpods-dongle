@@ -3,6 +3,55 @@
 #include <stdio.h>
 #include "../src/btstack/playback_pcm.h"
 static playback_pcm_t pcm;
+
+// Keep the original scalar convolution as an oracle for the unity-rate fast path.
+static void unity_reference(const playback_resample_t *work,int16_t *dst) {
+    const uint32_t denominator=655360u;
+    for(uint32_t frame=0;frame<work->frames;++frame) {
+        uint32_t position=work->fraction+frame*work->rate;
+        uint32_t phase=(position%denominator)*PLAYBACK_FILTER_PHASES;
+        unsigned bin=phase/denominator;
+        float blend=(float)(phase%denominator)/(float)denominator;
+        uint32_t center=PLAYBACK_FILTER_TAPS+position/denominator;
+        float left=0,right=0;
+        if(!phase) {
+            left=work->samples[2*(center-PLAYBACK_FILTER_DELAY)];
+            right=work->samples[2*(center-PLAYBACK_FILTER_DELAY)+1];
+        } else for(unsigned tap=0;tap<PLAYBACK_FILTER_TAPS;++tap) {
+            float c=playback_filter[0][bin][tap]+blend*
+                (playback_filter[0][bin+1][tap]-playback_filter[0][bin][tap]);
+            left+=c*work->samples[2*(center-tap)];
+            right+=c*work->samples[2*(center-tap)+1];
+        }
+        dst[2*frame]=playback_pcm_quantize(left);dst[2*frame+1]=playback_pcm_quantize(right);
+    }
+}
+
+static void unity_exact_output(void) {
+    playback_resample_t work={.frames=2,.rate=655360u};
+    int16_t expected[2048],actual[2048];
+    for(unsigned i=0;i<sizeof(work.samples)/sizeof(work.samples[0]);++i)
+        work.samples[i]=(float)((int)(i*7411u%131071u)-65536)/32768;
+    for(work.fraction=0;work.fraction<655360u;++work.fraction) {
+        unity_reference(&work,expected);playback_pcm_render(&work,actual);
+        assert(!memcmp(expected,actual,work.frames*2*sizeof(int16_t)));
+    }
+    const unsigned sizes[]={1,128,480,1024},phases[]={0,1,327679,327680,655359};
+    for(unsigned size=0;size<4;++size)for(unsigned phase=0;phase<5;++phase) {
+        work.frames=sizes[size];work.fraction=phases[phase];
+        unity_reference(&work,expected);playback_pcm_render(&work,actual);
+        assert(!memcmp(expected,actual,work.frames*2*sizeof(int16_t)));
+    }
+    const float special[]={NAN,INFINITY,-INFINITY,0,-0.0f,1,-1,0x1p127f,-0x1p127f,0x1p-149f};
+    for(unsigned i=0;i<sizeof(work.samples)/sizeof(work.samples[0]);++i)
+        work.samples[i]=special[i%10];
+    for(unsigned phase=0;phase<5;++phase) {
+        work.fraction=phases[phase];
+        unity_reference(&work,expected);playback_pcm_render(&work,actual);
+        assert(!memcmp(expected,actual,work.frames*2*sizeof(int16_t)));
+    }
+}
+
 static void spectral_continuity(void) {
     float input[4096*2];int16_t output[480*2];
     const double pi=3.14159265358979323846;
@@ -41,6 +90,7 @@ int main(void) {
     int16_t output[8];assert(playback_pcm_read(&pcm,output,4)==4);
     assert(output[0]==playback_pcm_quantize(input[0]) && output[1]==playback_pcm_quantize(input[1]));
     assert(output[4]==INT16_MAX && output[5]==INT16_MIN && !output[6] && !output[7]);
+    unity_exact_output();
     spectral_continuity();
-    puts("float PCM: full S16 roundtrip, precision retention, nonfinite input, rounding and saturation passed");
+    puts("float PCM: S16 roundtrip, precision, unity-phase equivalence, spectrum and numeric boundaries passed");
 }

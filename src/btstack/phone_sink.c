@@ -75,6 +75,9 @@ static struct {
     uint8_t volume, requested_volume;
     uint8_t controls[PHONE_CONTROL_QUEUE], control_head, control_count;
     uint32_t control_since_ms;
+    bool takeover_pause_pending, takeover_pause_sent, takeover_pause_done;
+    uint16_t takeover_media_cid, takeover_control_cid;
+    uint32_t takeover_session, takeover_since_ms;
 } phone;
 
 static void select_bluetooth_route(void) {
@@ -100,6 +103,20 @@ static void notify_phone_volume(void) {
 static bool phone_media_session_current(void) {
     return bluetooth_route.session && !memcmp(bluetooth_route.peer, phone.address, 6) &&
         bt_hci_phone_session(phone.address) == bluetooth_route.session;
+}
+
+static bool takeover_pause_inflight(void) {
+    return phone.takeover_pause_sent && !phone.takeover_pause_done &&
+        phone.avrcp_cid != 0 && phone.avrcp_cid == phone.takeover_control_cid &&
+        bt_hci_phone_session(phone.address) == phone.takeover_session;
+}
+
+static void cancel_takeover_pause(void) {
+    bool cancel = phone.takeover_pause_pending && takeover_pause_inflight();
+    phone.takeover_pause_pending = false;
+    // A queued SDK command survives A2DP teardown. Retire its exact control
+    // channel and block fresh Start until it closes or the operation completes.
+    if (cancel) (void)avrcp_disconnect(phone.takeover_control_cid);
 }
 
 static void apply_phone_volume_intent(void) {
@@ -180,6 +197,7 @@ static void reject_start(void) {
 }
 
 static void disconnect_phone(void) {
+    cancel_takeover_pause();
     audio_stop();
     phone.controls_owned = false;
     phone.requested_volume_valid = false;
@@ -413,7 +431,8 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
         }
         case A2DP_SUBEVENT_START_STREAM_REQUESTED:
             if (size != 6 || packet[5] != phone.seid) return;
-            if (!phone.configured || !phone.opened || !phone_media_session_current()) {
+            if (!phone.configured || !phone.opened || !phone_media_session_current() ||
+                phone.takeover_pause_pending || takeover_pause_inflight()) {
                 a2dp_sink_start_stream_reject(phone.cid, phone.seid);
                 return;
             }
@@ -445,6 +464,7 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
             break;
         case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
             if (size != 5) return;
+            cancel_takeover_pause();
             audio_stop();
             phone.controls_owned = false;
             phone.requested_volume_valid = false;
@@ -657,7 +677,59 @@ static uint8_t send_control(uint8_t operation) {
     }
 }
 
+void phone_sink_pause_for_takeover(void) {
+    if (phone.takeover_pause_pending || !phone.controls_owned || !phone.avrcp_cid ||
+        phone.disconnecting || !phone_media_session_current()) return;
+    phone.takeover_pause_pending = true;
+    phone.takeover_pause_sent = phone.takeover_pause_done = false;
+    phone.takeover_media_cid = phone.cid;
+    phone.takeover_control_cid = phone.avrcp_cid;
+    phone.takeover_session = bluetooth_route.session;
+    phone.takeover_since_ms = btstack_run_loop_get_time_ms();
+    audio_stop();
+    phone.controls_owned = phone.requested_volume_valid = false;
+    phone.control_head = phone.control_count = 0; // Old Play/Next intent must not overtake the automatic Pause.
+    bt_volume_cancel_phone();
+}
+
+static bool takeover_pause_current(void) {
+    return phone.takeover_pause_pending && phone.cid == phone.takeover_media_cid &&
+        phone.avrcp_cid == phone.takeover_control_cid && phone_media_session_current() &&
+        bluetooth_route.session == phone.takeover_session;
+}
+
+static bool takeover_pause_poll(void) {
+    if (!phone.takeover_pause_pending) return false;
+    if (!takeover_pause_current()) {
+        bool old_media = phone.cid == phone.takeover_media_cid && phone_media_session_current() &&
+            bluetooth_route.session == phone.takeover_session;
+        cancel_takeover_pause();
+        if (old_media) disconnect_phone();
+        return false;
+    }
+    if (aacp_audio_owned()) {
+        // The old decoder was closed; cancel this Pause and require fresh media negotiation.
+        disconnect_phone();
+        return true;
+    }
+    phone_worker_close();
+    bool expired = (uint32_t)(btstack_run_loop_get_time_ms() - phone.takeover_since_ms) >= PHONE_CONTROL_TIMEOUT_MS;
+    if (!expired && !phone.takeover_pause_sent && !phone.takeover_pause_done) {
+        phone.takeover_pause_sent = true; // The SDK can service its send request synchronously.
+        uint8_t status = avrcp_controller_pause(phone.takeover_control_cid);
+        if (status != ERROR_CODE_SUCCESS) {
+            phone.takeover_pause_sent = false;
+            if (status != ERROR_CODE_COMMAND_DISALLOWED) phone.takeover_pause_done = true;
+        }
+    }
+    // SDK acceptance only queues the press; keep the media profile until the
+    // press/release operation completes, or the original bounded deadline wins.
+    if (expired || phone.takeover_pause_done) disconnect_phone();
+    return true;
+}
+
 void phone_sink_poll(void) {
+    if (takeover_pause_poll()) return;
     // A closed USB microphone may still be draining; keep the new route, but
     // do not allocate its decoder until main has released the microphone's.
     if (aacp_mic_active() && phone.configured && !phone.disconnecting) return;
@@ -887,6 +959,7 @@ bool phone_sink_handle_avrcp(uint8_t type, uint16_t channel, uint8_t *packet, ui
     if (packet[2] == AVRCP_SUBEVENT_CONNECTION_RELEASED && size == 5) {
         bt_volume_cancel_phone();
         phone.avrcp_cid = 0;
+        phone.takeover_pause_sent = false;
         phone.control_head = phone.control_count = 0;
         phone_sink_volume_invalidated();
     }
@@ -895,9 +968,14 @@ bool phone_sink_handle_avrcp(uint8_t type, uint16_t channel, uint8_t *packet, ui
 
 bool phone_sink_handle_controller(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {
     (void)channel;
-    return type == HCI_EVENT_PACKET && event_complete(packet, size) && size >= 5 &&
-        packet[0] == HCI_EVENT_AVRCP_META && phone.avrcp_cid != 0 &&
-        little_endian_read_16(packet, 3) == phone.avrcp_cid;
+    if (type != HCI_EVENT_PACKET || !event_complete(packet, size) || size < 5 ||
+        packet[0] != HCI_EVENT_AVRCP_META || phone.avrcp_cid == 0 ||
+        little_endian_read_16(packet, 3) != phone.avrcp_cid) return false;
+    if (size == 10 && packet[2] == AVRCP_SUBEVENT_OPERATION_COMPLETE &&
+        packet[6] == AVRCP_CMD_OPCODE_PASS_THROUGH && packet[8] == AVRCP_OPERATION_ID_PAUSE &&
+        takeover_pause_inflight())
+        phone.takeover_pause_done = true;
+    return true;
 }
 
 bool phone_sink_handle_target(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -914,6 +992,7 @@ bool phone_sink_handle_target(uint8_t type, uint16_t channel, uint8_t *packet, u
 
 bool phone_sink_media_control(uint8_t operation) {
     if (phone.avrcp_cid == 0) return false;
+    if (phone.takeover_pause_pending) return true;
     switch (operation) {
         case AVRCP_OPERATION_ID_PLAY: case AVRCP_OPERATION_ID_PAUSE:
         case AVRCP_OPERATION_ID_STOP: case AVRCP_OPERATION_ID_FORWARD:

@@ -155,7 +155,7 @@ Unknown routing stays passive, including at startup; standalone automatic start
 therefore needs a valid local-owner/source or sole-local device report. Older
 models and cold standalone startup require hardware verification.
 
-A confirmed competing owner pauses this dongle's active music host once and
+A confirmed competing owner requests Pause from this dongle's active music host and
 suspends its outgoing media while retaining the control connection. Fresh USB
 input cannot override that loss. Volume, microphone acquisition and Game Mode's
 receiver-buffer writes also stay passive. A takeover invalidates stale gain:
@@ -166,6 +166,16 @@ incoming Bluetooth call; existing preparation timeouts release an unusable voice
 link. Physical takeover is blocked while local capture is requested. Call handoff
 remains unverified. Manual `t` diagnostics include
 a bounded `[ROUTING]` state line without printing routing traffic continuously.
+
+In 0.1.43, phone takeover Pause takes priority over old queued media commands.
+Input stops immediately; media teardown waits for AVRCP operation completion
+or a two-second deadline. An unresolved command is canceled on its exact control
+channel, and fresh Start cannot race it. Automatic USB Pause uses explicit
+Consumer Pause (`0xB1`), expires if delayed, and is canceled when ownership
+returns. Intentional stem Play/Pause remains `0xCD`. Android's generic mapping
+may ignore explicit USB Pause; no toggle fallback risks resuming an already
+paused player. Command delivery does not prove the host application paused.
+See the [re-audit](AUDIT-0.1.42.md) for the reproduced failures and host limitation.
 
 LibrePods connects to the saved phone's encrypted, bonded RFCOMM service for
 device settings, hearing profiles, saved checks, audio profiles, performance

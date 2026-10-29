@@ -38,6 +38,7 @@
  #include "../btstack/aacp_mic_dec.h"
  #include "../btstack/btstack_aacp.h"
  #include "../btstack/volume_scale.h"
+ #include "../realtime_metrics.h"
  #include "pico/flash.h"
  #include "pico/time.h"
  #include "hardware/sync.h"
@@ -220,6 +221,13 @@
 
  }
 
+
+ uint32_t tinyusb_service_interval_us(void) {
+   // A suspended open endpoint can resume without another SET_INTERFACE.
+   // Keep its fast cadence; an idle console also retains diagnostic throughput.
+   return speaker_interface_open || mic_interface_open || debug_cdc_terminal_connected() ?
+       REALTIME_USB_SERVICE_BUDGET_US : REALTIME_USB_IDLE_INTERVAL_US;
+ }
 
  void tinyusb_task(void){
     usb_audio_mode_task();

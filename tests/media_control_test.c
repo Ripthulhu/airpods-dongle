@@ -195,6 +195,34 @@ static void test_volume_completion(void) {
     tick();
 }
 
+static void test_automatic_pause_is_not_a_toggle(void) {
+    fresh_host();
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));tick();tick();
+    assert(count==2 && reports[0]==0xb1 && reports[1]==0);
+    // Repeated ownership loss still emits Pause, including when the host is already paused.
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));tick();tick();
+    assert(count==4 && reports[2]==0xb1 && reports[3]==0);
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE));tick();tick();
+    assert(usb_media_enqueue(USB_MEDIA_PLAY));tick();tick();
+    assert(count==8 && reports[4]==0xcd && reports[6]==0xcd); // Intentional stems retain their toggle.
+    fresh_host();assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));
+    reject_report=true;tick();assert(!count);
+    reject_report=false;tick();tick();assert(count==2 && reports[0]==0xb1 && reports[1]==0);
+    fresh_host();assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));usb_media_set_available(false);
+    usb_media_set_available(true);tick();tick();assert(count==1 && reports[0]==0);
+    fresh_host();
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));
+    assert(usb_media_enqueue(USB_MEDIA_PLAY));ready=false;
+    usb_media_task();assert(!count);
+    usb_media_cancel_pause();tick();tick();
+    assert(count==2 && reports[0]==0xcd && reports[1]==0); // Return takeover discards only the obsolete automatic Pause.
+    fresh_host();test_time_us=UINT32_MAX-100u;
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));test_time_us+=5000000u;tick();assert(!count);
+    fresh_host();assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));tick();assert(reports[0]==0xb1);
+    usb_media_cancel_pause();tick();assert(count==2 && reports[1]==0); // An accepted press still receives its release.
+    usb_media_set_available(false);
+}
+
 int main(void) {
     assert(!usb_media_enqueue(USB_MEDIA_PLAY));
     usb_media_set_available(true);
@@ -260,5 +288,6 @@ int main(void) {
     assert(reports[count - 1] == 0);
     test_volume_queue();
     test_volume_completion();
+    test_automatic_pause_is_not_a_toggle();
     puts("media controls: bounded queue, ordered releases, completed volume receipts/epochs/expiry, suspend/reset and retry passed");
 }

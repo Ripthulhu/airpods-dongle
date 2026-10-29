@@ -51,7 +51,7 @@ static bool mic_prepare_open;
 static bool audio_owned=true, call_in_progress;
 static bool aacp_audio_owned(void) {return audio_owned;}
 static bool phone_call_active(void) {return call_in_progress;}
-static unsigned buffer_cancels, usb_pauses, phone_pauses;
+static unsigned buffer_cancels, usb_pauses, phone_pauses, usb_pause_cancels;
 #ifdef USB_GAME_VERIFICATION_TEST
 static void verification_test_buffer_cancel(void);
 #endif
@@ -61,10 +61,11 @@ static void aacp_receive_buffer_cancel(void) {
     verification_test_buffer_cancel();
 #endif
 }
-#define USB_MEDIA_PAUSE 1
+#define USB_MEDIA_PAUSE_ONLY 7
 #define AVRCP_OPERATION_ID_PAUSE 0x46
-static bool usb_media_enqueue(unsigned command) {assert(command==USB_MEDIA_PAUSE);++usb_pauses;return true;}
-static bool phone_sink_media_control(uint8_t operation) {assert(operation==AVRCP_OPERATION_ID_PAUSE);++phone_pauses;return true;}
+static bool usb_media_enqueue(unsigned command) {assert(command==USB_MEDIA_PAUSE_ONLY);++usb_pauses;return true;}
+static void phone_sink_pause_for_takeover(void) {++phone_pauses;}
+static void usb_media_cancel_pause(void) {++usb_pause_cancels;}
 typedef struct { unsigned l2cap_media_cid; } test_endpoint_t;
 static test_endpoint_t endpoint;
 static struct { test_endpoint_t *local_stream_endpoint; } sc={&endpoint};
@@ -117,7 +118,9 @@ static void btstack_run_loop_add_timer(btstack_timer_source_t *t) { t->active = 
 static void btstack_run_loop_set_timer_context(btstack_timer_source_t *t, void *context) { t->context = context; }
 static void btstack_run_loop_set_timer_handler(btstack_timer_source_t *t, void (*handler)(btstack_timer_source_t *)) { (void)t; (void)handler; }
 static void avdtp_audio_timeout_handler(btstack_timer_source_t *t) { (void)t; }
-static int avdtp_max_media_payload_size(unsigned cid, unsigned seid) { assert(cid == 10 && seid == 5); return 986; }
+static int media_mtu=986, sbc_frame_bytes=118;
+static int avdtp_max_media_payload_size(unsigned cid, unsigned seid) { assert(cid == 10 && seid == 5); return media_mtu; }
+static int btstack_sbc_encoder_sbc_buffer_length(void) {return sbc_frame_bytes;}
 static void aacp_disconnect(void) { }
 static unsigned a2dp_source_disconnect(unsigned cid) { assert(cid == 10); ++closes; return 0; }
 static unsigned avdtp_source_suspend(unsigned cid, unsigned seid) { assert(cid == 10 && seid == 5); ++suspends; return suspend_error; }
@@ -154,13 +157,14 @@ static void fixture(void) {
     is_usb_streaming = phone_opened = phone_active = mic_requested = mic_active = false;
     call_active = call_opened = call_capture = false;
     audio_owned=true;call_in_progress=false;endpoint.l2cap_media_cid=0x40;
-    buffer_cancels=usb_pauses=phone_pauses=0;
+    buffer_cancels=usb_pauses=phone_pauses=usb_pause_cancels=0;
     playback_peer_suspended=false;
     usb_playback_revision=playback_peer_suspend_revision=0;
     phone_yields=0;
     phone_output_recovery=false;
     for(unsigned i=0;i<6;++i)selected_peer[i]=cur_active_device[i]=(uint8_t)(i+1);
     cur_codec = 4;
+    media_mtu=986;sbc_frame_bytes=118;
     game_eligible=false; playback_game=(playback_game_t){0};
 }
 static void suspend_idle(void) {
@@ -264,7 +268,7 @@ static void ownership_loss_is_passive_until_explicit_claim(void) {
     set_usb_streaming(false);set_usb_streaming(true);playback_idle_poll(++now);
     assert(!starts && !closes && suspends==1 && usb_pauses==1);
     audio_owned=true;dongle_playback_ownership_changed(true);playback_idle_poll(++now);
-    assert(starts==1 && playback_idle_phase==PLAYBACK_STARTING);
+    assert(starts==1 && playback_idle_phase==PLAYBACK_STARTING && usb_pause_cancels==1);
     accept(AVDTP_SI_START,5);assert(media_tracker.streaming);
 
     // Both powered hosts can keep USB packets arriving without an initial claim.
@@ -428,7 +432,28 @@ static void call_output_ownership(void) {
     fixture();assert(bridge_call_open());bridge_call_stop();assert(!call_opened && !call_active);
 }
 
+static void sbc_start_requires_one_complete_frame(void) {
+    const int sizes[]={-1,0,1,100,118,119,120,986};
+    for(unsigned i=0;i<sizeof(sizes)/sizeof(*sizes);++i) {
+        fixture();a2dp_demo_timer_stop(&media_tracker);
+        cur_codec=1;media_mtu=sizes[i];
+        assert(btstack_sbc_encoder_sbc_buffer_length()==118);
+        bool fits=media_mtu>=119; // One-byte SBC header plus a whole 118-byte frame.
+        assert(a2dp_demo_timer_start(&media_tracker)==fits);
+        assert(media_tracker.streaming==fits && media_tracker.audio_timer.active==fits);
+        assert(closes==(unsigned)!fits);
+    }
+    const int invalid_frames[]={-1,0,656}; // The local packet ceiling is 656 bytes.
+    for(unsigned i=0;i<sizeof(invalid_frames)/sizeof(*invalid_frames);++i) {
+        fixture();a2dp_demo_timer_stop(&media_tracker);
+        cur_codec=1;sbc_frame_bytes=invalid_frames[i];
+        assert(!a2dp_demo_timer_start(&media_tracker));
+        assert(closes==1 && !media_tracker.streaming && !media_tracker.audio_timer.active);
+    }
+}
+
 int main(void) {
+    sbc_start_requires_one_complete_frame();
     fresh_phone_start_reclaims_only_owned_output();
     call_output_ownership();
     phone_output_recovers_without_losing_input();

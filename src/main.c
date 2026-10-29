@@ -284,6 +284,8 @@ bool usb_timer_callback(repeating_timer_t *rt){
     hw_set_bits(&watchdog_hw->scratch[0],RUNTIME_WATCH_USB);
     uint32_t started = time_us_32();
     tinyusb_task();
+    // Apply newly opened endpoints before the next START-relative timer deadline.
+    rt->delay_us = -(int64_t)tinyusb_service_interval_us();
     realtime_metric_record(&usb_service_metric, started, time_us_32(), REALTIME_USB_SERVICE_BUDGET_US);
     hw_clear_bits(&watchdog_hw->scratch[0],RUNTIME_WATCH_USB);
     return true;
@@ -599,12 +601,15 @@ int main() {
         if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report();bt_volume_report();aacp_routing_report(); }
         volume_trace_console_poll(&volume_console, now_ms);
         bool enter_bootsel = bootsel_request_poll(&bootsel, now_ms);
+        // Snapshot under the Bluetooth lock; USB ingress keeps running in its IRQ.
+        bool fully_idle = !check_is_streaming() && !bootsel_busy() &&
+            !decoder.start_pending && !decoder.releasing && !debug_cdc_terminal_connected();
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
         runtime_watch_set(WATCH_UNLOCK);
         async_context_release_lock(ctx);
         if (enter_bootsel) bootsel_enter_if_idle(bootsel.terminal_generation);
         runtime_watch_set(WATCH_IDLE);
-        uint32_t idle_us = realtime_loop_idle_us(bluetooth_started, time_us_32());
+        uint32_t idle_us = realtime_loop_idle_us(bluetooth_started, time_us_32(), fully_idle);
         if (idle_us) sleep_us(idle_us);
     }
 
