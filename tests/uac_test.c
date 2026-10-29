@@ -178,7 +178,8 @@ static bool tud_audio_buffer_and_schedule_control_xfer(uint8_t rhport, const tus
 
 static void service(void) { usb_context = true; tinyusb_task(); usb_context = false; }
 static void fixture(void) {
-    atomic_store(&usb_bluetooth_requested,false);atomic_store(&usb_audio_present,true);
+    // Most callback tests start after a headset has connected and audio enumerated.
+    atomic_store(&usb_audio_requested,true);atomic_store(&usb_audio_present,true);
     usb_descriptor_audio=presented_audio=true;usb_mode_reconnecting=false;usb_reconnect_at=0;
     disconnects=connects=descriptor_changes=0;
     terminal_connected=false;
@@ -201,7 +202,11 @@ static void fixture(void) {
     bt_volume = 127;
     memset(host_mic, 0x55, sizeof(host_mic));
 }
-static void mount_host(void) { mounted = true; tud_mount_cb(); assert(usb_host_active() && media_available); }
+static void mount_host(void) {
+    mounted=true;tud_mount_cb();
+    assert(usb_mounted && atomic_load(&usb_host_available) && media_available);
+    assert(usb_host_active()==usb_audio_available());
+}
 static void interface_alt(uint16_t itf, uint16_t alt, bool closing) {
     tusb_control_request_t request = {.wIndex = itf, .wValue = alt};
     assert(closing ? tud_audio_set_itf_close_EP_cb(0, &request) : tud_audio_set_itf_cb(0, &request));
@@ -557,11 +562,11 @@ static void bluetooth_removes_audio_preserves_control(void) {
     assert(packet(pcm,sizeof(pcm),sizeof(pcm),1));
     interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,1,false);
     assert(speaker_active && usb_mic_requested());
-    usb_audio_set_bluetooth(true);
+    usb_audio_set_route(true,true);
     service();assert(!disconnects && usb_audio_available() && usb_mic_requested());
     interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,0,true);
     host_volume(-8000); // Queued in the old host generation.
-    usb_audio_set_bluetooth(true);
+    usb_audio_set_route(true,true);
     assert(!usb_audio_available() && !usb_host_active());
     unsigned before=pushes;
     assert(packet(pcm,sizeof(pcm),sizeof(pcm),1) && pushes==before && !rx_used);
@@ -582,7 +587,7 @@ static void bluetooth_removes_audio_preserves_control(void) {
     tud_mount_cb();assert(usb_mounted && media_available && !usb_host_active());
     for(unsigned i=0;i<100;++i){now+=1000;service();}
     assert(disconnects==1 && connects==1 && !int_attempts);
-    usb_audio_set_bluetooth(false);service();
+    usb_audio_set_route(true,false);service();
     assert(disconnects==2 && connects==1 && !usb_audio_available());
     now+=USB_REENUMERATE_US;service();assert(connects==2 && presented_audio);
     mount_host();interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,1,false);
@@ -592,12 +597,12 @@ static void bluetooth_removes_audio_preserves_control(void) {
 
 static void usb_mode_coalesces_and_wraps(void) {
     fixture();mount_host();now=UINT32_MAX-100000u;
-    usb_audio_set_bluetooth(true);service();
-    usb_audio_set_bluetooth(false); // Cancel while detached: restore the latest intent.
+    usb_audio_set_route(true,true);service();
+    usb_audio_set_route(true,false); // Cancel while detached: restore the latest intent.
     now+=USB_REENUMERATE_US-1;service();assert(!connects && !usb_audio_available());
     now++;service();assert(connects==1 && presented_audio && descriptor_changes==1);
     mount_host();service();assert(disconnects==1);
-    usb_audio_set_bluetooth(true);usb_audio_set_bluetooth(false);service();
+    usb_audio_set_route(true,true);usb_audio_set_route(true,false);service();
     assert(disconnects==1); // No detach for an intent that never reaches USB service.
 }
 
@@ -632,17 +637,85 @@ static void service_cadence_preserves_open_endpoints(void) {
     terminal_connected=true;
     assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
     terminal_connected=false;
-    mount_host();usb_audio_set_bluetooth(true);service();
+    mount_host();usb_audio_set_route(true,true);service();
     assert(usb_mode_reconnecting && tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
     now+=USB_REENUMERATE_US;service();
     assert(!presented_audio && tinyusb_service_interval_us()==REALTIME_USB_IDLE_INTERVAL_US);
-    usb_audio_set_bluetooth(false);service();
+    usb_audio_set_route(true,false);service();
     now+=USB_REENUMERATE_US;service();mount_host();
     interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,1,false);
     assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
 }
 
+static void cold_boot_has_controls_without_audio(void) {
+    // This runs before fixture(), using the production static initializers.
+    assert(!atomic_load(&usb_audio_requested) && !atomic_load(&usb_audio_present));
+    assert(!usb_descriptor_audio && !usb_audio_available());
+    service();mount_host();service();
+    assert(!disconnects && !connects && !usb_host_active() && media_available);
+    assert(usb_tasks && media_tasks && debug_tasks);
+    tusb_control_request_t open={.wIndex=ITF_NUM_AUDIO_STREAMING_SPK,.wValue=1};
+    assert(!tud_audio_set_itf_cb(0,&open));
+    usb_audio_set_route(false,false);service();
+    assert(!disconnects && !usb_audio_available());
+    usb_audio_set_route(true,false);
+    assert(!usb_audio_available()); // Desired audio is not yet enumerated.
+    service();assert(disconnects==1 && !connects && !usb_host_active());
+    now+=USB_REENUMERATE_US-1;service();assert(!connects);
+    now++;service();mount_host();
+    assert(connects==1 && presented_audio && usb_audio_available() && usb_host_active());
+}
+
+static void headset_absence_closes_audio_even_during_recording(void) {
+    fixture();open_speaker();
+    interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,1,false);
+    bool wanted=false;
+    assert(usb_mic_take_request(&wanted) && wanted);
+    const int16_t pcm[]={100,-100,200,-200};
+    assert(packet(pcm,sizeof(pcm),sizeof(pcm),1) && speaker_active);
+    usb_audio_set_route(true,true);service();
+    assert(usb_audio_available() && usb_mic_requested() && !disconnects);
+    unsigned before=pushes,resets=mic_resets;
+    usb_audio_set_route(false,true);
+    assert(!usb_audio_available()); // No late packet survives the presence publication.
+    assert(packet(pcm,sizeof(pcm),sizeof(pcm),1) && pushes==before);
+    tusb_control_request_t open={.wIndex=ITF_NUM_AUDIO_STREAMING_MIC,.wValue=1};
+    assert(!tud_audio_set_itf_cb(0,&open));
+    service();
+    assert(disconnects==1 && !usb_mic_requested() && !speaker_active && stops==1);
+    assert(usb_mic_take_request(&wanted) && !wanted && mic_resets>resets);
+    assert(!speaker_interface_open && !mic_interface_open && speaker_format==0);
+    now+=USB_REENUMERATE_US;service();mount_host();
+    assert(!presented_audio && !usb_host_active() && media_available);
+    // Returning AirPods cannot steal a retained Bluetooth-input session.
+    usb_audio_set_route(true,true);service();
+    assert(disconnects==1 && !usb_audio_available());
+    usb_audio_set_route(true,false);service();
+    now+=USB_REENUMERATE_US;service();mount_host();
+    assert(presented_audio && usb_audio_available() && !usb_mic_requested());
+    assert(!speaker_interface_open && !mic_interface_open); // No old host stream resumes itself.
+}
+
+static void presence_changes_coalesce_without_stale_audio(void) {
+    fixture();mount_host();now=UINT32_MAX-100000u;
+    usb_audio_set_route(false,false);service();
+    usb_audio_set_route(true,false); // Headset returns during the detach interval.
+    now+=USB_REENUMERATE_US;service();
+    assert(connects==1 && presented_audio && usb_audio_available());
+    mount_host();
+    usb_audio_set_route(false,false);service();
+    usb_audio_set_route(true,false);
+    usb_audio_set_route(false,false); // Latest absence wins even if audio was briefly requested.
+    now+=USB_REENUMERATE_US;service();mount_host();
+    assert(connects==2 && !presented_audio && !usb_audio_available());
+    usb_audio_set_route(false,true);service();
+    assert(disconnects==2 && !usb_host_active() && media_available);
+}
+
 int main(void) {
+    cold_boot_has_controls_without_audio();
+    headset_absence_closes_audio_even_during_recording();
+    presence_changes_coalesce_without_stale_audio();
     service_cadence_preserves_open_endpoints();
     bluetooth_removes_audio_preserves_control();
     usb_mode_coalesces_and_wraps();
@@ -663,5 +736,5 @@ int main(void) {
 #if AIRPODS_USB_FLOAT
     float_packets_and_switching();
 #endif
-    puts("UAC: PCM/float, duplex, volume fencing, Bluetooth USB exclusion, late callbacks, mic priority and re-enumeration wrap passed");
+    puts("UAC: control-only boot, headset presence, PCM/float, duplex, route priorities and re-enumeration wrap passed");
 }

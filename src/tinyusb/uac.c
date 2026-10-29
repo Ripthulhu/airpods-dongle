@@ -108,31 +108,32 @@
  static _Atomic bool volume_notification_pending;
 
  // Main publishes routing intent; only the USB service changes descriptors.
- static _Atomic bool usb_bluetooth_requested;
- static _Atomic bool usb_audio_present = true;
- static bool usb_descriptor_audio = true;
+ static _Atomic bool usb_audio_requested;
+ static _Atomic bool usb_audio_present;
+ static bool usb_descriptor_audio;
  static bool usb_mode_reconnecting;
  static uint32_t usb_reconnect_at;
  #define USB_REENUMERATE_US 250000u
 
  #define USB_PLAYBACK_IDLE_US 50000u
 
- void usb_audio_set_bluetooth(bool requested) {
+ void usb_audio_set_route(bool airpods_connected, bool bluetooth_requested) {
    // A USB mic SET_INTERFACE can arrive between main's policy read and this
-   // publication. An already accepted USB recording request retains priority.
+   // publication. Recording beats Bluetooth input, but cannot outlive the headset.
    uint32_t saved = save_and_disable_interrupts();
-   atomic_store_explicit(&usb_bluetooth_requested,
-       requested && !usb_mic_request_wanted(&mic_request), memory_order_release);
+   atomic_store_explicit(&usb_audio_requested,
+       airpods_connected && (!bluetooth_requested || usb_mic_request_wanted(&mic_request)),
+       memory_order_release);
    restore_interrupts(saved);
  }
 
  bool usb_audio_available(void) {
-   return !atomic_load_explicit(&usb_bluetooth_requested, memory_order_acquire) &&
+   return atomic_load_explicit(&usb_audio_requested, memory_order_acquire) &&
           atomic_load_explicit(&usb_audio_present, memory_order_acquire);
  }
 
  static void usb_audio_mode_task(void) {
-   bool audio = !atomic_load_explicit(&usb_bluetooth_requested, memory_order_acquire);
+   bool audio = atomic_load_explicit(&usb_audio_requested, memory_order_acquire);
    if (!usb_mode_reconnecting && audio != usb_descriptor_audio) {
      usb_mode_reconnecting = true;
      atomic_store_explicit(&usb_audio_present, false, memory_order_release);

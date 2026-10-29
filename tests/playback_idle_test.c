@@ -172,10 +172,12 @@ static void suspend_idle(void) {
     now += 999; playback_idle_poll(now); assert(!suspends);
     ++now; playback_idle_poll(now); assert(suspends == 1);
     assert(is_streaming && media_tracker.streaming && playback_idle_phase == PLAYBACK_SUSPENDING);
+    assert(get_a2dp_connected_flag()); // USB availability survives ordinary idle suspension.
     accept(AVDTP_SI_SUSPEND, 6); assert(media_tracker.streaming);
     accept(AVDTP_SI_SUSPEND, 5);
     assert(!is_streaming && !media_tracker.streaming && !media_tracker.audio_timer.active);
     assert(playback_idle_phase == PLAYBACK_SUSPENDED);
+    assert(get_a2dp_connected_flag());
 }
 static void usb_onset_survives_restart(void) {
     fixture(); suspend_idle();
@@ -186,9 +188,11 @@ static void usb_onset_survives_restart(void) {
     playback_idle_poll(++now);
     assert(starts == 1 && resets == 1 && !media_tracker.streaming);
     assert(playback_idle_phase == PLAYBACK_STARTING);
+    assert(get_a2dp_connected_flag());
     accept(AVDTP_SI_START, 6); assert(!media_tracker.streaming);
     accept(AVDTP_SI_START, 5);
     assert(media_tracker.streaming && is_streaming && playback_idle_phase == PLAYBACK_RUNNING);
+    assert(get_a2dp_connected_flag());
     assert(playback_pcm.priming == 4800 && playback_pcm.used == 480);
     for(unsigned i=0;i<PLAYBACK_FILTER_TAPS*2;++i)assert(playback_pcm.history[i]==0.0f);
     for (unsigned i = 0; i < 10; ++i) {
@@ -263,13 +267,16 @@ static void ownership_loss_is_passive_until_explicit_claim(void) {
     fixture();set_usb_streaming(true);audio_owned=false;
     dongle_playback_ownership_changed(false);
     assert(!media_tracker.streaming && !is_streaming && suspends==1 && usb_pauses==1);
+    assert(get_a2dp_connected_flag()); // The standby dongle keeps its connected USB endpoint.
     accept(AVDTP_SI_SUSPEND,5);assert(playback_idle_phase==PLAYBACK_SUSPENDED);
     for(unsigned i=0;i<100;++i){now+=10;playback_idle_poll(now);}
     set_usb_streaming(false);set_usb_streaming(true);playback_idle_poll(++now);
     assert(!starts && !closes && suspends==1 && usb_pauses==1);
+    assert(get_a2dp_connected_flag());
     audio_owned=true;dongle_playback_ownership_changed(true);playback_idle_poll(++now);
     assert(starts==1 && playback_idle_phase==PLAYBACK_STARTING && usb_pause_cancels==1);
     accept(AVDTP_SI_START,5);assert(media_tracker.streaming);
+    assert(get_a2dp_connected_flag());
 
     // Both powered hosts can keep USB packets arriving without an initial claim.
     fixture();a2dp_demo_timer_stop(&media_tracker);audio_owned=false;set_usb_streaming(true);

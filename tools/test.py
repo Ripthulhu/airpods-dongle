@@ -18,13 +18,13 @@ def uac_sources(directory):
     end = source.index("\n }", start) + 3
     (directory / "uac_mic_callback.inc").write_text(source[start:end])
     start = source.index(" const uint32_t sample_rates[]")
-    end = source.index(" void usb_audio_set_bluetooth(bool requested)")
+    end = source.index(" void usb_audio_set_route(")
     declarations = source[start:end]
     start = source.index(" static union {")
     end = source.index(" //void led_blinking_task", start)
     declarations += source[start:end]
     functions = []
-    for name in ["usb_audio_set_bluetooth", "usb_audio_available", "usb_audio_mode_task", "usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
+    for name in ["usb_audio_set_route", "usb_audio_available", "usb_audio_mode_task", "usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
                  "tinyusb_service_interval_us",
                  "usb_mic_requested", "usb_host_active", "usb_volume_set_revision", "usb_volume_set_generation", "usb_volume_set_receipt", "tinyusb_task", "tinyusb_control_task",
                  "tud_mount_cb", "tud_umount_cb", "tud_suspend_cb", "tud_resume_cb",
@@ -45,6 +45,18 @@ def uac_sources(directory):
             end += 1
         functions.append(source[start:end])
     (directory / "uac.inc").write_text(declarations + "\n".join(functions))
+
+
+def usb_descriptor_sources(directory):
+    source = (ROOT / "src/tinyusb/usb_descriptors.c").read_text()
+    start = source.index("static bool descriptor_audio")
+    parts = [source[start:source.index(";", start)+1]]
+    for signature in ["void usb_descriptors_set_audio(", "uint8_t const * tud_descriptor_device_cb(",
+                      "uint8_t const * tud_descriptor_configuration_cb("]:
+        start = source.index(signature)
+        end = source.index("\n}", start)+2
+        parts.append(source[start:end])
+    (directory / "usb_descriptor_selector.inc").write_text("\n".join(parts))
 
 
 def playback_lifecycle_sources(directory):
@@ -70,7 +82,7 @@ def playback_lifecycle_sources(directory):
         clock_functions.append(source[start:end])
     (directory / "playback_cancel.inc").write_text("\n".join(clock_functions))
     functions = []
-    for signature in ["bool avdtp_disconnect_and_scan(void)",
+    for signature in ["bool get_a2dp_connected_flag()", "bool avdtp_disconnect_and_scan(void)",
                       "void avdtp_source_establish_stream(void)",
                       "uint8_t dongle_playback_configure(",
                       "void dongle_playback_mic_request_changed(",
@@ -134,7 +146,7 @@ def playback_lifecycle_sources(directory):
     (directory / "playback_timing.inc").write_text(instrumentation+"\n".join(functions))
 
     functions = []
-    for signature in ["static void playback_idle_reset(void) {",
+    for signature in ["bool get_a2dp_connected_flag()", "static void playback_idle_reset(void) {",
                       "static bool playback_pcm_warm(void) {",
                       "static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){",
                       "static int playback_encoder_failed(",
@@ -290,6 +302,7 @@ def main():
         "usb_control": ["tests/usb_control_test.c"],
         "uac": ["tests/uac_test.c"],
         "uac_s16": ["-DAIRPODS_USB_FLOAT=0", "tests/uac_test.c"],
+        "usb_descriptor_selector": ["tests/usb_descriptor_selector_test.c"],
         "volume_sync": ["tests/volume_sync_test.c"],
         "playback_volume": ["-Itests/media_stubs", "tests/playback_volume_test.c", "src/tinyusb/media_control.c"],
         "avrcp_reconnect": ["tests/avrcp_reconnect_test.c"],
@@ -320,6 +333,7 @@ def main():
         avrcp_reconnect_sources(pathlib.Path(tmp))
         usb_game_verification_sources(pathlib.Path(tmp))
         uac_sources(pathlib.Path(tmp))
+        usb_descriptor_sources(pathlib.Path(tmp))
         main_button_sources(pathlib.Path(tmp))
         for name, sources in tests.items():
             binary = pathlib.Path(tmp) / name

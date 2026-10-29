@@ -9,8 +9,8 @@ void tinyusb_task(void);
 // USB service context only, after processing this tick's interface changes.
 uint32_t tinyusb_service_interval_us(void);
 void tinyusb_control_task(void);
-// Main publishes Bluetooth ownership; USB service re-enumerates asynchronously.
-void usb_audio_set_bluetooth(bool requested);
+// Main publishes headset presence and input ownership; USB service re-enumerates.
+void usb_audio_set_route(bool airpods_connected, bool bluetooth_requested);
 bool usb_audio_available(void);
 
 // Latest USB capture intent; consumed only by the main loop.

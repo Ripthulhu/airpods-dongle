@@ -15,7 +15,7 @@ import time
 
 HEADER = b'APDG' + bytes((1, 64))
 USB_VENDOR = 0xcafe
-USB_PRODUCTS = (0x4015, 0x4005)  # Audio composite or Bluetooth control-only mode.
+USB_PRODUCTS = (0x4015, 0x4005)  # Audio composite or control-only mode.
 
 
 class Hid:

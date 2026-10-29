@@ -1,6 +1,27 @@
 # Phone bridge
 
-## Bluetooth and USB selection in 0.1.41
+## USB audio presence and Bluetooth selection
+
+Starting with 0.1.44, USB boots as `CAFE:4005` with HID/CDC controls only.
+Headphones and microphone appear only when the selected AirPods establish their
+Bluetooth audio-profile signaling connection. A real loss of that connection
+removes USB audio, even if a USB microphone was open. Ordinary music pause,
+media Suspend/Start, Game Mode adjustment, microphone recovery and standby
+ownership changes retain the connection and do not change the USB identity.
+
+| AirPods connection | Input selection | USB interfaces |
+| --- | --- | --- |
+| Absent | Any | HID/CDC only (`CAFE:4005`) |
+| Present | USB | Speaker, microphone, HID/CDC (`CAFE:4015`) |
+| Present | Bluetooth phone selected | HID/CDC only (`CAFE:4005`) |
+| Present | Already accepted USB microphone request | Audio retained; USB capture has priority over Bluetooth selection |
+
+The existing 250 ms detach interval coalesces rapid connection changes. Controls
+remain available after re-enumeration; clients must reopen their handles as with
+the existing Bluetooth mode switch. USB availability does not depend on active
+playback or owning the AirPods audio route, which avoids a circular dependency
+when starting music or requesting takeover. The host decides its output route
+when the audio device is removed or restored.
 
 An authenticated Bluetooth music connection selects the wireless input,
 even before codec negotiation or Play and while paused. The dongle briefly detaches USB and returns
@@ -12,10 +33,12 @@ do not select this mode.
 Once selected, media setup failure, profile teardown, pause and retry retain
 wireless mode for that phone connection. Only releasing the entire phone ACL
 connection (or replacing that phone) clears the selection and restores
-`CAFE:4015`, the normal S16/float32 speaker and unchanged microphone. A session
+`CAFE:4015`, the normal S16/float32 speaker and unchanged microphone, if the
+AirPods are still connected. A session
 token prevents a later connection reusing the same address/handle from inheriting
 old mode state. Bluetooth voice capture/cleanup also hold wireless selection. An already
-accepted USB microphone request retains priority; merely ringing is insufficient
+accepted USB microphone request retains priority while the AirPods are connected;
+merely ringing is insufficient
 to remove a USB call's audio devices. Selecting Bluetooth while USB recording
 is active remains subject to that priority.
 

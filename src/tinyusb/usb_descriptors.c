@@ -84,7 +84,8 @@ tusb_desc_device_t const desc_device_control =
     .bNumConfigurations = 0x01
 };
 
-static bool descriptor_audio = true;
+// Enumerate controls only until the Bluetooth headset is connected.
+static bool descriptor_audio;
 
 void usb_descriptors_set_audio(bool enabled) {
     descriptor_audio = enabled;

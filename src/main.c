@@ -559,8 +559,8 @@ int main() {
         runtime_watch_set(WATCH_HCI);
         bt_hci_phone_poll();
         phone_call_poll();
-        usb_audio_set_bluetooth(phone_sink_usb_exclusion_requested() ||
-                                phone_call_usb_exclusion_requested());
+        usb_audio_set_route(get_a2dp_connected_flag(), phone_sink_usb_exclusion_requested() ||
+                                                     phone_call_usb_exclusion_requested());
         runtime_watch_set(WATCH_MIC);
         if (aacp_mic_update_owner(usb_mic_take_request(&mic_wanted))) {
             // Preserve coalesced close/open revisions even when the final request stays true.

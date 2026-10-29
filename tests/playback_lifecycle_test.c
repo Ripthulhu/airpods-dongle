@@ -142,6 +142,24 @@ static void signaling_released(uint16_t cid) {
     }
 }
 
+static void headset_presence_follows_current_signaling(void) {
+    // Media/AACP can be idle while the actual headset profile remains connected.
+    a2dp_is_connected_flag=true;media_tracker.avdtp_cid=70;
+    media_tracker.streaming=game_ready=false;
+    assert(get_a2dp_connected_flag());
+    signaling_released(69);
+    assert(get_a2dp_connected_flag() && media_tracker.avdtp_cid==70);
+    signaling_released(70);
+    assert(!get_a2dp_connected_flag() && media_tracker.avdtp_cid==0);
+
+    // A late release from the old connection cannot hide a newly connected pair.
+    a2dp_is_connected_flag=true;media_tracker.avdtp_cid=71;
+    signaling_released(70);
+    assert(get_a2dp_connected_flag() && media_tracker.avdtp_cid==71);
+    signaling_released(71);
+    assert(!get_a2dp_connected_flag() && media_tracker.avdtp_cid==0);
+}
+
 static void profile_then_pair(bool storage_succeeds, bool inquiry_succeeds) {
     static const uint8_t old_peer[6] = {1, 2, 3, 4, 5, 6};
     playback_options = (playback_options_t){0};
@@ -447,6 +465,7 @@ static void game_changes_reset_continuity_without_packets(void) {
 }
 
 int main(void) {
+    assert(!get_a2dp_connected_flag());
     standalone_boot_connects_in_normal_mode();
     profile_then_pair(true, true);
     profile_then_pair(false, true);
@@ -469,5 +488,6 @@ int main(void) {
     now+=9;dongle_playback_poll();assert(inspect_enabled);
     ++now;dongle_playback_poll();assert(!inspect_enabled);
     game_changes_reset_continuity_without_packets();
+    headset_presence_follows_current_signaling();
     puts("playback lifecycle: Pair cancels pending profile reconnect, failures stay closed, fresh profile works");
 }

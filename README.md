@@ -12,6 +12,16 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.44** presents USB headphones and microphone only while the
+selected AirPods have a Bluetooth audio-profile connection. Boot and a real
+AirPods disconnect expose only HID/CDC controls; reconnect restores audio unless
+the phone's Bluetooth route owns it. Paused music, Game Mode changes and standby
+takeovers retain the connection and do not remove the USB device. AirPods absence
+overrides an open USB microphone. This also lets the idle-power changes below
+engage when the host would otherwise keep an unused USB audio stream open.
+Both builds and all offline checks pass; this candidate is not yet flashed.
+See [0.1.44 validation and hardware checks](docs/VALIDATION-0.1.44.md).
+
 Candidate **0.1.43** adds the renewed audit fixes: bounded, cancelable takeover
 Pause; explicit automatic USB Pause without changing stem toggles; and rejection
 of an SBC payload too small for a frame. A sample-equivalent unity-rate resampler
@@ -251,7 +261,9 @@ in pairing mode. Hold for at least three seconds to allow phone pairing for two
 minutes, then select **AirPods Dongle** in the phone's Bluetooth settings. For
 wireless use, power the Pico externally or leave its USB cable connected.
 Connecting the phone's Bluetooth music profile removes the USB audio device;
-disconnect the phone from the Bluetooth dongle to use USB audio again. Pausing music does not switch
+disconnect the phone from the Bluetooth dongle to use USB audio again while the
+AirPods are connected. With no AirPods connection, USB remains control-only.
+Pausing music does not switch
 back to USB. An existing USB recording session retains priority.
 See [phone bridge](docs/PHONE-TRANSPORT.md) for details.
 The selected saved headset reconnects automatically, with 1–8 seconds between
