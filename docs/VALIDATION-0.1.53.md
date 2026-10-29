@@ -115,7 +115,7 @@ Neither interval added malformed/short USB packets. Both remained on ACL epoch
 255200 through 220000/192000/174000 to 128000, then recovered to 174000; all five
 changes completed without encoder error. The Game capture began after the first
 downshift. Boot-wide maxima at its end were 8485 us per encode unit (including
-preparation), 7956 us inside the encoder, 2000 us send wait and 40226 us send gap;
+preparation), 7920 us inside the encoder, 2000 us send wait and 40226 us send gap;
 these maxima include earlier playback and transitions, not just the interval.
 
 The live entry report was 159 ms and remained cached after the finite clock
