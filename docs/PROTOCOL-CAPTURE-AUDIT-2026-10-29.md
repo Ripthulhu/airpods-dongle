@@ -49,6 +49,11 @@ one/five discard events in the two 60 ms intervals and none at 200 ms. It does
 not establish a fix or eliminate this packet-policy difference. See
 [the measured result](VALIDATION-0.1.49.md).
 
+Version 0.1.50 implements this per-AirPods policy with a controller-confirmed,
+capability-safe normal baseline and restores that baseline on exit. The phone
+Pico's startup now confirms normal `CC18`; Game Mode hardware acceptance remains
+pending. See [candidate validation](VALIDATION-0.1.50.md).
+
 ### Other setup messages
 
 The Pico sends the handshake, its supported-feature envelope, notifications and

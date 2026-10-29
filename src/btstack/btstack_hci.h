@@ -26,7 +26,8 @@ bool bt_hci_phone_peer_connected(const uint8_t address[6]);
 uint32_t bt_hci_phone_session(const uint8_t address[6]);
 bool bt_hci_phone_address(uint8_t address[6]);
 void bt_hci_phone_poll(void);
-// Only the selected AirPods ACL changes; control packets remain non-flushable.
+// Selected AirPods Game Mode link policy; retiring live links restore their confirmed packet baseline.
+// Media alone is flushable; signaling/AACP and the phone ACL keep their existing policy.
 void bt_hci_airpods_flush_timeout(bool low_latency);
 // Temporarily compare 200-ms controller flush with unchanged Game Mode; expires after 120 seconds.
 bool bt_hci_airpods_flush_comparison(bool enabled);
@@ -44,6 +45,10 @@ typedef struct {
     uint16_t media_flush_desired_ms, media_flush_confirmed_ms;
     uint8_t media_flush_status;
     bool media_flush_pending, media_flush_failed;
+    // FFFF unknown. Requested is SDK-derived; normal/confirmed require actual packet-type events.
+    uint16_t media_packet_requested, media_packet_normal, media_packet_desired, media_packet_confirmed;
+    uint8_t media_packet_status;
+    bool media_packet_pending, media_packet_failed;
 } bt_hci_credit_diagnostics_t;
 // Read under the Bluetooth lock; false means Read Buffer Size has not succeeded.
 bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out);

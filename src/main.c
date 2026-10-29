@@ -97,6 +97,10 @@ static void realtime_metrics_print(void) {
     printf("[FLUSH] desired_ms=%u confirmed_ms=%u pending=%u failed=%u status=%u\n",
         credits.media_flush_desired_ms,credits.media_flush_confirmed_ms,
         credits.media_flush_pending,credits.media_flush_failed,credits.media_flush_status);
+    printf("[PACKET] requested=0x%04x normal=0x%04x desired=0x%04x confirmed=0x%04x pending=%u failed=%u status=%u\n",
+        credits.media_packet_requested,credits.media_packet_normal,
+        credits.media_packet_desired,credits.media_packet_confirmed,
+        credits.media_packet_pending,credits.media_packet_failed,credits.media_packet_status);
 }
 
 void aacp_mic_dec_wake_worker(void) {

@@ -64,6 +64,20 @@ static struct {
 // Observe BTstack's initial 200-ms ACK before issuing another command on that ACL.
 static struct { uint16_t handle, confirmed_ms; uint32_t epoch; } media_flush_links[2];
 static uint32_t media_flush_link_epoch;
+static struct {
+    bd_addr_t address;
+    uint32_t epoch;
+    uint16_t handle, requested, normal, desired, confirmed;
+    uint8_t status;
+    bool baseline, failed;
+} media_packets[2];
+static struct {
+    uint32_t epoch, since;
+    uint16_t handle, mask;
+    bool active, accepted, baseline;
+} media_packet_pending;
+static uint32_t media_packet_epoch;
+static bool media_packet_game;
 
 typedef struct {
     uint8_t version;
@@ -86,6 +100,7 @@ static void media_flush_forget(void) {
     media_flush.status = UINT8_MAX;
     media_flush.failed = false;
     media_flush.low_latency = media_flush.comparison = false;
+    media_packet_game = false;
     media_flush.since = btstack_run_loop_get_time_ms();
     memset(media_flush.address, 0, sizeof(media_flush.address));
 }
@@ -124,7 +139,9 @@ static void media_flush_policy(void) {
     }
 }
 void bt_hci_airpods_flush_timeout(bool low_latency) {
-    if (media_flush_bind() == NULL || !hci_non_flushable_packet_boundary_flag_supported()) return;
+    hci_connection_t *connection = media_flush_bind();
+    media_packet_game = connection != NULL && low_latency;
+    if (connection == NULL || !hci_non_flushable_packet_boundary_flag_supported()) return;
     media_flush.low_latency = low_latency;
     media_flush_policy();
 }
@@ -236,6 +253,131 @@ static void media_flush_event(const uint8_t *p, uint16_t size) {
     }
 }
 
+static int media_packet_index(uint16_t handle) {
+    for (unsigned i = 0; i < 2; ++i) if (media_packets[i].handle == handle) return (int)i;
+    return -1;
+}
+static bool media_packet_live(unsigned i) {
+    hci_connection_t *connection = hci_connection_for_handle(media_packets[i].handle);
+    return connection != NULL && connection->state == OPEN && connection->address_type == BD_ADDR_TYPE_ACL &&
+        memcmp(connection->address, media_packets[i].address, 6) == 0;
+}
+static uint16_t media_packet_allowed(uint16_t mask) {
+    // The wire EDR bits forbid types; DM1 is always allowed irrespective of bit 3.
+    return ((mask ^ 0x3306u) & ACL_PACKET_TYPES_ALL) | ACL_PACKET_TYPES_DM1;
+}
+static bool media_packet_equal(uint16_t a, uint16_t b) {
+    return (a & ~ACL_PACKET_TYPES_ALL) == 0 && media_packet_allowed(a) == media_packet_allowed(b);
+}
+static int media_packet_selected(void) {
+    hci_connection_t *connection = peer_address_valid(device_addr) ?
+        hci_connection_for_bd_addr_and_type(device_addr, BD_ADDR_TYPE_ACL) : NULL;
+    if (connection == NULL || connection->state != OPEN || connection->address_type != BD_ADDR_TYPE_ACL ||
+        memcmp(connection->address, device_addr, 6)) return -1;
+    for (unsigned i = 0; i < 2; ++i)
+        if (media_packets[i].handle != HCI_CON_HANDLE_INVALID && !media_packet_live(i))
+            media_packets[i].handle = HCI_CON_HANDLE_INVALID;
+    int index = media_packet_index(connection->con_handle);
+    if (index >= 0) return index;
+    for (unsigned i = 0; i < 2; ++i) {
+        if (media_packets[i].handle != HCI_CON_HANDLE_INVALID) continue;
+        memset(&media_packets[i], 0, sizeof(media_packets[i]));
+        media_packets[i].handle = connection->con_handle;
+        memcpy(media_packets[i].address, connection->address, 6);
+        if (!++media_packet_epoch) ++media_packet_epoch;
+        media_packets[i].epoch = media_packet_epoch;
+        // This is a safe startup request, not a measurement of the controller's prior mask.
+        media_packets[i].requested = hci_usable_acl_packet_types();
+        media_packets[i].normal = media_packets[i].confirmed = UINT16_MAX;
+        media_packets[i].desired = media_packets[i].requested;
+        media_packets[i].status = UINT8_MAX;
+        return (int)i;
+    }
+    return -1;
+}
+static void media_packet_poll(void) {
+    int selected = media_packet_selected();
+    for (unsigned i = 0; i < 2; ++i) {
+        if (media_packets[i].handle == HCI_CON_HANDLE_INVALID) continue;
+        uint16_t desired = media_packets[i].baseline ? media_packets[i].normal : media_packets[i].requested;
+        if (media_packets[i].baseline && (int)i == selected && media_packet_game &&
+            media_flush.handle == media_packets[i].handle && !memcmp(media_flush.address, media_packets[i].address, 6))
+            desired |= ACL_PACKET_TYPES_EDR3;
+        if (desired != media_packets[i].desired) {
+            media_packets[i].desired = desired;
+            media_packets[i].failed = false;
+        }
+    }
+    if (media_packet_pending.active) {
+        int index = media_packet_index(media_packet_pending.handle);
+        if (index >= 0 && media_packets[index].epoch == media_packet_pending.epoch &&
+            (uint32_t)(btstack_run_loop_get_time_ms() - media_packet_pending.since) >= 1000u) {
+            media_packets[index].failed = true;
+            media_packets[index].status = UINT8_MAX;
+        }
+        return; // Status has no handle; quarantine this opcode until its terminal event or controller reset.
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        if (media_packets[i].handle == HCI_CON_HANDLE_INVALID || !media_packet_live(i) || media_packets[i].failed ||
+            (!media_packets[i].baseline && (int)i != selected) ||
+            (media_packets[i].baseline && media_packet_equal(media_packets[i].confirmed, media_packets[i].desired))) continue;
+        if (!hci_can_send_command_packet_now()) return;
+        media_packet_pending.epoch = media_packets[i].epoch;
+        media_packet_pending.handle = media_packets[i].handle;
+        media_packet_pending.mask = media_packets[i].desired;
+        media_packet_pending.since = btstack_run_loop_get_time_ms();
+        media_packet_pending.baseline = !media_packets[i].baseline;
+        media_packet_pending.accepted = false;
+        media_packet_pending.active = true;
+        uint8_t status = hci_send_cmd(&hci_change_connection_packet_type, media_packet_pending.handle, media_packet_pending.mask);
+        if (status != ERROR_CODE_SUCCESS && media_packet_pending.active && media_packet_pending.epoch == media_packets[i].epoch) {
+            media_packet_pending.active = false;
+            media_packets[i].failed = true;
+            media_packets[i].status = status;
+        }
+        return;
+    }
+}
+static void media_packet_event(const uint8_t *p, uint16_t size) {
+    if (p[0] == BTSTACK_EVENT_STATE && size >= 3 && p[2] != HCI_STATE_WORKING) {
+        media_packets[0].handle = media_packets[1].handle = HCI_CON_HANDLE_INVALID;
+        media_packet_pending.active = false;
+    } else if (p[0] == HCI_EVENT_DISCONNECTION_COMPLETE && size == 6 && p[2] == 0) {
+        int index = media_packet_index((uint16_t)p[3] | (uint16_t)p[4] << 8);
+        if (index >= 0) media_packets[index].handle = HCI_CON_HANDLE_INVALID;
+    } else if (media_packet_pending.active && p[0] == HCI_EVENT_COMMAND_STATUS && size == 6 &&
+        ((uint16_t)p[4] | (uint16_t)p[5] << 8) == HCI_OPCODE_HCI_CHANGE_CONNECTION_PACKET_TYPE) {
+        media_packet_pending.accepted = p[2] == ERROR_CODE_SUCCESS;
+        if (media_packet_pending.accepted) return;
+        media_packet_pending.active = false;
+        int index = media_packet_index(media_packet_pending.handle);
+        if (index >= 0 && media_packets[index].epoch == media_packet_pending.epoch) {
+            media_packets[index].status = p[2];
+            media_packets[index].failed = media_packet_pending.baseline ||
+                media_packet_equal(media_packets[index].desired, media_packet_pending.mask);
+        }
+    } else if (media_packet_pending.active && media_packet_pending.accepted &&
+        p[0] == HCI_EVENT_CONNECTION_PACKET_TYPE_CHANGED && size == 7 &&
+        ((uint16_t)p[3] | (uint16_t)p[4] << 8) == media_packet_pending.handle) {
+        media_packet_pending.active = false;
+        int index = media_packet_index(media_packet_pending.handle);
+        if (index < 0 || media_packets[index].epoch != media_packet_pending.epoch || !media_packet_live((unsigned)index)) return;
+        uint16_t mask = (uint16_t)p[5] | (uint16_t)p[6] << 8;
+        bool match = p[2] == 0 && (mask & ~ACL_PACKET_TYPES_ALL) == 0;
+        if (match && media_packet_pending.baseline)
+            match = (media_packet_allowed(mask) & ~media_packet_allowed(media_packet_pending.mask)) == 0;
+        else if (match) match = media_packet_equal(mask, media_packet_pending.mask);
+        if (p[2] == 0) media_packets[index].confirmed = mask;
+        media_packets[index].status = p[2];
+        media_packets[index].failed = !match && (media_packet_pending.baseline ||
+            media_packet_equal(media_packets[index].desired, media_packet_pending.mask));
+        if (match && media_packet_pending.baseline) {
+            media_packets[index].normal = mask;
+            media_packets[index].baseline = true;
+        }
+    }
+}
+
 static void phone_load(void) {
     const btstack_tlv_t *tlv;
     void *context;
@@ -333,6 +475,19 @@ bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out) {
     credit_link(phone_address, &out->phone_handle, &out->phone_local_role);
     if (out->phone_handle == HCI_CON_HANDLE_INVALID)
         credit_link(phone_candidate, &out->phone_handle, &out->phone_local_role);
+    out->media_packet_requested = out->media_packet_normal = out->media_packet_desired =
+        out->media_packet_confirmed = UINT16_MAX;
+    out->media_packet_status = UINT8_MAX;
+    out->media_packet_pending = media_packet_pending.active;
+    int index = out->airpods_handle != HCI_CON_HANDLE_INVALID ? media_packet_index(out->airpods_handle) : -1;
+    if (index >= 0 && media_packet_live((unsigned)index)) {
+        out->media_packet_requested = media_packets[index].requested;
+        out->media_packet_normal = media_packets[index].normal;
+        out->media_packet_desired = media_packets[index].desired;
+        out->media_packet_confirmed = media_packets[index].confirmed;
+        out->media_packet_status = media_packets[index].status;
+        out->media_packet_failed = media_packets[index].failed;
+    }
     if (credit_buffer_known) {
         out->effective_acl_limit = credit_raw_acl_count < MAX_NR_CONTROLLER_ACL_BUFFERS ?
             credit_raw_acl_count : MAX_NR_CONTROLLER_ACL_BUFFERS;
@@ -370,6 +525,7 @@ static void phone_pairing_stop(void) {
 }
 
 void bt_hci_phone_poll(void) {
+    media_packet_poll();
     media_flush_poll();
     if (!phone_pairing_audio_busy()) credit_roles[0].armed = credit_roles[1].armed = false;
     if (phone_pairing && !bt_hci_phone_pairing_active()) phone_pairing_stop();
@@ -499,6 +655,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     if (packet_type != HCI_EVENT_PACKET || size < 2 || (unsigned)packet[1] + 2 != size) return;
     credit_event(packet, size);
     media_flush_event(packet, size);
+    media_packet_event(packet, size);
     dongle_playback_controller_event(packet,size);
     uint8_t status;
     UNUSED(status);
@@ -662,6 +819,8 @@ void bt_hci_init(void){
     media_flush_forget();
     media_flush_pending.active = false;
     media_flush_links[0].handle = media_flush_links[1].handle = HCI_CON_HANDLE_INVALID;
+    media_packets[0].handle = media_packets[1].handle = HCI_CON_HANDLE_INVALID;
+    media_packet_pending.active = false;
     phone_session_generation = 0;
     phone_session_handle = HCI_CON_HANDLE_INVALID;
     memset(phone_session_address, 0, sizeof(phone_session_address));

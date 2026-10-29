@@ -3,6 +3,14 @@
 #include <stdarg.h>
 #include "hci_stubs/btstack.h"
 
+#define HCI_EVENT_CONNECTION_PACKET_TYPE_CHANGED 0x1d
+#define HCI_OPCODE_HCI_CHANGE_CONNECTION_PACKET_TYPE 0x040f
+#define ACL_PACKET_TYPES_DM1 0x0008
+#define ACL_PACKET_TYPES_EDR3 0x2204
+#define ACL_PACKET_TYPES_ALL 0xff1e
+extern const hci_cmd_t hci_change_connection_packet_type;
+uint16_t hci_usable_acl_packet_types(void);
+
 // The transport header has unrelated static encoder declarations.
 #define PICOW_USB_BT_AUDIO_SSP_COUNTER_H
 void avdtp_source_establish_stream(void);
@@ -21,6 +29,12 @@ static unsigned flush_writes;
 static uint16_t flush_handle, flush_slots;
 static bool command_ready;
 static uint8_t command_result;
+static unsigned packet_writes;
+static uint16_t packet_handle, packet_mask, usable_packet_mask;
+static uint8_t packet_result;
+static bool packet_sync_complete, consume_command_credit;
+static void packet_status(uint8_t status);
+static void packet_changed(uint16_t handle,uint16_t mask,uint8_t status);
 static bool ble_ready;
 static bool fail_storage;
 static uint32_t now;
@@ -57,16 +71,23 @@ void ble_scan_set_paused(uint32_t reason, bool paused) {
 }
 void gap_enable_link_watchdog(uint16_t timeout) { flush_timeout = timeout; }
 const hci_cmd_t hci_write_automatic_flush_timeout = {HCI_OPCODE_HCI_WRITE_AUTOMATIC_FLUSH_TIMEOUT};
+const hci_cmd_t hci_change_connection_packet_type = {HCI_OPCODE_HCI_CHANGE_CONNECTION_PACKET_TYPE};
+uint16_t hci_usable_acl_packet_types(void) {return usable_packet_mask;}
 bool hci_can_send_command_packet_now(void) { return command_ready; }
 uint8_t hci_send_cmd(const hci_cmd_t *cmd, ...) {
-    assert(cmd == &hci_write_automatic_flush_timeout);
     va_list args;
     va_start(args, cmd);
-    flush_handle = (uint16_t)va_arg(args, int);
-    flush_slots = (uint16_t)va_arg(args, unsigned);
+    uint16_t handle = (uint16_t)va_arg(args, int);
+    uint16_t value = (uint16_t)va_arg(args, int);
     va_end(args);
-    ++flush_writes;
-    return command_result;
+    if(consume_command_credit)command_ready=false;
+    if (cmd == &hci_write_automatic_flush_timeout) {
+        flush_handle=handle;flush_slots=value;++flush_writes;return command_result;
+    }
+    assert(cmd == &hci_change_connection_packet_type);
+    packet_handle=handle;packet_mask=value;++packet_writes;
+    if(packet_sync_complete) {packet_status(0);packet_changed(handle,value,0);}
+    return packet_result;
 }
 bool hci_non_flushable_packet_boundary_flag_supported(void) { return non_flushable; }
 void gap_pin_code_response(bd_addr_t address, const char *pin) {
@@ -207,6 +228,9 @@ static void fixture(void) {
     flush_timeout = UINT16_MAX;
     flush_writes = 0;flush_handle = flush_slots = 0;
     command_ready = true;command_result = 0;
+    packet_writes=0;packet_handle=packet_mask=0;usable_packet_mask=0xcc18;packet_result=0;
+    packet_sync_complete=false;
+    consume_command_credit=false;
     ble_ready = false;
     fail_storage = false;
     ble_pauses = 0;
@@ -801,6 +825,15 @@ static void flush_ack(uint16_t handle, uint8_t status) {
         (uint8_t)handle,(uint8_t)(handle >> 8)};
     hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
 }
+static void packet_status(uint8_t status) {
+    uint8_t p[]={HCI_EVENT_COMMAND_STATUS,4,status,1,0x0f,0x04};
+    hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void packet_changed(uint16_t handle,uint16_t mask,uint8_t status) {
+    uint8_t p[]={HCI_EVENT_CONNECTION_PACKET_TYPE_CHANGED,5,status,(uint8_t)handle,(uint8_t)(handle>>8),
+        (uint8_t)mask,(uint8_t)(mask>>8)};
+    hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
 static void flush_fixture(void) {
     fixture();memcpy(saved[0],first,6);has_key[0]=true;bt_hci_init();
     credit_connections[0] = (hci_connection_t){.con_handle=0x11,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};
@@ -959,7 +992,176 @@ static void test_media_flush_comparison_clears_on_cancel_scope_loss_and_stale_ac
     assert(!bt_hci_airpods_flush_comparison(true));
 }
 
+static void packet_fixture(void) {
+    flush_fixture();flush_ack(0x11,0);bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(packet_writes==1 && packet_handle==0x11 && packet_mask==0xcc18 && media_packet_pending.active);
+}
+static void packet_normal_fixture(void) {
+    packet_fixture();packet_status(0);packet_changed(0x11,0xcc18,0);bt_hci_phone_poll();
+    assert(media_packets[0].baseline && media_packets[0].normal==0xcc18 && packet_writes==1);
+}
+static void packet_game_fixture(void) {
+    packet_normal_fixture();bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();flush_ack(0x11,0);
+    assert(packet_writes==2 && packet_mask==0xee1c);
+    packet_status(0);packet_changed(0x11,0xee1c,0);
+}
+static void test_media_packet_baseline_game_and_normal_are_confirmed_per_acl(void) {
+    flush_fixture();flush_ack(0x11,0);command_ready=false;bt_hci_phone_poll();
+    assert(!packet_writes && media_packets[0].normal==UINT16_MAX);
+    command_ready=true;bt_hci_phone_poll();
+    assert(packet_writes==1 && packet_handle==0x11 && packet_mask==0xcc18);
+    for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(packet_writes==1 && media_packet_pending.active);
+    packet_changed(0x11,0xcc18,0); // A result cannot stand in for the missing Command Status.
+    assert(!media_packets[0].baseline && media_packet_pending.active);
+    packet_status(0);bt_hci_phone_poll();
+    assert(media_packet_pending.active && !media_packets[0].baseline);
+    packet_changed(0x22,0xcc18,0);assert(media_packet_pending.active);
+    uint8_t short_result[]={HCI_EVENT_CONNECTION_PACKET_TYPE_CHANGED,4,0,0x11,0,0x18};
+    hci_packet_handler(HCI_EVENT_PACKET,0,short_result,sizeof(short_result));
+    assert(media_packet_pending.active);
+    packet_changed(0x11,0xcc18,0);bt_hci_phone_poll();
+    assert(media_packets[0].baseline && media_packets[0].normal==0xcc18 && !media_packet_pending.active && packet_writes==1);
+    bt_hci_credit_diagnostics_t data;bt_hci_credit_diagnostics(&data);
+    assert(data.media_packet_requested==0xcc18 && data.media_packet_normal==0xcc18 &&
+        data.media_packet_confirmed==0xcc18 && !data.media_packet_failed && !data.media_packet_pending);
+
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();flush_ack(0x11,0);
+    assert(packet_writes==2 && packet_handle==0x11 && packet_mask==0xee1c);
+    packet_status(0);assert(media_packets[0].confirmed==0xcc18);
+    packet_changed(0x11,0xee1c,0);
+    for(unsigned i=0;i<10;++i){bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();}
+    assert(packet_writes==2 && media_packets[0].confirmed==0xee1c);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(packet_writes==3 && packet_handle==0x11 && packet_mask==0xcc18);
+    packet_status(0);packet_changed(0x11,0xcc18,0);bt_hci_phone_poll();
+    assert(packet_writes==3 && media_packets[0].confirmed==0xcc18);
+}
+static void test_media_packet_baseline_clamp_polarity_dm1_and_reserved_bits(void) {
+    packet_fixture();packet_status(0);packet_changed(0x11,0xc818,0);
+    assert(media_packets[0].baseline && media_packets[0].normal==0xc818);
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();assert(packet_mask==0xea1c);
+    packet_status(0);packet_changed(0x11,0xea1c,0);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();assert(packet_mask==0xc818);
+    packet_status(0);packet_changed(0x11,0xc818,0);bt_hci_phone_poll();assert(packet_writes==3);
+
+    packet_fixture();packet_status(0);packet_changed(0x11,0xee1c,0); // A narrower EDR baseline is safe.
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+    assert(media_packets[0].normal==0xee1c && packet_writes==1);
+
+    flush_fixture();usable_packet_mask=0xee1c;bt_hci_phone_poll();assert(packet_mask==0xee1c);
+    packet_status(0);packet_changed(0x11,0xcc18,0); // Clearing negative EDR bits would broaden permissions.
+    assert(media_packets[0].failed && !media_packets[0].baseline && media_packets[0].confirmed==0xcc18);
+    for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(packet_writes==1);
+
+    packet_fixture();packet_status(0);packet_changed(0x11,0xcc19,0);
+    assert(media_packets[0].failed && !media_packets[0].baseline);
+    for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(packet_writes==1);
+
+    packet_fixture();packet_status(0);packet_changed(0x11,0xcc10,0);
+    assert(media_packets[0].baseline && media_packets[0].normal==0xcc10);
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();assert(packet_mask==0xee14);
+    packet_status(0);packet_changed(0x11,0xee1c,0);bt_hci_phone_poll();assert(packet_writes==2);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();assert(packet_mask==0xcc10);
+    packet_status(0);packet_changed(0x11,0xcc18,0);bt_hci_phone_poll();
+    assert(packet_writes==3 && !media_packets[0].failed);
+}
+static void test_media_packet_command_credit_preserves_native_policy_order(void) {
+    packet_normal_fixture();consume_command_credit=true;
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+    assert(packet_writes==2 && packet_mask==0xee1c && !command_ready && !flush_writes);
+    for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(packet_writes==2 && !flush_writes);
+    packet_status(0);command_ready=true;bt_hci_phone_poll();
+    assert(media_packet_pending.active && flush_writes==1 && flush_slots==96 && !command_ready);
+    flush_ack(0x11,0);command_ready=true;packet_changed(0x11,0xee1c,0);bt_hci_phone_poll();
+    assert(packet_writes==2 && flush_writes==1 && !media_packet_pending.active);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(packet_writes==3 && packet_mask==0xcc18 && flush_writes==1 && !command_ready);
+    packet_status(0);command_ready=true;bt_hci_phone_poll();
+    assert(flush_writes==2 && flush_slots==320 && media_packet_pending.active);
+    flush_ack(0x11,0);command_ready=true;packet_changed(0x11,0xcc18,0);bt_hci_phone_poll();
+    assert(!media_packet_pending.active && packet_writes==3 && flush_writes==2);
+}
+static void test_media_packet_failures_are_bounded_and_status_is_not_completion(void) {
+    flush_fixture();packet_result=0x0c;bt_hci_phone_poll();
+    assert(packet_writes==1 && !media_packet_pending.active && media_packets[0].failed);
+    for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(packet_writes==1);
+    packet_fixture();packet_status(0x0c);
+    assert(!media_packet_pending.active && media_packets[0].failed && media_packets[0].status==0x0c);
+    packet_fixture();packet_status(0);packet_changed(0x11,0xcc18,0x0c);
+    assert(!media_packet_pending.active && media_packets[0].failed && !media_packets[0].baseline);
+
+    packet_normal_fixture();bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+    packet_status(0);packet_changed(0x11,0xcc18,0); // Success with a different meaningful mask is not confirmation.
+    assert(media_packets[0].failed && media_packets[0].confirmed==0xcc18);
+    for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(packet_writes==2);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(!media_packets[0].failed && packet_writes==2); // Already at the saved normal mask.
+
+    packet_game_fixture();bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    packet_status(0);packet_changed(0x11,0xee1c,0);
+    assert(media_packets[0].failed && media_packets[0].confirmed==0xee1c);
+    for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(packet_writes==3);
+
+    flush_fixture();now=UINT32_MAX-499u;bt_hci_phone_poll();
+    now=499;bt_hci_phone_poll();assert(!media_packets[0].failed);
+    now=500;bt_hci_phone_poll();assert(media_packets[0].failed && media_packet_pending.active);
+    uint8_t short_status[]={HCI_EVENT_COMMAND_STATUS,3,0,1,0x0f};
+    hci_packet_handler(HCI_EVENT_PACKET,0,short_status,sizeof(short_status));
+    uint8_t unrelated[]={HCI_EVENT_COMMAND_STATUS,4,0,1,0x28,0x0c};
+    hci_packet_handler(HCI_EVENT_PACKET,0,unrelated,sizeof(unrelated));
+    assert(!media_packet_pending.accepted);
+    packet_status(0);for(unsigned i=0;i<10;++i)bt_hci_phone_poll();
+    assert(media_packet_pending.active && media_packets[0].failed && packet_writes==1);
+    packet_changed(0x11,0xcc18,0);bt_hci_phone_poll();
+    assert(!media_packet_pending.active && !media_packets[0].failed && media_packets[0].baseline && packet_writes==1);
+
+    flush_fixture();packet_sync_complete=true;bt_hci_phone_poll();
+    assert(!media_packet_pending.active && media_packets[0].baseline && packet_writes==1);
+}
+static void test_media_packet_old_peer_restore_phone_exclusion_and_handle_reuse(void) {
+    packet_game_fixture();memcpy(saved[1],second,6);memcpy(device_addr_list[1],second,6);
+    credit_connections[2]=(hci_connection_t){.con_handle=0x33,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};
+    memcpy(credit_connections[2].address,second,6);memcpy(device_addr,second,6);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(packet_writes==3 && packet_handle==0x11 && packet_mask==0xcc18); // Restore the old live AirPods ACL.
+    packet_status(0);packet_changed(0x11,0xcc18,0);bt_hci_phone_poll();
+    assert(packet_writes==4 && packet_handle==0x33 && packet_mask==0xcc18);
+    packet_status(0);packet_changed(0x33,0xcc18,0);bt_hci_phone_poll();assert(packet_writes==4);
+    assert(media_packet_index(0x22)<0); // The independent phone ACL is never a policy target.
+
+    packet_fixture();uint32_t old_epoch=media_packets[0].epoch;
+    uint8_t disconnected[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnected,sizeof(disconnected));
+    bt_hci_phone_poll(); // The fixture reuses the same open handle/address immediately.
+    assert(media_packets[0].epoch!=old_epoch && !media_packets[0].baseline && packet_writes==1);
+    packet_status(0);packet_changed(0x11,0xcc18,0);
+    assert(!media_packet_pending.active && !media_packets[0].baseline && media_packets[0].confirmed==UINT16_MAX);
+    bt_hci_phone_poll();assert(packet_writes==2 && media_packet_pending.active);
+    packet_changed(0x11,0xcc18,0);assert(!media_packets[0].baseline);
+    packet_status(0);packet_changed(0x11,0xcc18,0);assert(media_packets[0].baseline);
+
+    packet_fixture();memcpy(device_addr,second,6);credit_connections[2]=(hci_connection_t){
+        .con_handle=0x33,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};memcpy(credit_connections[2].address,second,6);
+    bt_hci_phone_poll();assert(packet_writes==1 && media_packet_pending.active);
+    packet_status(0x0c);bt_hci_phone_poll();assert(packet_writes==2 && packet_handle==0x33);
+    uint8_t off[]={BTSTACK_EVENT_STATE,1,0};hci_packet_handler(HCI_EVENT_PACKET,0,off,sizeof(off));
+    assert(!media_packet_pending.active && media_packets[0].handle==HCI_CON_HANDLE_INVALID &&
+        media_packets[1].handle==HCI_CON_HANDLE_INVALID);
+}
+
 int main(void) {
+    test_media_packet_baseline_game_and_normal_are_confirmed_per_acl();
+    test_media_packet_baseline_clamp_polarity_dm1_and_reserved_bits();
+    test_media_packet_command_credit_preserves_native_policy_order();
+    test_media_packet_failures_are_bounded_and_status_is_not_completion();
+    test_media_packet_old_peer_restore_phone_exclusion_and_handle_reuse();
     test_media_flush_targets_only_airpods_and_confirms_ack();
     test_media_flush_failures_and_superseded_commands_are_bounded();
     test_media_flush_reconnect_ack_cannot_confirm_new_epoch();
