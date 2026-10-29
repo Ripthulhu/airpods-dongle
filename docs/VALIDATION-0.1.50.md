@@ -47,8 +47,43 @@ region matched byte for byte. Startup confirmed normal packet mask `CC18` and
 200 ms timeout, with no pending or failed policy command. The AirPods ACL
 reconnected; audio ownership still belonged to the other source at that snapshot.
 
-The original PC Pico remains on 0.1.49. Live Game entry/restoration and listening
-acceptance of the new packet policy remain pending. The separate Android native
+The original PC Pico was subsequently updated from 0.1.49 to the identical
+0.1.50 image at the user's request. Its full backup, firmware readback and
+byte-exact pairing preservation passed. Startup confirmed normal `CC18` and
+200 ms, with no pending or failed policy command. A read-only audio-profile
+query reported AAC-ELD, CBR, negotiated 256,000 bits/s and Game Mode off.
+Live Game entry/restoration and listening acceptance of the new packet policy
+remain pending. The separate Android native
 volume bridge APK is not installed by this firmware update. This document does
 not claim that the packet policy fixes the hitches or proves which baseband
 packet types were actually sent over the air.
+
+## Outdoor field report and adaptation limits
+
+The user reported barely usable audio outdoors while cycling, in both normal
+and Game Mode, including two complete disconnections. The route was Pixel to
+Pico over USB. The Pico is integrated into the phone case, against the phone,
+with the phone in a jacket. The same placement works much better indoors but
+still has some hitches. No radio telemetry was recorded during the ride, so this
+does not identify Wi-Fi interference, antenna obstruction, power or another
+specific cause. The release is not accepted as an outdoor reliability fix.
+
+The firmware offers manual AAC-ELD CBR/VBR profiles and bitrate ceilings of 128,
+174, 192, 220 and 256 kbps. Startup Auto means codec/max-compatible selection,
+not automatic radio adaptation. Content-sensitive VBR is capped by its selected
+peak bitrate; it does not respond to RF quality. Current profile changes require
+idle audio and A2DP renegotiation. No live link-adaptive bitrate controller exists.
+
+Radio hopping and retransmission are controller functions. The application does
+not currently query the audio ACL's AFH mode/map, RSSI, link quality or transmit
+power, nor does it tune AFH or power in response to conditions. Scan/finder RSSI
+describes advertisements and cannot substitute for audio-link measurements.
+Classic HCI RSSI is relative to the controller's receive-power window, not the
+absolute dBm used for LE advertisement RSSI. Controller completion credits also
+do not prove successful audio delivery.
+
+The next useful evidence is bounded, opt-in audio-link telemetry alongside
+existing source and flush counters, followed by separate placement, phone Wi-Fi
+and lower-bitrate comparisons. The Pico antenna should have clear space; nearby
+metal can significantly reduce its performance, per
+[Raspberry Pi's board documentation](https://www.raspberrypi.com/documentation/microcontrollers/pico-series.html).
