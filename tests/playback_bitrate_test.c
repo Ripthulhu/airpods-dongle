@@ -228,11 +228,46 @@ static void test_repeated_radio_recovery_can_lower_but_pcm_starvation_cannot(voi
     assert(!playback_bitrate.urgent && playback_bitrate.target==256000);
     radio_known=false;playback_bitrate_transport_stalled();assert(!playback_bitrate.urgent);
 }
+static void test_sparse_losses_accumulate_and_recovery_requires_truly_clean_windows(void) {
+    fixture(false,256000);ready();
+    window(1,0);assert(playback_bitrate.target==256000 && playback_bitrate.bad_windows==1);
+    for(unsigned i=0;i<7;++i)window(0,0);
+    assert(playback_bitrate.bad_windows==1 && playback_bitrate.target==256000);
+    window(1,0);assert(playback_bitrate.target==220000);
+    assert(playback_bitrate_apply(&media_tracker) && playback_bitrate.current==220000);
+    for(unsigned i=0;i<29;++i)window(0,0);
+    assert(playback_bitrate.target==220000);
+    for(unsigned i=0;i<60;++i)window(0,1); // A weak but recurring stall is not clean recovery.
+    assert(playback_bitrate.target==220000 && playback_bitrate.changes==1);
+    for(unsigned i=0;i<29;++i)window(0,0);
+    assert(playback_bitrate.target==220000);
+    window(0,0);assert(playback_bitrate.target==256000);
+    assert(playback_bitrate_apply(&media_tracker) && playback_bitrate.current==256000);
+
+    window(1,0);
+    for(unsigned i=0;i<29;++i)window(0,0);
+    assert(playback_bitrate.bad_windows==1);
+    window(0,0);assert(!playback_bitrate.bad_windows);
+    window(1,0);assert(playback_bitrate.target==256000 && playback_bitrate.bad_windows==1);
+    mic_requested=true;playback_bitrate_poll(++now);
+    mic_requested=false;ready();window(1,0);
+    assert(playback_bitrate.target==256000 && playback_bitrate.bad_windows==1); // No stale strike across a freeze.
+
+    fixture(false,256000);now=UINT32_MAX-4500u;ready();window(1,0);
+    for(unsigned i=0;i<9;++i)window(0,0);
+    window(1,0);assert(playback_bitrate.target==220000);
+    assert(playback_bitrate_apply(&media_tracker));
+    for(unsigned i=0;i<29;++i)window(0,0);
+    assert(playback_bitrate.target==220000);
+    window(0,0);assert(playback_bitrate.target==256000);
+    assert(sizeof(playback_bitrate_t)<=64); // The sensitivity correction needs no additional state.
+}
 int main(void) {
     test_live_updates_and_queued_old_units();
     test_vbr_limits_freezes_and_pressure_without_radio_queries();
     test_errors_rollback_and_cap_validation();
     test_jitter_wrap_pause_reconnect_and_read_only_snapshot();
     test_repeated_radio_recovery_can_lower_but_pcm_starvation_cannot();
+    test_sparse_losses_accumulate_and_recovery_requires_truly_clean_windows();
     puts("live ELD bitrate: bounded pressure response, slow recovery, freezes, encoder rollback and read-only diagnostics passed");
 }

@@ -83,12 +83,34 @@ The local validation records are
 `outputs/airpods-pico-bringup-20261027/logs-0.1.51-r2.tgz` and
 `outputs/airpods-pico-bringup-20261027/release-0.1.51-float-r2/memory-check.json`.
 
-The PC dongle remains on 0.1.50. The user first reported clean Game Mode audio
-from another room, then reported hitches while close to the PC. It is therefore
-not a proven-clean reference. Install and validate 0.1.51 on the phone-mounted
-Pico first. Neither observation establishes which RF, power or software condition
-caused the mobile field failure. Hardware acceptance and outdoor improvement
-remain unverified.
+The user first reported clean PC Game Mode audio from another room on 0.1.50,
+then reported hitches while close to the PC. It is not a proven-clean reference.
+The user subsequently requested updating both boards. Both received this exact
+0.1.51 image, with full private flash backups, readback verification and unchanged
+64 KiB pairing tails. The PC serial is `8B39F1F49316A397`; the phone serial is
+`DC1F379C3B1EFCA5`. The phone itself and its apps were not restarted or modified.
+
+The PC selected genuine float USB alternate setting 2. All five radio fields
+returned valid data with no query failures. On the idle phone dongle, radio
+sampling was stopped as intended. During PC Game Mode playback, the 90-snapshot
+radio capture covered 178 seconds and showed live 256 -> 220 -> 256 kbps changes
+without encoder errors or an ACL epoch change. The listener nevertheless reported
+hitches at 256, the same or worse at 220, and finally stuttering more often than
+every ten seconds. Game Mode was turned off at the end of this failed comparison.
+
+Source snapshots spanning a longer interval than the radio capture showed no
+active PCM drops, zero insertion, malformed USB packets or timeline recoveries,
+while the controller flush count increased by 24. Maximum encoding-unit time
+since boot was 7,011 us for 10 ms of audio; maximum send wait was 8 ms and maximum
+send gap 40.243 ms. These readings do not establish CPU saturation or an exact
+acoustic correlation with each flush. RSSI stayed near the Classic reference
+window and link quality remained 255 despite the audible failure; neither can
+be treated as proof of good audio delivery.
+
+The run also exposed a policy weakness: separated single-loss windows were
+forgotten after one clean second, so recurring sparse losses did not reliably
+produce further reductions. The follow-up 0.1.52 corrects that sensitivity.
+Hardware acceptance and outdoor improvement remain unverified.
 
 Required device checks: live budget reductions/recovery with uninterrupted
 stereo, unchanged native volume behavior, both USB sample formats, ordinary and

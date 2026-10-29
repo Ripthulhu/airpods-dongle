@@ -72,8 +72,8 @@ static inline void playback_bitrate_observe(playback_bitrate_t *s, uint32_t now,
     s->window_pressure = pressure - s->last_pressure;
     s->last_flushes = flushes; s->last_pressure = pressure; s->window_since = now;
     if (elapsed > 2500u) { s->bad_windows = 0; s->clean_since = now; return; }
+    if (s->window_flushes || s->window_pressure) s->clean_since = now;
     if (s->window_flushes || s->window_pressure >= 2u) {
-        s->clean_since = now;
         if (s->bad_windows < 2u) ++s->bad_windows;
         if (s->window_flushes >= 3u || s->bad_windows >= 2u) {
             s->target = playback_bitrate_rung(s, false);
@@ -81,10 +81,13 @@ static inline void playback_bitrate_observe(playback_bitrate_t *s, uint32_t now,
             s->bad_windows = 0;
         }
     } else {
-        s->bad_windows = 0;
-        if (s->current < s->ceiling && (uint32_t)(now - s->clean_since) >= 30000u) {
-            s->target = playback_bitrate_rung(s, true);
-            s->reason = PLAYBACK_RATE_RECOVER;
+        // A quiet second cannot erase recurring loss; require the same clean period as recovery.
+        if ((uint32_t)(now - s->clean_since) >= 30000u) {
+            s->bad_windows = 0;
+            if (s->current < s->ceiling) {
+                s->target = playback_bitrate_rung(s, true);
+                s->reason = PLAYBACK_RATE_RECOVER;
+            }
         }
     }
 }
