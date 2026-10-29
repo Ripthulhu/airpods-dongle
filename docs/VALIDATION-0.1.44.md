@@ -62,13 +62,31 @@ under `build-receipt-0.1.44-r1.json`, `logs-0.1.44-r1/` and
 Final validation documentation was added after the frozen build snapshot; code,
 configuration and test hashes match that snapshot.
 
+## Deployment and startup checks — 29 October 2026
+
+Both lab Picos were updated from 0.1.42 to the float-enabled 0.1.44 image above.
+Each board's chip identity, old/new firmware version and 4 MiB flash size were
+checked. A complete private backup was taken before programming, `picotool load
+-v` verified the image, and the last 64 KiB containing pairing data matched byte
+for byte before reboot. Both boards rebooted and answered HID and CDC diagnostics.
+
+The disconnected PC dongle enumerated as control-only `CAFE:4005`, with no USB
+audio endpoint. The Pixel dongle automatically reconnected to the AirPods and
+restored `CAFE:4015` and the Android USB audio card. Its playback and capture were
+stopped. Game Mode was off in the startup observations. Android's automatic USB
+routing preference remained `null` before and after deployment. Full backups and
+per-board verification receipts are retained privately in the lab project.
+
+The old phone firmware refused remote BOOTSEL while reported playback, capture
+and call activity were idle. Physical BOOTSEL was used for that board. A stale
+playback transition is a review candidate; the exact busy predicate was not
+observed, and this deployment does not claim to fix it.
+
 ## Hardware acceptance still needed
 
-This candidate has not been flashed. Both lab Picos remain on 0.1.42.
-
-On the Pixel and Windows, verify that cold USB attachment with the buds asleep
-shows no headphones or microphone, while HID/CDC still work. Then wake/connect
-the buds and verify both USB audio formats and microphone availability. Pause,
+Listening and current-consumption tests have not been performed on this image.
+On both hosts, repeat cold USB attachment with the buds asleep and wake/connect
+checks, then verify both USB audio formats and microphone availability. Pause,
 Game Mode switching and standby takeover must keep the device present. Put the
 buds away and verify that both audio endpoints disappear; repeat with an open
 microphone. Check case return and Bluetooth phone mode without manually changing

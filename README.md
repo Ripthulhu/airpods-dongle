@@ -19,7 +19,10 @@ the phone's Bluetooth route owns it. Paused music, Game Mode changes and standby
 takeovers retain the connection and do not remove the USB device. AirPods absence
 overrides an open USB microphone. This also lets the idle-power changes below
 engage when the host would otherwise keep an unused USB audio stream open.
-Both builds and all offline checks pass; this candidate is not yet flashed.
+Both builds and all offline checks pass. Both lab dongles are flashed with
+0.1.44, pairing storage verified unchanged. Startup checks saw control-only USB
+on the disconnected PC dongle and automatic audio return after the Pixel dongle
+reconnected to the AirPods. Listening and power measurements remain open.
 See [0.1.44 validation and hardware checks](docs/VALIDATION-0.1.44.md).
 
 Candidate **0.1.43** adds the renewed audit fixes: bounded, cancelable takeover
@@ -39,7 +42,7 @@ full buffer from draining. It also detects accumulated output timing loss across
 short stalls and uses the existing receiver-confirmed restart, instead of letting
 playback remain silent after the sender catches up. Hearing the final candidate
 on hardware remains necessary; these are regression results, not audio acceptance.
-Both lab dongles are flashed with 0.1.42, with pairing storage preserved. All
+Both lab dongles previously ran 0.1.42, with pairing storage preserved. All
 build checks passed, and a silent Windows stream verified actual IEEE float32
 USB input. See [0.1.42 validation and next checks](docs/VALIDATION-0.1.42.md).
 
