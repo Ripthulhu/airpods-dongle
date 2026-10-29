@@ -29,18 +29,10 @@ jobs:
         run: python3 tools/test.py --sanitize
 
   firmware:
-    name: Pico 2 W / ${{ matrix.variant }}
+    name: Pico 2 W firmware
     needs: tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: float
-            usb_float: "ON"
-          - variant: s16-only
-            usb_float: "OFF"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,7 +46,6 @@ jobs:
       - name: Prepare pinned Pico SDK and verified patches
         run: python3 tools/prepare_sdk.py --sdk .sdk/pico-sdk
       - name: Test AVRCP volume, phone decoders and jitter handling
-        if: matrix.variant == 'float'
         run: |
           python3 tools/test_volume_sdk.py --sdk .sdk/pico-sdk --sanitize
           python3 tools/test_phone_codecs.py --sdk .sdk/pico-sdk --sanitize
@@ -64,7 +55,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DAIRPODS_USB_FLOAT=${{ matrix.usb_float }}
+            -DAIRPODS_USB_FLOAT=ON
       - name: Build and validate firmware
         run: cmake --build build --parallel 2
       - name: Package checked outputs
@@ -81,7 +72,7 @@ jobs:
       - name: Upload firmware download
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: airpods-dongle-pico2w-${{ matrix.variant }}
+          name: airpods-dongle-pico2w-float
           path: build/artifact/
           if-no-files-found: error
           retention-days: 30

@@ -7,6 +7,7 @@
 #include "../src/btstack/volume_sync.h"
 #include "../src/btstack/volume_scale.h"
 #include "../src/btstack/volume_trace.h"
+#include "../src/btstack/volume_authority.h"
 #include "../src/tinyusb/media_control.h"
 enum {AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED=1,AVRCP_SUBEVENT_SET_ABSOLUTE_VOLUME_RESPONSE=2,
  AVRCP_CTYPE_RESPONSE_INTERIM=15,AVRCP_CTYPE_RESPONSE_CHANGED_STABLE=13,AVRCP_CTYPE_NOTIFY=3,
@@ -37,7 +38,12 @@ static unsigned query_delay,queries;
 static unsigned clock_reads;
 static bool drop_interim;
 static bool audio_owned=true;
+static bool profile_connected=true;
+static uint32_t control_generation=1;
 static bool aacp_audio_owned(void){return audio_owned;}
+static bool get_a2dp_connected_flag(void){return profile_connected;}
+static bool usb_audio_available(void){return usb_media_generation()&1u;}
+static uint32_t dongle_control_client_generation(uint8_t client){assert(client==0);return control_generation;}
 enum {SOFTWARE_HOST,HARDWARE_HOST,IGNORING_HOST};
 void dongle_control_available(bool v){(void)v;}
 void dongle_rpc_available(bool v){(void)v;}
@@ -129,12 +135,13 @@ static void fixture(uint8_t level,unsigned mode,bool baseline){
  transfer_pending=drop_transfer=false;
  usb_media_set_available(false);usb_media_set_available(true);hid_ready=true;usb_media_task();complete_report();
  memset(&sink_volume,0,sizeof(sink_volume));memset(&usb_volume_relay,0,sizeof(usb_volume_relay));
+ memset(&usb_host_volume,0,sizeof(usb_host_volume));volume_observation_revision=0;host_volume_write=host_volume_quiet=false;
  connection=(avrcp_connection_t){0};now=revision=set_generation=receipt_snapshot=0;
  absolute_sets=send_attempts=keys_up=keys_down=volume_target_requests=0;ack.pending=host_update.pending=false;
  last_host_set_at=UINT32_MAX;
  ack_delay=host_delay=query_delay=1;queries=0;registration_generation=1;event_generation=0;
  interim.pending=drop_interim=false;
- audio_owned=true;
+ audio_owned=profile_connected=true;control_generation=1;
  mic=phone_owner=drop_ack=ack_reject=ack_applied=bt_busy=false;ack_clamp=ack_physical=-1;
  is_usb_streaming=true;peer[0]=1;_bt_sink_volume_changed=false;
  host_mode=mode;host_index=mode==HARDWARE_HOST?level:15;physical=level;
@@ -206,8 +213,8 @@ static void queue_failure_and_lifecycle(void){
  fixture(47,SOFTWARE_HOST,true);hid_ready=false;changed(37);
  usb_media_set_available(false);bt_volume_poll();usb_media_set_available(true);bt_volume_poll();
  hid_ready=true;advance(500);assert(!keys_down && !absolute_sets && physical==37);
- changed(27);is_usb_streaming=false;bt_volume_poll();advance(200);assert(physical==27 && !keys_down && !absolute_sets);
- is_usb_streaming=true;bt_volume_poll();changed(37);peer[0]=9;bt_volume_select_peer();advance(200);
+ changed(27);is_usb_streaming=false;phone_owner=true;bt_volume_poll();advance(200);assert(physical==27 && !keys_down && !absolute_sets);
+ phone_owner=false;is_usb_streaming=true;bt_volume_poll();changed(37);peer[0]=9;bt_volume_select_peer();advance(200);
  assert(!keys_up && !sink_volume.cid && physical==37);
 }
 static void echoes_stale_set_and_receipts(void){
@@ -336,6 +343,146 @@ static void quiet_debounce_and_standby(void){
  audio_owned=true;advance(500);assert(absolute_sets==1 && physical==20 && !sink_volume.known);
  // An already-applied pre-yield host SET is never replayed on the next claim.
 }
+static void pause_preserves_usb_volume_authority(void){
+ fixture(47,SOFTWARE_HOST,true);changed(37);advance(100);
+ assert(keys_down==1 && physical==37 && usb_volume_relay.anchor==47);
+ is_usb_streaming=false;usb_media_cancel_volume();advance(200);
+ assert(physical==47 && usb_volume_relay.anchor==47 && absolute_sets==1);
+ is_usb_streaming=true;advance(100);
+ assert(physical==47 && host_index==14 && keys_down==1 && !keys_up);
+ // A pending native readback still belongs to this paused USB session.
+ fixture(47,SOFTWARE_HOST,true);query_delay=100;changed(37);advance(20);
+ assert(usb_volume_relay.readback_pending && !keys_down);
+ is_usb_streaming=false;usb_media_cancel_volume();advance(300);
+ assert(physical==47 && host_index==14 && keys_down==1 && absolute_sets==1);
+ is_usb_streaming=true;advance(100);assert(usb_volume_relay.anchor==47 && absolute_sets==1);
+ // Host volume changed while paused remains the newer authority.
+ fixture(47,SOFTWARE_HOST,true);changed(37);advance(100);is_usb_streaming=false;
+ usb_media_cancel_volume();advance(1);host_set(20);advance(250);
+ is_usb_streaming=true;advance(250);
+ assert(physical==20 && usb_volume_relay.anchor==20 && absolute_sets==1 && host_index==14);
+ // Real USB-session or audio-ownership loss still cancels the old correction.
+ fixture(47,SOFTWARE_HOST,true);changed(37);advance(100);is_usb_streaming=false;
+ usb_media_set_available(false);advance(250);
+ assert(physical==37 && !absolute_sets && !usb_volume_relay.waiting && !usb_volume_relay.owned);
+ fixture(47,SOFTWARE_HOST,true);changed(37);advance(100);is_usb_streaming=false;
+ audio_owned=false;advance(250);
+ assert(physical==37 && !absolute_sets && !usb_volume_relay.waiting && !usb_volume_relay.owned);
+}
+static void reconnect_discards_only_internal_repairs(void){
+ fixture(47,SOFTWARE_HOST,true);bt_busy=true;changed(37);wait_for_repair(false);
+ assert(sink_volume.pending && usb_volume_relay.restoring && !absolute_sets);
+ volume_sync_connection(&sink_volume,0,now);bt_volume_relay_reset(false);
+ volume_sync_connection(&sink_volume,7,now);bt_volume_relay_reset(false);
+ physical=20;event(1,AVRCP_CTYPE_RESPONSE_INTERIM,20);bt_busy=false;advance(250);
+ assert(physical==20 && usb_volume_relay.anchor==20 && !absolute_sets && !sink_volume.pending);
+ // A real USB SET awaiting its first AVRCP channel is still current host intent.
+ fixture(47,SOFTWARE_HOST,false);
+ volume_sync_connection(&sink_volume,0,now);bt_volume_relay_reset(false);
+ host_set(64);advance(1);assert(sink_volume.pending && !absolute_sets);
+ volume_sync_connection(&sink_volume,7,now);bt_volume_relay_reset(false);
+ physical=20;event(1,AVRCP_CTYPE_RESPONSE_INTERIM,20);advance(250);
+ assert(physical==64 && usb_volume_relay.anchor==64 && absolute_sets==1 && !sink_volume.pending);
+}
+static uint8_t host_authority_request(uint8_t client,uint8_t action,uint32_t token,uint8_t level,uint8_t out[24]) {
+ uint8_t request[7]={17,action,0,0,0,0,level};uint16_t length=0;
+ dongle_put32(request+2,token);
+ uint8_t result=dongle_volume_request(client,request,sizeof(request),out,24,&length);
+ if(result==DONGLE_ACCEPTED)assert(length==24 && out[0]==1);
+ return result;
+}
+static uint32_t acquire_host_authority(void) {
+ uint8_t out[24];assert(host_authority_request(0,0,0,0,out)==DONGLE_ACCEPTED);
+ assert((out[1]&25)==25 && out[2]==physical && out[3]==255);
+ uint32_t token=dongle_u32(out+8);assert(token);return token;
+}
+static void explicit_host_volume_has_one_gain(void) {
+ fixture(47,SOFTWARE_HOST,true);uint32_t token=acquire_host_authority();uint8_t out[24];
+ unsigned writes=absolute_sets;host_set(127);advance(200);
+ assert(physical==47 && absolute_sets==writes && !bt_volume_usb_ready());
+ uint32_t observed=volume_observation_revision;
+ changed(57);advance(250);
+ assert(physical==57 && !keys_up && !keys_down && absolute_sets==writes);
+ assert(dongle_volume_snapshot(0,out,24)==24 && out[2]==57 && dongle_u32(out+4)>observed);
+ assert(host_authority_request(0,3,token,70,out)==DONGLE_ACCEPTED && (out[1]&2) && out[3]==70);
+ advance(50);assert(physical==70 && absolute_sets==writes+1 && !keys_up && !keys_down);
+ assert(dongle_volume_snapshot(1,out,24)==24 && !dongle_u32(out+8) && out[2]==70 && !(out[1]&6));
+ // Paused playback retains the lease, and native maximum is never repaired to126.
+ is_usb_streaming=false;advance(50);
+ assert(host_authority_request(0,1,token,0,out)==DONGLE_ACCEPTED && (out[1]&8));
+ assert(host_authority_request(0,3,token,127,out)==DONGLE_ACCEPTED);advance(250);
+ assert(physical==127 && absolute_sets==writes+2 && !keys_up && !keys_down);
+ changed(117);advance(250);is_usb_streaming=true;advance(250);
+ assert(physical==117 && absolute_sets==writes+2 && !keys_up && !keys_down);
+}
+static void explicit_host_volume_fails_quietly(void) {
+ fixture(47,SOFTWARE_HOST,true);uint32_t token=acquire_host_authority();uint8_t out[24];
+ bt_busy=true;assert(host_authority_request(0,3,token,80,out)==DONGLE_ACCEPTED);advance(100);
+ assert(sink_volume.pending && !absolute_sets);advance(5000);bt_busy=false;advance(100);
+ assert(!usb_host_volume.active && host_volume_quiet && !sink_volume.pending && !absolute_sets && physical==47);
+ assert(host_authority_request(0,3,token,90,out)==DONGLE_STALE);
+ changed(57);advance(250);host_set(127);advance(200);
+ assert(physical==57 && !absolute_sets && !keys_up && !keys_down);
+ // Explicit release at the physical maximum also leaves it unchanged.
+ fixture(47,SOFTWARE_HOST,true);token=acquire_host_authority();
+ assert(host_authority_request(0,3,token,127,out)==DONGLE_ACCEPTED);advance(100);
+ assert(host_authority_request(0,2,token,0,out)==DONGLE_ACCEPTED);advance(1000);
+ assert(physical==127 && absolute_sets==1 && !keys_up && !keys_down && host_volume_quiet);
+ // A fresh lease adopts current readback, without replaying its predecessor's gain.
+ token=acquire_host_authority();assert(absolute_sets==1 && physical==127);
+ assert(host_authority_request(1,3,token,30,out)==DONGLE_UNSUPPORTED);
+ assert(host_authority_request(0,3,token+1,30,out)==DONGLE_STALE);
+ unsigned before=absolute_sets;dongle_volume_client_disconnect(0);advance(1000);
+ assert(absolute_sets==before && physical==127 && !usb_host_volume.active && host_volume_quiet);
+}
+static void explicit_host_volume_preserves_observation_order(void) {
+ uint8_t out[24];
+ for(unsigned rejected=0;rejected<2;++rejected) {
+  fixture(47,SOFTWARE_HOST,true);uint32_t token=acquire_host_authority();ack_delay=50;ack_reject=rejected;
+  assert(host_authority_request(0,3,token,70,out)==DONGLE_ACCEPTED);advance(1);
+  assert(sink_volume.inflight && physical==47);
+  changed(57);assert(dongle_volume_snapshot(0,out,24)==24 && !(out[1]&1) && out[2]==255);
+  advance(2);assert(!usb_volume_relay.deferred_interim);
+  assert(dongle_volume_snapshot(0,out,24)==24 && (out[1]&7)==7 && out[2]==57 && out[3]==70);
+  uint32_t observation=dongle_u32(out+4);advance(100);
+  assert(dongle_volume_snapshot(0,out,24)==24 && (out[1]&7)==1 && out[3]==255);
+  assert(physical==(rejected?57:70) && out[2]==physical && sink_volume.confirmed==physical);
+  assert(rejected ? dongle_u32(out+4)==observation : dongle_u32(out+4)>observation);
+  assert(!usb_volume_relay.readback_pending && absolute_sets==1 && !keys_up && !keys_down);
+ }
+ // An accepted ACK is a fresh physical observation; a rejection supplies no gain.
+ for(unsigned rejected=0;rejected<2;++rejected) {
+  fixture(47,SOFTWARE_HOST,true);uint32_t token=acquire_host_authority();ack_delay=50;ack_reject=rejected;drop_interim=true;
+  assert(host_authority_request(0,3,token,70,out)==DONGLE_ACCEPTED);advance(1);changed(57);advance(100);
+  assert(dongle_volume_snapshot(0,out,24)==24);
+  assert(rejected ? (!(out[1]&1) && out[2]==255) : ((out[1]&1) && out[2]==70));
+  if(rejected) {
+   event(1,AVRCP_CTYPE_RESPONSE_INTERIM,57);
+   assert(dongle_volume_snapshot(0,out,24)==24 && (out[1]&1) && out[2]==57);
+  }
+ }
+}
+static void explicit_host_volume_scope_and_validation(void) {
+ uint8_t out[24];
+ for(unsigned kind=0;kind<5;++kind) {
+  fixture(47,SOFTWARE_HOST,true);uint32_t token=acquire_host_authority();bt_busy=true;
+  assert(host_authority_request(0,3,token,80,out)==DONGLE_ACCEPTED);advance(20);
+  switch(kind) {
+   case 0:usb_media_set_available(false);break;
+   case 1:++control_generation;break;
+   case 2:volume_sync_connection(&sink_volume,9,now);break;
+   case 3:peer[0]=2;break;
+   case 4:audio_owned=false;break;
+  }
+  advance(20);bt_busy=false;advance(100);
+  assert(!usb_host_volume.active && !sink_volume.pending && !absolute_sets && physical==47);
+ }
+ fixture(47,SOFTWARE_HOST,true);uint32_t token=acquire_host_authority();
+ volume_authority_t old=usb_host_volume;volume_sync_t old_sink=sink_volume;
+ assert(host_authority_request(0,3,token,128,out)==DONGLE_MALFORMED);
+ assert(!memcmp(&old,&usb_host_volume,sizeof(old)) && !memcmp(&old_sink,&sink_volume,sizeof(old_sink)));
+ assert(!dongle_volume_snapshot(0,out,23));
+}
 static void trace_is_bounded_and_default_off(void){
  fixture(47,SOFTWARE_HOST,true);clock_reads=0;
  event(1,AVRCP_CTYPE_RESPONSE_INTERIM,47);assert(!clock_reads); // No timestamp/counter work when tracing is off.
@@ -348,7 +495,8 @@ int main(void){
  software_host_one_gain();hardware_host_and_late_sets();endpoints_and_unknown();target_request_is_not_physical();
  queue_failure_and_lifecycle();echoes_stale_set_and_receipts();bounded_repair_and_ignored_host();
  partial_delivery_and_inflight_gesture();headroom_no_progress_is_bounded();
- fresh_readback_rejects_feedback_loops();native_subscription_and_set_overlap();quiet_debounce_and_standby();trace_is_bounded_and_default_off();
+ explicit_host_volume_has_one_gain();explicit_host_volume_fails_quietly();explicit_host_volume_preserves_observation_order();explicit_host_volume_scope_and_validation();
+ fresh_readback_rejects_feedback_loops();native_subscription_and_set_overlap();quiet_debounce_and_standby();pause_preserves_usb_volume_authority();reconnect_discards_only_internal_repairs();trace_is_bounded_and_default_off();
  volume_sync_t saved=sink_volume;uint8_t relay[sizeof(usb_volume_relay)];memcpy(relay,&usb_volume_relay,sizeof(relay));
  unsigned sent=usb_media_volume_sent();bt_volume_report();
  assert(!memcmp(&saved,&sink_volume,sizeof(saved)) && !memcmp(relay,&usb_volume_relay,sizeof(relay)) && sent==usb_media_volume_sent());

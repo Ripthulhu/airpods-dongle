@@ -29,6 +29,15 @@ uint8_t dongle_finder_start(uint8_t c) {(void)c;return DONGLE_UNSUPPORTED;}
 uint8_t dongle_finder_stop(uint8_t c) {(void)c;return DONGLE_ACCEPTED;}
 uint16_t dongle_finder_snapshot(uint8_t c,uint8_t *p,uint16_t n) {(void)c;(void)p;(void)n;return 0;}
 void dongle_finder_disconnect(uint8_t c) {(void)c;}
+uint16_t dongle_volume_snapshot(uint8_t client,uint8_t *out,uint16_t capacity) {
+    (void)client;(void)out;(void)capacity;return 0;
+}
+uint8_t dongle_volume_request(uint8_t client,const uint8_t *p,uint16_t size,
+                             uint8_t *out,uint16_t capacity,uint16_t *length) {
+    (void)client;(void)p;(void)size;(void)out;(void)capacity;
+    *length=0;return DONGLE_UNSUPPORTED;
+}
+void dongle_volume_client_disconnect(uint8_t client) {(void)client;}
 void dongle_finder_poll(void) {}
 static void command(uint8_t client,uint8_t op,const uint8_t *p,uint8_t length) {
     uint8_t report[64]={3,'A','P','D','G',1,64};report[7]=op;

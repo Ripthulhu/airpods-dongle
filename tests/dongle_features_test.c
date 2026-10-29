@@ -8,6 +8,23 @@ static uint8_t result=DONGLE_ACCEPTED;
 static uint8_t expected_setting_id=0x28;
 static bool diagnostic_scan_paused;
 static bool inspection_active;
+static unsigned volume_reads,volume_writes,volume_disconnects;
+uint16_t dongle_volume_snapshot(uint8_t client,uint8_t *out,uint16_t capacity) {
+    assert(client<2);++volume_reads;
+    if(capacity<24)return 0;
+    memset(out,0,24);out[0]=1;out[2]=47;return 24;
+}
+uint8_t dongle_volume_request(uint8_t client,const uint8_t *p,uint16_t size,
+                             uint8_t *out,uint16_t capacity,uint16_t *length) {
+    assert(client==0 && size==7 && p[0]==17 && capacity>=24);
+    uint8_t action=p[1],level=p[6];uint32_t token=dongle_u32(p+2);
+    ++volume_writes;
+    if(result!=DONGLE_ACCEPTED)return result;
+    memset(out,0,24);out[0]=1;out[2]=level;
+    out[3]=action;dongle_put32(out+8,token);*length=24;
+    return result;
+}
+void dongle_volume_client_disconnect(uint8_t client) {assert(client==1);++volume_disconnects;}
 uint16_t phone_sink_diagnostics(uint8_t *out,uint16_t cap) {
     if(cap<64)return 0;
     memset(out,0,64);out[0]=2;out[3]=15;return 64;
@@ -101,7 +118,31 @@ int main(void) {
     assert(dongle_features_request(1,p,1,out,63,&n)==7 && n==0);
     assert(dongle_features_request(1,p,2,out,64,&n)==1 && n==0);
     assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==64 && out[0]==2 && out[3]==15);
+    p[0]=16;
+    assert(dongle_features_request(1,p,2,out,64,&n)==1 && !volume_reads);
+    assert(dongle_features_request(1,p,1,out,23,&n)==1 && !volume_reads);
+    assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==24 && out[2]==47 && volume_reads==1);
+    uint8_t acquire[]={17,0,0,0,0,0,0};
+    for(unsigned size=1;size<7;++size)
+        assert(dongle_features_request(0,acquire,size,out,64,&n)==1 && !volume_writes);
+    assert(dongle_features_request(0,acquire,7,out,23,&n)==1 && !volume_writes);
+    assert(dongle_features_request(1,acquire,7,out,64,&n)==7 && !volume_writes);
+    assert(dongle_features_request(0,acquire,7,out,64,&n)==0 && n==24 && volume_writes==1);
+    const uint8_t bad[][7]={{17,4,1,0,0,0,0},{17,0,1,0,0,0,0},{17,0,0,0,0,0,1},
+        {17,1,0,0,0,0,0},{17,2,1,0,0,0,1},{17,3,1,0,0,0,128}};
+    for(unsigned i=0;i<sizeof(bad)/sizeof(*bad);++i)
+        assert(dongle_features_request(0,bad[i],7,out,64,&n)==1 && volume_writes==1);
+    uint8_t absolute[]={17,3,0x78,0x56,0x34,0x12,127};
+    for(unsigned i=0;i<sizeof(results);++i){
+        result=results[i];
+        assert(dongle_features_request(0,absolute,7,out,64,&n)==errors[i] && n==0);
+    }
+    result=DONGLE_ACCEPTED;
+    memcpy(p,absolute,sizeof(absolute));
+    assert(dongle_features_request(0,p,7,p,64,&n)==0 && n==24 && p[2]==127 &&
+        p[3]==3 && dongle_u32(p+8)==UINT32_C(0x12345678));
     p[0]=0;assert(dongle_features_request(1,p,1,out,64,&n)==7 && n==0);
-    dongle_features_poll();dongle_features_disconnect(1);assert(polls==2 && stops==2);
+    dongle_features_poll();dongle_features_disconnect(1);
+    assert(polls==2 && stops==2 && volume_disconnects==1);
     puts("typed features: validation, exact integer values, aliased buffers, bounded responses and result mapping passed");
 }

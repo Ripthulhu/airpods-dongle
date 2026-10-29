@@ -61,6 +61,7 @@ int main(void) {
     assert(!memcmp(out, "APDG", 4));
     assert(controls[0].status[42] & 32); // Whole-workflow settings lease support.
     assert(controls[0].status[42] & 64); // Presence and case provenance extension.
+    assert(controls[0].status[42] & 128); // Explicit USB host volume authority.
     uint32_t same_generation=controls[0].generation;
     case_fallback=true; dongle_control_poll();
     assert(controls[0].generation==same_generation);

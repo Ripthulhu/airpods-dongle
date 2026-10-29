@@ -69,6 +69,8 @@ _Static_assert(PHONE_PCM_CAPACITY <= PLAYBACK_PCM_FRAMES, "Phone jitter reserve 
 #include "volume_scale.h"
 #include "volume_sync.h"
 #include "volume_trace.h"
+#include "volume_authority.h"
+#include "../tinyusb/dongle_control.h"
 #include "btstack_resample.h"
 #include "../tinyusb/uac.h"
 
@@ -176,6 +178,10 @@ static struct {
     uint8_t deferred_level, deferred_label;
     bool deferred_interim;
 } usb_volume_relay;
+static volume_authority_t usb_host_volume;
+static uint32_t volume_observation_revision;
+static bool host_volume_write;
+static bool host_volume_quiet;
 static bool _bt_sink_volume_changed;
 
 static int current_sample_rate = 48000;
@@ -663,6 +669,22 @@ static void playback_encode_measured(uint32_t started) {
     PB_MAX(TRACE_ENCODER_US,elapsed);
 }
 
+static volume_authority_scope_t bt_volume_authority_scope(void) {
+    volume_authority_scope_t scope={
+        .usb_generation=usb_media_generation(),
+        .control_generation=dongle_control_client_generation(DONGLE_CLIENT_USB),
+        .cid=sink_volume.cid,
+        .ready=usb_audio_available() && usb_host_active() && get_a2dp_connected_flag() &&
+            aacp_audio_owned() && !phone_sink_owns_controls(),
+    };
+    const uint8_t *peer=(const uint8_t *)get_device_addr();
+    if (peer) memcpy(scope.peer,peer,sizeof(scope.peer));
+    return scope;
+}
+static bool bt_volume_host_managed(void) { return usb_host_volume.active || host_volume_quiet; }
+static void bt_volume_observed(void) {
+    if (!++volume_observation_revision) ++volume_observation_revision;
+}
 static void bt_volume_relay_reset(bool peer_changed) {
     uint32_t generation=usb_media_generation();
     if (peer_changed || usb_volume_relay.generation!=generation || usb_volume_relay.cid!=sink_volume.cid) {
@@ -670,7 +692,9 @@ static void bt_volume_relay_reset(bool peer_changed) {
             usb_volume_relay.set_revision==usb_volume_set_revision() && usb_volume_set_generation()==generation;
         uint8_t host_level=usb_volume_relay.host_level;
         usb_media_cancel_volume();
-        if (usb_volume_relay.generation!=generation && !sink_volume.phone_request)
+        // A repair belongs to the old AVRCP session; an explicit host SET can await a new channel.
+        if (!sink_volume.phone_request && (usb_volume_relay.generation!=generation ||
+            (usb_volume_relay.cid!=sink_volume.cid && usb_volume_relay.restoring && !usb_volume_relay.host_pending)))
             sink_volume.pending=false;
         memset(&usb_volume_relay,0,sizeof(usb_volume_relay));
         usb_volume_relay.generation=generation;
@@ -683,6 +707,70 @@ static void bt_volume_relay_reset(bool peer_changed) {
             usb_volume_relay.host_pending=usb_volume_relay.host_deferred=true;
         }
     }
+}
+static void bt_volume_host_end(void) {
+    if (host_volume_write && !sink_volume.phone_request) sink_volume.pending=false;
+    host_volume_write=false;
+    bt_volume_relay_reset(true);
+    host_volume_quiet=true; // A lost bridge cannot prove that Android restored software volume.
+    _bt_sink_volume_changed=false;
+}
+static void bt_volume_authority_poll(void) {
+    if (!usb_host_volume.active && !host_volume_quiet) return;
+    volume_authority_scope_t scope=bt_volume_authority_scope();
+    if (volume_authority_poll(&usb_host_volume,&scope,btstack_run_loop_get_time_ms()))
+        bt_volume_host_end();
+    if (host_volume_quiet && usb_host_volume.scope.usb_generation!=scope.usb_generation)
+        host_volume_quiet=false;
+}
+void dongle_volume_client_disconnect(uint8_t client) {
+    if (volume_authority_disconnect(&usb_host_volume,client)) bt_volume_host_end();
+}
+uint16_t dongle_volume_snapshot(uint8_t client,uint8_t *out,uint16_t capacity) {
+    if (!out || capacity<VOLUME_AUTHORITY_SNAPSHOT_SIZE) return 0;
+    volume_authority_scope_t scope=bt_volume_authority_scope();
+    uint32_t now=btstack_run_loop_get_time_ms();
+    bool active=volume_authority_current(&usb_host_volume,&scope,now);
+    bool observed=sink_volume.selected && sink_volume.known && !usb_volume_relay.readback_pending;
+    memset(out,0,VOLUME_AUTHORITY_SNAPSHOT_SIZE);
+    out[0]=1;
+    out[1]=(observed ? 1 : 0) |
+        (sink_volume.pending ? 2 : 0) | (sink_volume.inflight ? 4 : 0) |
+        (active ? 8 : 0) | (volume_authority_scope_ready(&scope) ? 16 : 0);
+    out[2]=observed ? sink_volume.confirmed : 255;
+    out[3]=sink_volume.pending || sink_volume.inflight ? sink_volume.desired : 255;
+    dongle_put32(out+4,volume_observation_revision);
+    if (volume_authority_owner(&usb_host_volume,client,&scope,now))
+        dongle_put32(out+8,usb_host_volume.token);
+    dongle_put32(out+12,volume_authority_remaining(&usb_host_volume,&scope,now));
+    dongle_put32(out+16,scope.usb_generation);
+    return VOLUME_AUTHORITY_SNAPSHOT_SIZE;
+}
+uint8_t dongle_volume_request(uint8_t client,const uint8_t *p,uint16_t size,
+                              uint8_t *out,uint16_t capacity,uint16_t *length) {
+    if (!p || size!=7 || p[0]!=17 || !out || !length || capacity<VOLUME_AUTHORITY_SNAPSHOT_SIZE ||
+        p[1]>3 || p[6]>127 || (p[1]!=3 && p[6]) ||
+        (!p[1] && dongle_u32(p+2)) || (p[1] && !dongle_u32(p+2))) return DONGLE_MALFORMED;
+    if (client!=DONGLE_CLIENT_USB) return DONGLE_UNSUPPORTED;
+    bt_volume_authority_poll();
+    volume_authority_scope_t scope=bt_volume_authority_scope();
+    if (!volume_authority_scope_ready(&scope)) return DONGLE_DISCONNECTED;
+    if (!p[1] && (sink_volume.pending || sink_volume.inflight || !sink_volume.known ||
+                  usb_volume_relay.waiting || usb_volume_relay.readback_pending)) return DONGLE_BUSY;
+    uint8_t result=volume_authority_manage(&usb_host_volume,client,&scope,p[1],
+        dongle_u32(p+2),p[6],btstack_run_loop_get_time_ms());
+    if (result!=DONGLE_ACCEPTED) return result;
+    if (!p[1]) {
+        bt_volume_relay_reset(true);
+        host_volume_quiet=false;
+        _bt_sink_volume_changed=false;
+    } else if (p[1]==2) bt_volume_host_end();
+    else if (p[1]==3) {
+        (void)volume_sync_request(&sink_volume,p[6],false,btstack_run_loop_get_time_ms());
+        host_volume_write=sink_volume.pending;
+    }
+    *length=dongle_volume_snapshot(client,out,capacity);
+    return DONGLE_ACCEPTED;
 }
 
 static volume_trace_t volume_history;
@@ -715,10 +803,12 @@ static void bt_volume_select_peer(void) {
     bt_volume_relay_reset(changed);
 }
 static bool bt_volume_usb_owned(void) {
-    return aacp_audio_owned() && usb_host_active() && (is_usb_streaming || usb_mic_requested());
+    // Pausing PCM does not transfer volume authority or turn temporary bud gain into a baseline.
+    return aacp_audio_owned() && usb_host_active() &&
+        (is_usb_streaming || usb_mic_requested() || (usb_volume_relay.owned && !phone_sink_owns_controls()));
 }
 bool bt_volume_usb_ready(void) {
-    return aacp_audio_owned() && !usb_volume_relay.waiting && !usb_volume_relay.restoring && !usb_volume_relay.readback_pending &&
+    return !bt_volume_host_managed() && aacp_audio_owned() && !usb_volume_relay.waiting && !usb_volume_relay.restoring && !usb_volume_relay.readback_pending &&
         usb_volume_relay.set_revision==usb_volume_set_revision();
 }
 void bt_volume_report(void) {
@@ -737,7 +827,7 @@ void bt_volume_report(void) {
         (unsigned)usb_volume_relay.target_known,(unsigned)usb_volume_relay.target_level);
 }
 static void bt_volume_publish(void) {
-    if (!aacp_audio_owned()) return;
+    if (!aacp_audio_owned() || bt_volume_host_managed()) return;
     uint8_t level;
     if (volume_sync_get(&sink_volume, &level)) {
         _bt_sink_volume_changed = true;
@@ -760,6 +850,11 @@ void set_bt_volume(int16_t db256) {
 void set_bt_volume_from_usb(int16_t db256,uint32_t revision,uint32_t generation,uint32_t receipt) {
     if (revision!=usb_volume_set_revision() || generation!=usb_media_generation() || !usb_host_active()) return;
     bt_volume_select_peer();
+    bt_volume_authority_poll();
+    if (bt_volume_host_managed()) {
+        usb_volume_relay.set_revision=revision;
+        return; // The explicit host bridge owns gain; UAC initialization is not a second volume intent.
+    }
     bt_volume_trace(VOLUME_TRACE_HOST,0,0,usb_volume_to_bt(db256),sink_volume.confirmed,0);
     usb_volume_relay.set_revision=revision;
     usb_volume_relay.sent=usb_media_volume_sent();
@@ -805,6 +900,7 @@ static void bt_volume_restore(uint8_t level,uint32_t now) {
     }
 }
 static void bt_volume_relay_poll(uint32_t now) {
+    if (bt_volume_host_managed()) return;
     if (!aacp_audio_owned()) {
         usb_media_cancel_volume();
         // Only a SET actually received in standby is deferred. Losing authority
@@ -916,7 +1012,8 @@ static void bt_volume_notification(uint16_t cid,uint8_t ctype,uint8_t level,uint
     if (!deferred) ++volume_interim_reports;
     if ((usb_volume_relay.physical_generation && (int32_t)(epoch-usb_volume_relay.physical_generation)<=0) ||
         (usb_volume_relay.readback_pending && (int32_t)(epoch-usb_volume_relay.readback_after)<=0)) return;
-    if (sink_volume.pending || sink_volume.inflight) {
+    // Managed observations keep receive order; a later SET ACK supersedes an earlier INTERIM.
+    if ((sink_volume.pending || sink_volume.inflight) && !bt_volume_host_managed()) {
         // Preserve the normal registration's current value across SET ACK. Do
         // not replace its subscription or mistake an initial report for a key.
         if (usb_volume_relay.readback_pending && !usb_volume_relay.host_pending) {
@@ -932,10 +1029,15 @@ static void bt_volume_notification(uint16_t cid,uint8_t ctype,uint8_t level,uint
     bool known=sink_volume.known;
     uint8_t previous=sink_volume.confirmed;
     if (!volume_sync_notification(&sink_volume,cid,level)) return;
+    bt_volume_observed();
     usb_volume_relay.physical_generation=epoch;
     usb_volume_relay.readback_pending=false;
     usb_volume_relay.restoring=false;
     usb_volume_relay.host_pending=false;
+    if (bt_volume_host_managed()) {
+        _bt_sink_volume_changed=false;
+        return; // Raw readback reaches the host bridge without a duplicate HID step or gain repair.
+    }
     if (baseline || !known) {
         usb_volume_relay.anchor=level;
         usb_volume_relay.enabled=aacp_audio_owned();
@@ -980,6 +1082,7 @@ static void bt_volume_notification(uint16_t cid,uint8_t ctype,uint8_t level,uint
 }
 void bt_volume_poll(void) {
     bt_volume_select_peer();
+    bt_volume_authority_poll();
     if (usb_volume_relay.deferred_interim && !sink_volume.pending && !sink_volume.inflight && aacp_audio_owned()) {
         usb_volume_relay.deferred_interim=false;
         bt_volume_notification(sink_volume.cid,AVRCP_CTYPE_RESPONSE_INTERIM,usb_volume_relay.deferred_level,
@@ -1002,6 +1105,7 @@ void bt_volume_poll(void) {
         bt_volume_trace(VOLUME_TRACE_TX,0,connection?connection->transaction_id:0,level,sink_volume.confirmed,status);
     }
     if (active && !sink_volume.pending && !sink_volume.inflight) {
+        host_volume_write=false;
         bool internal=usb_volume_relay.restoring && !usb_volume_relay.host_pending;
         bt_volume_command_done();
         if (!internal) bt_volume_publish();
@@ -1024,6 +1128,14 @@ static bool bt_volume_controller_event(const uint8_t *packet,uint16_t size) {
             bool internal=usb_volume_relay.restoring && !usb_volume_relay.host_pending;
             if (connection && volume_sync_response(&sink_volume,sink_volume.cid,connection->controller_last_confirmed_transaction_id,
                     packet[5]==AVRCP_CTYPE_RESPONSE_ACCEPTED,packet[6])) {
+                if (packet[5]==AVRCP_CTYPE_RESPONSE_ACCEPTED) {
+                    bt_volume_observed();
+                    if (bt_volume_host_managed()) {
+                        usb_volume_relay.readback_pending=false;
+                        usb_volume_relay.deferred_interim=false;
+                    }
+                }
+                if (!sink_volume.pending && !sink_volume.inflight) host_volume_write=false;
                 ++volume_ack_reports;bt_volume_command_done();
                 if (!aacp_audio_owned()) sink_volume.known=false;
                 if (!internal) bt_volume_publish();

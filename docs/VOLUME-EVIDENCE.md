@@ -1,5 +1,25 @@
 # USB volume ownership evidence
 
+## 29 October 2026: reproduced lifecycle faults and authority contract
+
+Production-source regression tests reproduce two additional defects in 0.1.44.
+A delivered stem-down key followed by a pause before the 150 ms repair leaves
+the temporary physical attenuation in place; resume adopts it as the new anchor.
+An AVRCP-only reconnect can retain a pending internal repair after losing its
+origin marker and overwrite a new session's actual level. Candidate 0.1.45 keeps
+USB volume authority through ordinary playback pause and cancels old internal
+repairs on channel replacement. Isolated old-code negative controls fail both
+new assertions. Genuine host SET requests awaiting their first connection remain
+valid.
+
+The maximum-cue problem is a separate two-authority defect: the current endpoint
+test explicitly models `126 → native 127 → HID Up → restore 126`, independently
+of the Android software index. Replacing 126 with another arbitrary anchor is
+not a complete fix. The [host volume contract](HOST-VOLUME.md) disables the
+duplicate relay/repair while an explicit capable host owns physical volume.
+The required Android audio-policy integration and listening test remain distinct
+from firmware API/regression success.
+
 Reviewed 2026-10-28. Status: investigation, not a claim that Android USB volume synchronization works.
 The 0.1.36 Pixel listener rejected the audible down/up excursion caused by
 restoring the AirPods' hardware gain after forwarding a stem gesture.

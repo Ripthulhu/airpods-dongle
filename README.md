@@ -12,6 +12,14 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.45** fixes volume drift across pause/resume and cancels stale
+internal gain repairs after an AVRCP reconnect. It adds a bounded, explicit USB
+host volume authority contract so a capable host can use actual AirPods gain
+without duplicate HID steps or near-maximum anchor restoration. Android's normal
+software-volume path requires privileged host integration to eliminate premature
+maximum cues; the new firmware API alone does not establish that integration.
+See [host volume](docs/HOST-VOLUME.md). The installed dongles remain on 0.1.44.
+
 Candidate **0.1.44** presents USB headphones and microphone only while the
 selected AirPods have a Bluetooth audio-profile connection. Boot and a real
 AirPods disconnect expose only HID/CDC controls; reconnect restores audio unless
@@ -208,9 +216,8 @@ cmake --build build --parallel
 Output: `build/airpods_dongle.uf2`. Hold BOOTSEL while connecting the Pico 2 W,
 then copy the UF2 onto its USB drive. The original Pico W has insufficient RAM.
 
-For the S16-only comparison build, configure a separate build directory with
-`-DAIRPODS_USB_FLOAT=OFF`. This keeps identical processing but omits the float USB
-alternative. The normal build exposes both formats; the host chooses one.
+The standard firmware exposes float32 and S16 USB alternatives; the host chooses
+one. A separate S16-only firmware download is unnecessary.
 
 The SDK helper pins Pico SDK 2.3.1 and its submodules, checks original file hashes,
 applies the reviewed patches, and verifies readback. Configuration and builds
@@ -227,15 +234,14 @@ outputs. Tested allocations must leave a 64 KiB runtime reserve.
 [Firmware CI](https://github.com/Ripthulhu/airpods-dongle/actions/workflows/firmware.yml)
 runs on every push and pull request, and can be started with **Run workflow**.
 C/Python regression tests with address and undefined-behavior sanitizers must
-pass before the two Pico 2 W Release builds start. Each build uses the pinned SDK
-and picotool, including the existing codec, memory and USB descriptor checks.
+pass before the Pico 2 W Release build starts. It uses the pinned SDK and
+picotool, including the existing codec, memory and USB descriptor checks. Format
+regression tests still exercise float32 and S16 input.
 
-Open a successful run and download one of its **Artifacts**:
+Open a successful run and download the **airpods-dongle-pico2w-float** artifact.
+It contains the standard firmware with float32 and S16 USB input.
 
-- `airpods-dongle-pico2w-float`: normal firmware with float32 and S16 USB input.
-- `airpods-dongle-pico2w-s16-only`: compatibility firmware exposing S16 only.
-
-Each ZIP contains the UF2 to flash, BIN/ELF/map files, the memory-check receipt,
+The ZIP contains the UF2 to flash, BIN/ELF/map files, the memory-check receipt,
 source commit, compiler version and `SHA256SUMS`. Downloads are retained for
 30 days and require GitHub sign-in. CI does not replace hardware listening tests.
 

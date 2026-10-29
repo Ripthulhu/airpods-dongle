@@ -171,9 +171,9 @@ FDK/SBC input. This is not a float Bluetooth codec. Format changes clear obsolet
 source data and reset the USB clock state. Diagnostics report the actual selected
 USB alternative, rather than inferring it from a host mixer or source file.
 
-`AIRPODS_USB_FLOAT=OFF` builds the same processing with only alt 1 exposed. Use
-this comparison artifact to establish a clean S16 baseline before enabling float
-USB on hardware. The normal default is ON, retaining alt 1 compatibility.
+Release firmware enables float and retains S16 alt 1 compatibility in the same
+image. CI publishes that single image; regression tests exercise both formats.
+The earlier S16-only comparison images were used during the initial float rollout.
 
 ## Trace protocol
 

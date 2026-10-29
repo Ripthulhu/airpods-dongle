@@ -131,7 +131,7 @@ void dongle_control_poll(void) {
             dongle_put32(next + 24 + i * 4, dongle_readback_age(readback,i,now));
         dongle_put32(next + 36, c->last_sequence);
         next[40] = c->last_result; next[41] = c->last_opcode;
-        next[42] = 1 | 4 | 8 | 16 | 32 | 64 | (readback->anc ? 2 : 0);
+        next[42] = 1 | 4 | 8 | 16 | 32 | 64 | 128 | (readback->anc ? 2 : 0);
         next[44] = present;
         next[45] = case_source;
         irq = save_and_disable_interrupts();

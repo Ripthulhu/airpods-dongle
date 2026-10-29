@@ -146,7 +146,7 @@ command. Bluetooth work runs on core 0, outside the USB interrupt.
 | 36–39 | Last command sequence |
 | 40 | Result: 0 none, 1 accepted, 2 busy, 3 stale target, 4 unsupported, 5 disconnected, 6 malformed |
 | 41 | Last command opcode; 0 for an invalid opcode |
-| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16), settings workflow lease (32), battery observation flags (64) |
+| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16), settings workflow lease (32), battery observation flags (64), USB host volume authority (128) |
 | 44 | With capability 64: component present mask, left 1, right 2, case 4 |
 | 45 | With capability 64: components observed through case BLE association, same bit order |
 | 46–63 | Reserved zero |

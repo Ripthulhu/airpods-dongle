@@ -34,6 +34,10 @@ void set_bt_volume(int16_t db256);
 bool get_bt_volume(uint8_t *level);
 void bt_volume_poll(void);
 void bt_volume_cancel_phone(void);
+uint8_t dongle_volume_request(uint8_t client,const uint8_t *p,uint16_t size,
+                             uint8_t *out,uint16_t capacity,uint16_t *length);
+uint16_t dongle_volume_snapshot(uint8_t client,uint8_t *out,uint16_t capacity);
+void dongle_volume_client_disconnect(uint8_t client);
 
 void set_usb_streaming(bool flag);
 bool get_usb_streaming(void);
