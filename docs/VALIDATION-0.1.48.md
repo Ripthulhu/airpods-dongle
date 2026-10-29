@@ -80,5 +80,19 @@ Pause/reconnect volume retention, host PCM amplitude measurement and the Android
 bridge still need device verification. The phone board remains on 0.1.46. Game
 Mode hitch acceptance is separate. Its live transition has now confirmed the
 60-ms controller timeout on the same AirPods ACL, with no pending or failed
-command. A four-minute listening comparison is in progress. Detailed volume
-capture is off by default; the bounded volume comparison capture is now closed.
+command. The 242-second comparison recorded 25 controller Flush Occurred events
+and the listener reported a hitch. Active PCM drops, zero fills and timeline
+recoveries stayed unchanged at zero. Flush events identify discarded data, not
+an exact number of lost packets; the retained event records identify AirPods
+handle 0x000b. Packet age currently stops at HCI submission, so it does not bound
+radio residence. Normal mode and its confirmed 200-ms timeout were restored.
+This is transport-loss evidence, not acceptance of the Game Mode fix.
+
+The native Mac comparison uses the same flushability: media CID 0x0709 packets
+are PB=2 (2,632 outbound packets), while signaling/AACP use PB=0. Captured frames
+2726/2735 set/confirm 60 ms; media frame 2731 is the first two-frame Game packet.
+That capture's Game interval lasts about 20 seconds and contains no flush events;
+it does not establish equivalent long-run behavior on the Pico controller.
+Detailed volume capture is off by default; all bounded comparison handles are
+closed. Firmware gain remained 103 when playback was later paused, with no
+additional gain writes.
