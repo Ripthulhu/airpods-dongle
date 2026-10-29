@@ -400,11 +400,6 @@ static bool bootsel_request_poll(bootsel_request_t *state, uint32_t now_ms) {
         state->pending = false;
         return false;
     }
-    if (bootsel_busy()) {
-        state->pending = false;
-        printf("[BOOTSEL] busy\n");
-        return false;
-    }
     if (!state->pending) {
         state->pending = true;
         state->requested_ms = now_ms;
@@ -418,15 +413,14 @@ static bool bootsel_request_poll(bootsel_request_t *state, uint32_t now_ms) {
     return true;
 }
 
-// Outside the Bluetooth lock and USB IRQ. Recheck atomically against a USB
-// capture/playback start before requesting the RP2350 ROM's USB bootloader.
-static void bootsel_enter_if_idle(uint32_t generation) {
+// Outside the Bluetooth lock and USB IRQ. The explicit update interrupts audio;
+// the SDK resets the whole chip, including core 1, before entering the boot ROM.
+static void bootsel_enter_if_current(uint32_t generation) {
     uint32_t irq = save_and_disable_interrupts();
     bool connected = debug_cdc_terminal_connected() &&
         debug_cdc_terminal_generation() == generation;
-    if (connected && !bootsel_busy()) reset_usb_boot(0, 0);
+    if (connected) reset_usb_boot(0, 0);
     restore_interrupts(irq);
-    if (connected) printf("[BOOTSEL] busy\n");
 }
 
 int main() {
@@ -607,7 +601,7 @@ int main() {
         realtime_metric_record(&bluetooth_main_metric, bluetooth_started, time_us_32(), UINT32_MAX);
         runtime_watch_set(WATCH_UNLOCK);
         async_context_release_lock(ctx);
-        if (enter_bootsel) bootsel_enter_if_idle(bootsel.terminal_generation);
+        if (enter_bootsel) bootsel_enter_if_current(bootsel.terminal_generation);
         runtime_watch_set(WATCH_IDLE);
         uint32_t idle_us = realtime_loop_idle_us(bluetooth_started, time_us_32(), fully_idle);
         if (idle_us) sleep_us(idle_us);

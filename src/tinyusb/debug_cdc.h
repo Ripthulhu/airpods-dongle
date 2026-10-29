@@ -33,7 +33,7 @@ enum { DEBUG_CDC_VOLUME_TRACE_ARM = 1, DEBUG_CDC_VOLUME_TRACE_DUMP = 2 };
 uint8_t debug_cdc_take_volume_trace_request(void);
 
 // Exact lowercase "bootsel" followed by LF/CRLF; IRQ only publishes intent.
-// Main must check all audio/call owners, allow bounded reply drain, then recheck.
+// Explicitly interrupts audio; main drains the reply then verifies the same DTR session.
 bool debug_cdc_take_bootsel_request(void);
 bool debug_cdc_terminal_connected(void);
 uint32_t debug_cdc_terminal_generation(void);

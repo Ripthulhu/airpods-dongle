@@ -132,6 +132,7 @@ void dongle_control_poll(void) {
         dongle_put32(next + 36, c->last_sequence);
         next[40] = c->last_result; next[41] = c->last_opcode;
         next[42] = 1 | 4 | 8 | 16 | 32 | 64 | 128 | (readback->anc ? 2 : 0);
+        next[43] = 1; // Capability 256: explicit runtime BOOTSEL may interrupt active audio.
         next[44] = present;
         next[45] = case_source;
         irq = save_and_disable_interrupts();

@@ -62,13 +62,14 @@ int main(void) {
     assert(controls[0].status[42] & 32); // Whole-workflow settings lease support.
     assert(controls[0].status[42] & 64); // Presence and case provenance extension.
     assert(controls[0].status[42] & 128); // Explicit USB host volume authority.
+    assert(controls[0].status[43] == 1); // Active-audio runtime update, capability 256.
     uint32_t same_generation=controls[0].generation;
     case_fallback=true; dongle_control_poll();
     assert(controls[0].generation==same_generation);
     assert(controls[0].status[19]==94 && controls[0].status[20]==93 && controls[0].status[21]==61);
     assert(controls[0].status[22]==1 && dongle_u32(controls[0].status+24)==10);
     assert(controls[0].status[44]==5 && controls[0].status[45]==7);
-    assert(controls[0].status[43]==0 && controls[0].status[46]==0);
+    assert(controls[0].status[46]==0);
     now+=(UINT64_C(1)<<32);
     dongle_control_poll();
     assert(dongle_u32(controls[0].status+24)==UINT32_MAX-1u);

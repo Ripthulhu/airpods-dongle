@@ -83,18 +83,24 @@ establish that the phone's media-volume UI follows hardware changes.
 
 ## USB bootloader entry
 
-From 0.1.34, open the USB CDC serial port with DTR asserted and send the exact
-lowercase line `bootsel` with LF or CRLF. Pause playback, close microphone use
-and finish calls first; allow the audio route to become idle. The USB callback
-only queues the request. Main context rejects active playback, capture, calls
-or output transitions with `[BOOTSEL] busy`.
+Open the identified board's USB CDC serial port with DTR asserted and send the
+exact lowercase line `bootsel` with LF or CRLF. From 0.1.46, capability 256
+indicates that this explicit maintenance request may interrupt playback, capture,
+calls and pending audio transitions. It does not wait for the host to release
+its audio interfaces. Ordinary discovery, status requests and physical button
+gestures do not authorize an update.
 
 `[BOOTSEL] ready` means the request was accepted, not that boot ROM is already
-running. Firmware briefly allows the reply to drain, checks for new activity
-again, then calls the Pico SDK's `reset_usb_boot(0, 0)`. Verify that the same board
+running. Firmware allows 20–100 ms for the reply to drain, verifies that the same
+DTR session is still connected, then calls the Pico SDK's `reset_usb_boot(0, 0)`
+from main context outside the Bluetooth lock. On RP2350 this resets the whole
+chip into ROM, stopping USB audio and both cores. No asynchronous audio cleanup
+or endpoint-idle wait can prevent the explicitly requested update. Verify that the same board
 serial reappears as `2E8A:000F` before using picotool. Firmware installation is a
 separate action; entering BOOTSEL does not erase flash or pairing storage.
-The first installation of this feature still requires physical BOOTSEL entry.
+Versions 0.1.34–0.1.45 reject active audio or transitions with `[BOOTSEL] busy`.
+Those versions may need one physical BOOTSEL entry to install 0.1.46. Do not loop
+or assume an old board supports interruptible entry without capability 256.
 The existing bare `t` diagnostics command remains available.
 Version 0.1.35 adds two manual `[VOLUME]` status lines to `t`: actual host SET
 revisions/session, HID receipts, relay state, physical readback,
@@ -146,7 +152,7 @@ command. Bluetooth work runs on core 0, outside the USB interrupt.
 | 36–39 | Last command sequence |
 | 40 | Result: 0 none, 1 accepted, 2 busy, 3 stale target, 4 unsupported, 5 disconnected, 6 malformed |
 | 41 | Last command opcode; 0 for an invalid opcode |
-| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16), settings workflow lease (32), battery observation flags (64), USB host volume authority (128) |
+| 42–43 | Capabilities: pair/reconnect (1), confirmed noise-control support (2), phone pairing (4), settings transport (8), typed feature RPC (16), settings workflow lease (32), battery observation flags (64), USB host volume authority (128), active-audio runtime update (256) |
 | 44 | With capability 64: component present mask, left 1, right 2, case 4 |
 | 45 | With capability 64: components observed through case BLE association, same bit order |
 | 46–63 | Reserved zero |

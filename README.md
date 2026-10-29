@@ -12,13 +12,24 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.46** allows an explicit runtime BOOTSEL request during playback,
+recording, calls or audio transitions. It interrupts audio through the SDK's
+chip reset after a bounded reply delay, retaining DTR/session fencing and board
+identity checks. It does not wait for Android to release USB audio. Older firmware
+may need one physical BOOTSEL update before this works. Both boards now run
+0.1.46, with pairing storage verified unchanged. The Pixel's USB playback was
+active when remote BOOTSEL entry passed; the board restarted and the listener
+confirmed music returned in both ears. See [validation](docs/VALIDATION-0.1.46.md)
+and the [runtime update protocol](docs/USB-CONTROL.md#usb-bootloader-entry).
+
 Candidate **0.1.45** fixes volume drift across pause/resume and cancels stale
 internal gain repairs after an AVRCP reconnect. It adds a bounded, explicit USB
 host volume authority contract so a capable host can use actual AirPods gain
 without duplicate HID steps or near-maximum anchor restoration. Android's normal
 software-volume path requires privileged host integration to eliminate premature
 maximum cues; the new firmware API alone does not establish that integration.
-See [host volume](docs/HOST-VOLUME.md). The installed dongles remain on 0.1.44.
+See [host volume](docs/HOST-VOLUME.md). These changes are included in 0.1.46;
+Android host integration and maximum-cue listening acceptance remain open.
 
 Candidate **0.1.44** presents USB headphones and microphone only while the
 selected AirPods have a Bluetooth audio-profile connection. Boot and a real
@@ -27,7 +38,7 @@ the phone's Bluetooth route owns it. Paused music, Game Mode changes and standby
 takeovers retain the connection and do not remove the USB device. AirPods absence
 overrides an open USB microphone. This also lets the idle-power changes below
 engage when the host would otherwise keep an unused USB audio stream open.
-Both builds and all offline checks pass. Both lab dongles are flashed with
+Both builds and all offline checks passed. Both lab dongles previously ran
 0.1.44, pairing storage verified unchanged. Startup checks saw control-only USB
 on the disconnected PC dongle and automatic audio return after the Pixel dongle
 reconnected to the AirPods. Listening and power measurements remain open.
@@ -162,9 +173,10 @@ Send `t` to read USB service and main-loop Bluetooth timing maxima, the current
 phone decoder maximum and flash-cache counters. Repeated requests are coalesced;
 counter collection does not acquire audio or run a sound-producing check.
 Version 0.1.34 also accepts `bootsel` followed by Enter on the USB serial port.
-Pause playback and close microphone/call use first. The command requests the ROM
-USB bootloader; it does not erase pairing or flash firmware. See
-[USB bootloader entry](docs/USB-CONTROL.md#usb-bootloader-entry) for the guarded handshake.
+From 0.1.46, the explicit command interrupts active audio and requests the ROM
+USB bootloader without waiting for the host to stop. It does not erase pairing
+or flash firmware. See [USB bootloader entry](docs/USB-CONTROL.md#usb-bootloader-entry)
+for the session-fenced handshake and older-firmware limits.
 LDAC is unsupported: the inherited encoder path could exceed the negotiated packet
 limit, and AirPods do not need that codec.
 
