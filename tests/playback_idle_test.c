@@ -81,6 +81,8 @@ static playback_game_t playback_game;
 static bool playback_game_eligible(void) { return game_eligible; }
 static struct { unsigned recoveries; } playback_metrics;
 static void *handleAAC = (void *)1;
+static void playback_encoder_invalidate(void) {}
+static struct { unsigned deferred_size; } encoder_job;
 static uint32_t aaceld_bitrate = 256000;
 static uint16_t pcm_frame_samples = 480, active_slot_count = 16;
 static unsigned audio_timer_interval = 10;
@@ -266,7 +268,9 @@ static void fresh_usb_start_reclaims_peer_suspend(void) {
 }
 static void ownership_loss_is_passive_until_explicit_claim(void) {
     fixture();set_usb_streaming(true);audio_owned=false;
+    phone_continuity=(playback_continuity_t){.armed=true,.deficit_us=80000,.last_us=1000};
     dongle_playback_ownership_changed(false);
+    assert(!phone_continuity.armed && !phone_continuity.deficit_us);
     assert(!media_tracker.streaming && !is_streaming && suspends==1 && usb_pauses==1);
     assert(get_a2dp_connected_flag()); // The standby dongle keeps its connected USB endpoint.
     accept(AVDTP_SI_SUSPEND,5);assert(playback_idle_phase==PLAYBACK_SUSPENDED);

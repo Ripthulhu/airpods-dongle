@@ -9,6 +9,7 @@
 #define AVDTP_AUDIO 0
 #define AVDTP_MEDIA_CODEC 7
 #define AVDTP_DELAY_REPORTING 8
+#define AVDTP_MAX_SEP_NUM 2
 #define btstack_assert assert
 typedef unsigned avdtp_media_codec_type_t;
 typedef struct {
@@ -24,9 +25,10 @@ typedef struct {
 static endpoint_t endpoint, *stream_endpoint_aaceld;
 static struct { endpoint_t *local_stream_endpoint; } sc;
 static struct { unsigned avdtp_cid, local_seid, remote_seid; } media_tracker={2,0,0};
-static struct { unsigned vendor_id, codec_id, codec_type, seid; bool delay_reporting;
-                uint8_t media_codec_event[14]; } remote_seps[1];
+static struct { unsigned vendor_id, codec_id, codec_type, seid; bool delay_reporting, have_media_codec_capabilities;
+                uint8_t media_codec_event[14]; } remote_seps[2];
 static uint16_t num_remote_seps=1, selected_remote_sep_index;
+static uint16_t peer_cap_len=14;
 static uint8_t cur_codec=4;
 static bool a2dp_is_connected_flag=true, model_supported=true;
 static uint8_t media_aaceld_codec_capabilities[14]={0x4c,0,0,0,1,0x80,0,0x80,0,0x84,0,0x83,0xe8,0};
@@ -54,7 +56,7 @@ static uint16_t store_bit16(uint16_t bits, unsigned bit, unsigned value) {
     return value ? bits | (1u<<bit) : bits & ~(1u<<bit);
 }
 static const uint8_t *avdtp_subevent_signaling_media_codec_other_capability_get_media_codec_information(const uint8_t *event) { return event; }
-static uint16_t avdtp_subevent_signaling_media_codec_other_capability_get_media_codec_information_len(const uint8_t *event) { (void)event; return 14; }
+static uint16_t avdtp_subevent_signaling_media_codec_other_capability_get_media_codec_information_len(const uint8_t *event) { (void)event; return peer_cap_len; }
 static int avdtp_source_set_configuration(unsigned cid, unsigned local, unsigned remote,
         uint16_t services, avdtp_capabilities_t configuration) {
     assert(cid==2 && local==3 && remote==4);
@@ -75,10 +77,77 @@ static void receive_report(uint8_t cid, uint8_t seid, uint16_t size) {
     }
 }
 
+static void incoming_eld_configuration_checks_current_endpoint_and_known_peer(void) {
+    uint8_t config[14];memcpy(config,media_aaceld_codec_capabilities,sizeof(config));
+    num_remote_seps=0; // Peer reconnect can configure before our asynchronous discovery completes.
+    assert(playback_eld_peer_configuration(3,4,config,sizeof(config)));
+    assert(!playback_eld_peer_configuration(9,4,config,sizeof(config)));
+    assert(!playback_eld_peer_configuration(3,0,config,sizeof(config)));
+    assert(!playback_eld_peer_configuration(3,0x3f,config,sizeof(config)));
+    stream_endpoint_aaceld=NULL;
+    assert(!playback_eld_peer_configuration(3,4,config,sizeof(config)));
+    stream_endpoint_aaceld=&endpoint;
+    num_remote_seps=2;selected_remote_sep_index=0;
+    remote_seps[0].seid=8;remote_seps[0].codec_type=0;remote_seps[0].have_media_codec_capabilities=true;
+    remote_seps[1]=remote_seps[0];remote_seps[1].seid=4;
+    remote_seps[1].codec_type=AVDTP_CODEC_NON_A2DP;
+    memcpy(remote_seps[1].media_codec_event,media_aaceld_codec_capabilities,14);
+    assert(!playback_eld_peer_configuration(3,8,config,sizeof(config)));
+    assert(playback_eld_peer_configuration(3,4,config,sizeof(config))); // Ignore an unrelated selected index.
+    remote_seps[1].have_media_codec_capabilities=false;
+    assert(playback_eld_peer_configuration(3,4,config,sizeof(config))); // Catalog entry still incomplete.
+    remote_seps[1].have_media_codec_capabilities=true;
+    remote_seps[1].vendor_id=0;
+    assert(!playback_eld_peer_configuration(3,4,config,sizeof(config)));
+    remote_seps[1].vendor_id=A2DP_CODEC_VENDOR_ID_APPLE;
+    remote_seps[1].media_codec_event[11]&=0x7f;
+    assert(!playback_eld_peer_configuration(3,4,config,sizeof(config))); // Known fixed-only peer.
+    config[11]&=0x7f;
+    assert(playback_eld_peer_configuration(3,4,config,sizeof(config)));
+    config[11]|=0x80;remote_seps[1].media_codec_event[11]|=0x80;
+    peer_cap_len=13;
+    assert(!playback_eld_peer_configuration(3,4,config,sizeof(config)));
+    peer_cap_len=14;
+    remote_seps[1].media_codec_event[11]=0x81;remote_seps[1].media_codec_event[12]=0xf4;
+    assert(!playback_eld_peer_configuration(3,4,config,sizeof(config))); // Config exceeds known peer ceiling.
+    num_remote_seps=0;
+    media_aaceld_codec_capabilities[11]&=0x7f;
+    assert(!playback_eld_peer_configuration(3,4,config,sizeof(config))); // Local offer always applies.
+    media_aaceld_codec_capabilities[11]|=0x80;
+    assert(!playback_eld_peer_configuration(3,4,config,13));
+    assert(!playback_eld_peer_configuration(3,4,NULL,sizeof(config)));
+}
+static void incoming_configuration_binds_before_open_and_late_catalog_enables_game(void) {
+    num_remote_seps=2;remote_seps[0].seid=8;remote_seps[1].seid=4;
+    selected_remote_sep_index=0;
+    sc.local_stream_endpoint=NULL;media_tracker.local_seid=1;media_tracker.remote_seid=8;
+    playback_eld_bind_configuration(3,4);
+    assert(sc.local_stream_endpoint==stream_endpoint_aaceld);
+    assert(media_tracker.local_seid==3 && media_tracker.remote_seid==4 && selected_remote_sep_index==1);
+    num_remote_seps=0;
+    playback_eld_bind_configuration(3,9);
+    assert(sc.local_stream_endpoint==stream_endpoint_aaceld);
+    assert(media_tracker.local_seid==3 && media_tracker.remote_seid==9 && selected_remote_sep_index==AVDTP_MAX_SEP_NUM);
+    model_supported=true;
+    assert(!playback_game_eligible());
+    num_remote_seps=2;remote_seps[1].seid=9;remote_seps[1].delay_reporting=true;
+    remote_seps[1].have_media_codec_capabilities=true;
+    remote_seps[1].codec_type=AVDTP_CODEC_NON_A2DP;
+    remote_seps[1].vendor_id=A2DP_CODEC_VENDOR_ID_APPLE;
+    remote_seps[1].codec_id=A2DP_APPLE_CODEC_AAC_ELD;
+    assert(playback_game_eligible()); // Uses current remote identity, not the stale sentinel index.
+    remote_seps[1].have_media_codec_capabilities=false;assert(!playback_game_eligible());
+    remote_seps[1].have_media_codec_capabilities=true;
+    remote_seps[1].codec_type=0;assert(!playback_game_eligible());
+    remote_seps[1].codec_type=AVDTP_CODEC_NON_A2DP;
+    remote_seps[1].delay_reporting=false;assert(!playback_game_eligible());
+}
+
 int main(void) {
     remote_seps[0].vendor_id=A2DP_CODEC_VENDOR_ID_APPLE;
     remote_seps[0].codec_id=A2DP_APPLE_CODEC_AAC_ELD;
     remote_seps[0].codec_type=AVDTP_CODEC_NON_A2DP; remote_seps[0].seid=4;
+    remote_seps[0].have_media_codec_capabilities=true;
     memcpy(remote_seps[0].media_codec_event,media_aaceld_codec_capabilities,14);
     assert(setup_aaceld_configuration()==0);
     assert(configured_services==(1u<<AVDTP_MEDIA_CODEC));
@@ -93,5 +162,7 @@ int main(void) {
     receive_report(2,9,8); assert(delay_revision==0);
     receive_report(2,3,7); assert(delay_revision==0);
     receive_report(2,3,8); assert(delay_revision==1 && reported_delay==600);
+    incoming_eld_configuration_checks_current_endpoint_and_known_peer();
+    incoming_configuration_binds_before_open_and_late_catalog_enables_game();
     puts("playback delay: negotiated category required for Game Mode");
 }

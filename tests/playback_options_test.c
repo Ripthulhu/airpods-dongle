@@ -17,21 +17,78 @@ static void test_profiles(void) {
         for (unsigned mode=0;mode<2;++mode) {
             playback_options_t p={3,(uint8_t)mode,rates[i]};
             assert(playback_options_valid(p) && playback_options_eld(cap,sizeof(cap),p,out));
-            assert(playback_eld_bitrate(out)==(mode ? rates[i]/800*800 : rates[i]));
+            assert(playback_eld_variable(out) && playback_eld_bitrate(out)==256000);
+            uint32_t actual=mode ? rates[i]/800*800 : rates[i]>255200 ? 255200 : rates[i];
+            assert(playback_options_eld_rate(out,sizeof(out),p)==actual);
+            assert(p.rate_mode==mode && p.bitrate==rates[i]);
             assert(playback_options_eld_configuration(out,sizeof(out),p));
+            assert(playback_eld_configuration_supported(out,sizeof(out),cap,sizeof(cap)));
             assert(!playback_options_eld_configuration(out,sizeof(out)-1,p));
             playback_options_t wrong=p; wrong.rate_mode^=1;
-            assert(!playback_options_eld_configuration(out,sizeof(out),wrong));
+            assert(playback_options_eld_configuration(out,sizeof(out),wrong));
         }
     }
     playback_options_t requested={3,1,174000};
     cap[11]&=0x7f; assert(!playback_options_eld(cap,sizeof(cap),requested,out));
     requested.rate_mode=0; assert(playback_options_eld(cap,sizeof(cap),requested,out));
+    assert(!playback_eld_variable(out) && playback_eld_bitrate(out)==174000);
+    assert(playback_options_eld_rate(out,sizeof(out),requested)==174000);
+    assert(playback_options_eld_configuration(out,sizeof(out),requested));
+    playback_options_t variable=requested; variable.rate_mode=1;
+    assert(!playback_options_eld_configuration(out,sizeof(out),variable));
+    out[11]|=0x80;
+    assert(!playback_eld_configuration_supported(out,sizeof(out),cap,sizeof(cap)));
     cap[11]=2; cap[12]=0x58; cap[13]=0; // Peer ceiling 153600.
     assert(!playback_options_eld(cap,sizeof(cap),requested,out));
     requested.bitrate=0;
     assert(playback_options_eld(cap,sizeof(cap),requested,out) && playback_eld_bitrate(out)==153600);
     for (unsigned n=0;n<14;++n) assert(!playback_options_eld(cap,n,requested,out));
+}
+static void test_eld_wire_ceiling_and_received_configuration(void) {
+    uint8_t cap[]={0x4c,0,0,0,1,0x80,0,0x80,0,0x8c,0,0x83,0xe8,0}, out[14];
+    playback_options_t p={3,0,256000};
+    assert(playback_options_eld(cap,sizeof(cap),p,out));
+    assert(playback_options_eld_rate(out,sizeof(out),p)==255200);
+    assert(playback_eld_au_ceiling(255200,false)*800u<=playback_eld_bitrate(out));
+    assert(playback_options_eld_configuration(out,sizeof(out),p));
+    out[11]=3; // A fixed-only peer keeps the requested exact rate and cannot adapt.
+    assert(playback_options_eld_configuration(out,sizeof(out),p));
+    assert(playback_options_eld_rate(out,sizeof(out),p)==256000);
+    out[12]=0x5b; out[13]=0x60; // Received 220000 cannot satisfy a 256000 request.
+    assert(!playback_options_eld_configuration(out,sizeof(out),p));
+    out[11]|=0x80;
+    assert(!playback_options_eld_configuration(out,sizeof(out),p));
+    p.bitrate=128000;
+    cap[11]=0x81;cap[12]=0xf4;cap[13]=0; // 128000: no CBR alignment headroom.
+    assert(playback_options_eld(cap,sizeof(cap),p,out));
+    assert(!playback_eld_variable(out) && playback_eld_bitrate(out)==128000);
+    assert(playback_options_eld_rate(out,sizeof(out),p)==128000);
+    assert(playback_eld_configuration_supported(out,sizeof(out),cap,sizeof(cap)));
+    out[11]|=0x80;
+    assert(!playback_options_eld_configuration(out,sizeof(out),p));
+    p.rate_mode=1;
+    assert(playback_options_eld(cap,sizeof(cap),p,out));
+    assert(playback_eld_variable(out) && playback_options_eld_rate(out,sizeof(out),p)==128000);
+    p.rate_mode=0;cap[12]=0xf7;cap[13]=0x20; // 128800: exactly enough for 128000 CBR.
+    assert(playback_options_eld(cap,sizeof(cap),p,out));
+    assert(playback_eld_variable(out) && playback_options_eld_rate(out,sizeof(out),p)==128000);
+    p.bitrate=174000;
+    assert(!playback_options_eld(cap,sizeof(cap),p,out));
+    for (unsigned n=0;n<14;++n) {
+        assert(!playback_options_eld_configuration(out,n,p));
+        assert(!playback_options_eld_rate(out,n,p));
+    }
+    assert(!playback_options_eld_configuration(NULL,14,p));
+    assert(!playback_options_eld_configuration(out,15,p));
+    p=(playback_options_t){0,0,0};cap[11]=0x80;cap[12]=cap[13]=0;
+    assert(playback_options_eld(cap,sizeof(cap),p,out)); // Unspecified peer ceiling.
+    assert(playback_eld_bitrate(out)==256000 && playback_options_eld_rate(out,sizeof(out),p)==255200);
+    assert(playback_eld_configuration_supported(out,sizeof(out),cap,sizeof(cap)));
+    p=(playback_options_t){3,0,220000};
+    cap[11]=0x83;cap[12]=0xe8;cap[13]=0;
+    assert(playback_options_eld(cap,sizeof(cap),p,out));
+    assert(playback_options_eld_rate(out,sizeof(out),p)==220000);
+    assert(playback_eld_au_ceiling(220000,false)*800u<=playback_eld_bitrate(out));
 }
 static void test_game_confirmation_and_restore(void) {
     playback_game_t s={0}; playback_game_request(&s,true);
@@ -134,7 +191,8 @@ static void test_game_faults_wrap_and_session_loss(void) {
     assert(s.phase==GAME_RESTORING);
 }
 int main(void) {
-    test_profiles(); test_catalog_preflight(); test_game_confirmation_and_restore(); test_game_faults_wrap_and_session_loss();
+    test_profiles(); test_eld_wire_ceiling_and_received_configuration(); test_catalog_preflight();
+    test_game_confirmation_and_restore(); test_game_faults_wrap_and_session_loss();
     test_normal_boot_preparation();
     puts("playback options: explicit codec/rate bounds, VBR negotiation, fresh Game Mode reports and restoration passed");
 }

@@ -32,28 +32,42 @@ static inline bool playback_options_preflight(playback_options_t p, bool complet
     return playback_options_valid(p) && (!p.codec || !complete ||
         (matching_codecs&(uint8_t)(1u<<p.codec))!=0);
 }
+static inline uint32_t playback_options_eld_rate(const uint8_t *config, unsigned size,
+                                                 playback_options_t p) {
+    if (!playback_options_valid(p) || (p.codec!=0 && p.codec!=3) ||
+        !playback_eld_configuration(config,size) ||
+        (p.rate_mode && !playback_eld_variable(config))) return 0;
+    uint32_t ceiling=playback_eld_bitrate(config);
+    uint32_t rate=p.bitrate ? p.bitrate : ceiling;
+    if (rate>ceiling) return 0;
+    if (p.rate_mode) rate=rate/800*800;
+    else if (playback_eld_variable(config)) {
+        // CBR may need one alignment byte beyond its nominal 10-ms AU budget.
+        uint32_t maximum=ceiling/800*800-800;
+        if (rate>maximum) rate=maximum;
+    }
+    return rate>=PLAYBACK_ELD_MIN_BITRATE ? rate : 0;
+}
 static inline bool playback_options_eld(const uint8_t *cap, unsigned size,
                                          playback_options_t p, uint8_t out[14]) {
     if (!playback_options_valid(p) || (p.codec!=0 && p.codec!=3) ||
         !playback_eld_negotiate(cap,size,out)) return false;
     uint32_t ceiling=playback_eld_bitrate(out);
-    uint32_t bitrate=p.bitrate ? p.bitrate : ceiling;
-    if (bitrate>ceiling || (p.rate_mode && !(cap[11]&0x80))) return false;
-    if (p.rate_mode) bitrate=bitrate/800*800; // FDK's VBR frame ceiling is byte-aligned.
-    if (bitrate<PLAYBACK_ELD_MIN_BITRATE) return false;
-    out[11]=(uint8_t)(bitrate>>16) | (p.rate_mode ? 0x80 : 0);
-    out[12]=(uint8_t)(bitrate>>8); out[13]=(uint8_t)bitrate;
-    return true;
+    uint32_t rate=p.bitrate ? p.bitrate : ceiling;
+    if (rate>ceiling || (p.rate_mode && !playback_eld_variable(out))) return false;
+    if (!p.rate_mode && playback_eld_variable(out) &&
+        ceiling/800*800-800<PLAYBACK_ELD_MIN_BITRATE) out[11]&=0x7f;
+    if (!playback_eld_variable(out)) {
+        out[11]=(uint8_t)(rate>>16);
+        out[12]=(uint8_t)(rate>>8); out[13]=(uint8_t)rate;
+    }
+    return playback_options_eld_rate(out,size,p)!=0;
 }
 static inline bool playback_options_eld_configuration(const uint8_t *p, unsigned n,
                                                        playback_options_t options) {
-    if (!p || n!=14 || !playback_options_valid(options) ||
-        (options.codec!=0 && options.codec!=3) || (p[11]>>7)!=options.rate_mode) return false;
-    uint8_t cbr[14]; memcpy(cbr,p,sizeof(cbr)); cbr[11]&=0x7f;
-    if (!playback_eld_configuration(cbr,sizeof(cbr))) return false;
-    uint32_t requested=options.bitrate;
-    if (options.rate_mode) requested=requested/800*800;
-    return !requested || playback_eld_bitrate(p)==requested;
+    if (!playback_options_eld_rate(p,n,options)) return false;
+    return !options.bitrate || playback_eld_variable(p) ||
+           playback_eld_bitrate(p)==options.bitrate;
 }
 
 enum { GAME_OFF, GAME_PENDING, GAME_SENT, GAME_CONFIRMED, GAME_FAILED, GAME_UNSUPPORTED, GAME_RESTORING };

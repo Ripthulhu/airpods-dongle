@@ -80,6 +80,7 @@ static void realtime_metrics_print(void) {
            (unsigned long)usb.overruns, (unsigned long)bluetooth.count,
            (unsigned long)bluetooth.max_us, (unsigned long)bluetooth.max_gap_us,
            (unsigned long)phone_worker_max_decode_us());
+    printf("[ENCODER] cancelled=%lu\n", (unsigned long)dongle_playback_encode_cancelled());
     printf("[XIP] hits=%lu accesses=%lu (read then cleared; counters saturate)\n",
            (unsigned long)hits, (unsigned long)accesses);
     bt_hci_credit_diagnostics_t credits;
@@ -551,6 +552,7 @@ int main() {
         runtime_watch_set(WATCH_LOCK);
         async_context_acquire_lock_blocking(ctx);
         uint32_t bluetooth_started = time_us_32();
+        dongle_playback_encode_complete();
         // Serialize SDK flash lockout with Bluetooth's interrupt-driven TLV writes.
         if ((uint32_t)(now_ms - button_sample_ms) >= 20u) {
             runtime_watch_set(WATCH_BUTTON);
@@ -609,6 +611,7 @@ int main() {
         runtime_watch_set(WATCH_UNLOCK);
         async_context_release_lock(ctx);
         if (enter_bootsel) bootsel_enter_if_current(bootsel.terminal_generation);
+        dongle_playback_encode_run();
         runtime_watch_set(WATCH_IDLE);
         uint32_t idle_us = realtime_loop_idle_us(bluetooth_started, time_us_32(), fully_idle);
         if (idle_us) sleep_us(idle_us);

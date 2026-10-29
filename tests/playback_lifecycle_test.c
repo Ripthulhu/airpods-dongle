@@ -18,7 +18,7 @@ static bool is_usb_streaming, phone_active, phone_opened, profile_pending;
 static bool call_active, call_capture;
 static bool a2dp_connect_pending, a2dp_is_connected_flag, profile_reconnect;
 static bool allow_switch_slot, finish_scan_avdtp_codec;
-static bool have_aaceld_codec_capabilities, finish_setup_aac;
+static bool have_aaceld_codec_capabilities, finish_setup_aac, aaceld_variable_allowed;
 static playback_options_t playback_options, profile_previous;
 #include "playback_defaults.inc"
 static uint8_t address[6], profile_peer[6], game_peer[6], connected_address[6];
@@ -36,7 +36,7 @@ static unsigned playback_recoveries;
 static void *handleAAC;
 typedef struct { uint32_t timeout; } btstack_timer_source_t;
 typedef struct {
-    uint16_t avdtp_cid, avrcp_cid, local_seid;
+    uint16_t avdtp_cid, avrcp_cid, local_seid, remote_seid;
     bool streaming;
     uint8_t codec_ready_to_send;
     uint32_t time_audio_data_sent, samples_ready, acc_num_missed_samples;
@@ -129,6 +129,8 @@ static uint16_t avdtp_subevent_signaling_connection_released_get_avdtp_cid(const
     return *p;
 }
 static void aacEncClose(void **handle) { *handle = NULL; }
+static void playback_encoder_close(void) {if(handleAAC)aacEncClose(&handleAAC);}
+static void playback_encoder_invalidate(void) {}
 void avdtp_source_establish_stream(void);
 
 // The runner extracts these functions and this callback case from the firmware.
@@ -147,19 +149,21 @@ static void signaling_released(uint16_t cid) {
 static void headset_presence_follows_current_signaling(void) {
     // Media/AACP can be idle while the actual headset profile remains connected.
     a2dp_is_connected_flag=true;media_tracker.avdtp_cid=70;
+    aaceld_variable_allowed=true;
     media_tracker.streaming=game_ready=false;
     assert(get_a2dp_connected_flag());
     signaling_released(69);
-    assert(get_a2dp_connected_flag() && media_tracker.avdtp_cid==70);
+    assert(get_a2dp_connected_flag() && media_tracker.avdtp_cid==70 && aaceld_variable_allowed);
     signaling_released(70);
-    assert(!get_a2dp_connected_flag() && media_tracker.avdtp_cid==0);
+    assert(!get_a2dp_connected_flag() && media_tracker.avdtp_cid==0 && !aaceld_variable_allowed);
 
     // A late release from the old connection cannot hide a newly connected pair.
     a2dp_is_connected_flag=true;media_tracker.avdtp_cid=71;
+    aaceld_variable_allowed=true;
     signaling_released(70);
-    assert(get_a2dp_connected_flag() && media_tracker.avdtp_cid==71);
+    assert(get_a2dp_connected_flag() && media_tracker.avdtp_cid==71 && aaceld_variable_allowed);
     signaling_released(71);
-    assert(!get_a2dp_connected_flag() && media_tracker.avdtp_cid==0);
+    assert(!get_a2dp_connected_flag() && media_tracker.avdtp_cid==0 && !aaceld_variable_allowed);
 }
 
 static void profile_then_pair(bool storage_succeeds, bool inquiry_succeeds) {

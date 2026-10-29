@@ -14,26 +14,36 @@ codec information starts with:
 00 80               AAC-ELD object-type bitmap
 00 84               Selected 48 kHz stereo configuration
 00                  Reserved
-03 E8 00            CBR, 256000 bits/s
+83 E8 00            Variable-rate permission, 256000 bits/s wire ceiling
 ```
 
-Capabilities can advertise both channels and the VBR bit. The selected
-configuration uses CBR to match the encoder. A lower advertised maximum reduces
-the selected rate; rates below 128 kbps are rejected by this implementation.
+Capabilities can advertise both channels and the variable-rate permission bit.
+The selected configuration retains that permission when the peer supports it,
+independently of the local CBR/VBR encoder choice. The wire ceiling is capped by
+both peers; a requested lower local rate does not reduce that permission.
+CBR reserves one alignment byte per 10 ms access unit, allowing a 255200 bits/s
+local budget under the 256000 wire ceiling. Lower local requests remain unchanged
+when they fit. Profile status reports requested and effective local rates; the
+wire field is a separate ceiling, not a measurement of encoded throughput.
+
+A fixed-only peer uses fixed CBR at the selected rate, without live adaptation.
+That path is also the fallback when variable permission leaves insufficient
+headroom for 128 kbps CBR. Actual VBR encoding requires variable permission;
+unsupported combinations and rates below 128 kbps are rejected.
 
 | Encoder parameter | Selected value |
 | --- | --- |
 | Audio object type | 39, ER AAC-ELD |
 | PCM input | 48 kHz stereo, signed 16-bit |
 | Frame length | 480 samples per channel, 10 ms |
-| Bitrate | CBR, at most 256 kbps and the peer's ceiling |
+| Bitrate | Requested CBR/VBR mode, bounded by the selected wire ceiling |
 | SBR | Off |
 | Afterburner | Off |
 | Transport | Raw access units |
 
-Changing the SBR setting or advertising VBR requires a separate encoder and
-wire check. A host-reported PCM bit depth does not establish the compressed
-stream's effective resolution.
+Changing SBR requires a separate encoder and wire check. The variable-rate
+permission does not silently enable actual VBR encoding. A host-reported PCM bit
+depth does not establish the compressed stream's effective resolution.
 
 ## Packet framing
 

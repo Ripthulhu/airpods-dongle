@@ -36,6 +36,7 @@ static void check_bootsel_state(void) {
     ++samples; pending_action=true;
     flash_lock=false;
 }
+static void dongle_playback_encode_complete(void) {assert(lock_depth==1);}
 
 #include "main_button_poll.inc"
 

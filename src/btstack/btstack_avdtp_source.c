@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <malloc.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "btstack.h"
 #include "btstack_avdtp_source.h"
 #include "pico/platform/sections.h"
@@ -160,6 +161,30 @@ typedef struct {
 #ifdef HAVE_AAC_FDK
 static HANDLE_AACENCODER handleAAC;
 static AACENC_InfoStruct aacinf;
+enum { ENCODE_IDLE, ENCODE_PREPARED, ENCODE_RUNNING, ENCODE_DONE };
+// One job exclusively owns the existing PCM buffer and unused packet tail.
+static struct {
+    atomic_uint epoch, state;
+    HANDLE_AACENCODER handle;
+    uint32_t epoch_at_prepare, session, usb_revision, unit_started, encode_us;
+    uint32_t cancelled, deferred_epoch, deferred_session;
+    uint16_t samples, offset, capacity, reset_cid;
+    int error, bytes, consumed;
+    uint8_t codec, input, deferred_size, deferred_event[40], deferred_peer[6];
+    bool close_pending, reset_pending;
+} encoder_job = {.epoch = 1};
+_Static_assert(sizeof(encoder_job) <= 128, "AAC job must not consume another audio buffer");
+static bool playback_encoder_busy(void) {
+    return atomic_load_explicit(&encoder_job.state, memory_order_acquire) != ENCODE_IDLE;
+}
+static void playback_encoder_invalidate(void) {
+    atomic_fetch_add_explicit(&encoder_job.epoch, 1u, memory_order_relaxed);
+}
+static void playback_encoder_close(void);
+static bool playback_encoder_defer_configuration(const uint8_t *packet, uint16_t size);
+static bool playback_encoder_scope_current(void);
+static void playback_encoder_discard(bool current_job);
+static bool playback_encoder_packet_current(void);
 #endif
 
 static a2dp_media_sending_context_t media_tracker;
@@ -411,6 +436,8 @@ static void playback_clock_switch(a2dp_media_sending_context_t *,uint32_t,uint8_
 static void playback_adjust_cancel_stream(a2dp_media_sending_context_t *,uint32_t,uint8_t);
 static void a2dp_demo_send_media_packet(void) {
     a2dp_media_sending_context_t *context = &media_tracker;
+    if (playback_encoder_busy()) return;
+    if (!playback_encoder_packet_current()) return;
     if (!context->streaming || !context->codec_ready_to_send ||
         !a2dp_is_connected_flag || context->codec_storage_count == 0) return;
     uint16_t payload_size = context->codec_storage_count;
@@ -517,6 +544,7 @@ static bool have_aaceld_codec_capabilities;
 bd_addr_t cur_active_device;
 static uint16_t aaceld_frame_sequence = 1;
 static uint32_t aaceld_bitrate = PLAYBACK_ELD_BITRATE;
+static bool aaceld_variable_allowed;
 bool finish_setup_aac;
 bool allow_switch_slot = true;
 static btstack_timer_source_t suspend_recovery_timer;
@@ -1118,6 +1146,7 @@ bool bridge_phone_recovering(void) {
 }
 
 bool bridge_phone_start(void) {
+    playback_encoder_invalidate();
     if (!bridge_phone_ready()) return false;
     playback_continuity_reset(&phone_continuity);
     critical_section_enter_blocking(&playback_pcm_lock);
@@ -1131,6 +1160,7 @@ bool bridge_phone_start(void) {
 }
 
 void bridge_phone_drop_pcm(void) {
+    playback_encoder_invalidate();
     critical_section_enter_blocking(&playback_pcm_lock);
     if (phone_active && !call_active) {
         playback_continuity_reset(&phone_continuity);
@@ -1143,6 +1173,7 @@ void bridge_phone_drop_pcm(void) {
 }
 
 void bridge_phone_stop(void) {
+    playback_encoder_invalidate();
     playback_continuity_reset(&phone_continuity);
     phone_output_recovery = false;
     critical_section_enter_blocking(&playback_pcm_lock);
@@ -1191,6 +1222,7 @@ bool bridge_call_open(void) {
     if (is_usb_streaming || usb_mic_requested() ||
         !peer_address_valid((const uint8_t *)get_device_addr())) return false;
     if (!call_opened) {
+        playback_encoder_invalidate();
         call_opened = true;
         phone_sink_pause_for_call();
     }
@@ -1213,6 +1245,7 @@ bool bridge_call_ready(void) {
 }
 
 void bridge_call_stop(void) {
+    if (call_opened || call_active) playback_encoder_invalidate();
     critical_section_enter_blocking(&playback_pcm_lock);
     if (call_active && !phone_active) playback_pcm_clear(&playback_pcm, audio_slot_capacity());
     call_opened = call_active = false;
@@ -1248,6 +1281,7 @@ static void suspend_recovery_handler(btstack_timer_source_t *timer) {
 }
 
 void audio_slot_queue_init(void) {
+    playback_encoder_invalidate();
     if (!playback_pcm_initialized) {
         critical_section_init(&playback_pcm_lock);
         playback_pcm_initialized = true;
@@ -1258,6 +1292,7 @@ void audio_slot_queue_init(void) {
 }
 
 static void audio_slot_queue_configure_with_count(uint16_t samples_per_slot, uint8_t slot_count) {
+    playback_encoder_invalidate();
     if (samples_per_slot == 0 || samples_per_slot > AUDIO_SLOT_MAX_SAMPLES ||
         slot_count == 0 || (uint32_t)samples_per_slot * slot_count > PLAYBACK_PCM_FRAMES) return;
     critical_section_enter_blocking(&playback_pcm_lock);
@@ -1299,6 +1334,7 @@ void audio_slot_push_float(const float *src,uint16_t frames) {
     audio_slot_push_data(src,frames,true);
 }
 void audio_slot_usb_reset(void) {
+    playback_encoder_invalidate();
     critical_section_enter_blocking(&playback_pcm_lock);
     if(!phone_active && !call_active)playback_pcm_clear(&playback_pcm,audio_slot_capacity());
     playback_usb_clock_reset(&usb_clock);
@@ -1386,6 +1422,7 @@ void set_usb_streaming(bool flag){
     if (!flag && !usb_mic_requested()) usb_media_cancel_volume();
     if (flag && (call_opened || call_active)) bridge_call_stop();
     if(is_usb_streaming!=flag) {
+        playback_encoder_invalidate();
         critical_section_enter_blocking(&playback_pcm_lock);
         if (flag) ++usb_playback_revision;
         playback_usb_clock_reset(&usb_clock);
@@ -1407,6 +1444,7 @@ bool get_allow_switch_slot(){
 
 
 static int fill_sbc_audio_buffer(a2dp_media_sending_context_t * context){
+    if (playback_encoder_busy()) return 0;
     int total_num_bytes_read = 0;
     unsigned int num_audio_samples_per_sbc_buffer = btstack_sbc_encoder_num_audio_frames();
 
@@ -1448,6 +1486,15 @@ static int playback_encoder_failed(a2dp_media_sending_context_t *context) {
 }
 
 static bool aaceld_encoder_init(void) {
+    if (playback_encoder_busy()) {
+        if (encoder_job.deferred_size) return true;
+        playback_encoder_invalidate();
+        encoder_job.reset_pending = true;
+        encoder_job.deferred_session = aacp_control_session();
+        encoder_job.reset_cid = media_tracker.avdtp_cid;
+        memcpy(encoder_job.deferred_peer, cur_active_device, sizeof(encoder_job.deferred_peer));
+        return true;
+    }
     if (handleAAC != NULL) aacEncClose(&handleAAC);
     handleAAC = NULL;
     if (aacEncOpen(&handleAAC, 0x01, 2) != AACENC_OK) return false;
@@ -1485,7 +1532,7 @@ fail:
 
 // A failed update is rolled back before another PCM unit can enter the encoder.
 static int playback_eld_rate_update(uint32_t previous, uint32_t target) {
-    if (!handleAAC || previous < 128000u || previous > aaceld_bitrate ||
+    if (!aaceld_variable_allowed || !handleAAC || previous < 128000u || previous > aaceld_bitrate ||
         target < 128000u || target > aaceld_bitrate ||
         (playback_options.rate_mode && (target % 800u || previous % 800u))) return 1;
     if (previous == target) return 0;
@@ -1511,7 +1558,7 @@ static int playback_eld_rate_update(uint32_t previous, uint32_t target) {
 }
 
 static bool playback_bitrate_eligible(void) {
-    return cur_codec == 4 && handleAAC && a2dp_is_connected_flag && media_tracker.streaming &&
+    return aaceld_variable_allowed && cur_codec == 4 && handleAAC && a2dp_is_connected_flag && media_tracker.streaming &&
         (is_usb_streaming || phone_active) && !call_active && !call_opened &&
         playback_pcm_warm() && aacp_audio_owned() && playback_idle_phase == PLAYBACK_RUNNING &&
         !profile_pending && !a2dp_connect_pending && !aacp_mic_requested() && !aacp_mic_active() &&
@@ -1553,7 +1600,7 @@ static void playback_bitrate_poll(uint32_t now) {
     bool changed = input != bitrate_input || bitrate_game_requested != playback_game.requested;
     bool same_epoch = known && bitrate_radio_epoch == radio.epoch;
     bool scope_changed = known && !same_epoch;
-    if (scope_changed || cur_codec != 4 || !a2dp_is_connected_flag ||
+    if (scope_changed || !aaceld_variable_allowed || cur_codec != 4 || !a2dp_is_connected_flag ||
         changed || !input || !aacp_audio_owned() || call_active || call_opened ||
         aacp_mic_requested() || aacp_mic_active() || mic_prepare_open || mic_recovery_pending ||
         playback_game.restore_failed || profile_pending || a2dp_connect_pending ||
@@ -1577,97 +1624,193 @@ static void playback_bitrate_poll(uint32_t now) {
 }
 
 static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
-    int          total_samples_read               = 0;
-
+    if (playback_encoder_busy()) return 0;
+    (void)playback_encoder_packet_current();
     if (cur_codec == 4 && !playback_bitrate_apply(context)) return playback_encoder_failed(context);
-    unsigned int num_audio_samples_per_aac_buffer = acc_num_simples;
-
-    btstack_assert(num_audio_samples_per_aac_buffer <= AUDIO_SLOT_MAX_SAMPLES);
-
-    unsigned required_samples = num_audio_samples_per_aac_buffer * aacinf.inputChannels;
-
-    AACENC_BufDesc in_buf   = { 0 }, out_buf = { 0 };
-    AACENC_InArgs  in_args  = { 0 };
-    AACENC_OutArgs out_args = { 0 };
-    int in_identifier = IN_AUDIO_DATA;
-    int in_size, in_elem_size;
-    int out_identifier = OUT_BITSTREAM_DATA;
-    int out_size, out_elem_size;
-    void *in_ptr, *out_ptr;
-
-    in_elem_size             = 2;
-    in_buf.numBufs           = 1;
-    in_buf.bufs              = &in_ptr;
-    in_buf.bufferIdentifiers = &in_identifier;
-    in_buf.bufSizes          = &in_size;
-    in_buf.bufElSizes        = &in_elem_size;
-
-    out_elem_size             = 1;
-    out_buf.numBufs           = 1;
-    out_buf.bufs              = &out_ptr;
-    out_buf.bufferIdentifiers = &out_identifier;
-    out_buf.bufSizes          = &out_size;
-    out_buf.bufElSizes        = &out_elem_size;
-
-    // AAC-ELD: Apple per-frame header (BTAudioHALPlugin adds "AAC-ELD Size Header")
-    int aaceld_hdr_size = (cur_codec == 4) ? 4 : 0;
-
-    // Reserve a complete AU and its Apple header before consuming source PCM.
-    int min_space = (cur_codec == 4) ? (int)(playback_eld_au_ceiling(aaceld_bitrate, playback_options.rate_mode != 0) + 4) : 50;
-    if (handleAAC == NULL) return playback_encoder_failed(context);
-    while (context->samples_ready >= num_audio_samples_per_aac_buffer &&
-           (context->max_media_payload_size - context->codec_storage_count) >= min_space) {
-
-        uint32_t unit_started=time_us_32();
-        runtime_watch_set(WATCH_PCM);
-        audio_pcm_read((uint16_t)num_audio_samples_per_aac_buffer);
-        if(inspect_enabled)playback_inspect_samples(&playback_inspect,encoder_pcm,required_samples,false,false,time_us_32());
-
-        int hdr_offset = context->codec_storage_count + aaceld_hdr_size;
-
-        in_ptr               = encoder_pcm;
-        in_size              = required_samples * sizeof(int16_t);
-        in_args.numInSamples = required_samples;
-        out_ptr              = &context->codec_storage[hdr_offset];
-        out_size             = context->max_media_payload_size - hdr_offset;
-        out_buf.bufs         = &out_ptr;
-        out_buf.bufSizes     = &out_size;
-        AACENC_ERROR err;
-
-        uint32_t started=time_us_32();
-        if(!context->codec_storage_count)packet_oldest_us=started;
-        runtime_watch_set(WATCH_ENCODER);
-        err=aacEncEncode(handleAAC, &in_buf, &out_buf, &in_args, &out_args);
-        runtime_watch_set(WATCH_PACKET);
-        playback_encode_measured(started);
-        PB_MAX(TRACE_UNIT_US,time_us_32()-unit_started);
-        if (err != AACENC_OK) {
-            printf("Error in AAC encoding %d, storage=%d/%d, out_size=%d\n",
-                   err, context->codec_storage_count, (int)sizeof(context->codec_storage), out_size);
-            return playback_encoder_failed(context);
-        }
-
-        total_samples_read += num_audio_samples_per_aac_buffer;
-        context->samples_ready -= num_audio_samples_per_aac_buffer;
-        if (out_args.numOutBytes <= 0) continue;
-        if (cur_codec==4 && playback_options.rate_mode &&
-            (unsigned)out_args.numOutBytes>playback_bitrate.current/800u) return playback_encoder_failed(context);
-        ++playback_metrics.encoded_units;
-        if (cur_codec == 4) {
-            if (!playback_eld_append(context->codec_storage, context->max_media_payload_size,
-                                     &context->codec_storage_count, &aaceld_frame_sequence,
-                                     (size_t)out_args.numOutBytes)) return playback_encoder_failed(context);
-        } else {
-            context->codec_storage_count += out_args.numOutBytes;
-        }
-        context->codec_num_frames++;
-
-        // Yield after one ELD unit; the next main-loop pass may complete its packet.
-        if (cur_codec == 4 || cur_codec == 2 || context->codec_num_frames >=
-            ((phone_opened || call_opened) ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3)) break;
-    }
-    return total_samples_read;
+    unsigned frames = acc_num_simples;
+    unsigned header = cur_codec == 4 ? PLAYBACK_ELD_HEADER_SIZE : 0;
+    unsigned minimum = cur_codec == 4 ? playback_eld_au_ceiling(aaceld_bitrate,
+        playback_options.rate_mode != 0) + header : 50u;
+    if (!handleAAC) return playback_encoder_failed(context);
+    if (context->samples_ready < frames ||
+        context->max_media_payload_size - context->codec_storage_count < (int)minimum) return 0;
+    btstack_assert(frames <= AUDIO_SLOT_MAX_SAMPLES);
+    encoder_job.unit_started = time_us_32();
+    critical_section_enter_blocking(&playback_pcm_lock);
+    if (context->codec_storage_count && !playback_encoder_scope_current()) playback_encoder_discard(false);
+    encoder_job.session = aacp_control_session();
+    encoder_job.usb_revision = usb_playback_revision;
+    encoder_job.epoch_at_prepare = atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed);
+    encoder_job.input = (is_usb_streaming ? 1u : 0u) | (phone_active ? 2u : 0u) | (call_active ? 4u : 0u);
+    critical_section_exit(&playback_pcm_lock);
+    runtime_watch_set(WATCH_PCM);
+    audio_pcm_read((uint16_t)frames);
+    if (inspect_enabled) playback_inspect_samples(&playback_inspect, encoder_pcm,
+        frames * aacinf.inputChannels, false, false, time_us_32());
+    encoder_job.handle = handleAAC;
+    encoder_job.samples = (uint16_t)(frames * aacinf.inputChannels);
+    encoder_job.offset = context->codec_storage_count + header;
+    encoder_job.capacity = (uint16_t)(context->max_media_payload_size - encoder_job.offset);
+    encoder_job.codec = cur_codec;
+    // The timer can accrue more debt while encoding; debit this unit exactly once.
+    context->samples_ready -= frames;
+    if (!context->codec_storage_count) packet_oldest_us = encoder_job.unit_started;
+    atomic_store_explicit(&encoder_job.state, ENCODE_PREPARED, memory_order_release);
+    return (int)frames;
 }
+
+// Main thread only, after releasing the CYW43 lock. Lifecycle requests pin this handle.
+void dongle_playback_encode_run(void) {
+    if (atomic_load_explicit(&encoder_job.state, memory_order_acquire) != ENCODE_PREPARED) return;
+    atomic_store_explicit(&encoder_job.state, ENCODE_RUNNING, memory_order_release);
+    encoder_job.error = AACENC_OK; encoder_job.bytes = encoder_job.consumed = 0;
+    encoder_job.encode_us = 0;
+    if (encoder_job.epoch_at_prepare == atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed)) {
+        void *input_data = encoder_pcm;
+        void *output_data = media_tracker.codec_storage + encoder_job.offset;
+        int input_id = IN_AUDIO_DATA, output_id = OUT_BITSTREAM_DATA;
+        int input_size = encoder_job.samples * sizeof(*encoder_pcm), output_size = encoder_job.capacity;
+        int input_element = sizeof(*encoder_pcm), output_element = 1;
+        AACENC_BufDesc input = {1, &input_data, &input_id, &input_size, &input_element};
+        AACENC_BufDesc output = {1, &output_data, &output_id, &output_size, &output_element};
+        AACENC_InArgs arguments = {0}; AACENC_OutArgs result = {0};
+        arguments.numInSamples = encoder_job.samples;
+        uint32_t started = time_us_32();
+        runtime_watch_set(WATCH_ENCODER);
+        encoder_job.error = aacEncEncode(encoder_job.handle, &input, &output, &arguments, &result);
+        encoder_job.encode_us = time_us_32() - started;
+        encoder_job.bytes = result.numOutBytes;
+        encoder_job.consumed = result.numInSamples;
+    }
+    atomic_store_explicit(&encoder_job.state, ENCODE_DONE, memory_order_release);
+}
+
+static void playback_encoder_close(void) {
+    playback_encoder_invalidate();
+    encoder_job.reset_pending = false;
+    encoder_job.deferred_size = 0;
+    if (playback_encoder_busy()) { encoder_job.close_pending = true; return; }
+    if (handleAAC) aacEncClose(&handleAAC);
+}
+
+static bool playback_encoder_defer_configuration(const uint8_t *packet, uint16_t size) {
+    if (!playback_encoder_busy()) return false;
+    a2dp_demo_timer_stop(&media_tracker);
+    encoder_job.reset_pending = false;
+    if (size > sizeof(encoder_job.deferred_event)) {
+        encoder_job.deferred_size = 0;
+        playback_encoder_failed(&media_tracker);
+    } else {
+        memcpy(encoder_job.deferred_event, packet, size);
+        encoder_job.deferred_size = (uint8_t)size;
+        encoder_job.deferred_epoch = atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed);
+        encoder_job.deferred_session = aacp_control_session();
+        memcpy(encoder_job.deferred_peer, cur_active_device, sizeof(encoder_job.deferred_peer));
+    }
+    return true;
+}
+
+static bool playback_encoder_scope_current(void) {
+    return encoder_job.epoch_at_prepare == atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed) &&
+        encoder_job.handle == handleAAC && encoder_job.codec == cur_codec &&
+        encoder_job.session == aacp_control_session() && encoder_job.usb_revision == usb_playback_revision &&
+        encoder_job.input == ((is_usb_streaming ? 1u : 0u) | (phone_active ? 2u : 0u) | (call_active ? 4u : 0u)) &&
+        a2dp_is_connected_flag && media_tracker.streaming && aacp_audio_owned();
+}
+
+// Caller holds the PCM exclusion; every retained AU is still unsent while a job owns the packet.
+static void playback_encoder_discard(bool current_job) {
+    uint32_t discarded = media_tracker.codec_num_frames + (current_job ? 1u : 0u);
+    uint32_t unsent_bytes = media_tracker.codec_storage_count;
+    if (media_tracker.streaming && cur_codec == 4 && encoder_job.codec == 4 && encoder_job.handle == handleAAC)
+        aaceld_frame_sequence = (aaceld_frame_sequence - media_tracker.codec_num_frames) & 0xfffu;
+    media_tracker.codec_storage_count = media_tracker.codec_num_frames = media_tracker.codec_ready_to_send = 0;
+    media_tracker.send_wait_start = 0;
+    packet_oldest_us = media_last_sent_us = 0;
+    playback_continuity_reset(&phone_continuity);
+    playback_work_pending = true;
+    ++encoder_job.cancelled;
+    PB_EVENT(TRACE_DROP, discarded * (encoder_job.samples / 2u), unsent_bytes);
+}
+
+static bool playback_encoder_packet_current(void) {
+    if ((cur_codec != 2 && cur_codec != 4) || !media_tracker.codec_storage_count) return true;
+    critical_section_enter_blocking(&playback_pcm_lock);
+    bool current = playback_encoder_scope_current();
+    if (!current) playback_encoder_discard(false);
+    critical_section_exit(&playback_pcm_lock);
+    return current;
+}
+
+static bool playback_aac_packet_submit(a2dp_media_sending_context_t *context, uint32_t now) {
+    if (playback_encoder_busy() || context->codec_ready_to_send || !context->codec_storage_count) return false;
+    if (!playback_encoder_packet_current()) return false;
+    unsigned limit = (phone_opened || call_opened) ? 2u :
+        playback_game.changed && playback_game.target == 60 ? 2u : 3u;
+    bool full = cur_codec == 2 || (cur_codec == 4 &&
+        (context->codec_num_frames >= limit ||
+         context->max_media_payload_size - context->codec_storage_count <
+         (int)(playback_eld_au_ceiling(aaceld_bitrate, playback_options.rate_mode != 0) + 4)));
+    if (!full) return false;
+    context->codec_ready_to_send = 1;
+    context->send_wait_start = now;
+    a2dp_source_stream_endpoint_request_can_send_now(context->avdtp_cid, context->local_seid);
+    return true;
+}
+
+static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+void dongle_playback_encode_complete(void) {
+    if (atomic_load_explicit(&encoder_job.state, memory_order_acquire) != ENCODE_DONE) return;
+    bool failed = false;
+    // USB reset/alternate IRQs share this exclusion; an old job cannot publish after reset.
+    critical_section_enter_blocking(&playback_pcm_lock);
+    bool current = playback_encoder_scope_current();
+    atomic_store_explicit(&encoder_job.state, ENCODE_IDLE, memory_order_release);
+    if (current) {
+        failed = encoder_job.error != AACENC_OK || encoder_job.consumed != encoder_job.samples ||
+            encoder_job.bytes < 0 || encoder_job.bytes > encoder_job.capacity ||
+            (cur_codec == 4 && playback_options.rate_mode &&
+             (unsigned)encoder_job.bytes > playback_bitrate.current / 800u);
+        if (!failed && encoder_job.bytes) {
+            if (cur_codec == 4) failed = !playback_eld_append(media_tracker.codec_storage,
+                media_tracker.max_media_payload_size, &media_tracker.codec_storage_count,
+                &aaceld_frame_sequence, (size_t)encoder_job.bytes);
+            else media_tracker.codec_storage_count += (uint16_t)encoder_job.bytes;
+            if (!failed) { ++media_tracker.codec_num_frames; ++playback_metrics.encoded_units; }
+        }
+        playback_work_pending = true;
+    } else playback_encoder_discard(true);
+    critical_section_exit(&playback_pcm_lock);
+    if (encoder_job.encode_us) {
+        playback_encode_measured(time_us_32() - encoder_job.encode_us);
+        PB_MAX(TRACE_UNIT_US, time_us_32() - encoder_job.unit_started);
+    }
+    if (failed) playback_encoder_failed(&media_tracker);
+    if (encoder_job.close_pending) {
+        encoder_job.close_pending = false;
+        if (handleAAC) aacEncClose(&handleAAC);
+    }
+    if (encoder_job.deferred_size) {
+        uint8_t event[sizeof(encoder_job.deferred_event)];
+        uint16_t size = encoder_job.deferred_size;
+        memcpy(event, encoder_job.deferred_event, size); encoder_job.deferred_size = 0;
+        if (a2dp_is_connected_flag && size >= 5 && little_endian_read_16(event, 3) == media_tracker.avdtp_cid &&
+            encoder_job.deferred_epoch == atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed) &&
+            encoder_job.deferred_session == aacp_control_session() &&
+            !memcmp(encoder_job.deferred_peer, cur_active_device, sizeof(encoder_job.deferred_peer)))
+            packet_handler(HCI_EVENT_PACKET, 0, event, size);
+    } else if (encoder_job.reset_pending) {
+        encoder_job.reset_pending = false;
+        if (cur_codec == 4 && a2dp_is_connected_flag && encoder_job.reset_cid == media_tracker.avdtp_cid &&
+            encoder_job.deferred_session == aacp_control_session() &&
+            !memcmp(encoder_job.deferred_peer, cur_active_device, sizeof(encoder_job.deferred_peer)) &&
+            !aaceld_encoder_init())
+            playback_encoder_failed(&media_tracker);
+    }
+    if (current && !failed) (void)playback_aac_packet_submit(&media_tracker, btstack_run_loop_get_time_ms());
+}
+
+uint32_t dongle_playback_encode_cancelled(void) { return encoder_job.cancelled; }
 
 #endif
 
@@ -1721,6 +1864,7 @@ static bool playback_phone_recovery_poll(void) {
 }
 
 static void playback_audio_work(uint32_t now) {
+    if (playback_encoder_busy()) return;
     static bool phone_overrun;
     a2dp_media_sending_context_t *context=&media_tracker;
     if(!context->streaming) {phone_overrun=false;return;}
@@ -1865,6 +2009,7 @@ static void avdtp_audio_timeout_handler(btstack_timer_source_t * timer){
 
 // A successful send can leave another whole packet owed by this timer interval.
 static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint32_t now) {
+    if (playback_encoder_busy()) return;
     if (!context->streaming || !a2dp_is_connected_flag || sc.local_stream_endpoint == NULL ||
         playback_idle_phase != PLAYBACK_RUNNING) return;
     if (context->codec_ready_to_send == 2) {
@@ -1903,16 +2048,8 @@ static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint3
             break;
 #ifdef HAVE_AAC_FDK
         case AVDTP_CODEC_MPEG_2_4_AAC:
-            if (context->codec_storage_count == 0){
+            if (!playback_aac_packet_submit(context, now) && context->codec_storage_count == 0)
                 if (fill_aac_audio_buffer(context) < 0) return;
-            }
-
-            if (context->codec_storage_count > 0) {
-                // schedule sending
-                context->codec_ready_to_send = 1;
-                context->send_wait_start = now;
-                a2dp_source_stream_endpoint_request_can_send_now(context->avdtp_cid, context->local_seid);
-            }
             break;
 #endif
         case AVDTP_CODEC_NON_A2DP:
@@ -1922,17 +2059,8 @@ static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint3
 
             // Playback encoding stays with its packet/transport state on core 0.
             if (local_vendor_id == A2DP_CODEC_VENDOR_ID_APPLE && local_codec_id == A2DP_APPLE_CODEC_AAC_ELD) {
+                if (playback_aac_packet_submit(context, now)) return;
                 if (fill_aac_audio_buffer(context) < 0) return;
-
-                if (context->codec_num_frames >=
-                    ((phone_opened || call_opened) ? 2 : playback_game.changed && playback_game.target == 60 ? 2 : 3) ||
-                    (context->codec_num_frames > 0 &&
-                     (context->max_media_payload_size - context->codec_storage_count) <
-                     (int)(playback_eld_au_ceiling(aaceld_bitrate, playback_options.rate_mode != 0) + 4))) {
-                    context->codec_ready_to_send = 1;
-                    context->send_wait_start = now;
-                    a2dp_source_stream_endpoint_request_can_send_now(context->avdtp_cid, context->local_seid);
-                }
             }
             break;
         default:
@@ -1942,6 +2070,7 @@ static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint3
 
 
 static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
+    playback_encoder_invalidate();
     playback_continuity_reset(&phone_continuity);
     playback_transport_stale=false;
 
@@ -2003,6 +2132,7 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
 }
 
 static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){
+    playback_encoder_invalidate();
     playback_continuity_reset(&phone_continuity);
     playback_usb_verify_cancel();
     phone_output_recovery = false;
@@ -2159,11 +2289,44 @@ static int find_remote_seid(uint8_t remote_seid){
 
 
 
+// An incoming/reconnect config can precede our asynchronous peer capability discovery.
+static bool playback_eld_peer_configuration(uint8_t local_seid, uint8_t remote_seid,
+                                             const uint8_t *config, uint16_t size) {
+    if (!local_seid || local_seid > 0x3e || !remote_seid || remote_seid > 0x3e ||
+        !stream_endpoint_aaceld || local_seid != avdtp_local_seid(stream_endpoint_aaceld) ||
+        !playback_eld_configuration_supported(config, size,
+            media_aaceld_codec_capabilities, sizeof(media_aaceld_codec_capabilities))) return false;
+    for (int i = 0; i < num_remote_seps; ++i) {
+        if (remote_seps[i].seid != remote_seid) continue;
+        if (!remote_seps[i].have_media_codec_capabilities) return true;
+        if (remote_seps[i].codec_type != AVDTP_CODEC_NON_A2DP ||
+            remote_seps[i].vendor_id != A2DP_CODEC_VENDOR_ID_APPLE ||
+            remote_seps[i].codec_id != A2DP_APPLE_CODEC_AAC_ELD) return false;
+        const uint8_t *event = remote_seps[i].media_codec_event;
+        return playback_eld_configuration_supported(config, size,
+            avdtp_subevent_signaling_media_codec_other_capability_get_media_codec_information(event),
+            avdtp_subevent_signaling_media_codec_other_capability_get_media_codec_information_len(event));
+    }
+    return true;
+}
+
+static void playback_eld_bind_configuration(uint8_t local_seid, uint8_t remote_seid) {
+    sc.local_stream_endpoint = stream_endpoint_aaceld;
+    media_tracker.local_seid = local_seid;
+    media_tracker.remote_seid = remote_seid;
+    int index = find_remote_seid(remote_seid);
+    selected_remote_sep_index = index >= 0 ? index : AVDTP_MAX_SEP_NUM;
+}
+
 static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     if (packet_type != HCI_EVENT_PACKET || size < 3 || packet[1] + 2u != size) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVDTP_META) return;
     if (packet[2] != AVDTP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED &&
         (size < 5 || little_endian_read_16(packet, 3) != media_tracker.avdtp_cid)) return;
+    if ((packet[2] == AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION ||
+         packet[2] == AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CONFIGURATION ||
+         packet[2] == AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION) &&
+        playback_encoder_defer_configuration(packet, size)) return;
     UNUSED(channel);
     UNUSED(size);
 
@@ -2204,6 +2367,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 break;
             }
             a2dp_connect_pending = false;
+            playback_encoder_close();
+            aaceld_variable_allowed = false;
             memcpy(cur_active_device, address, sizeof(bd_addr_t));
             cur_codec=0; actual_bitrate=0; reported_delay=UINT16_MAX; delay_revision=0;
             memset(remote_seps, 0, sizeof(remote_seps));
@@ -2460,6 +2625,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             break;
 
         case AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION:{
+            aaceld_variable_allowed = false;
             if (size < 18) break;
             if (playback_options.codec && playback_options.codec!=1) { playback_encoder_failed(&media_tracker); break; }
             printf("Set configuration and init encoder\n");
@@ -2503,7 +2669,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 break;
             }
             a2dp_demo_timer_stop(&media_tracker);
-            if (handleAAC != NULL) aacEncClose(&handleAAC);
+            playback_encoder_close();
             dump_sbc_configuration(sbc_configuration);
             current_sample_rate = 48000;
             btstack_sbc_encoder_init(&sbc_encoder_state, SBC_MODE_STANDARD, 
@@ -2525,6 +2691,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
         }
 
         case AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CONFIGURATION: {
+            aaceld_variable_allowed = false;
             if (size < 18) break;
             if (!finish_setup_aac) break;
             if (playback_options.codec && playback_options.codec!=2) { playback_encoder_failed(&media_tracker); break; }
@@ -2540,7 +2707,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 playback_encoder_failed(&media_tracker);
                 break;
             }
-            if (handleAAC != NULL) aacEncClose(&handleAAC);
+            a2dp_demo_timer_stop(&media_tracker);
+            playback_encoder_close();
             handleAAC = NULL;
             bool ready = aacEncOpen(&handleAAC, 0x01, channels) == AACENC_OK;
             const struct { AACENC_PARAM key; UINT value; } params[] = {
@@ -2558,7 +2726,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             uint16_t frame_samples = ready ? playback_aac_frame_samples(rate, aacinf.inputChannels,
                                                                        aacinf.frameLength, false) : 0;
             if (frame_samples == 0) {
-                if (handleAAC != NULL) aacEncClose(&handleAAC);
+                playback_encoder_close();
                 handleAAC = NULL;
                 playback_encoder_failed(&media_tracker);
                 break;
@@ -2576,7 +2744,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
         case AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AUDIO_CONFIGURATION:
         case AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_ATRAC_CONFIGURATION:
             // TODO: handle other configuration event
-            printf("Config not handled for %s\n", codec_name_for_type(remote_seps[selected_remote_sep_index].codec_type));
+            printf("MPEG audio/ATRAC configuration not supported\n");
             break;
         case AVDTP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION:
             if (size < 19) break;
@@ -2589,6 +2757,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 
             // Apple AAC-ELD
             if (vendor_id == A2DP_CODEC_VENDOR_ID_APPLE && codec_id == A2DP_APPLE_CODEC_AAC_ELD) {
+                aaceld_variable_allowed = false;
                 printf("A2DP Source: Received Apple AAC-ELD configuration!\n");
                 printf("  raw config bytes: ");
                 uint16_t config_info_len = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information_len(packet);
@@ -2597,13 +2766,22 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 }
                 printf("\n");
 
-                if (!playback_options_eld_configuration(codec_info, config_info_len,playback_options)) {
+                if (!playback_options_eld_configuration(codec_info, config_info_len,playback_options) ||
+                    !playback_eld_peer_configuration(
+                        a2dp_subevent_signaling_media_codec_other_configuration_get_local_seid(packet),
+                        a2dp_subevent_signaling_media_codec_other_configuration_get_remote_seid(packet),
+                        codec_info, config_info_len)) {
                     printf("Unsupported AAC-ELD configuration\n");
                     aacp_disconnect();
                     a2dp_source_disconnect(media_tracker.avdtp_cid);
                     break;
                 }
-                aaceld_bitrate = playback_eld_bitrate(codec_info);
+                a2dp_demo_timer_stop(&media_tracker);
+                playback_eld_bind_configuration(
+                    a2dp_subevent_signaling_media_codec_other_configuration_get_local_seid(packet),
+                    a2dp_subevent_signaling_media_codec_other_configuration_get_remote_seid(packet));
+                aaceld_variable_allowed = playback_eld_variable(codec_info);
+                aaceld_bitrate = playback_options_eld_rate(codec_info, config_info_len, playback_options);
                 playback_bitrate_reset(&playback_bitrate, aaceld_bitrate, playback_options.rate_mode != 0);
                 if (!aaceld_encoder_init()) {
                     printf("AAC-ELD encoder initialization failed\n");
@@ -2629,7 +2807,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             }
             else
             {
-                printf("Config not handled for %s\n", codec_name_for_type(remote_seps[selected_remote_sep_index].codec_type));
+                printf("Config not handled: vendor=0x%08lx codec=0x%04x\n", (unsigned long)vendor_id, codec_id);
             }
             break;
 
@@ -2659,6 +2837,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 case AVDTP_SI_SET_CONFIGURATION:
                     break;
                 case  AVDTP_SI_START:
+                    if (encoder_job.deferred_size) break;
                     if (avdtp_subevent_signaling_accept_get_local_seid(packet) != media_tracker.local_seid) break;
                     if (profile_pending || a2dp_connect_pending || !finish_scan_avdtp_codec) break;
                     if (!aacp_audio_owned()) {
@@ -2747,16 +2926,18 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             break;
         case AVDTP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
             if (avdtp_subevent_signaling_connection_released_get_avdtp_cid(packet) != media_tracker.avdtp_cid) break;
+            aaceld_variable_allowed = false;
             avrcp_reconnect_reset();
             mic_prepare_open=mic_recovery_pending=mic_recovery_started=false;
             a2dp_demo_timer_stop(&media_tracker);
             aacp_disconnect();
             l2cap_set_flushable_local_cid(0);
             audio_slot_queue_init();
-            if (handleAAC != NULL) aacEncClose(&handleAAC);
+            playback_encoder_close();
             a2dp_connect_pending = false;
             media_tracker.avdtp_cid = 0;
             media_tracker.local_seid = 0;
+            media_tracker.remote_seid = 0;
             allow_switch_slot = true;
             finish_scan_avdtp_codec = false;
             a2dp_is_connected_flag = false;
@@ -2876,7 +3057,8 @@ static void stdin_process(char cmd){
                 printf("Remote Stream Endpoints not discovered yet, please discover stream endpoints first\n");
                 break;
             }
-            if (remote_seps[selected_remote_sep_index].have_media_codec_capabilities == false){
+            if (selected_remote_sep_index >= num_remote_seps ||
+                remote_seps[selected_remote_sep_index].have_media_codec_capabilities == false){
                 printf("Remote Stream Endpoints Media Codec Capabilities not received yet, please get (all) capabilities for stream endpoint with seid %u first\n",  media_tracker.remote_seid);
                 break;
             }
@@ -3261,8 +3443,11 @@ void set_next_capablity_and_start_stream(void) {
 
 static uint8_t playback_input(void) { return is_usb_streaming ? 1 : (phone_active || call_active) ? 2 : 0; }
 static bool playback_game_eligible(void) {
+    int index = find_remote_seid(media_tracker.remote_seid);
     return a2dp_is_connected_flag && cur_codec==4 && aacp_model_game_supported() &&
-        selected_remote_sep_index<num_remote_seps && remote_seps[selected_remote_sep_index].delay_reporting &&
+        index >= 0 && index < num_remote_seps && remote_seps[index].delay_reporting &&
+        remote_seps[index].have_media_codec_capabilities && remote_seps[index].codec_type == AVDTP_CODEC_NON_A2DP &&
+        remote_seps[index].vendor_id == A2DP_CODEC_VENDOR_ID_APPLE && remote_seps[index].codec_id == A2DP_APPLE_CODEC_AAC_ELD &&
         sc.local_stream_endpoint &&
         (sc.local_stream_endpoint->remote_configuration_bitmap & (1 << AVDTP_DELAY_REPORTING));
 }
@@ -3322,6 +3507,7 @@ uint8_t dongle_playback_configure(uint8_t codec, uint8_t rate_mode, uint32_t bit
 }
 
 void dongle_playback_mic_request_changed(void) {
+    playback_encoder_invalidate();
     mic_prepare_open=false;
 }
 bool dongle_playback_mic_ready(void) {

@@ -44,13 +44,61 @@ static INT_PCM reference_sample(uint64_t sample, unsigned channel) {
 }
 
 #ifndef ADAPTIVE_CODEC_DECODER
+// Linker wrappers cover the static FDK archive, not just fixture allocations.
+static bool heap_guard;
+static unsigned heap_calls[4], guarded_heap_calls[4], guarded_frames;
+extern "C" {
+void *__real_malloc(size_t);
+void *__real_calloc(size_t, size_t);
+void *__real_realloc(void *, size_t);
+void __real_free(void *);
+void *__wrap_malloc(size_t size) {
+    ++heap_calls[0]; if (heap_guard) ++guarded_heap_calls[0];
+    return __real_malloc(size);
+}
+void *__wrap_calloc(size_t count, size_t size) {
+    ++heap_calls[1]; if (heap_guard) ++guarded_heap_calls[1];
+    return __real_calloc(count, size);
+}
+void *__wrap_realloc(void *pointer, size_t size) {
+    ++heap_calls[2]; if (heap_guard) ++guarded_heap_calls[2];
+    return __real_realloc(pointer, size);
+}
+void __wrap_free(void *pointer) {
+    ++heap_calls[3]; if (heap_guard) ++guarded_heap_calls[3];
+    __real_free(pointer);
+}
+}
+
+static void check_allocator_wrappers() {
+    // Volatile storage prevents the compiler from removing paired allocations.
+    heap_guard = true;
+    void *volatile pointer = std::malloc(7);
+    require(pointer != nullptr, "malloc probe");
+    pointer = std::realloc(pointer, 13);
+    require(pointer != nullptr, "realloc probe");
+    std::free(pointer);
+    pointer = std::calloc(2, 9);
+    require(pointer != nullptr, "calloc probe");
+    std::free(pointer);
+    heap_guard = false;
+    require(guarded_heap_calls[0] == 1 && guarded_heap_calls[1] == 1 &&
+            guarded_heap_calls[2] == 1 && guarded_heap_calls[3] == 2,
+            "allocator wrappers inactive");
+    std::memset(heap_calls, 0, sizeof(heap_calls));
+    std::memset(guarded_heap_calls, 0, sizeof(guarded_heap_calls));
+}
+
 static HANDLE_AACENCODER handleAAC;
 static AACENC_InfoStruct aacinf;
 static struct { unsigned rate_mode; } playback_options;
 static uint32_t aaceld_bitrate;
+static bool aaceld_variable_allowed = true;
 static bool fail_peak_once, fail_info_once;
+static unsigned setter_calls;
 
 static AACENC_ERROR checked_set_param(HANDLE_AACENCODER handle, AACENC_PARAM parameter, UINT value) {
+    ++setter_calls;
     if (fail_peak_once && parameter == AACENC_PEAK_BITRATE) {
         fail_peak_once = false;
         return AACENC_INVALID_CONFIG;
@@ -92,12 +140,71 @@ static void encoder_open(unsigned mode, uint32_t ceiling) {
             aacEncInfo(handleAAC, &aacinf) == AACENC_OK, "encoder initialize");
 }
 
+static AACENC_ERROR encode_without_heap(AACENC_BufDesc *input, AACENC_BufDesc *output,
+                                        AACENC_InArgs *arguments, AACENC_OutArgs *result) {
+    heap_guard = true;
+    AACENC_ERROR error = aacEncEncode(handleAAC, input, output, arguments, result);
+    heap_guard = false;
+    ++guarded_frames;
+    require(guarded_heap_calls[0] == 0 && guarded_heap_calls[1] == 0 &&
+            guarded_heap_calls[2] == 0 && guarded_heap_calls[3] == 0,
+            "steady encode touched the heap");
+    return error;
+}
+
+static void check_lc_allocator(uint32_t bitrate) {
+    require(bitrate == 96000 || bitrate == 128000 || bitrate == 174000 ||
+            bitrate == 192000 || bitrate == 220000, "AAC-LC bitrate");
+    check_allocator_wrappers();
+    require(aacEncOpen(&handleAAC, 1, 2) == AACENC_OK, "AAC-LC open");
+    // Matches the production AAC-LC configuration, including its LATM headers.
+    const struct { AACENC_PARAM parameter; UINT value; } parameters[] = {
+        {AACENC_AOT, AOT_AAC_LC}, {AACENC_BITRATE, bitrate},
+        {AACENC_SAMPLERATE, 48000}, {AACENC_CHANNELMODE, MODE_2},
+        {AACENC_BITRATEMODE, 0}, {AACENC_AFTERBURNER, 0},
+        {AACENC_TRANSMUX, TT_MP4_LATM_MCP1},
+        {AACENC_HEADER_PERIOD, 1}, {AACENC_AUDIOMUXVER, 1}
+    };
+    for (const auto &parameter : parameters)
+        require(aacEncoder_SetParam(handleAAC, parameter.parameter, parameter.value) == AACENC_OK,
+                "AAC-LC parameters");
+    require(aacEncEncode(handleAAC, nullptr, nullptr, nullptr, nullptr) == AACENC_OK &&
+            aacEncInfo(handleAAC, &aacinf) == AACENC_OK && aacinf.inputChannels == 2 &&
+            aacinf.frameLength == 1024 && heap_calls[0] + heap_calls[1] > 0,
+            "AAC-LC initialization");
+    for (unsigned frame = 0; frame < 128; ++frame) {
+        INT_PCM pcm[2048]; unsigned char output[2048];
+        for (unsigned sample = 0; sample < 1024; ++sample)
+            for (unsigned channel = 0; channel < 2; ++channel)
+                pcm[2 * sample + channel] = reference_sample(uint64_t(frame) * 1024 + sample, channel);
+        void *inputs[] = {pcm}, *outputs[] = {output};
+        INT input_id = IN_AUDIO_DATA, output_id = OUT_BITSTREAM_DATA;
+        INT input_size = sizeof(pcm), output_size = sizeof(output);
+        INT input_element = sizeof(INT_PCM), output_element = 1;
+        AACENC_BufDesc input = {1, inputs, &input_id, &input_size, &input_element};
+        AACENC_BufDesc encoded = {1, outputs, &output_id, &output_size, &output_element};
+        AACENC_InArgs arguments = {2048, 0}; AACENC_OutArgs result = {};
+        require(encode_without_heap(&input, &encoded, &arguments, &result) == AACENC_OK &&
+                result.numInSamples == 2048 && result.numOutBytes >= 0 &&
+                (frame < 3 || result.numOutBytes > 0), "AAC-LC steady encode");
+    }
+    require(aacEncClose(&handleAAC) == AACENC_OK, "AAC-LC close");
+    std::printf("AAC_LC bitrate=%u guarded_frames=%u heap_calls=0 allocator_probe=passed\n",
+                bitrate, guarded_frames);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && std::strcmp(argv[1], "lc") == 0) {
+        check_lc_allocator(std::strtoul(argv[2], nullptr, 10));
+        return 0;
+    }
     require(argc == 4 || argc == 5, "encoder arguments: mode ceiling output [reset]");
     unsigned mode = std::strtoul(argv[1], nullptr, 10);
     uint32_t ceiling = std::strtoul(argv[2], nullptr, 10);
     require(mode <= 1 && ceiling >= 128000 && ceiling <= 256000, "encoder case");
+    check_allocator_wrappers();
     encoder_open(mode, ceiling);
+    require(heap_calls[0] + heap_calls[1] > 0, "FDK archive allocator interception");
     const AACENC_InfoStruct initial = aacinf;
     require(initial.inputChannels == 2 && initial.frameLength == 480, "initial stereo 480");
     FILE *file = std::fopen(argv[3], "wb"); require(file != nullptr, "open output");
@@ -115,6 +222,15 @@ int main(int argc, char **argv) {
     unsigned frame = 0, transitions = 0, largest = 0;
     uint32_t previous = ceiling;
     HANDLE_AACENCODER original = handleAAC;
+    aaceld_variable_allowed = false;
+    unsigned setters_before = setter_calls;
+    uint32_t unauthorized = previous > 128000 ? 128000 : previous;
+    require(playback_eld_rate_update(previous, unauthorized) == 1 &&
+            setter_calls == setters_before && handleAAC == original &&
+            aacEncoder_GetParam(handleAAC, AACENC_PEAK_BITRATE) == previous &&
+            aacEncoder_GetParam(handleAAC, AACENC_CONTROL_STATE) == 0,
+            "CBR-only wire configuration forbids live retune");
+    aaceld_variable_allowed = true;
     require(playback_eld_rate_update(previous, 127999) == 1 &&
             playback_eld_rate_update(previous, ceiling + 800) == 1 &&
             (!mode || playback_eld_rate_update(previous, 128001) == 1), "invalid budget guard");
@@ -163,8 +279,8 @@ int main(int argc, char **argv) {
             AACENC_BufDesc input = {1, inputs, &input_id, &input_size, &input_element};
             AACENC_BufDesc encoded = {1, outputs, &output_id, &output_size, &output_element};
             AACENC_InArgs arguments = {960, 0}; AACENC_OutArgs result = {};
-            require(aacEncEncode(handleAAC, &input, &encoded, &arguments, &result) == AACENC_OK,
-                    "encode after live update");
+            AACENC_ERROR error = encode_without_heap(&input, &encoded, &arguments, &result);
+            require(error == AACENC_OK, "encode after live update");
             require(result.numInSamples == 960 && result.numOutBytes > 0, "one complete AU per frame");
             unsigned limit = (rate + 799) / 800 + (mode ? 0 : 1);
             // FDK CBR permits one alignment byte above its average; VBR peak is strict.
@@ -177,8 +293,9 @@ int main(int argc, char **argv) {
     }
     require(std::fclose(file) == 0, "close output");
     require(aacEncClose(&handleAAC) == AACENC_OK, "encoder close");
-    std::printf("ENCODE mode=%u ceiling=%u frames=%u transitions=%u max_au=%u\n",
-                mode, ceiling, frame, transitions, largest);
+    std::printf("ENCODE mode=%u ceiling=%u frames=%u transitions=%u max_au=%u "
+                "guarded_frames=%u heap_calls=0 allocator_probe=passed\n",
+                mode, ceiling, frame, transitions, largest, guarded_frames);
 }
 #else
 int main(int argc, char **argv) {

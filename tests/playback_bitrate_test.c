@@ -22,8 +22,9 @@ static playback_game_t playback_game;
 static playback_usb_verification_t usb_game_verification;
 static playback_adjust_t playback_adjust;
 static uint32_t aaceld_bitrate, bitrate_pressure, bitrate_discontinuities, bitrate_radio_epoch, now;
+static void playback_encoder_invalidate(void) {}
 static uint8_t bitrate_input;
-static bool bitrate_game_requested;
+static bool bitrate_game_requested, aaceld_variable_allowed;
 static uint16_t aaceld_frame_sequence;
 static unsigned params[4], sets, initializes, fail_set, fail_init, bad_info, fail_rollback;
 static bool a2dp_is_connected_flag, is_usb_streaming, phone_active, call_active, call_opened;
@@ -80,6 +81,7 @@ static void fixture(bool variable,uint32_t ceiling) {
     memset(&playback_adjust,0,sizeof(playback_adjust));
     aacinf=(AACENC_InfoStruct){.inputChannels=2,.frameLength=480,.confSize=4,.confBuf={0xf8,0xe6,0x50,0}};
     handleAAC=(void *)1;playback_options=(playback_options_t){.codec=3,.rate_mode=variable};
+    aaceld_variable_allowed=true;
     aaceld_bitrate=ceiling;playback_bitrate_reset(&playback_bitrate,ceiling,variable);
     params[AACENC_BITRATE]=params[AACENC_PEAK_BITRATE]=ceiling;
     params[AACENC_BITRATEMODE]=variable?5:0;params[AACENC_SAMPLERATE]=48000;
@@ -262,6 +264,49 @@ static void test_sparse_losses_accumulate_and_recovery_requires_truly_clean_wind
     window(0,0);assert(playback_bitrate.target==256000);
     assert(sizeof(playback_bitrate_t)<=64); // The sensitivity correction needs no additional state.
 }
+static void test_effective_cbr_ceiling_and_fixed_only_permission(void) {
+    const uint8_t variable_config[]={0x4c,0,0,0,1,0x80,0,0x80,0,0x84,0,0x83,0xe8,0};
+    playback_options_t requested={3,0,256000};
+    uint32_t ceiling=playback_options_eld_rate(variable_config,sizeof(variable_config),requested);
+    assert(ceiling==255200 && playback_eld_au_ceiling(ceiling,false)*800u<=256000);
+    fixture(false,ceiling);playback_options=requested;ready();
+    const uint32_t down[]={220000,192000,174000,128000};
+    for (unsigned i=0;i<sizeof(down)/sizeof(*down);++i) {
+        window(3,0);assert(playback_bitrate.target==down[i]);
+        assert(playback_bitrate_apply(&media_tracker) && playback_bitrate.current==down[i]);
+        assert(playback_eld_au_ceiling(playback_bitrate.current,false)*800u<=256000);
+    }
+    const uint32_t up[]={174000,192000,220000,255200};
+    for (unsigned i=0;i<sizeof(up)/sizeof(*up);++i) {
+        for (unsigned second=0;second<30;++second) window(0,0);
+        assert(playback_bitrate.target==up[i]);
+        assert(playback_bitrate_apply(&media_tracker) && playback_bitrate.current==up[i]);
+        assert(playback_bitrate.current<=255200 && playback_options.bitrate==256000 && !playback_options.rate_mode);
+    }
+    uint8_t snapshot[64];assert(dongle_playback_adaptive_snapshot(snapshot,sizeof(snapshot))==64);
+    assert(get32(snapshot+4)==255200 && get32(snapshot+8)==255200 && !(snapshot[1]&8));
+
+    playback_bitrate_transport_stalled();
+    assert(playback_bitrate.urgent && playback_bitrate.target==220000);
+    aaceld_variable_allowed=false; // A released/replaced session cannot retain a live lower target.
+    playback_bitrate_poll(++now);
+    assert(!playback_bitrate.urgent && playback_bitrate.target==255200);
+    unsigned before=sets;
+    assert(!playback_bitrate_eligible() && playback_eld_rate_update(255200,220000)==1 && sets==before);
+    playback_bitrate_transport_stalled();assert(!playback_bitrate.urgent);
+    playback_transport_stale=true;++radio_state.flush_events;playback_bitrate_poll(++now);
+    assert(!playback_bitrate.urgent && playback_bitrate.target==255200 && sets==before);
+
+    uint8_t fixed_config[14];memcpy(fixed_config,variable_config,sizeof(fixed_config));fixed_config[11]&=0x7f;
+    ceiling=playback_options_eld_rate(fixed_config,sizeof(fixed_config),requested);
+    assert(ceiling==256000);
+    playback_bitrate_reset(&playback_bitrate,ceiling,false);aaceld_bitrate=ceiling;
+    playback_transport_stale=false;params[AACENC_BITRATE]=params[AACENC_PEAK_BITRATE]=ceiling;
+    for(unsigned i=0;i<40;++i)window(3,3);
+    assert(playback_bitrate.frozen && !playback_bitrate.active && !playback_bitrate.urgent);
+    assert(playback_bitrate.current==256000 && playback_bitrate.target==256000);
+    assert(playback_bitrate_apply(&media_tracker) && sets==before);
+}
 int main(void) {
     test_live_updates_and_queued_old_units();
     test_vbr_limits_freezes_and_pressure_without_radio_queries();
@@ -269,5 +314,6 @@ int main(void) {
     test_jitter_wrap_pause_reconnect_and_read_only_snapshot();
     test_repeated_radio_recovery_can_lower_but_pcm_starvation_cannot();
     test_sparse_losses_accumulate_and_recovery_requires_truly_clean_windows();
+    test_effective_cbr_ceiling_and_fixed_only_permission();
     puts("live ELD bitrate: bounded pressure response, slow recovery, freezes, encoder rollback and read-only diagnostics passed");
 }

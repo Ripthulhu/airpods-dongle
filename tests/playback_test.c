@@ -169,19 +169,34 @@ static void test_eld_negotiation(void) {
     for (size_t n = 0; n < sizeof(cap); ++n) assert(!playback_eld_negotiate(cap, n, config));
     assert(playback_eld_negotiate(cap, sizeof(cap), config));
     assert(playback_eld_configuration(config, sizeof(config)));
-    assert(config[9] == 0x84 && config[11] == 3);
+    assert(config[9] == 0x84 && config[11] == 0x83);
+    assert(playback_eld_configuration_supported(config, sizeof(config), cap, sizeof(cap)));
     assert(playback_eld_bitrate(config) == 256000);
     cap[11] = 0x82; cap[12] = 0xee; cap[13] = 0;
     assert(playback_eld_negotiate(cap, sizeof(cap), config));
     assert(playback_eld_bitrate(config) == 192000);
+    assert(playback_eld_variable(config));
+    config[11] = 0x83; config[12] = 0xe8; config[13] = 0;
+    assert(!playback_eld_configuration_supported(config, sizeof(config), cap, sizeof(cap)));
     cap[11] = 0x81; cap[12] = 0; cap[13] = 0;
     assert(!playback_eld_negotiate(cap, sizeof(cap), config));
     cap[11] = cap[12] = cap[13] = 0;
     assert(playback_eld_negotiate(cap, sizeof(cap), config));
     assert(playback_eld_bitrate(config) == 256000);
+    assert(!playback_eld_variable(config));
+    assert(playback_eld_configuration_supported(config, sizeof(config), cap, sizeof(cap)));
+    config[11] |= 0x80;
+    assert(playback_eld_configuration(config, sizeof(config)));
+    assert(!playback_eld_configuration_supported(config, sizeof(config), cap, sizeof(cap)));
+    for (size_t n = 0; n < sizeof(cap); ++n) {
+        assert(!playback_eld_configuration_supported(config, n, cap, sizeof(cap)));
+        assert(!playback_eld_configuration_supported(config, sizeof(config), cap, n));
+    }
+    assert(!playback_eld_configuration_supported(NULL, sizeof(config), cap, sizeof(cap)));
+    assert(!playback_eld_configuration_supported(config, sizeof(config), NULL, sizeof(cap)));
     cap[9] = 0x88; // No stereo support.
     assert(!playback_eld_negotiate(cap, sizeof(cap), config));
-    config[11] |= 0x80;
+    config[10] = 1;
     assert(!playback_eld_configuration(config, sizeof(config)));
 }
 

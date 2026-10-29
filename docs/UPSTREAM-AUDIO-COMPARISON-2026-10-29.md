@@ -7,6 +7,10 @@ This was a source review by three independent reviewers, checked against our
 capture notes and current firmware. No upstream code has been merged or flashed
 as a result of this comparison.
 
+Follow-up: the user subsequently requested both changes. Their implementation
+and validation are tracked separately in [0.1.53](VALIDATION-0.1.53.md); the
+observations and proposed experiment order below describe the 0.1.52 review.
+
 Our [latest listening run](VALIDATION-0.1.52.md) still hitched after reaching
 128 kbps, with no active PCM loss but 15 controller flush events in three
 minutes. Lower average bitrate alone has not solved the fault. Two concrete

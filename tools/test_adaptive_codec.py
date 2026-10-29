@@ -86,17 +86,29 @@ def main():
                    "-I", output, "-I", ROOT / "src/btstack"]
         for module in ("libAACenc", "libAACdec", "libSYS"):
             command += ["-isystem", fdk / module / "include"]
-        run(command + sanitizer + [fixture, libraries[name], "-lm", "-o", executable], log)
+        wrappers = (["-Wl,--wrap=" + name for name in ("malloc", "calloc", "realloc", "free")]
+                    if name == "encoder" else [])
+        run(command + sanitizer + [fixture, libraries[name]] + wrappers + ["-lm", "-o", executable], log)
         executables[name] = executable
     cases = []
     for mode in (0, 1):
-        for requested in (256000, 220000, 192000, 174000, 160000, 150400, 128000):
+        ceilings = ((256000, 255200, 220000, 192000, 174000, 160000, 150400, 128000)
+                    if mode == 0 else (256000, 220000, 192000, 174000, 160000, 150400, 128000))
+        for requested in ceilings:
             ceiling = requested // 800 * 800 if mode else requested
             path = output / f"mode{mode}-cap{requested}.aus"
             encoded = run([executables["encoder"], mode, ceiling, path], log)
+            if "heap_calls=0 allocator_probe=passed" not in encoded:
+                raise ValueError("Missing steady-encode allocator guard result")
             decoded = run([executables["decoder"], path], log)
             cases.append({"mode": mode, "requested_ceiling": requested, "ceiling": ceiling,
                           "encode": encoded.strip(), "decode": decoded.strip()})
+    lc_cases = []
+    for bitrate in (96000, 128000, 174000, 192000, 220000):
+        encoded = run([executables["encoder"], "lc", bitrate], log)
+        if "heap_calls=0 allocator_probe=passed" not in encoded:
+            raise ValueError("Missing AAC-LC allocator guard result")
+        lc_cases.append({"bitrate": bitrate, "encode": encoded.strip()})
     # Prove the quality oracle catches a tempting full-history-reset implementation.
     negative = output / "reset-history.aus"
     run([executables["encoder"], 1, 256000, negative, "reset"], log)
@@ -109,6 +121,13 @@ def main():
     report = {"production_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
               "sanitizers": sanitizer,
               "cases": cases, "history_reset_rejected": True,
+              "cbr_only_wire_retune_rejected": True,
+              "aac_lc_allocator_cases": lc_cases,
+              "steady_encode_allocator_calls": 0,
+              "allocator_scope": "malloc/calloc/realloc/free linker-wrapped in profiled static FDK; "
+                                 "normal frame encode only, including first frame after live retune; "
+                                 "plus AAC-LC stereo 48kHz/1024 LATM at all manual bitrates; "
+                                 "initialization/configuration/close remain outside guard",
               "scope": "host semantics only; ARM memory, board timing and radio delivery are separate checks"}
     (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"Real FDK live ELD transitions passed: {len(cases)} CBR/VBR cases; deliberate history reset rejected.")

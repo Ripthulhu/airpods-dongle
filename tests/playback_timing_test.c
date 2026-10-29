@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include "../src/btstack/playback_eld.h"
 #include "../src/btstack/playback_continuity.h"
 #include "../src/btstack/playback_adjust.h"
@@ -33,12 +34,24 @@ static playback_continuity_t phone_continuity;
 #define OUT_BITSTREAM_DATA 1
 #define AACENC_OK 0
 typedef int AACENC_ERROR;
+typedef void *HANDLE_AACENCODER;
 typedef struct { int numBufs; void **bufs; int *bufferIdentifiers, *bufSizes, *bufElSizes; } AACENC_BufDesc;
 typedef struct { unsigned numInSamples; } AACENC_InArgs;
-typedef struct { int numOutBytes; } AACENC_OutArgs;
+typedef struct { int numOutBytes, numInSamples; } AACENC_OutArgs;
 static void *handleAAC = (void *)1;
 static struct { unsigned inputChannels; } aacinf = {2};
 static struct { bool rate_mode; } playback_options;
+static bool bt_locked = true, encode_in_progress;
+static uint32_t control_session = 1, usb_playback_revision = 1;
+static uint32_t aacp_control_session(void) {return control_session;}
+static void (*encode_hook)(void);
+static void (*pcm_read_hook)(void), (*pcm_lock_hook)(void);
+static unsigned encoder_closes, encoder_resets, configuration_callbacks;
+static unsigned encoder_errors;
+static bool allow_encoder_failure, encode_zero;
+static int encode_error, encode_consumed_delta;
+static uint8_t last_configuration;
+#include "playback_encoder_state.inc"
 static uint16_t aaceld_frame_sequence;
 static uint32_t now, consumed, emitted, frame_size, sample_frames, send_failures;
 static unsigned encode_calls, eld_packets, eld_units;
@@ -79,6 +92,11 @@ static void playback_adjust_cancel_stream(a2dp_media_sending_context_t *,uint32_
 static bool a2dp_is_connected_flag = true;
 #ifndef PLAYBACK_PIPELINE
 static bool is_usb_streaming;
+static unsigned playback_pcm_lock;
+static void critical_section_enter_blocking(void *p) {
+    (void)p;assert(bt_locked);if(pcm_lock_hook)pcm_lock_hook();
+}
+static void critical_section_exit(void *p) {(void)p;assert(bt_locked);}
 #endif
 static struct { unsigned encoded_units, recoveries, send_failures;
     uint32_t pcm_peak,pcm_drops,pcm_underflows; } playback_metrics;
@@ -99,6 +117,7 @@ static void *btstack_run_loop_get_timer_context(btstack_timer_source_t *t) { ret
 static uint32_t btstack_run_loop_get_time_ms(void) { return now; }
 static unsigned a2dp_sample_rate(void) { return 48000; }
 static void a2dp_demo_timer_stop(void *a) {
+    playback_encoder_invalidate();
     playback_continuity_reset(&phone_continuity);
     (void)a; assert(allow_recovery); media_tracker.streaming=false;
     media_tracker.samples_ready=media_tracker.acc_num_missed_samples=0;
@@ -119,6 +138,7 @@ static void playback_encode_measured(unsigned a) { (void)a; }
 static void audio_pcm_read(unsigned frames) {
     consumed += frames;
     source_consumed += frames * playback_adjust_interval(&playback_adjust) / 10;
+    if(pcm_read_hook)pcm_read_hook();
 }
 #else
 #include "../src/btstack/playback_pcm.h"
@@ -218,31 +238,72 @@ static unsigned a2dp_source_stream_send_media_payload_rtp(unsigned a, unsigned b
     return 0;
 }
 static int playback_encoder_failed(a2dp_media_sending_context_t *context) {
-    (void)context; assert(false); return -1;
+    assert(allow_encoder_failure);++encoder_errors;a2dp_demo_timer_stop(context);return -1;
+}
+static void aacEncClose(void **handle) {
+    assert(bt_locked && !encode_in_progress);
+    ++encoder_closes; *handle = NULL;
+}
+#include "playback_encoder_reset_guard.inc"
+static bool aaceld_encoder_init(void) {
+    if(production_encoder_reset_guard())return true;
+    assert(bt_locked && !encode_in_progress);
+    ++encoder_resets; handleAAC = (void *)1; return true;
+}
+#define HCI_EVENT_PACKET 4
+static uint16_t little_endian_read_16(const uint8_t *data, unsigned offset) {
+    return data[offset] | (uint16_t)data[offset + 1] << 8;
+}
+static void packet_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {
+    (void)type; (void)channel;
+    assert(bt_locked && !encode_in_progress); ++configuration_callbacks;
+    last_configuration=size>5?packet[5]:0;
 }
 static AACENC_ERROR aacEncEncode(void *handle, AACENC_BufDesc *input, AACENC_BufDesc *output,
     AACENC_InArgs *args, AACENC_OutArgs *result) {
     (void)handle; (void)input;
+    assert(!bt_locked && !encode_in_progress);
+    encode_in_progress = true;
+    if (encode_hook) encode_hook();
 #ifdef PLAYBACK_PIPELINE
     pipeline_encode(input,args);
 #endif
     assert(args->numInSamples == sample_frames * 2);
     unsigned bytes = frame_size - (cur_codec == 4 ? 4 : 0);
     assert(output->bufSizes[0] >= (int)bytes);
-    memset(output->bufs[0], (uint8_t)encode_calls++, bytes); result->numOutBytes = (int)bytes;
-    return AACENC_OK;
+    // The byte tag checks committed packet order; canceled jobs never go on air.
+    uint8_t tag=cur_codec==4?(uint8_t)(emitted/sample_frames+media_tracker.codec_num_frames):(uint8_t)encode_calls;
+    ++encode_calls;memset(output->bufs[0],tag,bytes);
+    result->numOutBytes = encode_zero?0:(int)bytes;
+    result->numInSamples = (int)args->numInSamples+encode_consumed_delta;
+    encode_in_progress = false;
+    return encode_error;
 }
 #include "playback_timing.inc"
+#include "playback_encoder_job.inc"
+
+static void complete_test_encode(void) {
+    assert(bt_locked);
+    bt_locked = false; dongle_playback_encode_run(); bt_locked = true;
+    dongle_playback_encode_complete();
+}
+static void prepare_test_packet(a2dp_media_sending_context_t *context, uint32_t time) {
+    playback_prepare_packet(context, time);
+    complete_test_encode();
+    playback_prepare_packet(context, time);
+}
+#define playback_prepare_packet prepare_test_packet
 
 static void drain(void) {
     unsigned limit=sample_frames*4;
     if(limit<1920)limit=1920;
     if(media_tracker.samples_ready>limit)media_tracker.samples_ready=limit;
     unsigned budget = 100;
-    while (send_requested || playback_work_pending ||
+    while (send_requested || playback_work_pending || playback_encoder_busy() ||
            (!media_tracker.codec_ready_to_send && media_tracker.samples_ready>=sample_frames)) {
         assert(budget--);
-        if(playback_work_pending || (!media_tracker.codec_ready_to_send && media_tracker.samples_ready>=sample_frames)) {
+        if(playback_work_pending || playback_encoder_busy() ||
+           (!media_tracker.codec_ready_to_send && media_tracker.samples_ready>=sample_frames)) {
             playback_work_pending=false;
             playback_prepare_packet(&media_tracker,now);
         }
@@ -256,6 +317,15 @@ static void drain(void) {
     }
 }
 static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigned interval, unsigned mtu) {
+    memset(&encoder_job, 0, sizeof(encoder_job));
+    atomic_init(&encoder_job.epoch, 1);
+    atomic_init(&encoder_job.state, ENCODE_IDLE);
+    handleAAC = (void *)1; bt_locked = true; encode_in_progress = false; encode_hook = NULL;
+    encoder_closes = encoder_resets = configuration_callbacks = 0;
+    encoder_errors = 0;allow_encoder_failure = encode_zero = false;
+    encode_error = encode_consumed_delta = 0;last_configuration = 0;
+    pcm_read_hook = pcm_lock_hook = NULL;
+    control_session = usb_playback_revision = 1;
     playback_continuity_reset(&phone_continuity);
     phone_buffer_started=false;audio_owned=true;
     playback_adjust_cancel(&playback_adjust);
@@ -379,7 +449,7 @@ static void rate_boundaries_preserve_source_time(void) {
         assert(media_tracker.time_audio_data_sent==now);
     }
 }
-#ifndef PLAYBACK_PIPELINE
+#if !defined(PLAYBACK_PIPELINE) && !defined(PLAYBACK_ENCODER_JOB)
 int main(void) {
     phone_packet_groups();
     rate_boundaries_preserve_source_time();

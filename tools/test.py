@@ -61,6 +61,28 @@ def usb_descriptor_sources(directory):
 
 def playback_lifecycle_sources(directory):
     source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    start = source.index("enum { ENCODE_IDLE")
+    end = source.index("\nstatic void playback_encoder_close(void);", start)
+    (directory / "playback_encoder_state.inc").write_text(source[start:end])
+    start = source.index("static bool aaceld_encoder_init(void) {")
+    start = source.index("{", start) + 1
+    end = source.index("\n    if (handleAAC != NULL)", start)
+    (directory / "playback_encoder_reset_guard.inc").write_text(
+        "static bool production_encoder_reset_guard(void) {" + source[start:end] +
+        "\n    return false;\n}\n")
+    encoder = []
+    lifecycle = []
+    for signature in ["void dongle_playback_encode_run(", "void dongle_playback_encode_complete(",
+                      "static void playback_encoder_close(",
+                      "static bool playback_encoder_defer_configuration("]:
+        match = re.search(r"(?m)^" + re.escape(signature) + r"[^;]*?\{", source)
+        if match is None:
+            raise ValueError("Missing production encoder job function: " + signature)
+        start = match.start()
+        end = source.index("\n}", start) + 2
+        (lifecycle if "close(" in signature or "defer_configuration(" in signature else encoder).append(source[start:end])
+    (directory / "playback_encoder_job.inc").write_text("\n".join(encoder))
+    (directory / "playback_encoder_lifecycle.inc").write_text("\n".join(lifecycle))
     bitrate_functions = []
     for signature in ["static int playback_eld_rate_update(", "static bool playback_bitrate_eligible(",
                       "static void playback_bitrate_transport_stalled(",
@@ -110,7 +132,10 @@ def playback_lifecycle_sources(directory):
         functions.append(source[start:end])
     (directory / "playback_lifecycle.inc").write_text("\n".join(functions))
     functions = []
-    for signature in ["static int setup_aaceld_configuration(){", "static bool playback_game_eligible(void) {"]:
+    for signature in ["static int find_remote_seid(", "static int setup_aaceld_configuration(){",
+                      "static bool playback_game_eligible(void) {",
+                      "static bool playback_eld_peer_configuration(",
+                      "static void playback_eld_bind_configuration("]:
         start = source.index("\n" + signature) + 1
         end = source.index("\n}", start) + 2
         functions.append(source[start:end])
@@ -125,10 +150,14 @@ def playback_lifecycle_sources(directory):
     (directory / "playback_release.inc").write_text(source[start:end])
 
     functions = []
-    for signature in ["static void playback_clock_accrue(", "static void playback_clock_switch(",
+    for signature in ["static bool playback_encoder_scope_current(",
+                      "static void playback_encoder_discard(",
+                      "static bool playback_encoder_packet_current(",
+                      "static void playback_clock_accrue(", "static void playback_clock_switch(",
                       "static void playback_adjust_cancel_stream(",
                       "static void playback_transport_recover(",
-                      "static int fill_sbc_audio_buffer(", "static int fill_aac_audio_buffer(",
+                      "static int fill_sbc_audio_buffer(",
+                      "static bool playback_aac_packet_submit(", "static int fill_aac_audio_buffer(",
                       "static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint32_t now)",
                       "static void avdtp_audio_timeout_handler(",
                       "static void a2dp_demo_send_media_packet("]:
@@ -303,6 +332,7 @@ def main():
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],
         "playback_buttons": ["tests/playback_buttons_test.c"],
         "playback_timing": ["tests/playback_timing_test.c"],
+        "playback_encoder_job": ["-Wno-unused-function", "tests/playback_encoder_job_test.c"],
         "phone_continuity": ["-Wno-unused-function", "tests/phone_continuity_test.c"],
         "playback_trace": ["tests/playback_trace_test.c"],
         "playback_float": ["tests/playback_float_test.c", "-lm"],

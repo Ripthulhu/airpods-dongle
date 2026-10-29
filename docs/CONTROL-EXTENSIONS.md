@@ -123,7 +123,8 @@ send remains separate from a fresh matching device report.
 From 0.1.51, feature 19 reports the selected AirPods ACL and the live AAC-ELD
 encoder budget. Reading it never starts a radio query, changes a setting or
 enables packet logging. Existing audio-profile status continues reporting the
-negotiated ceiling; use this snapshot for the current adaptive budget.
+configured local ceiling, including CBR alignment headroom; use this snapshot for
+the current adaptive budget. The local ceiling can be below the wire ceiling.
 
 The exact response is 128 bytes, little-endian:
 
@@ -220,6 +221,19 @@ AAC is stereo 48 kHz LC. ELD is stereo 48 kHz with 480-sample frames.
 VBR additionally requires the peer's advertised VBR capability and the supported
 FDK mode. Its peak is floored to a whole byte per 10 ms frame: a 174000 request
 has a 173600 bits/s peak. Requested and actual values remain distinct.
+
+The rate mode describes the local encoder, independently of the Apple vendor
+configuration's variable-rate permission. When the peer permits variable rate,
+the selected wire ceiling remains capped by both peers while a lower local
+CBR target or VBR peak can change within it. CBR reserves one alignment byte per
+10 ms frame: a 256000 wire ceiling allows a 255200 local CBR budget; a lower
+220000 request stays 220000. Profile status keeps the requested bitrate and local
+rate mode unchanged and reports the effective local budget as its actual rate;
+feature 19 reports the current adaptive budget and its local ceiling, not the
+wire ceiling.
+A fixed-only peer retains fixed CBR negotiation with no live bitrate adaptation.
+If variable permission cannot fit 128000 CBR plus alignment headroom, selection
+falls back to that fixed path. An unsupported actual VBR request is rejected.
 
 A profile change returns busy during USB/phone playback, phone preparation,
 microphone use, pending connection/profile work or an unresolved Game Mode

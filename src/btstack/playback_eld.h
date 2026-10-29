@@ -31,15 +31,20 @@ static inline uint32_t playback_eld_bitrate(const uint8_t *config) {
            ((uint32_t)config[12] << 8) | config[13];
 }
 
+static inline bool playback_eld_variable(const uint8_t *config) {
+    return (config[11] & 0x80) != 0;
+}
+
 static inline bool playback_eld_negotiate(const uint8_t *cap, size_t len,
                                          uint8_t config[PLAYBACK_ELD_CONFIG_SIZE]) {
     if (!playback_eld_capability(cap, len)) return false;
     uint32_t bitrate = playback_eld_bitrate(cap);
+    uint8_t permission = cap[11] & 0x80;
     if (bitrate == 0 || bitrate > PLAYBACK_ELD_BITRATE) bitrate = PLAYBACK_ELD_BITRATE;
     if (bitrate < PLAYBACK_ELD_MIN_BITRATE) return false;
     static const uint8_t fixed[14] = {0x4c, 0, 0, 0, 1, 0x80, 0, 0x80, 0, 0x84, 0, 0, 0, 0};
     memcpy(config, fixed, sizeof(fixed));
-    config[11] = (uint8_t)(bitrate >> 16); // CBR matches the actual encoder mode.
+    config[11] = (uint8_t)(bitrate >> 16) | permission;
     config[12] = (uint8_t)(bitrate >> 8);
     config[13] = (uint8_t)bitrate;
     return true;
@@ -48,9 +53,17 @@ static inline bool playback_eld_negotiate(const uint8_t *cap, size_t len,
 static inline bool playback_eld_configuration(const uint8_t *config, size_t len) {
     if (!playback_eld_capability(config, len)) return false;
     return config[6] == 0 && config[7] == 0x80 && config[8] == 0 &&
-           config[9] == 0x84 && config[10] == 0 && (config[11] & 0x80) == 0 &&
+           config[9] == 0x84 && config[10] == 0 &&
            playback_eld_bitrate(config) >= PLAYBACK_ELD_MIN_BITRATE &&
            playback_eld_bitrate(config) <= PLAYBACK_ELD_BITRATE;
+}
+
+static inline bool playback_eld_configuration_supported(const uint8_t *config, size_t len,
+                                                         const uint8_t *cap, size_t cap_len) {
+    if (!playback_eld_configuration(config, len) || !playback_eld_capability(cap, cap_len)) return false;
+    uint32_t ceiling = playback_eld_bitrate(cap);
+    return (!playback_eld_variable(config) || playback_eld_variable(cap)) &&
+           (!ceiling || playback_eld_bitrate(config) <= ceiling);
 }
 
 static inline bool playback_eld_append(uint8_t *packet, size_t capacity,

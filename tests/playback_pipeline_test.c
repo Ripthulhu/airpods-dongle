@@ -9,6 +9,7 @@ static int drift_ppm;
 static unsigned encode_cost,blocked_until;
 static unsigned filter_cost,loop_cost;
 static unsigned timer_phase;
+static unsigned unlocked_timer_callbacks, encode_timer_callbacks;
 static unsigned request_wait,next_wait;
 static void pipeline_request(void) {
     if(request_wait && now>=next_wait) {
@@ -63,6 +64,13 @@ static void advance(unsigned ms) {
         if(sink_started) {
             if(sink_frames<48) {++sink_underruns;sink_frames=0;}
             else sink_frames-=48;
+        }
+        // Unlike the old locked encode, the new job lets Bluetooth timers run.
+        if(!bt_locked && media_tracker.streaming &&
+           (int32_t)(now-media_tracker.audio_timer.timeout-timer_phase)>=0) {
+            assert(!bt_locked);++unlocked_timer_callbacks;
+            if(encode_in_progress)++encode_timer_callbacks;
+            bt_locked=true;avdtp_audio_timeout_handler(&media_tracker.audio_timer);bt_locked=false;
         }
         if(phone_active) {
             if(now%15u==0)++phone_arrivals; // 720-frame LHDC packets.
@@ -130,6 +138,7 @@ static void fixture(int ppm) {
     ingress_fraction=0;drift_ppm=ppm;encode_cost=5;blocked_until=0;
     filter_cost=loop_cost=0;
     timer_phase=0;
+    unlocked_timer_callbacks=encode_timer_callbacks=0;
     request_wait=next_wait=0;
     check_sequence=ppm==0;have_previous=false;
     usb_jitter=variable_cost=false;delayed_frames=0;
@@ -141,6 +150,7 @@ static void fixture(int ppm) {
 }
 static void step(void) {
     uint32_t started=now*1000u;
+    dongle_playback_encode_complete();
     unsigned encoded_before=encode_calls;
     if(phone_active && phone_output_ready) {
         phone_ingress(720);phone_output_ready=false;
@@ -152,10 +162,17 @@ static void step(void) {
         a2dp_demo_send_media_packet();
     }
     playback_audio_work(now);
+    bt_locked=false;dongle_playback_encode_run();bt_locked=true;
     assert(encode_calls-encoded_before<=1); // Can-send callbacks cannot recursively encode.
     advance(loop_cost);
     advance(realtime_loop_idle_us(started,now*1000u,false)/1000u);
 }
+static void pipeline_audio_work(uint32_t time) {
+    dongle_playback_encode_complete();
+    playback_audio_work(time);
+    complete_test_encode();
+}
+#define playback_audio_work pipeline_audio_work
 static void startup_keeps_one_filter_phase(void) {
     for(unsigned floating=0;floating<2;++floating) {
         fixture(0);
@@ -299,6 +316,13 @@ static void send_wait_after_encoding(void) {
     assert(!playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
     assert(!sink_underruns && !playback_trace.stats[TRACE_RECOVERIES]);
     assert(playback_trace.stats[TRACE_SEND_WAIT_US]<=41000u);
+    assert(encode_timer_callbacks>0); // The production callback ran during unlocked FDK work.
+}
+static void timer_interrupts_respect_bluetooth_lock(void) {
+    fixture(0);bt_locked=true;advance(11);
+    assert(!unlocked_timer_callbacks && media_tracker.audio_timer.timeout==10);
+    bt_locked=false;advance(1);bt_locked=true;
+    assert(unlocked_timer_callbacks==1 && media_tracker.audio_timer.timeout==20);
 }
 static void excessive_stall(void) {
     fixture(0);
@@ -321,7 +345,10 @@ static void excessive_stall(void) {
 static void stale_receiver_window(void) {
     fixture(0);
     while(!emitted)step();
-    while(!send_requested)step();
+    blocked_until=now+1000; // Hold the callback; completion now submits immediately.
+    unsigned deadline=now+100;
+    while(!send_requested && now<deadline)step();
+    assert(send_requested);
     now+=80; // Isolate a successful submission after the 60 ms receiver window.
     send_requested=false;a2dp_demo_send_media_packet();
     assert(playback_transport_stale);
@@ -472,7 +499,10 @@ static void phone_stale_receiver_window(void) {
     generated=encoded=0;phone_arrivals=phone_queued=phone_decode_due=phone_decoded=0;
     phone_decoding=phone_output_ready=false;phone_ingress(4320);
     while(!emitted)step();
-    while(!send_requested)step();
+    blocked_until=now+1000;
+    unsigned deadline=now+100;
+    while(!send_requested && now<deadline)step();
+    assert(send_requested);
     advance(80); // The real 60 ms phone receiver window is exceeded.
     send_requested=false;a2dp_demo_send_media_packet();
     assert(playback_transport_stale && !suspend_recovery_pending);
@@ -535,6 +565,7 @@ static void call_prefill_uses_call_clock(void) {
 }
 
 int main(void) {
+    timer_interrupts_respect_bluetooth_lock();
     call_prefill_uses_call_clock();
     startup_keeps_one_filter_phase();
     fractional_shortage_keeps_filter();

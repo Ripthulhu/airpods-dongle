@@ -69,6 +69,10 @@ void dongle_playback_usb_packet(uint32_t us, uint16_t frames, uint8_t format, ui
 void dongle_playback_usb_format(uint8_t format);
 void dongle_playback_controller_event(const uint8_t *packet, uint16_t size);
 void dongle_playback_poll(void);
+// Main thread: complete under the CYW43 lock, run pure AAC encoding after releasing it.
+void dongle_playback_encode_complete(void);
+void dongle_playback_encode_run(void);
+uint32_t dongle_playback_encode_cancelled(void);
 // AACP routing callback under the Bluetooth lock; retain signaling/control.
 void dongle_playback_ownership_changed(bool owned);
 
