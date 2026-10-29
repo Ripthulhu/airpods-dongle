@@ -28,6 +28,8 @@ bool bt_hci_phone_address(uint8_t address[6]);
 void bt_hci_phone_poll(void);
 // Only the selected AirPods ACL changes; control packets remain non-flushable.
 void bt_hci_airpods_flush_timeout(bool low_latency);
+// Temporarily compare 200-ms controller flush with unchanged Game Mode; expires after 120 seconds.
+bool bt_hci_airpods_flush_comparison(bool enabled);
 
 typedef struct {
     uint32_t events, packets, max_active_gap_ms;

@@ -4,6 +4,7 @@
 #include "dongle_client.h"
 #include "../btstack/btstack_aacp.h"
 #include "../btstack/btstack_avdtp_source.h"
+#include "../btstack/btstack_hci.h"
 #include "../btstack/dongle_finder.h"
 #include "../btstack/btstack_ble_scan.h"
 #include "../btstack/phone_sink.h"
@@ -81,10 +82,15 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
                 (!p[1] && dongle_u32(p+2)) || (p[1] && !dongle_u32(p+2))) return 1;
             if(client!=DONGLE_CLIENT_USB)return 7;
             return error(dongle_volume_request(client,p,size,out,capacity,length));
+        case 18:
+            if(size!=2 || p[1]>1)return 1;
+            if(client!=DONGLE_CLIENT_USB)return 7;
+            return bt_hci_airpods_flush_comparison(p[1]!=0)?0:2;
         default:return 7;
     }
 }
 void dongle_features_disconnect(uint8_t client) {
     dongle_finder_disconnect(client);dongle_volume_client_disconnect(client);
+    if(client==DONGLE_CLIENT_USB)(void)bt_hci_airpods_flush_comparison(false);
 }
 void dongle_features_poll(void) { dongle_playback_poll();dongle_finder_poll(); }

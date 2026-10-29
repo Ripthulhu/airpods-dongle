@@ -33,6 +33,7 @@ static bool selected_bonded;
 
 #define PHONE_TAG 0x4150484eu // APHN, independent of APSL and BTstack bond records.
 #define PHONE_PAIRING_MS 120000u
+#define MEDIA_FLUSH_COMPARISON_MS 120000u
 static bd_addr_t phone_address, phone_candidate;
 static bool phone_bonded, phone_pairing, phone_storage_supported;
 static uint32_t phone_pairing_since;
@@ -50,10 +51,10 @@ static struct {
 
 static struct {
     bd_addr_t address;
-    uint32_t epoch, since;
+    uint32_t epoch, since, comparison_since;
     uint16_t handle, desired_ms, confirmed_ms;
     uint8_t status;
-    bool failed;
+    bool failed, low_latency, comparison;
 } media_flush;
 static struct {
     uint32_t epoch, since, link_epoch;
@@ -84,6 +85,7 @@ static void media_flush_forget(void) {
     media_flush.confirmed_ms = 0;
     media_flush.status = UINT8_MAX;
     media_flush.failed = false;
+    media_flush.low_latency = media_flush.comparison = false;
     media_flush.since = btstack_run_loop_get_time_ms();
     memset(media_flush.address, 0, sizeof(media_flush.address));
 }
@@ -111,16 +113,41 @@ static hci_connection_t *media_flush_bind(void) {
     }
     return connection;
 }
-void bt_hci_airpods_flush_timeout(bool low_latency) {
-    if (media_flush_bind() == NULL || !hci_non_flushable_packet_boundary_flag_supported()) return;
-    uint16_t desired = low_latency ? 60 : 200;
+static void media_flush_policy(void) {
+    if (!media_flush.low_latency || (media_flush.comparison &&
+        (uint32_t)(btstack_run_loop_get_time_ms() - media_flush.comparison_since) >= MEDIA_FLUSH_COMPARISON_MS))
+        media_flush.comparison = false;
+    uint16_t desired = media_flush.low_latency && !media_flush.comparison ? 60 : 200;
     if (desired != media_flush.desired_ms) {
         media_flush.desired_ms = desired;
         media_flush.failed = false;
     }
 }
+void bt_hci_airpods_flush_timeout(bool low_latency) {
+    if (media_flush_bind() == NULL || !hci_non_flushable_packet_boundary_flag_supported()) return;
+    media_flush.low_latency = low_latency;
+    media_flush_policy();
+}
+bool bt_hci_airpods_flush_comparison(bool enabled) {
+    hci_connection_t *connection = media_flush_bind();
+    media_flush_policy();
+    if (!enabled) {
+        media_flush.comparison = false;
+        media_flush_policy();
+        return true;
+    }
+    if (connection == NULL || !hci_non_flushable_packet_boundary_flag_supported() ||
+        !media_flush.low_latency || media_flush.failed) return false;
+    if (media_flush.comparison) return true; // Repeated requests cannot extend the bounded comparison.
+    if (media_flush_pending.active || media_flush.confirmed_ms != 60) return false;
+    media_flush.comparison = true;
+    media_flush.comparison_since = btstack_run_loop_get_time_ms();
+    media_flush_policy();
+    return true;
+}
 static void media_flush_poll(void) {
     hci_connection_t *connection = media_flush_bind();
+    media_flush_policy();
     if (media_flush_pending.active) {
         if ((uint32_t)(btstack_run_loop_get_time_ms() - media_flush_pending.since) >= 1000u &&
             media_flush_pending.epoch == media_flush.epoch) {

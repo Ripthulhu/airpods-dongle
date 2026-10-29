@@ -9,6 +9,13 @@ static uint8_t expected_setting_id=0x28;
 static bool diagnostic_scan_paused;
 static bool inspection_active;
 static unsigned volume_reads,volume_writes,volume_disconnects;
+static unsigned flush_comparison_calls;
+static bool flush_comparison_active,flush_comparison_ready=true;
+bool bt_hci_airpods_flush_comparison(bool enabled) {
+    ++flush_comparison_calls;
+    if(enabled && !flush_comparison_ready)return false;
+    flush_comparison_active=enabled;return true;
+}
 uint16_t dongle_volume_snapshot(uint8_t client,uint8_t *out,uint16_t capacity) {
     assert(client<2);++volume_reads;
     if(capacity<24)return 0;
@@ -24,7 +31,7 @@ uint8_t dongle_volume_request(uint8_t client,const uint8_t *p,uint16_t size,
     out[3]=action;dongle_put32(out+8,token);*length=24;
     return result;
 }
-void dongle_volume_client_disconnect(uint8_t client) {assert(client==1);++volume_disconnects;}
+void dongle_volume_client_disconnect(uint8_t client) {assert(client<2);++volume_disconnects;}
 uint16_t phone_sink_diagnostics(uint8_t *out,uint16_t cap) {
     if(cap<64)return 0;
     memset(out,0,64);out[0]=2;out[3]=15;return 64;
@@ -66,7 +73,7 @@ uint16_t dongle_finder_snapshot(uint8_t client,uint8_t *out,uint16_t cap) {
 }
 void dongle_playback_poll(void) {polls++;}
 void dongle_finder_poll(void) {polls++;}
-void dongle_finder_disconnect(uint8_t client) {assert(client==1);stops++;}
+void dongle_finder_disconnect(uint8_t client) {assert(client<2);stops++;}
 
 int main(void) {
     uint8_t out[64],p[64]={1,0x28,0xef,0xcd,0xab,0x89};uint16_t n=99;
@@ -141,8 +148,25 @@ int main(void) {
     memcpy(p,absolute,sizeof(absolute));
     assert(dongle_features_request(0,p,7,p,64,&n)==0 && n==24 && p[2]==127 &&
         p[3]==3 && dongle_u32(p+8)==UINT32_C(0x12345678));
+    uint8_t comparison[]={18,1};
+    assert(dongle_features_request(0,comparison,1,out,64,&n)==1 && !flush_comparison_calls);
+    assert(dongle_features_request(0,comparison,3,out,64,&n)==1 && !flush_comparison_calls);
+    comparison[1]=2;
+    assert(dongle_features_request(0,comparison,2,out,64,&n)==1 && !flush_comparison_calls);
+    comparison[1]=1;
+    assert(dongle_features_request(1,comparison,2,out,64,&n)==7 && !flush_comparison_calls);
+    flush_comparison_ready=false;
+    assert(dongle_features_request(0,comparison,2,out,64,&n)==2 && !n && !flush_comparison_active);
+    flush_comparison_ready=true;
+    assert(dongle_features_request(0,comparison,2,comparison,2,&n)==0 && !n && flush_comparison_active);
+    comparison[1]=0;
+    assert(dongle_features_request(0,comparison,2,out,64,&n)==0 && !n && !flush_comparison_active);
     p[0]=0;assert(dongle_features_request(1,p,1,out,64,&n)==7 && n==0);
     dongle_features_poll();dongle_features_disconnect(1);
     assert(polls==2 && stops==2 && volume_disconnects==1);
+    comparison[1]=1;
+    assert(dongle_features_request(0,comparison,2,out,64,&n)==0 && flush_comparison_active);
+    dongle_features_disconnect(0);
+    assert(!flush_comparison_active && stops==3 && volume_disconnects==2);
     puts("typed features: validation, exact integer values, aliased buffers, bounded responses and result mapping passed");
 }

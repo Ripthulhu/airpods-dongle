@@ -890,11 +890,82 @@ static void test_media_flush_selected_peer_remembers_confirmed_value(void) {
     flush_ack(0x11,0);assert(media_flush.confirmed_ms==200);
 }
 
+static void flush_game_fixture(void) {
+    flush_fixture();flush_ack(0x11,0);
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();flush_ack(0x11,0);
+    assert(media_flush.confirmed_ms==60 && !media_flush_pending.active);
+}
+static void test_media_flush_comparison_is_bounded_and_only_changes_timeout(void) {
+    flush_fixture();assert(!bt_hci_airpods_flush_comparison(true));
+    flush_ack(0x11,0);assert(!bt_hci_airpods_flush_comparison(true));
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+    assert(!bt_hci_airpods_flush_comparison(true)); // The normal 60-ms ACK is required first.
+    flush_ack(0x11,0);
+    assert(bt_hci_airpods_flush_comparison(true));bt_hci_phone_poll();
+    assert(media_flush.comparison && flush_handle==0x11 && flush_slots==320 && flush_writes==2);
+    flush_ack(0x11,0);
+    assert(media_flush.confirmed_ms==200 && bt_hci_airpods_flush_comparison(true));
+    for(unsigned i=1;i<120;++i) {
+        now=i*1000u;bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+        assert(media_flush.desired_ms==200 && flush_writes==2);
+    }
+    now=119999;assert(bt_hci_airpods_flush_comparison(true));
+    now=120000;bt_hci_phone_poll();
+    assert(!media_flush.comparison && media_flush.desired_ms==60 && flush_slots==96 && flush_writes==3);
+    flush_ack(0x11,0);
+    assert(media_flush.confirmed_ms==60 && inquiry_calls==0 && disconnect_calls==0 && flush_timeout==UINT16_MAX);
+
+    now=UINT32_MAX-59999u;
+    assert(bt_hci_airpods_flush_comparison(true));bt_hci_phone_poll();flush_ack(0x11,0);
+    now=59999u;bt_hci_phone_poll();assert(media_flush.comparison && media_flush.desired_ms==200);
+    now=60000u;bt_hci_phone_poll();assert(!media_flush.comparison && media_flush.desired_ms==60);
+}
+static void test_media_flush_comparison_clears_on_cancel_scope_loss_and_stale_ack(void) {
+    flush_game_fixture();assert(bt_hci_airpods_flush_comparison(true));
+    bt_hci_phone_poll();flush_ack(0x11,0);
+    assert(bt_hci_airpods_flush_comparison(false));bt_hci_phone_poll();
+    assert(!media_flush.comparison && media_flush.desired_ms==60 && flush_slots==96);
+    flush_ack(0x11,0);
+
+    assert(bt_hci_airpods_flush_comparison(true));bt_hci_phone_poll();
+    bt_hci_airpods_flush_timeout(false); // Game, ownership, microphone and source-session loss use this path.
+    assert(!media_flush.comparison && media_flush.desired_ms==200);
+    flush_ack(0x11,0);bt_hci_phone_poll();
+    assert(media_flush.confirmed_ms==200 && !media_flush_pending.active);
+    assert(!bt_hci_airpods_flush_comparison(true));
+
+    flush_game_fixture();assert(bt_hci_airpods_flush_comparison(true));bt_hci_phone_poll();
+    now=120000;bt_hci_phone_poll();
+    assert(!media_flush.comparison && media_flush.desired_ms==60 && media_flush_pending.active);
+    flush_ack(0x11,0);bt_hci_phone_poll();
+    assert(media_flush.confirmed_ms==200 && media_flush_pending.active && flush_slots==96);
+    flush_ack(0x11,0);assert(media_flush.confirmed_ms==60);
+
+    assert(bt_hci_airpods_flush_comparison(true));bt_hci_phone_poll();
+    uint8_t disconnected[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnected,sizeof(disconnected));
+    assert(!media_flush.comparison && !media_flush.low_latency);
+    flush_ack(0x11,0);assert(media_flush.confirmed_ms==0);
+
+    flush_game_fixture();assert(bt_hci_airpods_flush_comparison(true));
+    memcpy(device_addr,second,6);bt_hci_airpods_flush_timeout(true);
+    assert(!media_flush.comparison && media_flush.handle==HCI_CON_HANDLE_INVALID);
+
+    flush_game_fixture();assert(bt_hci_airpods_flush_comparison(true));
+    uint8_t off[]={BTSTACK_EVENT_STATE,1,0};hci_packet_handler(HCI_EVENT_PACKET,0,off,sizeof(off));
+    assert(!media_flush.comparison && !media_flush.low_latency);
+
+    flush_game_fixture();non_flushable=false;
+    assert(!bt_hci_airpods_flush_comparison(true));
+}
+
 int main(void) {
     test_media_flush_targets_only_airpods_and_confirms_ack();
     test_media_flush_failures_and_superseded_commands_are_bounded();
     test_media_flush_reconnect_ack_cannot_confirm_new_epoch();
     test_media_flush_selected_peer_remembers_confirmed_value();
+    test_media_flush_comparison_is_bounded_and_only_changes_timeout();
+    test_media_flush_comparison_clears_on_cancel_scope_loss_and_stale_ack();
     test_authenticated_phone_acl_session();
     test_current_link_roles();
     test_credit_diagnostics();

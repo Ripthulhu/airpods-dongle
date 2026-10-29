@@ -54,6 +54,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 15: phone input counters | none | read-only queue/decoder snapshot: v1 52 bytes, v2 64 bytes |
 | 16: physical volume snapshot | none | 24-byte version-1 status; capability 128 |
 | 17: USB host volume authority | action u8, token u32, level u8 | 24-byte status; USB client only; capability 128 |
+| 18: diagnostic Game Mode flush comparison | enabled u8 (0/1) | empty; USB client only; see below |
 
 The explicit [host volume authority contract](HOST-VOLUME.md) coordinates a host
 that actually delegates its mixer volume to the AirPods. It suppresses standalone
@@ -61,6 +62,24 @@ UAC gain requests and feedback while leased; simply moving the phone's slider is
 not proof of delegated gain. From 0.1.48 the legacy HID/anchor relay is removed
 entirely. The host extension uses a separate five-second lease and does not hold
 the ATT settings workflow lease.
+
+From 0.1.49, diagnostic feature 18 temporarily substitutes a 200 ms controller
+automatic flush timeout while leaving Game Mode's 60 ms receiver target,
+two-access-unit packets and clock adjustment unchanged. Send `12 01` to start
+the comparison and `12 00` to clear it (hexadecimal bytes). Enabling requires
+the selected AirPods ACL's normal Game Mode timeout already confirmed at 60 ms;
+otherwise it returns busy. A phone client returns unsupported. Success means
+the local policy was accepted, not that the controller acknowledged the change.
+Use the existing HCI `FLUSH` desired/confirmed values to verify each phase.
+
+The override expires after 120 seconds, including across timer wrap. Repeated
+enable requests and playback polling do not renew it. Disable, selected-peer or
+ACL changes, source/control-session or audio-ownership loss, microphone use,
+leaving Game Mode, USB-client disconnect and controller reset clear it. Expiry
+or cancellation restores the ordinary policy through the same bounded,
+per-handle ACK/epoch command engine; a failed or missing ACK remains visible.
+It is volatile and has no product UI or persistent setting. The report-3 layout
+and capability 16 remain unchanged; older firmware returns unsupported.
 
 Cached report slot 6 also returns the settings snapshot. Format: version u8=1,
 count u8, then count records of control ID u8, age milliseconds u32, report

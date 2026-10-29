@@ -24,6 +24,7 @@ uint16_t dongle_playback_trace(uint8_t *p,uint16_t n) {(void)p;(void)n;return 0;
 uint16_t dongle_playback_inspect(uint8_t *p,uint16_t n) {(void)p;(void)n;return 0;}
 void dongle_playback_inspect_enable(bool active) {(void)active;}
 void ble_scan_diagnostic_pause(bool paused) {(void)paused;}
+bool bt_hci_airpods_flush_comparison(bool enabled) {return !enabled;}
 void dongle_playback_poll(void) {}
 uint8_t dongle_finder_start(uint8_t c) {(void)c;return DONGLE_UNSUPPORTED;}
 uint8_t dongle_finder_stop(uint8_t c) {(void)c;return DONGLE_ACCEPTED;}

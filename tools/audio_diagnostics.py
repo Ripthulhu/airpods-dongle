@@ -242,7 +242,7 @@ def decode_trace(data):
 
 def _transaction(device, payload):
     read = len(payload) == 1 and payload[0] in (5, 9, 11, 13, 15)
-    profile = len(payload) == 2 and payload[0] in (4, 12, 14) and payload[1] in (0, 1)
+    profile = len(payload) == 2 and payload[0] in (4, 12, 14, 18) and payload[1] in (0, 1)
     if not (read or profile):
         raise ValueError('Only diagnostic reads and explicit audio profiling controls are allowed')
     generation = struct.unpack_from('<I', device.get(2), 8)[0]

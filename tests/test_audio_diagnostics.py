@@ -38,9 +38,10 @@ class FakeHid:
         self.writes.append(bytes(data))
         self.report = data[:]
         if data[7] == 7:
-            assert data[20] == 1 and data[22] in (5, 9, 11, 13, 15)
+            assert ((data[20] == 1 and data[22] in (5, 9, 11, 13, 15)) or
+                    (data[20] == 2 and data[22] == 18 and data[23] in (0, 1)))
             self.report[21] = 1
-            struct.pack_into('<H', self.report, 18, 1)
+            struct.pack_into('<H', self.report, 18, data[20])
         else:
             assert data[7] in (4, 6)
             if self.unsupported:
@@ -120,6 +121,19 @@ class AudioDiagnosticsTests(unittest.TestCase):
     def test_old_firmware_unsupported(self):
         with self.assertRaises(diagnostics.Unsupported):
             diagnostics.feature(FakeHid(bytes(20), unsupported=True), 11)
+
+    def test_bounded_flush_comparison_command(self):
+        for enabled in (0, 1):
+            fake = FakeHid(b'')
+            self.assertEqual(diagnostics._transaction(fake, bytes((18, enabled))), b'')
+            self.assertEqual(fake.writes[0][22:24], bytes((18, enabled)))
+        for malformed in (b'\x12', b'\x12\x02', b'\x12\x01\x00'):
+            fake = FakeHid(b'')
+            with self.assertRaises(ValueError):
+                diagnostics._transaction(fake, malformed)
+            self.assertFalse(fake.writes)
+        with self.assertRaises(diagnostics.Unsupported):
+            diagnostics._transaction(FakeHid(b'', unsupported=True), bytes((18, 1)))
 
     def test_trace_layout_and_bounds(self):
         data = bytearray(512)
