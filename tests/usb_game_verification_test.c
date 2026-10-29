@@ -10,6 +10,8 @@ static uint32_t mic_prepare_serial;
 static uint16_t reported_delay,buffer_last,queued_target;
 static bool defer_send,control_ready,admission_busy;
 static unsigned admission_attempts;
+static bool low_latency_flush;
+static void bt_hci_airpods_flush_timeout(bool enabled) {low_latency_flush=enabled;}
 static void verification_test_buffer_cancel(void) {queued_target=0;}
 #define DONGLE_ACCEPTED 0
 static bool aacp_control_ready(void) {return control_ready;}
@@ -54,6 +56,7 @@ static void cold_prepared_before_start(void) {
     now=500;production_game_poll();assert(requests_60==1 && playback_game.waiting_report && !starts);
     fresh_report(920);
     assert(playback_game.phase==GAME_CONFIRMED && !playback_adjust_busy(&playback_adjust));
+    assert(low_latency_flush);
     assert(starts==1 && !media_tracker.streaming);
     accept(AVDTP_SI_START,5);
     assert(media_tracker.streaming && playback_pcm.priming==4800 && !playback_pcm_warm());
@@ -72,6 +75,7 @@ static void post_prime_verification_uses_fresh_send_and_report(void) {
     cold_prepared_before_start();defer_send=true;
     prime_with_real_packet_receipts();
     assert(requests_60==2 && !requests_150 && playback_game.waiting_tx);
+    assert(low_latency_flush);
     assert(!playback_adjust_busy(&playback_adjust));
     fresh_report(600); // This report predates the deferred command's real send.
     assert(playback_game.waiting_tx && !playback_adjust_busy(&playback_adjust));

@@ -59,7 +59,7 @@ static inline bool playback_options_eld_configuration(const uint8_t *p, unsigned
 enum { GAME_OFF, GAME_PENDING, GAME_SENT, GAME_CONFIRMED, GAME_FAILED, GAME_UNSUPPORTED, GAME_RESTORING };
 typedef struct {
     bool requested, changed, failed, restore_failed, active;
-    bool waiting_tx, waiting_report;
+    bool waiting_tx, waiting_report, low_latency_confirmed;
     uint8_t phase;
     uint16_t target;
     uint32_t active_since, sent_since, tx_revision, report_revision;
@@ -88,6 +88,7 @@ static inline void playback_game_request(playback_game_t *s, bool enabled) {
 static inline void playback_game_queued(playback_game_t *s, uint16_t target,
                                          uint32_t now, uint32_t tx_revision) {
     s->target=target; s->changed=true; s->waiting_tx=true; s->waiting_report=false;
+    if (target!=60) s->low_latency_confirmed=false;
     s->sent_since=now; s->tx_revision=tx_revision;
     s->phase=target==60 ? GAME_PENDING : GAME_RESTORING;
 }
@@ -100,6 +101,7 @@ static inline void playback_game_observe_send(playback_game_t *s, uint32_t now,
     s->phase=s->target==60 ? GAME_SENT : GAME_RESTORING;
 }
 static inline void playback_game_session_lost(playback_game_t *s) {
+    s->low_latency_confirmed=false;
     s->waiting_tx=s->waiting_report=false;
     if (s->changed) s->phase=GAME_RESTORING;
     else { s->target=0; s->phase=s->requested ? GAME_PENDING : GAME_OFF; }
@@ -113,6 +115,7 @@ static inline uint16_t playback_game_step(playback_game_t *s, bool available,
     if (s->waiting_report && (uint32_t)(now-s->sent_since)<2000 &&
         report_revision!=s->report_revision && delay && delay!=UINT16_MAX) {
         s->waiting_report=false;
+        s->low_latency_confirmed=s->target==60;
         if (s->target==150) { s->changed=false; s->phase=s->failed ? GAME_FAILED : s->requested ? GAME_PENDING : GAME_OFF; }
         else s->phase=GAME_CONFIRMED;
     }

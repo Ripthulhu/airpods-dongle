@@ -48,6 +48,22 @@ static struct {
     bool armed;
 } credit_roles[2];
 
+static struct {
+    bd_addr_t address;
+    uint32_t epoch, since;
+    uint16_t handle, desired_ms, confirmed_ms;
+    uint8_t status;
+    bool failed;
+} media_flush;
+static struct {
+    uint32_t epoch, since, link_epoch;
+    uint16_t handle, milliseconds;
+    bool active;
+} media_flush_pending;
+// Observe BTstack's initial 200-ms ACK before issuing another command on that ACL.
+static struct { uint16_t handle, confirmed_ms; uint32_t epoch; } media_flush_links[2];
+static uint32_t media_flush_link_epoch;
+
 typedef struct {
     uint8_t version;
     uint8_t address[6];
@@ -59,6 +75,138 @@ static bool airpods_address(const uint8_t address[6]) {
         (memcmp(address, device_addr, 6) == 0 ||
          memcmp(address, device_addr_list[0], 6) == 0 ||
          memcmp(address, device_addr_list[1], 6) == 0);
+}
+
+static void media_flush_forget(void) {
+    ++media_flush.epoch;
+    media_flush.handle = HCI_CON_HANDLE_INVALID;
+    media_flush.desired_ms = 200;
+    media_flush.confirmed_ms = 0;
+    media_flush.status = UINT8_MAX;
+    media_flush.failed = false;
+    media_flush.since = btstack_run_loop_get_time_ms();
+    memset(media_flush.address, 0, sizeof(media_flush.address));
+}
+static uint16_t media_flush_known_timeout(uint16_t handle) {
+    for (unsigned i = 0; i < 2; ++i)
+        if (media_flush_links[i].handle == handle) return media_flush_links[i].confirmed_ms;
+    return 0;
+}
+static hci_connection_t *media_flush_bind(void) {
+    hci_connection_t *connection = peer_address_valid(device_addr) ?
+        hci_connection_for_bd_addr_and_type(device_addr, BD_ADDR_TYPE_ACL) : NULL;
+    if (connection == NULL || connection->address_type != BD_ADDR_TYPE_ACL || connection->state != OPEN ||
+        memcmp(connection->address, device_addr, 6)) {
+        if (media_flush.handle != HCI_CON_HANDLE_INVALID) media_flush_forget();
+        return NULL;
+    }
+    if (media_flush.handle != connection->con_handle || memcmp(media_flush.address, device_addr, 6)) {
+        media_flush_forget();
+        media_flush.handle = connection->con_handle;
+        memcpy(media_flush.address, device_addr, 6);
+        media_flush.confirmed_ms = media_flush_known_timeout(connection->con_handle);
+        if (media_flush.confirmed_ms) {
+            media_flush.status = ERROR_CODE_SUCCESS;
+        }
+    }
+    return connection;
+}
+void bt_hci_airpods_flush_timeout(bool low_latency) {
+    if (media_flush_bind() == NULL || !hci_non_flushable_packet_boundary_flag_supported()) return;
+    uint16_t desired = low_latency ? 60 : 200;
+    if (desired != media_flush.desired_ms) {
+        media_flush.desired_ms = desired;
+        media_flush.failed = false;
+    }
+}
+static void media_flush_poll(void) {
+    hci_connection_t *connection = media_flush_bind();
+    if (media_flush_pending.active) {
+        if ((uint32_t)(btstack_run_loop_get_time_ms() - media_flush_pending.since) >= 1000u &&
+            media_flush_pending.epoch == media_flush.epoch) {
+            media_flush.failed = true;
+            media_flush.status = UINT8_MAX;
+        }
+        // A late ACK has no transaction ID; do not overlap another same-opcode command.
+        return;
+    }
+    if (connection != NULL && !media_flush_known_timeout(connection->con_handle) &&
+        hci_non_flushable_packet_boundary_flag_supported() &&
+        (uint32_t)(btstack_run_loop_get_time_ms() - media_flush.since) >= 1000u) {
+        media_flush.failed = true;
+        media_flush.status = UINT8_MAX;
+    }
+    if (connection == NULL || !hci_non_flushable_packet_boundary_flag_supported() ||
+        !media_flush_known_timeout(connection->con_handle) || media_flush.failed ||
+        media_flush.desired_ms == media_flush.confirmed_ms || !hci_can_send_command_packet_now()) return;
+    media_flush_pending.epoch = media_flush.epoch;
+    media_flush_pending.handle = connection->con_handle;
+    media_flush_pending.milliseconds = media_flush.desired_ms;
+    media_flush_pending.since = btstack_run_loop_get_time_ms();
+    for (unsigned i = 0; i < 2; ++i)
+        if (media_flush_links[i].handle == connection->con_handle)
+            media_flush_pending.link_epoch = media_flush_links[i].epoch;
+    media_flush_pending.active = true;
+    uint8_t status = hci_send_cmd(&hci_write_automatic_flush_timeout, connection->con_handle,
+                                 media_flush.desired_ms * 8u / 5u);
+    if (status != ERROR_CODE_SUCCESS && media_flush_pending.active &&
+        media_flush_pending.epoch == media_flush.epoch) {
+        media_flush_pending.active = false;
+        media_flush.failed = true;
+        media_flush.status = status;
+    }
+}
+static void media_flush_event(const uint8_t *p, uint16_t size) {
+    if (p[0] == BTSTACK_EVENT_STATE && size >= 3 && p[2] != HCI_STATE_WORKING) {
+        media_flush_forget();
+        media_flush_pending.active = false;
+        media_flush_links[0].handle = media_flush_links[1].handle = HCI_CON_HANDLE_INVALID;
+    } else if (p[0] == HCI_EVENT_DISCONNECTION_COMPLETE && size == 6 && p[2] == 0) {
+        uint16_t handle = (uint16_t)p[3] | (uint16_t)p[4] << 8;
+        for (unsigned i = 0; i < 2; ++i)
+            if (media_flush_links[i].handle == handle) media_flush_links[i].handle = HCI_CON_HANDLE_INVALID;
+        if (media_flush.handle == handle) media_flush_forget();
+    } else if (p[0] == HCI_EVENT_COMMAND_COMPLETE && size == 8 &&
+        ((uint16_t)p[3] | (uint16_t)p[4] << 8) == HCI_OPCODE_HCI_WRITE_AUTOMATIC_FLUSH_TIMEOUT) {
+        uint16_t handle = (uint16_t)p[6] | (uint16_t)p[7] << 8;
+        (void)media_flush_bind();
+        if (media_flush_pending.active && media_flush_pending.handle == handle) {
+            media_flush_pending.active = false;
+            if (p[5] == ERROR_CODE_SUCCESS) {
+                for (unsigned i = 0; i < 2; ++i)
+                    if (media_flush_links[i].handle == handle &&
+                        media_flush_links[i].epoch == media_flush_pending.link_epoch)
+                        media_flush_links[i].confirmed_ms = media_flush_pending.milliseconds;
+            }
+            if (media_flush_pending.epoch != media_flush.epoch) return;
+            media_flush.status = p[5];
+            media_flush.failed = p[5] != ERROR_CODE_SUCCESS &&
+                media_flush.desired_ms == media_flush_pending.milliseconds;
+            if (p[5] == ERROR_CODE_SUCCESS) {
+                media_flush.confirmed_ms = media_flush_pending.milliseconds;
+            }
+            return;
+        }
+        hci_connection_t *connection = hci_connection_for_handle(handle);
+        if (connection == NULL || connection->address_type != BD_ADDR_TYPE_ACL ||
+            connection->state != OPEN || !airpods_address(connection->address) ||
+            media_flush_known_timeout(handle)) return;
+        if (p[5] == ERROR_CODE_SUCCESS) {
+            for (unsigned i = 0; i < 2; ++i) {
+                if (media_flush_links[i].handle != HCI_CON_HANDLE_INVALID) continue;
+                media_flush_links[i].handle = handle;
+                media_flush_links[i].confirmed_ms = 200;
+                if (++media_flush_link_epoch == 0) ++media_flush_link_epoch;
+                media_flush_links[i].epoch = media_flush_link_epoch;
+                break;
+            }
+        }
+        if (media_flush.handle == handle) {
+            media_flush.status = p[5];
+            media_flush.failed = p[5] != ERROR_CODE_SUCCESS;
+            if (p[5] == ERROR_CODE_SUCCESS) media_flush.confirmed_ms = 200;
+        }
+    }
 }
 
 static void phone_load(void) {
@@ -149,6 +297,11 @@ bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out) {
     out->raw_acl_length = credit_raw_acl_length;
     out->airpods = credit_roles[0].totals;
     out->phone = credit_roles[1].totals;
+    out->media_flush_desired_ms = media_flush.desired_ms;
+    out->media_flush_confirmed_ms = media_flush.confirmed_ms;
+    out->media_flush_status = media_flush.status;
+    out->media_flush_pending = media_flush_pending.active;
+    out->media_flush_failed = media_flush.failed;
     credit_link(device_addr, &out->airpods_handle, &out->airpods_local_role);
     credit_link(phone_address, &out->phone_handle, &out->phone_local_role);
     if (out->phone_handle == HCI_CON_HANDLE_INVALID)
@@ -190,6 +343,7 @@ static void phone_pairing_stop(void) {
 }
 
 void bt_hci_phone_poll(void) {
+    media_flush_poll();
     if (!phone_pairing_audio_busy()) credit_roles[0].armed = credit_roles[1].armed = false;
     if (phone_pairing && !bt_hci_phone_pairing_active()) phone_pairing_stop();
 }
@@ -317,6 +471,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     UNUSED(channel);
     if (packet_type != HCI_EVENT_PACKET || size < 2 || (unsigned)packet[1] + 2 != size) return;
     credit_event(packet, size);
+    media_flush_event(packet, size);
     dongle_playback_controller_event(packet,size);
     uint8_t status;
     UNUSED(status);
@@ -477,6 +632,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 static btstack_packet_callback_registration_t hci_state_callback_registration;
 
 void bt_hci_init(void){
+    media_flush_forget();
+    media_flush_pending.active = false;
+    media_flush_links[0].handle = media_flush_links[1].handle = HCI_CON_HANDLE_INVALID;
     phone_session_generation = 0;
     phone_session_handle = HCI_CON_HANDLE_INVALID;
     memset(phone_session_address, 0, sizeof(phone_session_address));

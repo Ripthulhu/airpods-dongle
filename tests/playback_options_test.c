@@ -115,7 +115,9 @@ static void test_game_faults_wrap_and_session_loss(void) {
     playback_game_queued(&s,60,UINT32_MAX-999,UINT32_MAX);
     playback_game_observe_send(&s,UINT32_MAX-998,1,60,UINT32_MAX);
     assert(!playback_game_step(&s,true,true,true,0,1,600) && s.phase==GAME_CONFIRMED);
+    assert(s.low_latency_confirmed);
     playback_game_session_lost(&s);
+    assert(!s.low_latency_confirmed);
     assert(!playback_game_step(&s,false,false,false,1,0,UINT16_MAX) && s.phase==GAME_RESTORING);
     assert(playback_game_step(&s,true,true,true,100,1,600)==150);
     playback_game_queued(&s,150,100,1); playback_game_observe_send(&s,101,2,150,1);

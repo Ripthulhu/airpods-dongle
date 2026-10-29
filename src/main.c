@@ -94,6 +94,9 @@ static void realtime_metrics_print(void) {
     printf("[LINKS] airpods_handle=0x%04x airpods_local_role=%u phone_handle=0x%04x phone_local_role=%u\n",
         (unsigned)credits.airpods_handle, (unsigned)credits.airpods_local_role,
         (unsigned)credits.phone_handle, (unsigned)credits.phone_local_role);
+    printf("[FLUSH] desired_ms=%u confirmed_ms=%u pending=%u failed=%u status=%u\n",
+        credits.media_flush_desired_ms,credits.media_flush_confirmed_ms,
+        credits.media_flush_pending,credits.media_flush_failed,credits.media_flush_status);
 }
 
 void aacp_mic_dec_wake_worker(void) {

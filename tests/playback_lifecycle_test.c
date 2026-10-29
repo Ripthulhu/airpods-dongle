@@ -132,6 +132,7 @@ void avdtp_source_establish_stream(void);
 
 // The runner extracts these functions and this callback case from the firmware.
 #include "playback_cancel.inc"
+static void bt_hci_airpods_flush_timeout(bool enabled) {(void)enabled;}
 #include "playback_lifecycle.inc"
 static void signaling_released(uint16_t cid) {
     const uint16_t *packet = &cid;

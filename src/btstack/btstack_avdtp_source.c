@@ -168,12 +168,12 @@ static uint32_t volume_changed_reports, volume_interim_reports, volume_ack_repor
 static uint32_t volume_target_requests;
 static struct {
     uint32_t generation, set_revision, sent, expected, since;
-    uint32_t readback_after, readback_since, physical_generation;
+    uint32_t readback_after, readback_since, physical_generation, acknowledged_generation;
     uint16_t cid;
     uint8_t anchor, target_level, host_level;
     bool enabled, waiting, owned, delivered, restoring, host_pending, target_known;
     bool headroom_attempted, readback_pending, readback_baseline;
-    bool host_deferred;
+    bool host_deferred, host_exact;
     uint32_t deferred_epoch;
     uint8_t deferred_level, deferred_label;
     bool deferred_interim;
@@ -705,6 +705,7 @@ static void bt_volume_relay_reset(bool peer_changed) {
         if (deferred) {
             usb_volume_relay.host_level=host_level;
             usb_volume_relay.host_pending=usb_volume_relay.host_deferred=true;
+            usb_volume_relay.host_exact=true;
         }
     }
 }
@@ -830,6 +831,10 @@ static void bt_volume_publish(void) {
     if (!aacp_audio_owned() || bt_volume_host_managed()) return;
     uint8_t level;
     if (volume_sync_get(&sink_volume, &level)) {
+        // Keep the host's finer dB value when AVRCP confirms its coarser mapping.
+        if (usb_volume_relay.host_exact && usb_volume_relay.generation==usb_media_generation() &&
+            usb_volume_relay.set_revision==usb_volume_set_revision() && level==usb_volume_relay.host_level) return;
+        usb_volume_relay.host_exact=false;
         _bt_sink_volume_changed = true;
         phone_sink_volume_changed(level);
     } else if (!sink_volume.pending && !sink_volume.inflight) {
@@ -845,7 +850,7 @@ void set_bt_volume(int16_t db256) {
     bt_volume_select_peer();
     if (volume_sync_request(&sink_volume, usb_volume_to_bt(db256), false,
                            btstack_run_loop_get_time_ms()) && !sink_volume.pending)
-        bt_volume_publish(); // Normalize a fractional USB request to confirmed readback.
+        bt_volume_publish();
 }
 void set_bt_volume_from_usb(int16_t db256,uint32_t revision,uint32_t generation,uint32_t receipt) {
     if (revision!=usb_volume_set_revision() || generation!=usb_media_generation() || !usb_host_active()) return;
@@ -862,6 +867,8 @@ void set_bt_volume_from_usb(int16_t db256,uint32_t revision,uint32_t generation,
     usb_volume_relay.delivered=usb_volume_relay.waiting && usb_volume_relay.sent==usb_volume_relay.expected;
     usb_volume_relay.restoring=false;
     usb_volume_relay.host_pending=true;
+    usb_volume_relay.host_exact=true;
+    _bt_sink_volume_changed=false;
     usb_volume_relay.headroom_attempted=false;
     usb_volume_relay.readback_pending=false;
     usb_volume_relay.deferred_interim=false;
@@ -1010,6 +1017,9 @@ static void bt_volume_notification(uint16_t cid,uint8_t ctype,uint8_t level,uint
         return; // AOSP model: CHANGED triggers a fresh INTERIM; its payload is not a gesture.
     }
     if (!deferred) ++volume_interim_reports;
+    // A registration sent before a newer SET ACK may still contain the old gain.
+    if (usb_volume_relay.acknowledged_generation &&
+        (int32_t)(epoch-usb_volume_relay.acknowledged_generation)<=0) return;
     if ((usb_volume_relay.physical_generation && (int32_t)(epoch-usb_volume_relay.physical_generation)<=0) ||
         (usb_volume_relay.readback_pending && (int32_t)(epoch-usb_volume_relay.readback_after)<=0)) return;
     // Managed observations keep receive order; a later SET ACK supersedes an earlier INTERIM.
@@ -1130,6 +1140,16 @@ static bool bt_volume_controller_event(const uint8_t *packet,uint16_t size) {
                     packet[5]==AVRCP_CTYPE_RESPONSE_ACCEPTED,packet[6])) {
                 if (packet[5]==AVRCP_CTYPE_RESPONSE_ACCEPTED) {
                     bt_volume_observed();
+                    // Fence only an INTERIM still in transit; an already observed gesture keeps its ordering.
+                    if (connection->controller_volume_active && !connection->controller_volume_interim) {
+                        usb_volume_relay.acknowledged_generation=connection->controller_volume_generation;
+                        if (usb_volume_relay.deferred_interim &&
+                            (int32_t)(usb_volume_relay.deferred_epoch-usb_volume_relay.acknowledged_generation)<=0)
+                            usb_volume_relay.deferred_interim=false;
+                        if (usb_volume_relay.readback_pending &&
+                            (int32_t)(usb_volume_relay.acknowledged_generation-usb_volume_relay.readback_after)>0)
+                            usb_volume_relay.readback_pending=false;
+                    }
                     if (bt_volume_host_managed()) {
                         usb_volume_relay.readback_pending=false;
                         usb_volume_relay.deferred_interim=false;
@@ -3377,7 +3397,7 @@ void dongle_playback_poll(void) {
     (void)playback_usb_verify_poll(now); // Revoke a stale verification before worker callbacks.
     if(inspect_enabled && (int32_t)(now-inspect_deadline)>=0)inspect_enabled=false;
     playback_audio_work(now);
-    if (playback_phone_recovery_poll()) return;
+    if (playback_phone_recovery_poll()) { bt_hci_airpods_flush_timeout(false); return; }
     if (profile_pending && (!peer || memcmp(peer,profile_peer,6))) {
         profile_pending=profile_reconnect=false; playback_options=profile_previous;
     }
@@ -3415,6 +3435,7 @@ void dongle_playback_poll(void) {
     if (mic_recovery_pending) {
         if ((uint32_t)(now-mic_recovery_since)>=8000u) {
             dongle_playback_mic_recovery_abort();
+            bt_hci_airpods_flush_timeout(false);
             return;
         }
         if (!mic_recovery_started && (playback_idle_phase==PLAYBACK_SUSPENDED ||
@@ -3482,6 +3503,10 @@ void dongle_playback_poll(void) {
         else if (playback_game.phase==GAME_PENDING && playback_game.changed)
             playback_game.phase=GAME_CONFIRMED;
     }
+    bt_hci_airpods_flush_timeout(available && playback_game_eligible() &&
+        playback_game.requested && playback_game.low_latency_confirmed &&
+        !playback_game.failed && !playback_game.restore_failed &&
+        !aacp_mic_requested() && !aacp_mic_active());
     playback_idle_poll(now);
     playback_reconnect_poll(now);
     avrcp_reconnect_poll(now);

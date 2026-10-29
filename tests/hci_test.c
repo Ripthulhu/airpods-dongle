@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include "hci_stubs/btstack.h"
 
 // The transport header has unrelated static encoder declarations.
@@ -16,6 +17,10 @@ static uint8_t slot, inquiry_result;
 static unsigned connect_calls, inquiry_calls, inquiry_stops, writes, pin_calls;
 static unsigned registered;
 static uint16_t flush_timeout;
+static unsigned flush_writes;
+static uint16_t flush_handle, flush_slots;
+static bool command_ready;
+static uint8_t command_result;
 static bool ble_ready;
 static bool fail_storage;
 static uint32_t now;
@@ -51,6 +56,18 @@ void ble_scan_set_paused(uint32_t reason, bool paused) {
     else ble_pauses &= ~reason;
 }
 void gap_enable_link_watchdog(uint16_t timeout) { flush_timeout = timeout; }
+const hci_cmd_t hci_write_automatic_flush_timeout = {HCI_OPCODE_HCI_WRITE_AUTOMATIC_FLUSH_TIMEOUT};
+bool hci_can_send_command_packet_now(void) { return command_ready; }
+uint8_t hci_send_cmd(const hci_cmd_t *cmd, ...) {
+    assert(cmd == &hci_write_automatic_flush_timeout);
+    va_list args;
+    va_start(args, cmd);
+    flush_handle = (uint16_t)va_arg(args, int);
+    flush_slots = (uint16_t)va_arg(args, unsigned);
+    va_end(args);
+    ++flush_writes;
+    return command_result;
+}
 bool hci_non_flushable_packet_boundary_flag_supported(void) { return non_flushable; }
 void gap_pin_code_response(bd_addr_t address, const char *pin) {
     (void)address;
@@ -188,6 +205,8 @@ static void fixture(void) {
     inquiry_result = 0;
     connect_calls = inquiry_calls = inquiry_stops = writes = pin_calls = registered = 0;
     flush_timeout = UINT16_MAX;
+    flush_writes = 0;flush_handle = flush_slots = 0;
+    command_ready = true;command_result = 0;
     ble_ready = false;
     fail_storage = false;
     ble_pauses = 0;
@@ -777,7 +796,105 @@ static void test_current_link_roles(void) {
     assert(data.phone_handle==HCI_CON_HANDLE_INVALID && data.phone_local_role==UINT8_MAX);
 }
 
+static void flush_ack(uint16_t handle, uint8_t status) {
+    uint8_t p[] = {HCI_EVENT_COMMAND_COMPLETE,6,1,0x28,0x0c,status,
+        (uint8_t)handle,(uint8_t)(handle >> 8)};
+    hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void flush_fixture(void) {
+    fixture();memcpy(saved[0],first,6);has_key[0]=true;bt_hci_init();
+    credit_connections[0] = (hci_connection_t){.con_handle=0x11,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};
+    credit_connections[1] = (hci_connection_t){.con_handle=0x22,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};
+    memcpy(credit_connections[0].address,first,6);memcpy(credit_connections[1].address,nearby,6);
+}
+static void test_media_flush_targets_only_airpods_and_confirms_ack(void) {
+    flush_fixture();
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+    assert(!flush_writes); // BTstack's initial 200-ms write must finish first.
+    flush_ack(0x22,0);bt_hci_phone_poll();assert(!flush_writes);
+    flush_ack(0x11,0);
+    command_ready=false;bt_hci_phone_poll();assert(!flush_writes);
+    command_ready=true;bt_hci_phone_poll();
+    assert(flush_writes==1 && flush_handle==0x11 && flush_slots==96 && media_flush_pending.active);
+    assert(media_flush.confirmed_ms==200);
+    bt_hci_phone_poll();bt_hci_airpods_flush_timeout(true);assert(flush_writes==1);
+    flush_ack(0x22,0);assert(media_flush_pending.active && media_flush.confirmed_ms==200);
+    uint8_t short_ack[]={HCI_EVENT_COMMAND_COMPLETE,5,1,0x28,0x0c,0,0x11};
+    hci_packet_handler(HCI_EVENT_PACKET,0,short_ack,sizeof(short_ack));
+    assert(media_flush_pending.active);
+    flush_ack(0x11,0);assert(!media_flush_pending.active && media_flush.confirmed_ms==60);
+    bt_hci_phone_poll();assert(flush_writes==1);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(flush_writes==2 && flush_handle==0x11 && flush_slots==320);
+    flush_ack(0x11,0);bt_hci_phone_poll();assert(flush_writes==2 && media_flush.confirmed_ms==200);
+    assert(flush_timeout==UINT16_MAX); // No global policy write or phone-ACL mutation.
+
+    flush_fixture();non_flushable=false;
+    bt_hci_airpods_flush_timeout(true);flush_ack(0x11,0);bt_hci_phone_poll();assert(!flush_writes);
+}
+static void test_media_flush_failures_and_superseded_commands_are_bounded(void) {
+    flush_fixture();flush_ack(0x11,0);bt_hci_airpods_flush_timeout(true);
+    command_result=0x0c;bt_hci_phone_poll();
+    assert(flush_writes==1 && media_flush.failed && !media_flush_pending.active);
+    for(unsigned i=0;i<100;++i)bt_hci_phone_poll();
+    assert(flush_writes==1 && media_flush.confirmed_ms==200);
+    bt_hci_airpods_flush_timeout(false);bt_hci_airpods_flush_timeout(true);
+    command_result=0;bt_hci_phone_poll();assert(flush_writes==2);
+    flush_ack(0x11,0x0c);assert(media_flush.failed && media_flush.confirmed_ms==200);
+    bt_hci_phone_poll();assert(flush_writes==2);
+    bt_hci_airpods_flush_timeout(false);bt_hci_airpods_flush_timeout(true);
+    now=UINT32_MAX-499u;bt_hci_phone_poll();assert(flush_writes==3);
+    now=500;bt_hci_phone_poll();
+    assert(media_flush.failed && media_flush_pending.active && media_flush.status==UINT8_MAX);
+    bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();assert(flush_writes==3);
+    flush_ack(0x11,0); // A late successful 60-ms command still requires normal restoration.
+    assert(media_flush.confirmed_ms==60 && !media_flush.failed);
+    bt_hci_phone_poll();assert(flush_writes==4 && flush_slots==320);
+    flush_ack(0x11,0);assert(media_flush.confirmed_ms==200);
+
+    flush_fixture();bt_hci_airpods_flush_timeout(true);now=1000;bt_hci_phone_poll();
+    assert(!flush_writes && media_flush.failed && !media_flush.confirmed_ms);
+    flush_ack(0x11,0);bt_hci_phone_poll();assert(flush_writes==1 && !media_flush.failed);
+    bt_hci_airpods_flush_timeout(false);flush_ack(0x11,0x0c);bt_hci_phone_poll();
+    assert(flush_writes==1 && !media_flush.failed && media_flush.confirmed_ms==200);
+}
+static void test_media_flush_reconnect_ack_cannot_confirm_new_epoch(void) {
+    flush_fixture();flush_ack(0x11,0);bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+    uint32_t epoch=media_flush.epoch;
+    uint8_t disconnected[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnected,sizeof(disconnected));
+    bt_hci_airpods_flush_timeout(true); // Same handle/address may be reused before the next poll.
+    assert(media_flush.epoch!=epoch && media_flush.confirmed_ms==0);
+    bt_hci_phone_poll();assert(flush_writes==1);
+    flush_ack(0x11,0);assert(media_flush.confirmed_ms==0 && !media_flush_pending.active);
+    bt_hci_phone_poll();assert(flush_writes==1);
+    flush_ack(0x11,0);bt_hci_phone_poll(); // New epoch's SDK startup write, then our own command.
+    assert(flush_writes==2 && media_flush.confirmed_ms==200);
+    flush_ack(0x11,0);assert(media_flush.confirmed_ms==60);
+    uint8_t off[]={BTSTACK_EVENT_STATE,1,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,off,sizeof(off));
+    assert(!media_flush_pending.active && media_flush.handle==HCI_CON_HANDLE_INVALID);
+}
+static void test_media_flush_selected_peer_remembers_confirmed_value(void) {
+    flush_fixture();memcpy(saved[1],second,6);memcpy(device_addr_list[1],second,6);
+    credit_connections[2] = (hci_connection_t){.con_handle=0x33,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};
+    memcpy(credit_connections[2].address,second,6);
+    flush_ack(0x11,0);flush_ack(0x33,0);
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();
+    assert(flush_writes==1 && media_flush.confirmed_ms==200);
+    memcpy(device_addr,second,6);bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(flush_writes==1 && media_flush.handle==0x33 && media_flush.confirmed_ms==200);
+    flush_ack(0x11,0);assert(media_flush.confirmed_ms==200); // Old peer's ACK updates only its own ACL record.
+    memcpy(device_addr,first,6);bt_hci_airpods_flush_timeout(false);bt_hci_phone_poll();
+    assert(flush_writes==2 && flush_handle==0x11 && flush_slots==320 && media_flush.confirmed_ms==60);
+    flush_ack(0x11,0);assert(media_flush.confirmed_ms==200);
+}
+
 int main(void) {
+    test_media_flush_targets_only_airpods_and_confirms_ack();
+    test_media_flush_failures_and_superseded_commands_are_bounded();
+    test_media_flush_reconnect_ack_cannot_confirm_new_epoch();
+    test_media_flush_selected_peer_remembers_confirmed_value();
     test_authenticated_phone_acl_session();
     test_current_link_roles();
     test_credit_diagnostics();
@@ -794,6 +911,6 @@ int main(void) {
     test_phone_pairing_survives_idle_output_transitions();
     test_new_phone_pairing_requires_quiet_routes();
     test_phone_candidate_timeout_and_busy_poll_close_only_candidate();
-    puts("HCI selected-peer ownership, quiet phone pairing/authentication/storage and BLE coordination: 14 groups passed");
+    puts("HCI selected-peer ownership, per-AirPods media flush, quiet phone pairing/authentication/storage and BLE coordination passed");
     return 0;
 }

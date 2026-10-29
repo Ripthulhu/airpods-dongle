@@ -12,6 +12,14 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.47** preserves fine USB volume requests when the AirPods confirm
+their coarser volume step, and rejects older pending volume readback after a
+newer accepted write. Game Mode now requests the captured 60-ms controller flush
+timeout on the selected AirPods connection, restoring 200 ms outside that mode.
+Build and regression checks pass. The PC board is updated with pairing preserved;
+normal controller timeout is confirmed, and listening validation is pending.
+See [validation](docs/VALIDATION-0.1.47.md).
+
 Candidate **0.1.46** allows an explicit runtime BOOTSEL request during playback,
 recording, calls or audio transitions. It interrupts audio through the SDK's
 chip reset after a bounded reply delay, retaining DTR/session fencing and board

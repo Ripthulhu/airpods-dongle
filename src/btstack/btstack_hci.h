@@ -26,6 +26,8 @@ bool bt_hci_phone_peer_connected(const uint8_t address[6]);
 uint32_t bt_hci_phone_session(const uint8_t address[6]);
 bool bt_hci_phone_address(uint8_t address[6]);
 void bt_hci_phone_poll(void);
+// Only the selected AirPods ACL changes; control packets remain non-flushable.
+void bt_hci_airpods_flush_timeout(bool low_latency);
 
 typedef struct {
     uint32_t events, packets, max_active_gap_ms;
@@ -37,6 +39,9 @@ typedef struct {
     uint16_t airpods_handle, phone_handle;
     // Actual local HCI role: 0 master, 1 slave, 255 unavailable.
     uint8_t airpods_local_role, phone_local_role;
+    uint16_t media_flush_desired_ms, media_flush_confirmed_ms;
+    uint8_t media_flush_status;
+    bool media_flush_pending, media_flush_failed;
 } bt_hci_credit_diagnostics_t;
 // Read under the Bluetooth lock; false means Read Buffer Size has not succeeded.
 bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out);
