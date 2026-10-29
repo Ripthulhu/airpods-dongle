@@ -33,6 +33,9 @@ static unsigned packet_writes;
 static uint16_t packet_handle, packet_mask, usable_packet_mask;
 static uint8_t packet_result;
 static bool packet_sync_complete, consume_command_credit;
+static unsigned radio_writes;
+static uint16_t radio_opcode, radio_handle;
+static uint8_t radio_power_type, radio_result;
 static void packet_status(uint8_t status);
 static void packet_changed(uint16_t handle,uint16_t mask,uint8_t status);
 static bool ble_ready;
@@ -70,14 +73,24 @@ void ble_scan_set_paused(uint32_t reason, bool paused) {
     else ble_pauses &= ~reason;
 }
 void gap_enable_link_watchdog(uint16_t timeout) { flush_timeout = timeout; }
-const hci_cmd_t hci_write_automatic_flush_timeout = {HCI_OPCODE_HCI_WRITE_AUTOMATIC_FLUSH_TIMEOUT};
-const hci_cmd_t hci_change_connection_packet_type = {HCI_OPCODE_HCI_CHANGE_CONNECTION_PACKET_TYPE};
+const hci_cmd_t hci_write_automatic_flush_timeout = {HCI_OPCODE_HCI_WRITE_AUTOMATIC_FLUSH_TIMEOUT,"H2"};
+const hci_cmd_t hci_change_connection_packet_type = {HCI_OPCODE_HCI_CHANGE_CONNECTION_PACKET_TYPE,"H2"};
+const hci_cmd_t hci_read_rssi={HCI_OPCODE_HCI_READ_RSSI,"H"};
+const hci_cmd_t hci_read_link_quality={HCI_OPCODE_HCI_READ_LINK_QUALITY,"H"};
+const hci_cmd_t hci_read_transmit_power_level={HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL,"H1"};
 uint16_t hci_usable_acl_packet_types(void) {return usable_packet_mask;}
 bool hci_can_send_command_packet_now(void) { return command_ready; }
 uint8_t hci_send_cmd(const hci_cmd_t *cmd, ...) {
     va_list args;
     va_start(args, cmd);
     uint16_t handle = (uint16_t)va_arg(args, int);
+    if(cmd==&hci_read_rssi || cmd==&hci_read_link_quality || cmd==&hci_read_transmit_power_level || cmd->opcode==0x1406) {
+        radio_opcode=cmd->opcode;radio_handle=handle;++radio_writes;
+        radio_power_type=cmd==&hci_read_transmit_power_level?(uint8_t)va_arg(args,int):0;
+        va_end(args);
+        if(consume_command_credit)command_ready=false;
+        return radio_result;
+    }
     uint16_t value = (uint16_t)va_arg(args, int);
     va_end(args);
     if(consume_command_credit)command_ready=false;
@@ -231,6 +244,7 @@ static void fixture(void) {
     packet_writes=0;packet_handle=packet_mask=0;usable_packet_mask=0xcc18;packet_result=0;
     packet_sync_complete=false;
     consume_command_credit=false;
+    radio_writes=0;radio_opcode=radio_handle=0;radio_power_type=radio_result=0;
     ble_ready = false;
     fail_storage = false;
     ble_pauses = 0;
@@ -1156,7 +1170,121 @@ static void test_media_packet_old_peer_restore_phone_exclusion_and_handle_reuse(
         media_packets[1].handle==HCI_CON_HANDLE_INVALID);
 }
 
+static void radio_reply(uint16_t opcode,uint16_t handle,uint8_t value,uint8_t status) {
+    uint8_t p[19]={HCI_EVENT_COMMAND_COMPLETE,7,1,(uint8_t)opcode,(uint8_t)(opcode>>8),status,
+        (uint8_t)handle,(uint8_t)(handle>>8),value};
+    if(opcode==0x1406) {p[1]=17;memset(p+9,0xff,9);p[18]=0x7f;}
+    hci_packet_handler(HCI_EVENT_PACKET,0,p,opcode==0x1406?19:9);
+}
+static void radio_fixture(void) {
+    packet_normal_fixture();bt_hci_radio_active(true);bt_hci_phone_poll();
+    assert(radio_writes==1 && radio_opcode==0x1405 && radio_handle==0x11);
+}
+static void test_radio_sampling_is_sparse_read_only_and_cached(void) {
+    assert(sizeof(radio)+sizeof(radio_pending)+sizeof(radio_epoch)<=128);
+    radio_fixture();radio_reply(radio_opcode,0x11,(uint8_t)-12,0);
+    bt_hci_phone_poll();assert(radio_writes==2 && radio_opcode==0x1403);radio_reply(radio_opcode,0x11,201,0);
+    bt_hci_phone_poll();assert(radio_writes==3 && radio_opcode==0x0c2d && !radio_power_type);radio_reply(radio_opcode,0x11,4,0);
+    bt_hci_phone_poll();assert(radio_writes==4 && radio_opcode==0x0c2d && radio_power_type==1);radio_reply(radio_opcode,0x11,10,0);
+    bt_hci_phone_poll();assert(radio_writes==5 && radio_opcode==0x1406);radio_reply(radio_opcode,0x11,1,0);
+    bt_hci_radio_diagnostics_t out;assert(bt_hci_radio_diagnostics(&out));
+    assert(out.valid==31 && !out.failed && !out.unavailable && out.active && !out.pending && out.rssi==-12 &&
+        out.quality==201 && out.tx_power==4 && out.max_tx_power==10 && out.afh_mode==1 && out.afh_map[9]==0x7f);
+    for(unsigned i=0;i<5;++i)assert(out.age_ms[i]==0);
+    now=1999;
+    for(unsigned i=0;i<10;++i){assert(bt_hci_radio_diagnostics(&out));bt_hci_phone_poll();}
+    assert(radio_writes==5 && out.age_ms[0]==1999);
+    now=2000;bt_hci_phone_poll();assert(radio_writes==6 && radio_opcode==0x1405);radio_reply(radio_opcode,0x11,0,0);
+    bt_hci_phone_poll();assert(radio_writes==7 && radio_opcode==0x1403);radio_reply(radio_opcode,0x11,220,0);
+    bt_hci_phone_poll();assert(radio_writes==7);
+    now=10000;
+    const uint16_t expected[]={0x0c2d,0x1406,0x1405,0x1403};
+    for(unsigned i=0;i<4;++i){
+        bt_hci_phone_poll();assert(radio_opcode==expected[i] && !radio_power_type);
+        radio_reply(radio_opcode,0x11,radio_opcode==0x1406?0:7,0);
+    }
+    bt_hci_radio_diagnostics(&out);assert(out.afh_mode==0 && !out.afh_map[0] && out.max_tx_power==10);
+    bt_hci_radio_active(false);now=100000;bt_hci_phone_poll();assert(radio_writes==11);
+    assert(bt_hci_radio_diagnostics(&out) && !out.active && !out.pending);
+    assert(packet_writes==1 && !flush_writes); // No radio sampling changes packet or flush policy.
+}
+static void test_radio_pressure_counts_only_the_selected_acl_and_reads_do_not_reset(void) {
+    packet_normal_fixture();bt_hci_radio_diagnostics_t out;assert(bt_hci_radio_diagnostics(&out));
+    uint32_t epoch=out.epoch;
+    uint8_t flush[]={0x11,2,0x11,0};hci_packet_handler(HCI_EVENT_PACKET,0,flush,sizeof(flush));
+    flush[2]=0x22;hci_packet_handler(HCI_EVENT_PACKET,0,flush,sizeof(flush));
+    uint8_t completed[]={HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS,9,2,0x11,0,3,0,0x22,0,7,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,completed,sizeof(completed));
+    for(unsigned i=0;i<10;++i){
+        assert(bt_hci_radio_diagnostics(&out) && out.epoch==epoch && out.flush_events==1 && out.completed_packets==3);
+    }
+    assert(!radio_writes && !out.valid);
+    memcpy(device_addr,second,6);credit_connections[2]=(hci_connection_t){
+        .con_handle=0x33,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};memcpy(credit_connections[2].address,second,6);
+    assert(bt_hci_radio_diagnostics(&out) && out.epoch!=epoch && out.handle==0x33 && !out.flush_events && !out.completed_packets);
+}
+static void test_radio_errors_unsupported_and_timeouts_stop_without_retry_spam(void) {
+    radio_fixture();
+    uint8_t unsupported[]={HCI_EVENT_COMMAND_COMPLETE,4,1,0x05,0x14,1};
+    hci_packet_handler(HCI_EVENT_PACKET,0,unsupported,sizeof(unsupported));
+    bt_hci_phone_poll();assert(radio_opcode==0x1403);radio_reply(radio_opcode,0x11,200,0);
+    bt_hci_phone_poll();assert(radio_opcode==0x0c2d && !radio_power_type);radio_reply(radio_opcode,0x11,0,0x0c);
+    bt_hci_phone_poll();assert(radio_power_type==1);radio_reply(radio_opcode,0x11,0,0x11);
+    bt_hci_phone_poll();assert(radio_opcode==0x1406);radio_reply(radio_opcode,0x11,2,0);
+    bt_hci_radio_diagnostics_t out;bt_hci_radio_diagnostics(&out);
+    assert(out.valid==BT_RADIO_QUALITY && out.unavailable==(BT_RADIO_RSSI|BT_RADIO_MAX_TX_POWER) &&
+        out.failed==(BT_RADIO_TX_POWER|BT_RADIO_AFH_MAP) && out.age_ms[0]==UINT32_MAX);
+    now=2000;bt_hci_phone_poll();assert(radio_writes==6 && radio_opcode==0x1403);
+    radio_reply(radio_opcode,0x11,210,0);
+    for(unsigned i=0;i<20;++i)bt_hci_phone_poll();
+    assert(radio_writes==6);
+
+    packet_normal_fixture();now=UINT32_MAX-499u;bt_hci_radio_active(true);bt_hci_phone_poll();
+    now=499;bt_hci_phone_poll();assert(!radio.data.failed);
+    now=500;for(unsigned i=0;i<20;++i)bt_hci_phone_poll();
+    assert(radio_writes==1 && radio_pending.active && radio_pending.timed_out && radio.data.failed==BT_RADIO_RSSI);
+    bt_hci_radio_active(false);bt_hci_radio_active(true);bt_hci_phone_poll();assert(radio_writes==1);
+    radio_reply(0x1405,0x11,(uint8_t)-20,0);bt_hci_radio_diagnostics(&out);
+    assert(!out.pending && out.valid==BT_RADIO_RSSI && !out.failed && out.rssi==-20 && !out.age_ms[0]);
+
+    packet_normal_fixture();radio_result=0x0c;bt_hci_radio_active(true);bt_hci_phone_poll();
+    assert(radio_writes==1 && !radio_pending.active && radio.data.failed==BT_RADIO_RSSI);
+}
+static void test_radio_stale_malformed_replies_and_policy_priority(void) {
+    radio_fixture();uint32_t epoch=radio.data.epoch;
+    uint8_t disconnected[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnected,sizeof(disconnected));
+    bt_hci_radio_active(true);bt_hci_phone_poll();
+    assert(radio.data.epoch!=epoch && radio_pending.active && radio_writes==1);
+    radio_reply(0x1405,0x11,(uint8_t)-45,0);
+    assert(!radio_pending.active && !radio.data.valid);
+    bt_hci_phone_poll();assert(radio_writes==2);
+    radio_reply(0x1403,0x11,200,0);radio_reply(0x1405,0x22,20,0);
+    assert(radio_pending.active && !radio.data.valid);
+    uint8_t short_reply[]={HCI_EVENT_COMMAND_COMPLETE,4,1,0x05,0x14,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,short_reply,sizeof(short_reply));assert(radio_pending.active);
+    radio_reply(0x1405,0x11,(uint8_t)-5,0);assert(!radio_pending.active && radio.data.rssi==-5);
+
+    radio_fixture();credit_connections[0].state=0;
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnected,sizeof(disconnected));
+    radio_reply(0x1405,0x11,20,0);
+    assert(!radio_pending.active && !radio.data.valid);
+    bt_hci_radio_diagnostics_t out;assert(!bt_hci_radio_diagnostics(&out) && out.handle==HCI_CON_HANDLE_INVALID);
+    uint8_t off[]={BTSTACK_EVENT_STATE,1,0};hci_packet_handler(HCI_EVENT_PACKET,0,off,sizeof(off));
+    assert(!radio_pending.active && !radio.data.valid);
+
+    packet_normal_fixture();consume_command_credit=true;bt_hci_radio_active(true);
+    bt_hci_airpods_flush_timeout(true);bt_hci_phone_poll();assert(packet_writes==2 && !flush_writes && !radio_writes);
+    packet_status(0);command_ready=true;bt_hci_phone_poll();assert(flush_writes==1 && !radio_writes);
+    flush_ack(0x11,0);packet_changed(0x11,0xee1c,0);command_ready=true;bt_hci_phone_poll();
+    assert(radio_writes==1 && radio_opcode==0x1405 && !command_ready);
+}
+
 int main(void) {
+    test_radio_sampling_is_sparse_read_only_and_cached();
+    test_radio_pressure_counts_only_the_selected_acl_and_reads_do_not_reset();
+    test_radio_errors_unsupported_and_timeouts_stop_without_retry_spam();
+    test_radio_stale_malformed_replies_and_policy_priority();
     test_media_packet_baseline_game_and_normal_are_confirmed_per_acl();
     test_media_packet_baseline_clamp_polarity_dm1_and_reserved_bits();
     test_media_packet_command_credit_preserves_native_policy_order();

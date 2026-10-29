@@ -106,6 +106,7 @@ static void playback_prepare_packet(void *context, uint32_t time) { (void)contex
 static void playback_audio_work(uint32_t time) {
     if(media_tracker.codec_ready_to_send==2)playback_prepare_packet(&media_tracker,time);
 }
+static void playback_bitrate_poll(uint32_t time) {(void)time;}
 static bool playback_phone_recovery_poll(void) {return false;}
 static void l2cap_set_flushable_local_cid(uint16_t cid) { (void)cid; }
 static void avrcp_disconnect(uint16_t cid) { (void)cid; }

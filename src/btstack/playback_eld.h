@@ -14,6 +14,11 @@
 #define PLAYBACK_ELD_FRAME_SAMPLES 480u
 #define PLAYBACK_ELD_PAYLOAD_CEILING 986u
 
+static inline uint32_t playback_eld_au_ceiling(uint32_t bitrate, bool variable) {
+    // FDK CBR permits one alignment byte beyond the rounded nominal frame.
+    return (bitrate + 799u) / 800u + (variable ? 0u : 1u);
+}
+
 static inline bool playback_eld_capability(const uint8_t *cap, size_t len) {
     static const uint8_t id[6] = {0x4c, 0, 0, 0, 1, 0x80};
     return cap != NULL && len == PLAYBACK_ELD_CONFIG_SIZE &&

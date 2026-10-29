@@ -38,7 +38,7 @@ class FakeHid:
         self.writes.append(bytes(data))
         self.report = data[:]
         if data[7] == 7:
-            assert ((data[20] == 1 and data[22] in (5, 9, 11, 13, 15)) or
+            assert ((data[20] == 1 and data[22] in (5, 9, 11, 13, 15, 19)) or
                     (data[20] == 2 and data[22] == 18 and data[23] in (0, 1)))
             self.report[21] = 1
             struct.pack_into('<H', self.report, 18, data[20])
@@ -56,6 +56,41 @@ class FakeHid:
 
 
 class AudioDiagnosticsTests(unittest.TestCase):
+    def test_radio_read_is_cached_bounded_and_preserves_signed_units(self):
+        data=bytearray(128);data[:4]=bytes((1,128,7,31));data[64:68]=bytes((1,9,3,0))
+        struct.pack_into('<IIH',data,4,10000,7,0x123)
+        data[14:21]=bytes((2,8,244,200,252,9,1));data[21]=0x55
+        struct.pack_into('<5I',data,32,200,400,600,0xffffffff,800)
+        struct.pack_into('<II',data,52,12,3400)
+        struct.pack_into('<15I',data,68,192000,256000,174000,3,0,9000,3,4,1000,
+                         128000,0,0,8,12,7)
+        fake=FakeHid(data)
+        result=diagnostics.sample(fake,radio=True)
+        self.assertEqual(set(result),{'time','radio'})
+        radio=result['radio']
+        self.assertEqual(radio['rssi_relative_db'],-12)
+        self.assertEqual(radio['tx_power_dbm'],-4)
+        self.assertEqual(radio['max_tx_power_dbm'],9)
+        self.assertIsNone(radio['age_ms']['max_tx_power'])
+        self.assertEqual(radio['handle'],0x123)
+        self.assertEqual(radio['adaptive']['current_bps'],192000)
+        self.assertEqual(radio['adaptive']['target_bps'],174000)
+        self.assertEqual(radio['adaptive']['reason'],'pressure')
+        self.assertTrue(radio['adaptive']['variable'])
+        self.assertEqual([p[22] for p in fake.writes if p[7]==7],[19])
+        data[3]=0
+        radio=diagnostics.decode_radio(data)
+        self.assertIsNone(radio['rssi_relative_db'])
+        self.assertIsNone(radio['afh_map'])
+        self.assertIsNone(radio['afh_mode'])
+        for bad in (data[:-1], bytes(128)):
+            with self.assertRaises(RuntimeError):diagnostics.decode_radio(bad)
+        for offset,value in ((0,2),(1,127),(2,8),(3,32),(14,32),(15,32),(64,2),(65,16),(66,7)):
+            bad=data[:];bad[offset]=value
+            with self.assertRaises(RuntimeError):diagnostics.decode_radio(bad)
+        with self.assertRaises(diagnostics.Unsupported):
+            diagnostics.sample(FakeHid(data,unsupported=True),radio=True)
+
     def test_linux_selects_serial_across_audio_and_control_personalities(self):
         devices = {10: (0xcafe, 0x4015, 'PC'), 11: (0xcafe, 0x4005, 'PHONE'),
                    12: (0xcafe, 0x4016, 'OTHER')}

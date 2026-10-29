@@ -27,6 +27,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y build-essential cmake ninja-build python3
       - name: Run regression tests with ASan and UBSan
         run: python3 tools/test.py --sanitize
+      - name: Verify live bitrate changes with the real AAC encoder and decoder
+        run: python3 tools/test_adaptive_codec.py --sanitize
 
   firmware:
     name: Pico 2 W firmware

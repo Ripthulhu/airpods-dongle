@@ -7,6 +7,7 @@
 #include "../src/btstack/playback_continuity.h"
 static playback_continuity_t phone_continuity;
 #include "../src/btstack/playback_options.h"
+static playback_options_t playback_options;
 #include "../src/btstack/playback_adjust.h"
 #include "../src/btstack/playback_usb_clock.h"
 #include "../src/btstack/phone_clock.h"

@@ -61,6 +61,19 @@ def usb_descriptor_sources(directory):
 
 def playback_lifecycle_sources(directory):
     source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    bitrate_functions = []
+    for signature in ["static int playback_eld_rate_update(", "static bool playback_bitrate_eligible(",
+                      "static void playback_bitrate_transport_stalled(",
+                      "static bool playback_bitrate_apply(", "static void playback_bitrate_poll(",
+                      "static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context)",
+                      "uint16_t dongle_playback_adaptive_snapshot("]:
+        match = re.search(r"(?m)^" + re.escape(signature) + r"[^;]*?\{", source)
+        if match is None:
+            raise ValueError("Missing adaptive playback function: " + signature)
+        start = match.start()
+        end = source.index("\n}", start) + 2
+        bitrate_functions.append(source[start:end])
+    (directory / "playback_bitrate.inc").write_text("\n".join(bitrate_functions))
     defaults = []
     for declaration in ["static playback_game_t playback_game", "static bool a2dp_accept_incoming"]:
         start = source.index(declaration)
@@ -284,6 +297,7 @@ def main():
         "dongle_case_battery": ["-Itests/case_stubs", "tests/dongle_case_battery_test.c"],
         "playback": ["tests/playback_test.c"],
         "playback_options": ["tests/playback_options_test.c"],
+        "playback_bitrate": ["tests/playback_bitrate_test.c"],
         "playback_adjust": ["tests/playback_adjust_test.c"],
         "playback_delay": ["tests/playback_delay_test.c"],
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],

@@ -241,7 +241,7 @@ def decode_trace(data):
 
 
 def _transaction(device, payload):
-    read = len(payload) == 1 and payload[0] in (5, 9, 11, 13, 15)
+    read = len(payload) == 1 and payload[0] in (5, 9, 11, 13, 15, 19)
     profile = len(payload) == 2 and payload[0] in (4, 12, 14, 18) and payload[1] in (0, 1)
     if not (read or profile):
         raise ValueError('Only diagnostic reads and explicit audio profiling controls are allowed')
@@ -299,7 +299,7 @@ def _transaction(device, payload):
 
 
 def feature(device, command):
-    if command not in (5, 9, 11, 13, 15):
+    if command not in (5, 9, 11, 13, 15, 19):
         raise ValueError('Collector permits audio/performance/trace reads only')
     return _transaction(device, bytes((command,)))
 
@@ -338,7 +338,43 @@ def decode_phone(data):
     return result
 
 
-def sample(device, trace=True, inspect=False, phone=False):
+def decode_radio(data):
+    if (len(data) != 128 or data[:2] != bytes((1, 128)) or data[64] != 1 or
+            data[2] & ~7 or data[3] & ~31 or data[14] & ~31 or data[15] & ~31 or
+            data[65] & ~15 or data[66] > 6):
+        raise RuntimeError('Unsupported radio/adaptation layout')
+    valid = data[3]
+    names = ('rssi', 'quality', 'tx_power', 'max_tx_power', 'afh_map')
+    ages = struct.unpack_from('<5I', data, 32)
+    measurements = dict(zip(names, (struct.unpack_from('<b', data, 16)[0], data[17],
+        struct.unpack_from('<b', data, 18)[0], struct.unpack_from('<b', data, 19)[0],
+        data[21:31].hex())))
+    for index, name in enumerate(names):
+        if not valid & (1 << index):
+            measurements[name] = None
+    adaptive_names = ('current_bps', 'ceiling_bps', 'target_bps', 'changes', 'errors',
+        'last_change_ms', 'window_flush_events', 'window_pressure_events', 'window_elapsed_ms',
+        'floor_bps', 'clean_ms', 'reserved', 'total_pressure_events', 'flush_events', 'radio_epoch')
+    adaptive = dict(zip(adaptive_names, struct.unpack_from('<15I', data, 68)))
+    del adaptive['reserved']
+    adaptive.update(active=bool(data[65] & 1), frozen=bool(data[65] & 2),
+        fault=bool(data[65] & 4), variable=bool(data[65] & 8),
+        reason=('off', 'startup', 'clean', 'pressure', 'recover', 'frozen', 'fault')[data[66]])
+    return dict(snapshot_ms=struct.unpack_from('<I', data, 4)[0],
+        epoch=struct.unpack_from('<I', data, 8)[0], handle=struct.unpack_from('<H', data, 12)[0],
+        connected=bool(data[2] & 1), sampling=bool(data[2] & 2), pending=bool(data[2] & 4),
+        valid_mask=valid, failed_mask=data[14], unavailable_mask=data[15],
+        rssi_relative_db=measurements['rssi'], quality=measurements['quality'],
+        tx_power_dbm=measurements['tx_power'], max_tx_power_dbm=measurements['max_tx_power'],
+        afh_mode=data[20] if valid & 16 else None, afh_map=measurements['afh_map'],
+        age_ms={name: None if age == 0xffffffff else age for name, age in zip(names, ages)},
+        flush_events=struct.unpack_from('<I', data, 52)[0],
+        completed_packets=struct.unpack_from('<I', data, 56)[0], adaptive=adaptive)
+
+
+def sample(device, trace=True, inspect=False, phone=False, radio=False):
+    if radio:
+        return dict(time=time.time(), radio=decode_radio(feature(device, 19)))
     audio, perf = feature(device, 9), feature(device, 5)
     if len(audio) != 20 or len(perf) != 64 or audio[0] != 1 or perf[0] != 1:
         raise RuntimeError('Unsupported audio/performance layout')
@@ -371,11 +407,14 @@ def main():
     parser.add_argument('--legacy', action='store_true', help='Only existing feature 5/9 snapshots')
     parser.add_argument('--inspect', action='store_true', help='Include signal levels and the latest submitted AAC-ELD frame')
     parser.add_argument('--phone', action='store_true', help='Include phone input queue and decoder counters')
+    parser.add_argument('--radio', action='store_true', help='Only cached radio and adaptive-bitrate readings, every two seconds')
     args = parser.parse_args()
     if not 1 <= args.seconds <= 1800:
         parser.error('--seconds must be 1..1800')
     if args.legacy and (args.inspect or args.phone):
         parser.error('--legacy cannot be combined with --inspect or --phone')
+    if args.radio and (args.legacy or args.inspect or args.phone):
+        parser.error('--radio is a separate lightweight capture')
     output = open(args.output, 'x', encoding='utf-8') if args.output else sys.stdout
     device = Hid(args.serial)
     inspecting=False
@@ -388,8 +427,8 @@ def main():
             started = time.monotonic()
             if inspecting and started-renewed>=10:
                 _transaction(device,bytes((14,1)));renewed=started
-            print(json.dumps(sample(device, not args.legacy, args.inspect, args.phone)), file=output, flush=True)
-            time.sleep(max(0, 1 - (time.monotonic() - started)))
+            print(json.dumps(sample(device, not args.legacy, args.inspect, args.phone, args.radio)), file=output, flush=True)
+            time.sleep(max(0, (2 if args.radio else 1) - (time.monotonic() - started)))
     finally:
         if inspecting:
             try:

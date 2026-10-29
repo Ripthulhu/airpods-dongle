@@ -9,6 +9,24 @@
 #include "../btstack/btstack_ble_scan.h"
 #include "../btstack/phone_sink.h"
 
+static uint16_t radio_snapshot(uint8_t *out,uint16_t capacity) {
+    if(capacity<128)return 0;
+    bt_hci_radio_diagnostics_t radio={0};
+    bool connected=bt_hci_radio_diagnostics(&radio);
+    memset(out,0,128);out[0]=1;out[1]=128;
+    out[2]=(connected?1u:0u)|(radio.active?2u:0u)|(radio.pending?4u:0u);
+    out[3]=radio.valid;dongle_put32(out+4,btstack_run_loop_get_time_ms());
+    dongle_put32(out+8,radio.epoch);
+    out[12]=(uint8_t)radio.handle;out[13]=(uint8_t)(radio.handle>>8);
+    out[14]=radio.failed;out[15]=radio.unavailable;
+    out[16]=(uint8_t)radio.rssi;out[17]=radio.quality;
+    out[18]=(uint8_t)radio.tx_power;out[19]=(uint8_t)radio.max_tx_power;
+    out[20]=radio.afh_mode;memcpy(out+21,radio.afh_map,10);
+    for(unsigned i=0;i<5;++i)dongle_put32(out+32+4*i,radio.age_ms[i]);
+    dongle_put32(out+52,radio.flush_events);dongle_put32(out+56,radio.completed_packets);
+    return dongle_playback_adaptive_snapshot(out+64,64)==64?128:0;
+}
+
 static uint8_t error(uint8_t result) {
     switch(result){
         case DONGLE_ACCEPTED:return 0;
@@ -86,6 +104,9 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
             if(size!=2 || p[1]>1)return 1;
             if(client!=DONGLE_CLIENT_USB)return 7;
             return bt_hci_airpods_flush_comparison(p[1]!=0)?0:2;
+        case 19:
+            if(size!=1)return 1;
+            *length=radio_snapshot(out,capacity);return *length?0:7;
         default:return 7;
     }
 }

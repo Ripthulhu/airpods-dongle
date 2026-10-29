@@ -78,6 +78,22 @@ static struct {
 } media_packet_pending;
 static uint32_t media_packet_epoch;
 static bool media_packet_game;
+static struct {
+    bt_hci_radio_diagnostics_t data;
+    uint32_t sampled_at[5];
+    bd_addr_t address;
+    uint8_t next;
+} radio;
+static struct {
+    uint32_t epoch, since;
+    uint16_t handle;
+    uint8_t field;
+    bool active, timed_out;
+} radio_pending;
+static uint32_t radio_epoch;
+static const uint16_t radio_opcodes[5]={HCI_OPCODE_HCI_READ_RSSI,HCI_OPCODE_HCI_READ_LINK_QUALITY,
+    HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL,HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL,0x1406};
+static const hci_cmd_t radio_read_afh_map={0x1406,"H"};
 
 typedef struct {
     uint8_t version;
@@ -378,6 +394,108 @@ static void media_packet_event(const uint8_t *p, uint16_t size) {
     }
 }
 
+static void radio_reset(void) {
+    memset(&radio,0,sizeof(radio));
+    if (!++radio_epoch) ++radio_epoch;
+    radio.data.epoch=radio_epoch;
+    radio.data.handle=HCI_CON_HANDLE_INVALID;
+}
+static bool radio_bind(void) {
+    hci_connection_t *connection=peer_address_valid(device_addr) ?
+        hci_connection_for_bd_addr_and_type(device_addr,BD_ADDR_TYPE_ACL) : NULL;
+    if (!connection || connection->state!=OPEN || connection->address_type!=BD_ADDR_TYPE_ACL ||
+        memcmp(connection->address,device_addr,6)) {
+        if (radio.data.handle!=HCI_CON_HANDLE_INVALID) radio_reset();
+        return false;
+    }
+    if (radio.data.handle!=connection->con_handle || memcmp(radio.address,connection->address,6)) {
+        radio_reset();radio.data.handle=connection->con_handle;
+        memcpy(radio.address,connection->address,6);
+    }
+    return true;
+}
+void bt_hci_radio_active(bool active) {radio.data.active=radio_bind() && active;}
+bool bt_hci_radio_diagnostics(bt_hci_radio_diagnostics_t *out) {
+    if (!out) return false;
+    bool connected=radio_bind();
+    *out=radio.data;out->pending=radio_pending.active;
+    uint32_t now=btstack_run_loop_get_time_ms();
+    for (unsigned i=0;i<5;++i)
+        out->age_ms[i]=(out->valid&(1u<<i)) ? now-radio.sampled_at[i] : UINT32_MAX;
+    return connected;
+}
+static void radio_error(uint8_t status) {
+    if (radio_pending.epoch!=radio.data.epoch) return;
+    uint8_t bit=1u<<radio_pending.field;
+    radio.data.valid&=~bit;
+    if (status==0x01 || status==0x11) radio.data.unavailable|=bit;
+    else radio.data.failed|=bit;
+}
+static void radio_poll(void) {
+    bool connected=radio_bind();
+    uint32_t now=btstack_run_loop_get_time_ms();
+    if (radio_pending.active) {
+        if (!radio_pending.timed_out && (uint32_t)(now-radio_pending.since)>=1000u) {
+            radio_error(UINT8_MAX);radio_pending.timed_out=true;
+        }
+        return; // A late same-opcode response must not populate a replacement ACL or another power query.
+    }
+    if (!connected || !radio.data.active || !hci_can_send_command_packet_now()) return;
+    for (unsigned offset=0;offset<5;++offset) {
+        unsigned field=(radio.next+offset)%5;
+        uint8_t bit=1u<<field;
+        if ((radio.data.failed|radio.data.unavailable)&bit) continue;
+        if (radio.data.valid&bit) {
+            if (field==3 || (uint32_t)(now-radio.sampled_at[field])<(field<2?2000u:10000u)) continue;
+        }
+        radio_pending.epoch=radio.data.epoch;radio_pending.handle=radio.data.handle;
+        radio_pending.field=(uint8_t)field;radio_pending.since=now;radio_pending.active=true;
+        radio_pending.timed_out=false;
+        radio.next=(field+1)%5;
+        uint8_t status;
+        if (field<2) status=hci_send_cmd(field?&hci_read_link_quality:&hci_read_rssi,radio_pending.handle);
+        else if (field<4) status=hci_send_cmd(&hci_read_transmit_power_level,radio_pending.handle,field==3?1:0);
+        else status=hci_send_cmd(&radio_read_afh_map,radio_pending.handle);
+        if (status && radio_pending.active && radio_pending.epoch==radio.data.epoch) {
+            radio_error(status);radio_pending.active=false;
+        }
+        return;
+    }
+}
+static void radio_event(const uint8_t *p,uint16_t size) {
+    if (p[0]==BTSTACK_EVENT_STATE && size>=3 && p[2]!=HCI_STATE_WORKING) {
+        radio_reset();radio_pending.active=false;return;
+    }
+    if (p[0]==HCI_EVENT_DISCONNECTION_COMPLETE && size==6 && p[2]==0 &&
+        ((uint16_t)p[3]|(uint16_t)p[4]<<8)==radio.data.handle) {radio_reset();return;}
+    bool connected=radio_bind();
+    if (connected && p[0]==0x11 && size==4 && ((uint16_t)p[2]|(uint16_t)p[3]<<8)==radio.data.handle)
+        ++radio.data.flush_events;
+    if (connected && p[0]==HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS && size>=3 && size==3u+4u*p[2])
+        for (unsigned i=0;i<p[2];++i)
+            if ((((uint16_t)p[3+4*i]|(uint16_t)p[4+4*i]<<8)&0x0fffu)==radio.data.handle)
+                radio.data.completed_packets+=(uint16_t)p[5+4*i]|(uint16_t)p[6+4*i]<<8;
+    if (!radio_pending.active || p[0]!=HCI_EVENT_COMMAND_COMPLETE || size<6 ||
+        ((uint16_t)p[3]|(uint16_t)p[4]<<8)!=radio_opcodes[radio_pending.field]) return;
+    if (p[5]) {radio_error(p[5]);radio_pending.active=false;return;}
+    uint16_t expected=radio_pending.field==4?19:9;
+    if (size!=expected || ((uint16_t)p[6]|(uint16_t)p[7]<<8)!=radio_pending.handle) return;
+    radio_pending.active=false;
+    if (radio_pending.epoch!=radio.data.epoch) return;
+    unsigned field=radio_pending.field;
+    if (field==4 && (p[8]>1 || (p[8] && (p[18]&0x80)))) {radio_error(UINT8_MAX);return;}
+    if (field==0) radio.data.rssi=(int8_t)p[8];
+    else if (field==1) radio.data.quality=p[8];
+    else if (field==2) radio.data.tx_power=(int8_t)p[8];
+    else if (field==3) radio.data.max_tx_power=(int8_t)p[8];
+    else {
+        radio.data.afh_mode=p[8];memset(radio.data.afh_map,0,10);
+        if (p[8]) memcpy(radio.data.afh_map,p+9,10);
+    }
+    radio.sampled_at[field]=btstack_run_loop_get_time_ms();
+    radio.data.failed&=~(1u<<field);radio.data.valid|=1u<<field;
+}
+
 static void phone_load(void) {
     const btstack_tlv_t *tlv;
     void *context;
@@ -527,6 +645,7 @@ static void phone_pairing_stop(void) {
 void bt_hci_phone_poll(void) {
     media_packet_poll();
     media_flush_poll();
+    radio_poll();
     if (!phone_pairing_audio_busy()) credit_roles[0].armed = credit_roles[1].armed = false;
     if (phone_pairing && !bt_hci_phone_pairing_active()) phone_pairing_stop();
 }
@@ -656,6 +775,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     credit_event(packet, size);
     media_flush_event(packet, size);
     media_packet_event(packet, size);
+    radio_event(packet,size);
     dongle_playback_controller_event(packet,size);
     uint8_t status;
     UNUSED(status);
@@ -821,6 +941,7 @@ void bt_hci_init(void){
     media_flush_links[0].handle = media_flush_links[1].handle = HCI_CON_HANDLE_INVALID;
     media_packets[0].handle = media_packets[1].handle = HCI_CON_HANDLE_INVALID;
     media_packet_pending.active = false;
+    radio_reset();radio_pending.active=false;
     phone_session_generation = 0;
     phone_session_handle = HCI_CON_HANDLE_INVALID;
     memset(phone_session_address, 0, sizeof(phone_session_address));

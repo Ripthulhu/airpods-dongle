@@ -55,6 +55,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 16: physical volume snapshot | none | 24-byte version-1 status; capability 128 |
 | 17: USB host volume authority | action u8, token u32, level u8 | 24-byte status; USB client only; capability 128 |
 | 18: diagnostic Game Mode flush comparison | enabled u8 (0/1) | empty; USB client only; see below |
+| 19: radio and adaptive bitrate | none | read-only, cached 128-byte version-1 snapshot; USB or phone |
 
 The explicit [host volume authority contract](HOST-VOLUME.md) coordinates a host
 that actually delegates its mixer volume to the AirPods. It suppresses standalone
@@ -116,6 +117,67 @@ packet is `04 00 04 00 09 00 1A 0B 00 00 00`. Both USB and phone use this same
 path and cached `1A` readback. It never sends `16` or changes either ear's hold
 assignment; only ears assigned noise control use the selected modes. A successful
 send remains separate from a fresh matching device report.
+
+## Radio and automatic bitrate snapshot
+
+From 0.1.51, feature 19 reports the selected AirPods ACL and the live AAC-ELD
+encoder budget. Reading it never starts a radio query, changes a setting or
+enables packet logging. Existing audio-profile status continues reporting the
+negotiated ceiling; use this snapshot for the current adaptive budget.
+
+The exact response is 128 bytes, little-endian:
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| 0 | u8 | version 1 |
+| 1 | u8 | length 128 |
+| 2 | u8 | flags: live selected ACL 1, sampling active 2, query pending 4 |
+| 3 | u8 | valid measurements mask |
+| 4 | u32 | snapshot uptime, milliseconds |
+| 8 | u32 | selected radio connection epoch |
+| 12 | u16 | selected ACL handle; FFFF unknown |
+| 14, 15 | u8 each | failed and unavailable measurements masks |
+| 16 | i8 | Classic RSSI relative to the controller's receive-power window; not absolute dBm |
+| 17 | u8 | controller-defined link quality, 0–255, higher is better |
+| 18, 19 | i8 each | current and maximum transmit power, dBm |
+| 20 | u8 | actual ACL AFH mode |
+| 21 | 10 bytes | AFH channel map, lowest numbered channel in the low bit |
+| 31 | u8 | reserved, zero |
+| 32 | five u32 | measurement ages, milliseconds; FFFFFFFF unknown |
+| 52, 56 | u32 each | selected-ACL flush events and completed packet credits |
+| 60 | u32 | reserved, zero |
+| 64 | u8 | adaptation block version 1 |
+| 65 | u8 | flags: active 1, frozen 2, fault 4, VBR 8 |
+| 66 | u8 | reason: off 0, startup 1, clean 2, pressure 3, recovery 4, frozen 5, fault 6 |
+| 67 | u8 | reserved, zero |
+| 68, 72, 76 | u32 each | current, negotiated/user ceiling and pending target bitrate, bits/s |
+| 80, 84 | u32 each | successful budget changes and update errors |
+| 88 | u32 | last budget change uptime, milliseconds |
+| 92, 96 | u32 each | latest observation window's flush and local transport-pressure events |
+| 100 | u32 | observation window duration, milliseconds |
+| 104 | u32 | minimum budget, bits/s |
+| 108 | u32 | continuous clean observation duration, milliseconds |
+| 112 | u32 | reserved, zero |
+| 116, 120 | u32 each | cumulative local pressure events and selected-ACL flush events |
+| 124 | u32 | radio epoch used by the adaptive controller |
+
+Measurement mask bits and age order are RSSI 1, link quality 2, current power 4,
+maximum power 8 and AFH map/mode 16. A zero value without its valid bit is unknown,
+not a successful reading. Check age as well as validity. Query failure is not
+evidence of a poor signal. Completed packet credits can include discarded data;
+they are not receiver delivery acknowledgements or a retransmission count.
+Link quality is vendor-defined and has no universal signal-strength threshold.
+
+The supplied Windows/Android collector reads only this cached snapshot every
+two seconds, with no companion application required:
+
+```text
+python tools/audio_diagnostics.py --radio --serial PICO_SERIAL --seconds 600 --output radio.jsonl
+```
+
+Android/Linux requires access to the dongle's hidraw interface (root on the test
+Pixel). A disconnected or unsupported controller remains explicitly unknown.
+Older firmware returns unsupported rather than a fabricated measurement.
 
 ## Settings workflow lease
 

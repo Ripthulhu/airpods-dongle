@@ -11,6 +11,20 @@ static bool inspection_active;
 static unsigned volume_reads,volume_writes,volume_disconnects;
 static unsigned flush_comparison_calls;
 static bool flush_comparison_active,flush_comparison_ready=true;
+uint32_t btstack_run_loop_get_time_ms(void) {return 12345;}
+static unsigned radio_reads,adaptive_reads;
+bool bt_hci_radio_diagnostics(bt_hci_radio_diagnostics_t *out) {
+    ++radio_reads;memset(out,0,sizeof(*out));
+    out->epoch=17;out->handle=0x123;out->active=true;out->pending=true;
+    out->valid=31;out->failed=2;out->unavailable=8;out->rssi=-12;out->quality=200;
+    out->tx_power=-4;out->max_tx_power=9;out->afh_mode=1;out->afh_map[0]=0x55;
+    for(unsigned i=0;i<5;++i)out->age_ms[i]=i?i*100:UINT32_MAX;
+    out->flush_events=5;out->completed_packets=987;return true;
+}
+uint16_t dongle_playback_adaptive_snapshot(uint8_t *out,uint16_t capacity) {
+    ++adaptive_reads;assert(capacity==64);
+    memset(out,0,64);out[0]=1;out[1]=3;dongle_put32(out+4,192000);return 64;
+}
 bool bt_hci_airpods_flush_comparison(bool enabled) {
     ++flush_comparison_calls;
     if(enabled && !flush_comparison_ready)return false;
@@ -162,6 +176,22 @@ int main(void) {
     comparison[1]=0;
     assert(dongle_features_request(0,comparison,2,out,64,&n)==0 && !n && !flush_comparison_active);
     p[0]=0;assert(dongle_features_request(1,p,1,out,64,&n)==7 && n==0);
+    p[0]=19;
+    assert(dongle_features_request(0,p,2,trace,128,&n)==1 && !radio_reads);
+    assert(dongle_features_request(0,p,1,trace,127,&n)==7 && !radio_reads);
+    for(uint8_t client=0;client<2;++client) {
+        trace[0]=19;
+        assert(dongle_features_request(client,trace,1,trace,128,&n)==0 && n==128);
+        assert(trace[0]==1 && trace[1]==128 && trace[2]==7 && trace[3]==31);
+        assert(dongle_u32(trace+4)==12345 && dongle_u32(trace+8)==17);
+        assert(trace[12]==0x23 && trace[13]==1 && trace[14]==2 && trace[15]==8);
+        assert((int8_t)trace[16]==-12 && trace[17]==200 && (int8_t)trace[18]==-4);
+        assert(trace[19]==9 && trace[20]==1 && trace[21]==0x55 && trace[31]==0);
+        assert(dongle_u32(trace+32)==UINT32_MAX && dongle_u32(trace+48)==400);
+        assert(dongle_u32(trace+52)==5 && dongle_u32(trace+56)==987 && !dongle_u32(trace+60));
+        assert(trace[64]==1 && trace[65]==3 && dongle_u32(trace+68)==192000);
+    }
+    assert(radio_reads==2 && adaptive_reads==2);
     dongle_features_poll();dongle_features_disconnect(1);
     assert(polls==2 && stops==2 && volume_disconnects==1);
     comparison[1]=1;

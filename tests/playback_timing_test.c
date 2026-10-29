@@ -297,12 +297,15 @@ static void timing(unsigned codec, unsigned samples, unsigned bytes, unsigned in
     assert(playback_metrics.recoveries == 0);
 }
 static void phone_packet_groups(void) {
-    const unsigned mtus[]={324,647,648,986};
+    // A nominal 320-byte CBR AU can need one extra byte from FDK's reservoir alignment.
+    initialize(4,480,324,10,324);media_tracker.samples_ready=480;
+    assert(fill_aac_audio_buffer(&media_tracker)==0 && !encode_calls && !consumed);
+    const unsigned mtus[]={325,648,649,986};
     for(unsigned target=60;target<=150;target+=90)for(unsigned m=0;m<4;++m) {
         initialize(4,480,324,10,mtus[m]);phone_opened=true;
         playback_game.changed=true;playback_game.target=(uint16_t)target;
         btstack_timer_source_t timer={.context=&media_tracker};
-        unsigned group=mtus[m]<648?1:2;
+        unsigned group=mtus[m]<649?1:2;
         for(unsigned unit=0;unit<600;++unit) {
             if(unit==301)playback_game.target=(uint16_t)(210-target); // Change modes with one AU queued.
             now+=10;avdtp_audio_timeout_handler(&timer);

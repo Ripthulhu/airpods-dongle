@@ -19,6 +19,9 @@
 #define HCI_EVENT_DISCONNECTION_COMPLETE 0x05
 #define HCI_OPCODE_HCI_INQUIRY 0x0401
 #define HCI_OPCODE_HCI_READ_BUFFER_SIZE 0x1005
+#define HCI_OPCODE_HCI_READ_RSSI 0x1405
+#define HCI_OPCODE_HCI_READ_LINK_QUALITY 0x1403
+#define HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL 0x0c2d
 #define HCI_OPCODE_HCI_WRITE_AUTOMATIC_FLUSH_TIMEOUT 0x0c28
 #define GAP_EVENT_INQUIRY_RESULT 0xdc
 #define GAP_EVENT_INQUIRY_COMPLETE 0xdd
@@ -36,8 +39,9 @@
 #define SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING 4
 #define LEVEL_2 2
 typedef uint8_t hci_link_type_t;
-typedef struct { uint16_t opcode; } hci_cmd_t;
+typedef struct { uint16_t opcode; const char *format; } hci_cmd_t;
 extern const hci_cmd_t hci_write_automatic_flush_timeout;
+extern const hci_cmd_t hci_read_rssi, hci_read_link_quality, hci_read_transmit_power_level;
 bool hci_can_send_command_packet_now(void);
 uint8_t hci_send_cmd(const hci_cmd_t *cmd, ...);
 typedef struct { uint16_t con_handle; uint8_t address[6], address_type, role, state; } hci_connection_t;

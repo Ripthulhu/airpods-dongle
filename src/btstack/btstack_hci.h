@@ -53,5 +53,20 @@ typedef struct {
 // Read under the Bluetooth lock; false means Read Buffer Size has not succeeded.
 bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out);
 
+enum { BT_RADIO_RSSI=1, BT_RADIO_QUALITY=2, BT_RADIO_TX_POWER=4,
+       BT_RADIO_MAX_TX_POWER=8, BT_RADIO_AFH_MAP=16 };
+typedef struct {
+    uint32_t epoch, flush_events, completed_packets;
+    // RSSI, quality, current power, maximum power, AFH map; FFFFFFFF means unknown.
+    uint32_t age_ms[5];
+    uint16_t handle;
+    uint8_t valid, failed, unavailable, quality, afh_mode, afh_map[10];
+    int8_t rssi, tx_power, max_tx_power;
+    bool active, pending;
+} bt_hci_radio_diagnostics_t;
+// RSSI is BR/EDR-relative dB. Completed packets include control and discarded data, not proven delivery.
+bool bt_hci_radio_diagnostics(bt_hci_radio_diagnostics_t *out);
+void bt_hci_radio_active(bool active);
+
 
 #endif //PICOW_USB_BT_AUDIO_BTSTACK_HCI_H
