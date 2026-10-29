@@ -14,6 +14,8 @@ import sys
 import time
 
 HEADER = b'APDG' + bytes((1, 64))
+USB_VENDOR = 0xcafe
+USB_PRODUCTS = (0x4015, 0x4005)  # Audio composite or Bluetooth control-only mode.
 
 
 class Hid:
@@ -24,17 +26,30 @@ class Hid:
             self.ioctl = fcntl.ioctl
             found = []
             for path in glob.glob('/dev/hidraw*'):
-                fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
-                info = bytearray(8)
-                self.ioctl(fd, 0x80084803, info, True)
-                if struct.unpack('<IHH', info)[1:] == (0xcafe, 0x4015):
+                fd, keep = None, False
+                try:
+                    fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+                    info = bytearray(8)
+                    self.ioctl(fd, 0x80084803, info, True)
+                    _, vid, pid = struct.unpack('<IHH', info)
+                    if vid != USB_VENDOR or pid not in USB_PRODUCTS:
+                        continue
+                    if serial:
+                        unique = bytearray(256)
+                        self.ioctl(fd, 0x81004808, unique, True)  # HIDIOCGRAWUNIQ(256)
+                        if unique.split(b'\0', 1)[0].decode('utf-8', 'replace') != serial:
+                            continue
                     found.append(fd)
-                else:
-                    os.close(fd)
+                    keep = True
+                except OSError:
+                    continue
+                finally:
+                    if fd is not None and not keep:
+                        os.close(fd)
             if len(found) != 1:
                 for fd in found:
                     os.close(fd)
-                raise RuntimeError('Expected exactly one CAFE:4015 HID interface')
+                raise RuntimeError('Expected exactly one matching Pico HID interface (CAFE:4015/4005)')
             self.handle = found[0]
             return
         from ctypes import wintypes as W
@@ -102,7 +117,7 @@ class Hid:
                 if not setup.SetupDiGetDeviceInterfaceDetailW(info, C.byref(interface), detail, required, None, None):
                     raise C.WinError(C.get_last_error())
                 path = C.wstring_at(C.addressof(detail) + 4)
-                if 'vid_cafe&pid_4015' not in path.lower():
+                if not any(f'vid_cafe&pid_{pid:04x}' in path.lower() for pid in USB_PRODUCTS):
                     continue
                 handle = self.kernel.CreateFileW(path, 0xc0000000, 3, None, 3, 0x40000000, None)
                 if handle == C.c_void_p(-1).value:
@@ -111,7 +126,8 @@ class Hid:
                 try:
                     attr = Attributes()
                     attr.size = C.sizeof(attr)
-                    if not self.hid.HidD_GetAttributes(handle, C.byref(attr)) or (attr.vid, attr.pid) != (0xcafe, 0x4015):
+                    if (not self.hid.HidD_GetAttributes(handle, C.byref(attr)) or
+                        attr.vid != USB_VENDOR or attr.pid not in USB_PRODUCTS):
                         continue
                     prep = C.c_void_p()
                     if not self.hid.HidD_GetPreparsedData(handle, C.byref(prep)):

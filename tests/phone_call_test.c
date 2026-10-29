@@ -213,5 +213,19 @@ int main(void) {
     for(unsigned i=0;i<3;++i){phone_call_poll();now+=10000;phone_call_poll();now+=30000;}
     phone_call_poll();assert(connects==3);
     saved_phone_address[0]=9;phone_call_poll();assert(connects==4);
+    reset();slc(0x20,phone_address);
+    assert(!phone_call_usb_exclusion_requested());
+    meta(HFP_SUBEVENT_RING,0x20);indicator("call",1);
+    assert(!phone_call_usb_exclusion_requested()); // Indicators also arrive for calls routed over USB.
+    audio(HFP_CODEC_CVSD);
+    assert(phone_call_usb_exclusion_requested());
+    usb_recording=true;
+    assert(!phone_call_usb_exclusion_requested());
+    usb_recording=false;authorized=false;
+    assert(!phone_call_usb_exclusion_requested());
+    authorized=true;mic_active=true;audio_stop(false);
+    assert(phone_call_usb_exclusion_requested());
+    mic_active=false;phone_call_poll();
+    assert(!phone_call_usb_exclusion_requested());
     puts("phone calls: authenticated HFP/CVSD, explicit stems, bounded SCO, microphone progress, USB priority and cleanup passed");
 }

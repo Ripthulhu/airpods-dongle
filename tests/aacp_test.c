@@ -392,6 +392,39 @@ static void test_watchdog_is_bounded_and_cancelable(void) {
     assert(starts == 3 && stops == 3 && !aacp_mic_stats_timer.active);
 }
 
+static void test_recovery_budget_counts_consecutive_failures(void) {
+    fixture();ready();
+    for (unsigned recovery=0;recovery<6;++recovery) {
+        uint16_t previous=aacp_cid;
+        event(L2CAP_EVENT_CHANNEL_CLOSED,previous);
+        assert(aacp_connect_timer.active && !aacp_audio_owned());
+        fire(&aacp_connect_timer);opened(aacp_cid,0,peer);drain();control(aacp_cid);
+        assert(aacp_control_ready() && aacp_attempts==1 && !starts);
+        event(L2CAP_EVENT_CHANNEL_CLOSED,previous);
+        assert(aacp_control_ready() && !aacp_connect_timer.active); // A stale close cannot reset this session.
+    }
+    event(L2CAP_EVENT_CHANNEL_CLOSED,aacp_cid);
+    for (unsigned failure=1;failure<=AACP_MAX_ATTEMPTS;++failure) {
+        assert(aacp_connect_timer.active);fire(&aacp_connect_timer);
+        opened(aacp_cid,0,peer);drain();
+        assert(!aacp_control_ready()); // An open without a received control packet is not verified success.
+        now+=AACP_CHANNEL_TIMEOUT_MS;aacp_poll();
+        assert(aacp_attempts==failure && !aacp_connected);
+    }
+    assert(!aacp_connect_timer.active);
+    unsigned before=connects;
+    now+=60000;aacp_poll();assert(connects==before);
+
+    fixture();connect_open();control(aacp_cid); // Input alone cannot erase an unsent-init failure.
+    assert(!aacp_control_ready());
+    event(L2CAP_EVENT_CHANNEL_CLOSED,aacp_cid);
+    assert(aacp_attempts==1 && aacp_connect_timer.active);
+    aacp_disconnect();
+    assert(!aacp_connect_timer.active);
+    aacp_connect_timer.handler(&aacp_connect_timer); // Canceled callback is harmless after explicit disconnect.
+    assert(connects==1 && !aacp_session);
+}
+
 static void test_reconnect_never_invents_microphone_demand(void) {
     fixture();
     ready();
@@ -1020,6 +1053,7 @@ static void test_call_capture_wire_flow(void) {
 #define TU_ARRAY_SIZE(a) (sizeof(a)/sizeof(*(a)))
 static int16_t usb_host_pcm[64];
 static unsigned usb_mic_frames;
+bool usb_audio_available(void) {return true;}
 static uint16_t tud_audio_write(const void *pcm,uint16_t bytes) {
     assert(bytes==sizeof(usb_host_pcm));memcpy(usb_host_pcm,pcm,bytes);++usb_mic_frames;return bytes;
 }
@@ -1153,6 +1187,7 @@ static void test_routing_authority_and_explicit_takeover(void) {
 }
 
 int main(void) {
+    test_recovery_budget_counts_consecutive_failures();
     test_routing_authority_and_explicit_takeover();
     test_microphone_consumer_ownership();
     test_call_capture_wire_flow();

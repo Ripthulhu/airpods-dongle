@@ -3,6 +3,7 @@ import pathlib
 import struct
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, mock_open
 
 path = pathlib.Path(__file__).resolve().parents[1] / 'tools/audio_diagnostics.py'
@@ -54,6 +55,36 @@ class FakeHid:
 
 
 class AudioDiagnosticsTests(unittest.TestCase):
+    def test_linux_selects_serial_across_audio_and_control_personalities(self):
+        devices = {10: (0xcafe, 0x4015, 'PC'), 11: (0xcafe, 0x4005, 'PHONE'),
+                   12: (0xcafe, 0x4016, 'OTHER')}
+        def ioctl(fd, command, data, mutable):
+            vid, pid, serial = devices[fd]
+            self.assertTrue(mutable)
+            if command == 0x80084803:
+                struct.pack_into('<IHH', data, 0, 3, vid, pid)
+            else:
+                self.assertEqual(command, 0x81004808)
+                data[:len(serial)] = serial.encode()
+        with patch.dict(sys.modules, {'fcntl': SimpleNamespace(ioctl=ioctl)}), \
+             patch.multiple(diagnostics.os, name='posix', O_CLOEXEC=0, create=True), \
+             patch.object(diagnostics.glob, 'glob', return_value=['a', 'b', 'c']), \
+             patch.object(diagnostics.os, 'open', side_effect=lambda path, _: {'a':10,'b':11,'c':12}[path]), \
+             patch.object(diagnostics.os, 'close') as close:
+            device = diagnostics.Hid('PHONE')
+            self.assertEqual(device.handle, 11)
+            self.assertEqual([call.args[0] for call in close.call_args_list], [10, 12])
+            device.close()
+            self.assertEqual(close.call_args.args, (11,))
+            close.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, 'exactly one matching'):
+                diagnostics.Hid()
+            self.assertEqual(sorted(call.args[0] for call in close.call_args_list), [10, 11, 12])
+            close.reset_mock()
+            device = diagnostics.Hid('PC')
+            self.assertEqual(device.handle, 10)
+            device.close()
+
     def test_inspection_is_disabled_after_capture_error(self):
         with patch.object(sys,'argv',['audio_diagnostics.py','--inspect','--seconds','1','--output','capture.jsonl']), \
              patch.object(diagnostics,'Hid') as hid, \

@@ -7,6 +7,9 @@
 void tinyusb_main(void);
 void tinyusb_task(void);
 void tinyusb_control_task(void);
+// Main publishes Bluetooth ownership; USB service re-enumerates asynchronously.
+void usb_audio_set_bluetooth(bool requested);
+bool usb_audio_available(void);
 
 // Latest USB capture intent; consumed only by the main loop.
 bool usb_mic_take_request(bool *wanted);

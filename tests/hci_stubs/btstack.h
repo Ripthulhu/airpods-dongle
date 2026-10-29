@@ -27,11 +27,15 @@
 #define HCI_LINK_TYPE_ESCO 2
 #define BD_ADDR_TYPE_ACL 0xff
 #define BD_ADDR_TYPE_SCO 0xfc
+#define HCI_CON_HANDLE_INVALID 0xffff
+#define HCI_ROLE_MASTER 0
+#define HCI_ROLE_SLAVE 1
+#define OPEN 4
 #define SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT 3
 #define SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING 4
 #define LEVEL_2 2
 typedef uint8_t hci_link_type_t;
-typedef struct { uint16_t con_handle; uint8_t address[6], address_type; } hci_connection_t;
+typedef struct { uint16_t con_handle; uint8_t address[6], address_type, role, state; } hci_connection_t;
 typedef uint8_t bd_addr_t[6];
 typedef uint8_t link_key_t[16];
 typedef uint8_t link_key_type_t;

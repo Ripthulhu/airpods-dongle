@@ -65,11 +65,36 @@ tusb_desc_device_t const desc_device =
     .bNumConfigurations = 0x01
 };
 
+// A separate identity keeps hosts from reusing the cached audio interfaces.
+tusb_desc_device_t const desc_device_control =
+{
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor           = 0xCafe,
+    .idProduct          = USB_PID & ~(1u << 4),
+    .bcdDevice          = 0x0100,
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01
+};
+
+static bool descriptor_audio = true;
+
+void usb_descriptors_set_audio(bool enabled) {
+    descriptor_audio = enabled;
+}
+
 // Invoked when received GET DEVICE DESCRIPTOR
 // Application return pointer to descriptor
 uint8_t const * tud_descriptor_device_cb(void)
 {
-  return (uint8_t const *)&desc_device;
+  return (uint8_t const *)(descriptor_audio ? &desc_device : &desc_device_control);
 }
 
 //--------------------------------------------------------------------+
@@ -160,13 +185,23 @@ uint8_t const desc_configuration[] =
 // boundaries at runtime even when enumeration appears to succeed.
 TU_VERIFY_STATIC(sizeof(desc_configuration) == CONFIG_TOTAL_LEN, "config descriptor length mismatch");
 
+#define CONFIG_CONTROL_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
+uint8_t const desc_configuration_control[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 3, 0, CONFIG_CONTROL_TOTAL_LEN, 0x00, 100),
+    TUD_CDC_DESCRIPTOR(0, 6, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+    TUD_HID_DESCRIPTOR(2, 7, HID_ITF_PROTOCOL_NONE,
+                       sizeof(desc_hid_report), EPNUM_HID_IN, 16, 5)
+};
+TU_VERIFY_STATIC(sizeof(desc_configuration_control) == CONFIG_CONTROL_TOTAL_LEN,
+                 "control-only config descriptor length mismatch");
+
 // Invoked when received GET CONFIGURATION DESCRIPTOR
 // Application return pointer to descriptor
 // Descriptor contents must exist long enough for transfer to complete
 uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
 {
   (void)index; // for multiple configurations
-  return desc_configuration;
+  return descriptor_audio ? desc_configuration : desc_configuration_control;
 }
 
 //--------------------------------------------------------------------+

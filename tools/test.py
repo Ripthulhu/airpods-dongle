@@ -18,13 +18,13 @@ def uac_sources(directory):
     end = source.index("\n }", start) + 3
     (directory / "uac_mic_callback.inc").write_text(source[start:end])
     start = source.index(" const uint32_t sample_rates[]")
-    end = source.index(" static void usb_speaker_stop(void)")
+    end = source.index(" void usb_audio_set_bluetooth(bool requested)")
     declarations = source[start:end]
     start = source.index(" static union {")
     end = source.index(" //void led_blinking_task", start)
     declarations += source[start:end]
     functions = []
-    for name in ["usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
+    for name in ["usb_audio_set_bluetooth", "usb_audio_available", "usb_audio_mode_task", "usb_speaker_stop", "usb_mic_update_request", "usb_mic_take_request",
                  "usb_mic_requested", "usb_host_active", "usb_volume_set_revision", "usb_volume_set_generation", "usb_volume_set_receipt", "tinyusb_task", "tinyusb_control_task",
                  "tud_mount_cb", "tud_umount_cb", "tud_suspend_cb", "tud_resume_cb",
                  "tud_audio_mic_clock_get_request", "tud_audio_clock_get_request",
@@ -139,7 +139,8 @@ def playback_lifecycle_sources(directory):
                       "static int playback_encoder_failed(",
                       "static void call_clock_init(",
                       "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
-                      "static void playback_idle_poll(", "void dongle_playback_ownership_changed(bool owned)", "bool bridge_phone_ready(void)",
+                      "static void playback_idle_poll(", "void dongle_playback_ownership_changed(bool owned)",
+                      "bool bridge_phone_open(void)", "void bridge_phone_start_requested(void)", "bool bridge_phone_ready(void)",
                       "static bool phone_output_recovery_owned(", "bool bridge_phone_recovering(void)",
                       "static void suspend_recovery_handler(",
                       "static void playback_transport_recover(", "static bool playback_phone_recovery_poll(",
@@ -153,6 +154,13 @@ def playback_lifecycle_sources(directory):
     start = source.index("                case  AVDTP_SI_START:")
     end = source.index("                case AVDTP_SI_ABORT:", start)
     (directory / "playback_accept.inc").write_text(source[start:end])
+
+
+def avrcp_reconnect_sources(directory):
+    source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    start = source.index("#define AVRCP_RETRY_MS")
+    end = source.index("\nstatic void avrcp_target_packet_handler(", start)
+    (directory / "avrcp_reconnect.inc").write_text(source[start:end])
 
 
 def playback_volume_sources(directory):
@@ -203,6 +211,12 @@ def main_button_sources(directory):
         "static void main_mic_request(mic_decoder_lifecycle_t *state) {\n"
         "    mic_decoder_lifecycle_t decoder=*state; bool mic_wanted;\n"+
         source[start:end]+"\n    *state=decoder;\n}\n")
+    start=source.index("        // The idle microphone decoder")
+    end=source.index("        ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND",start)
+    (directory / "main_phone_handover.inc").write_text(
+        "static void main_phone_handover(mic_decoder_lifecycle_t *state) {\n"
+        "    mic_decoder_lifecycle_t decoder=*state;\n"+
+        source[start:end]+"\n    *state=decoder;\n}\n")
     start=source.index("// Runtime BOOTSEL is deliberately separate")
     end=source.index("\nint main()",start)
     (directory/"main_bootsel.inc").write_text(source[start:end])
@@ -250,6 +264,7 @@ def main():
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],
         "playback_buttons": ["tests/playback_buttons_test.c"],
         "playback_timing": ["tests/playback_timing_test.c"],
+        "phone_continuity": ["-Wno-unused-function", "tests/phone_continuity_test.c"],
         "playback_trace": ["tests/playback_trace_test.c"],
         "playback_float": ["tests/playback_float_test.c", "-lm"],
         "playback_pipeline": ["-Wno-unused-function", "tests/playback_pipeline_test.c"],
@@ -264,6 +279,7 @@ def main():
         "uac_s16": ["-DAIRPODS_USB_FLOAT=0", "tests/uac_test.c"],
         "volume_sync": ["tests/volume_sync_test.c"],
         "playback_volume": ["-Itests/media_stubs", "tests/playback_volume_test.c", "src/tinyusb/media_control.c"],
+        "avrcp_reconnect": ["tests/avrcp_reconnect_test.c"],
         "volume_trace": ["tests/volume_trace_test.c"],
         "volume_trace_console": ["tests/volume_trace_console_test.c"],
         "main_button_actions": ["tests/main_button_actions_test.c"],
@@ -286,6 +302,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:
         playback_lifecycle_sources(pathlib.Path(tmp))
         playback_volume_sources(pathlib.Path(tmp))
+        avrcp_reconnect_sources(pathlib.Path(tmp))
         usb_game_verification_sources(pathlib.Path(tmp))
         uac_sources(pathlib.Path(tmp))
         main_button_sources(pathlib.Path(tmp))

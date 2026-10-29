@@ -39,6 +39,10 @@ static bool initialized, lhdc_disabled, aptx_disabled;
 static bool retry_codec;
 static struct {
     bd_addr_t peer;
+    uint32_t session;
+} bluetooth_route;
+static struct {
+    bd_addr_t peer;
     uint16_t cid;
     uint8_t attempts;
     bool pending, clock_started, waiting;
@@ -73,6 +77,14 @@ static struct {
     uint32_t control_since_ms;
 } phone;
 
+static void select_bluetooth_route(void) {
+    if (usb_mic_requested()) return;
+    uint32_t session = bt_hci_phone_session(phone.address);
+    if (session == 0) return;
+    memcpy(bluetooth_route.peer, phone.address, 6);
+    bluetooth_route.session = session;
+}
+
 static void notify_phone_volume(void) {
     if (phone.avrcp_cid == 0) return;
     if (!phone.volume_event_supported) {
@@ -83,6 +95,11 @@ static void notify_phone_volume(void) {
     if (!phone.volume_valid || !phone.volume_notification_pending) return;
     if (avrcp_target_volume_changed(phone.avrcp_cid, phone.volume) != ERROR_CODE_SUCCESS) return;
     phone.volume_notification_pending = false;
+}
+
+static bool phone_media_session_current(void) {
+    return bluetooth_route.session && !memcmp(bluetooth_route.peer, phone.address, 6) &&
+        bt_hci_phone_session(phone.address) == bluetooth_route.session;
 }
 
 static void apply_phone_volume_intent(void) {
@@ -287,6 +304,7 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
         phone.remote_lhdc_seid = phone.remote_aptx_seid = phone.remote_sbc_seid = 0;
         phone.select_codec = false;
         phone.requested_codec = PHONE_CODEC_NONE;
+        select_bluetooth_route();
         return;
     }
     if (size < 5 || little_endian_read_16(packet, 3) != phone.cid || phone.cid == 0) return;
@@ -364,6 +382,7 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
                 codec == PHONE_CODEC_SBC ? (uint16_t)(sbc.blocks * sbc.subbands) : 0u;
             phone.seid = packet[5];
             phone.configured = true;
+            select_bluetooth_route();
             phone.opened = already_open;
             // The SDK automatically Opens our outgoing configuration; a peer may idle configured.
             phone.opening = !already_open && local_configuration;
@@ -385,6 +404,7 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
                 return;
             }
             phone.opened = true;
+            select_bluetooth_route();
             phone.opening = false;
             (void)bridge_phone_open();
             printf("[PHONE] open: %s stereo/48000\n", phone.codec == PHONE_CODEC_LHDCV5 ? "LHDCv5" :
@@ -393,7 +413,7 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
         }
         case A2DP_SUBEVENT_START_STREAM_REQUESTED:
             if (size != 6 || packet[5] != phone.seid) return;
-            if (!phone.configured || !phone.opened) {
+            if (!phone.configured || !phone.opened || !phone_media_session_current()) {
                 a2dp_sink_start_stream_reject(phone.cid, phone.seid);
                 return;
             }
@@ -638,6 +658,9 @@ static uint8_t send_control(uint8_t operation) {
 }
 
 void phone_sink_poll(void) {
+    // A closed USB microphone may still be draining; keep the new route, but
+    // do not allocate its decoder until main has released the microphone's.
+    if (aacp_mic_active() && phone.configured && !phone.disconnecting) return;
     if (!phone_worker_poll(decoded_pcm, NULL)) {
         ++phone.total_decode_failures;
         bad_packet();
@@ -693,21 +716,27 @@ void phone_sink_poll(void) {
         if ((uint32_t)(now - phone.pending_since_ms) >= PHONE_START_TIMEOUT_MS) {
             printf("[PHONE] AirPods priming timed out\n");
             reject_start();
-        } else if (phone_worker_ready() && bridge_phone_open() && bridge_phone_ready()) {
-            if (!bridge_phone_start()) {
-                reject_start();
-            } else {
-                phone.start_pending = false;
-                phone.start_accepted = true;
-                phone.pending_since_ms = now;
-                reset_phone_buffer();
-                if (a2dp_sink_start_stream_accept(phone.cid, phone.seid) != ERROR_CODE_SUCCESS) {
-                    audio_stop();
-                    phone.controls_owned = false;
-                    phone.requested_volume_valid = false;
-                    bt_volume_cancel_phone();
+        } else if (!phone_media_session_current()) {
+            reject_start();
+        } else {
+            // USB removal or microphone cleanup may finish after the Start event.
+            bridge_phone_start_requested();
+            if (phone_worker_ready() && bridge_phone_open() && bridge_phone_ready()) {
+                if (!bridge_phone_start()) {
+                    reject_start();
                 } else {
-                    phone.controls_owned = true;
+                    phone.start_pending = false;
+                    phone.start_accepted = true;
+                    phone.pending_since_ms = now;
+                    reset_phone_buffer();
+                    if (a2dp_sink_start_stream_accept(phone.cid, phone.seid) != ERROR_CODE_SUCCESS) {
+                        audio_stop();
+                        phone.controls_owned = false;
+                        phone.requested_volume_valid = false;
+                        bt_volume_cancel_phone();
+                    } else {
+                        phone.controls_owned = true;
+                    }
                 }
             }
         }
@@ -798,6 +827,16 @@ bool phone_sink_connected(void) { return phone.cid != 0; }
 bool phone_sink_active(void) { return phone.started || phone.start_accepted; }
 bool phone_sink_start_pending(void) { return phone.start_pending; }
 bool phone_sink_owns_controls(void) { return phone.controls_owned; }
+
+bool phone_sink_usb_exclusion_requested(void) {
+    if (bluetooth_route.session == 0) return false;
+    if (bt_hci_phone_session(bluetooth_route.peer) != bluetooth_route.session) {
+        bluetooth_route.session = 0;
+        return false;
+    }
+    // Profile retries and Start failures must not make Android select USB again.
+    return !usb_mic_requested();
+}
 
 uint16_t phone_sink_diagnostics(uint8_t *out, uint16_t capacity) {
     if (out == NULL || capacity < 64u) return 0;

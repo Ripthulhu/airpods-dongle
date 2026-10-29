@@ -4,6 +4,8 @@
 #include <string.h>
 #include "../src/btstack/playback_options.h"
 #include "../src/btstack/playback_adjust.h"
+#include "../src/btstack/playback_continuity.h"
+static playback_continuity_t phone_continuity;
 static playback_adjust_t playback_adjust;
 static playback_usb_verification_t usb_game_verification;
 static void playback_usb_verify_cancel(void) {memset(&usb_game_verification,0,sizeof(usb_game_verification));}
@@ -107,6 +109,8 @@ static void playback_audio_work(uint32_t time) {
 static bool playback_phone_recovery_poll(void) {return false;}
 static void l2cap_set_flushable_local_cid(uint16_t cid) { (void)cid; }
 static void avrcp_disconnect(uint16_t cid) { (void)cid; }
+static void avrcp_reconnect_reset(void) {}
+static void avrcp_reconnect_poll(uint32_t time) {(void)time;}
 static void audio_slot_queue_init(void) {}
 static uint8_t read_uint8_last_flash(void) { return 1; }
 static bool write_slot1_mac(const uint8_t *p) {
@@ -426,6 +430,22 @@ static void microphone_prepares_normal_buffer_and_binds_repair(bool call) {
     mic_active=false; control_session=1; game_session=1;
 }
 
+static void game_changes_reset_continuity_without_packets(void) {
+    playback_game=(playback_game_t){0};game_eligible=true;
+    phone_continuity=(playback_continuity_t){.armed=true,.deficit_us=80000,.last_us=1000};
+    assert(dongle_playback_game_mode(true)==DONGLE_ACCEPTED && !phone_continuity.armed);
+    phone_continuity.armed=true;phone_continuity.deficit_us=1000;
+    assert(dongle_playback_game_mode(true)==DONGLE_ACCEPTED && phone_continuity.armed);
+    assert(dongle_playback_game_mode(false)==DONGLE_ACCEPTED && !phone_continuity.armed);
+    phone_continuity.armed=true;
+    playback_adjust_cancel(&playback_adjust);
+    playback_adjust_cancel_stream(&media_tracker,now,10);
+    assert(phone_continuity.armed); // The ordinary phone poll's no-op cancel is not a reset.
+    playback_adjust.pending=true;
+    playback_adjust_cancel_stream(&media_tracker,now,10);
+    assert(!phone_continuity.armed);
+}
+
 int main(void) {
     standalone_boot_connects_in_normal_mode();
     profile_then_pair(true, true);
@@ -448,5 +468,6 @@ int main(void) {
     inspect_enabled=true;inspect_deadline=now+10;
     now+=9;dongle_playback_poll();assert(inspect_enabled);
     ++now;dongle_playback_poll();assert(!inspect_enabled);
+    game_changes_reset_continuity_without_packets();
     puts("playback lifecycle: Pair cancels pending profile reconnect, failures stay closed, fresh profile works");
 }

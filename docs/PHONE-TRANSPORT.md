@@ -1,5 +1,63 @@
 # Phone bridge
 
+## Bluetooth and USB selection in 0.1.41
+
+An authenticated Bluetooth music connection selects the wireless input,
+even before codec negotiation or Play and while paused. The dongle briefly detaches USB and returns
+as `CAFE:4005` with CDC and HID only, so Android cannot select its USB speaker
+instead. Reconnect diagnostic handles after this change. The serial number and
+control protocol remain the same. Pairing, AVRCP alone, and an idle HFP connection
+do not select this mode.
+
+Once selected, media setup failure, profile teardown, pause and retry retain
+wireless mode for that phone connection. Only releasing the entire phone ACL
+connection (or replacing that phone) clears the selection and restores
+`CAFE:4015`, the normal S16/float32 speaker and unchanged microphone. A session
+token prevents a later connection reusing the same address/handle from inheriting
+old mode state. Bluetooth voice capture/cleanup also hold wireless selection. An already
+accepted USB microphone request retains priority; merely ringing is insufficient
+to remove a USB call's audio devices. Selecting Bluetooth while USB recording
+is active remains subject to that priority.
+
+This mode change addresses host routing, not Bluetooth radio delivery. The
+[0.1.39 audit](AUDIT-0.1.39.md) documents the separate audio stalls and the narrow
+overflow-accounting correction. Pixel testing confirmed that 0.1.40 removed the
+USB sound card while CDC/HID remained usable, but its media-profile-only lifetime
+restored USB during a failed startup. That fallback was captured and is the
+regression addressed by 0.1.41. Pixel checks on 29 October confirmed control-only
+USB with no sound card, persistence after disabling Media audio while the phone
+ACL survived, and restoration after full Bluetooth disconnect. Media reconnection
+removed USB audio again. The idle-HFP-only reconnect test was inconclusive because
+media became enabled too; it is covered by the host regression, not that hardware test.
+
+## Bluetooth continuity candidate 0.1.42
+
+The confirmed Bluetooth-only 0.1.41 run sounded good initially and then became
+silent. USB alternate 0 and control-only identity persisted throughout. Between
+47.36 and 68.35 seconds, 21.002 seconds elapsed but outgoing RTP advanced only
+19.980 seconds. No individual send gap exceeded 49.34 ms, so the existing
+single-gap recovery guard did not trigger. Both connections had the Pico as
+central/master, with no controller flushes. That rules out split roles as a
+necessary condition for this failure; it does not rule out radio stalls generally.
+
+The incoming packet size changed from 720 to 960 decoded stereo frames, while
+the input still delivered approximately 48,000 frames per second. A production
+scheduler reproduction exposed feedback in the 0.1.40/41 overflow credit: one
+early 960-frame packet into an almost-full ring could cancel every read that
+would drain it. The corrected accounting consumes that credit only against work
+already exceeding the catch-up budget, then expires the remainder. It never
+cancels healthy future deadlines or carries priming losses into active playback.
+
+The sender also measures cumulative shortage of successfully submitted audio
+against elapsed time. Catch-up packets repay it. Once shortage exceeds the
+current receiver reserve, the existing bounded Suspend/Start recovery establishes
+a new receiver boundary. Tracking resets across input/stream changes, priming,
+ownership loss and intentional Game Mode timing adjustments. No buffer-size,
+clock-speed, scanning or radio-role policy change is included. Submission remains
+distinct from actual radio delivery, and final listening validation is pending.
+
+## Earlier evidence
+
 Firmware 0.1.26 pairs with the Pixel 10 Pro XL and plays LHDC through the Pico,
 but its phone buffering can lose samples. Version 0.1.27's larger PCM reserve
 did not fix the audible crackle: hardware counters exposed compressed-input
@@ -26,8 +84,9 @@ Phone -- LHDC v5 / aptX / SBC --> Pico 2 W -- AAC-ELD / AAC / SBC --> AirPods
 
 The phone pairs with **AirPods Dongle** as an ordinary Bluetooth audio output.
 The Pico owns the AirPods bond, Apple Device ID, AACP and output codec. Android
-needs no vendor-ID modification. Power the Pico externally for wireless use;
-an active USB playback or recording stream takes priority over phone audio.
+needs no vendor-ID modification. Prior to 0.1.40, an active USB playback or
+recording stream took priority over phone audio, including when Android silently
+reselected USB after a replug. The selection policy above replaces that behavior.
 
 ## Pairing and controls
 
@@ -372,6 +431,37 @@ Its smallest modeled low-side margin is only 93 frames, so 90 ms is a controlled
 hardware candidate. Larger reserves also risk consuming real high-side headroom.
 Version-2 phone diagnostics measure actual Pico arrival/publication gaps and RTP
 timestamp discontinuities to validate this tradeoff on the next connection.
+
+The 0.1.39 Bluetooth-only audit still reproduced audible glitches with Game Mode
+off. During one 4.371-second interval, input decoding produced 210,960 frames
+without new sequence gaps, rejects or decode errors. Output discarded 41,376
+PCM frames, matching its discarded scheduling debt, and the controller reported
+45 flush events. These locate that interval's loss downstream of the decoder;
+they do not establish whether the original send delays came from radio scheduling
+or host processing. The four timeline-recovery counts were trimming episodes,
+not four connection restarts.
+
+The audit also found a separate accounting defect when decoded input physically
+overfilled its ring: those discarded samples remained owed by the sender and
+could be discarded again by the backlog limit. Version 0.1.42 matches physical
+loss only against current debt above the catch-up limit and immediately expires
+unused credit. The earlier 0.1.40/41 implementation also cancelled healthy future
+deadlines, creating the no-output feedback reproduced above. Resetting or priming
+the buffer clears its pending accounting. Explicit trims create no new credit, and
+overflow cannot shorten the mandatory startup silence. USB policy, phone reserve,
+clock correction and receiver deadlines are unchanged. A production-path test
+checks the former 320-frame overflow followed by a 620-frame trim: only 620 total
+frames should be discarded, rather than 940.
+
+This correction does not claim to resolve the observed wireless stutters.
+Disposable replays with the real worker and SDK resampler added 76 ms send waits
+to the captured arrival timing. Raising the phone debt limit from 60 to 70–80 ms,
+or relying only on physical overflow, reduced loss but still produced drops or
+zero-fill at some timer phases. Freezing clock correction during the backlog also
+failed clean-audio acceptance. Those policy changes were rejected. The existing
+90 ms input reserve and 8,192-frame pool cannot be treated as unlimited protection
+against simultaneous input jitter and outgoing stalls; controller credit/delivery
+evidence and another controlled hardware comparison are still needed.
 
 Control tests cover fragmented/coalesced RFCOMM frames, encrypted saved-peer
 checks, per-client RPC ownership, replay protection, blocked writers and cleanup.

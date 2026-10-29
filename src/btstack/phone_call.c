@@ -53,6 +53,11 @@ bool phone_call_audio_requested(void) {
 
 bool phone_call_mic_requested(void) { return phone_call_audio_requested(); }
 
+bool phone_call_usb_exclusion_requested(void) {
+    return !usb_mic_requested() && current_phone() &&
+           (call.sco != HCI_CON_HANDLE_INVALID || (call.cleanup && aacp_mic_active()));
+}
+
 bool phone_call_active(void) {
     return call.ringing || call.in_call || call.setup || call.sco != HCI_CON_HANDLE_INVALID ||
            (call.cleanup && aacp_mic_active());

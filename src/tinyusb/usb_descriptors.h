@@ -26,6 +26,11 @@
  #ifndef _USB_DESCRIPTORS_H_
  #define _USB_DESCRIPTORS_H_
 
+ #include <stdbool.h>
+
+ // USB service context only, while detached from the host.
+ void usb_descriptors_set_audio(bool enabled);
+
  // #include "tusb.h"
 
  // Unit numbers are arbitrary selected

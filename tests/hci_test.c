@@ -99,8 +99,12 @@ int gap_ssp_passkey_negative(const uint8_t address[6]) { (void)address; ++passke
 uint32_t btstack_run_loop_get_time_ms(void) { return now; }
 hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t address[6], uint8_t type) {
     assert(type == BD_ADDR_TYPE_ACL && address != NULL);
+    if (missing_acl) return NULL;
+    for (unsigned i=0;i<3;++i)
+        if (credit_connections[i].address_type==type && !memcmp(credit_connections[i].address,address,6))
+            return &credit_connections[i];
     static hci_connection_t connection = {.con_handle = 1};
-    return missing_acl ? NULL : &connection;
+    return &connection;
 }
 hci_connection_t *hci_connection_for_handle(uint16_t handle) {
     for (unsigned i=0;i<3;++i)
@@ -702,7 +706,80 @@ static void test_credit_diagnostics(void) {
     assert(data.airpods.events==UINT32_MAX && data.airpods.packets==UINT32_MAX);
 }
 
+static void test_authenticated_phone_acl_session(void) {
+    fixture();bt_hci_init();
+    memcpy(phone_address,nearby,6);memcpy(phone_key_address,nearby,6);
+    phone_bonded=phone_has_key=true;
+    credit_connections[0]=(hci_connection_t){.con_handle=1,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};
+    memcpy(credit_connections[0].address,nearby,6);
+    uint32_t session=bt_hci_phone_session(nearby);
+    assert(session!=0 && bt_hci_phone_session(nearby)==session);
+    assert(!bt_hci_phone_session(first));
+    security_level=1;assert(!bt_hci_phone_session(nearby));security_level=LEVEL_2;
+    missing_acl=true;assert(!bt_hci_phone_session(nearby));missing_acl=false;
+    credit_connections[0].state=0;assert(!bt_hci_phone_session(nearby));
+    credit_connections[0].state=OPEN;
+    assert(bt_hci_phone_session(nearby)==session);
+
+    uint8_t disconnect[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnect,sizeof(disconnect));
+    assert(bt_hci_phone_session(nearby)==session); // The AirPods ACL is independent.
+    disconnect[3]=1;disconnect[2]=1;
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnect,sizeof(disconnect));
+    assert(bt_hci_phone_session(nearby)==session); // A failed disconnect did not end this session.
+    disconnect[2]=0;
+    hci_packet_handler(HCI_EVENT_PACKET,0,disconnect,sizeof(disconnect));
+    // BTstack can reuse this handle/address before main polls after the event.
+    uint32_t reconnected=bt_hci_phone_session(nearby);
+    assert(reconnected!=0 && reconnected!=session);
+    session=reconnected;
+    uint8_t off[]={BTSTACK_EVENT_STATE,1,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,off,sizeof(off));
+    reconnected=bt_hci_phone_session(nearby);
+    assert(reconnected!=0 && reconnected!=session);
+
+    memcpy(phone_address,second,6);
+    assert(!bt_hci_phone_session(nearby));
+    memcpy(phone_key_address,second,6);memcpy(credit_connections[0].address,second,6);
+    session=bt_hci_phone_session(second);
+    assert(session!=0 && session!=reconnected);
+    phone_session_generation=UINT32_MAX;phone_session_handle=HCI_CON_HANDLE_INVALID;
+    assert(bt_hci_phone_session(second)==1); // Zero is reserved for no authenticated connection.
+}
+
+static void test_current_link_roles(void) {
+    fixture();
+    bt_hci_credit_diagnostics_t data;
+    assert(!bt_hci_credit_diagnostics(&data));
+    assert(data.airpods_handle==HCI_CON_HANDLE_INVALID && data.phone_handle==HCI_CON_HANDLE_INVALID);
+    assert(data.airpods_local_role==UINT8_MAX && data.phone_local_role==UINT8_MAX);
+    memcpy(device_addr,first,6);memcpy(phone_address,nearby,6);
+    credit_connections[0]=(hci_connection_t){.con_handle=0x11,.address_type=BD_ADDR_TYPE_ACL,
+        .state=OPEN,.role=HCI_ROLE_MASTER};
+    credit_connections[1]=(hci_connection_t){.con_handle=0x22,.address_type=BD_ADDR_TYPE_ACL,
+        .state=OPEN,.role=HCI_ROLE_SLAVE};
+    memcpy(credit_connections[0].address,first,6);memcpy(credit_connections[1].address,nearby,6);
+    bt_hci_credit_diagnostics(&data);
+    assert(data.airpods_handle==0x11 && data.airpods_local_role==HCI_ROLE_MASTER);
+    assert(data.phone_handle==0x22 && data.phone_local_role==HCI_ROLE_SLAVE);
+    credit_connections[1].role=HCI_ROLE_MASTER;
+    bt_hci_credit_diagnostics(&data);assert(data.phone_local_role==HCI_ROLE_MASTER);
+    assert(!data.airpods.events && !data.phone.events); // Role reads need no new completion event.
+    credit_connections[0].state=0;
+    credit_connections[1].address_type=BD_ADDR_TYPE_SCO;
+    bt_hci_credit_diagnostics(&data);
+    assert(data.airpods_handle==HCI_CON_HANDLE_INVALID && data.phone_handle==HCI_CON_HANDLE_INVALID);
+    assert(data.airpods_local_role==UINT8_MAX && data.phone_local_role==UINT8_MAX);
+    credit_connections[1].address_type=BD_ADDR_TYPE_ACL;
+    memcpy(phone_candidate,phone_address,6);memset(phone_address,0,6);
+    bt_hci_credit_diagnostics(&data);assert(data.phone_handle==0x22 && data.phone_local_role==HCI_ROLE_MASTER);
+    missing_acl=true;bt_hci_credit_diagnostics(&data);
+    assert(data.phone_handle==HCI_CON_HANDLE_INVALID && data.phone_local_role==UINT8_MAX);
+}
+
 int main(void) {
+    test_authenticated_phone_acl_session();
+    test_current_link_roles();
     test_credit_diagnostics();
     test_selected_bond_auto_connects();
     test_first_boot_can_pair_but_missing_selected_bond_cannot_fallback();

@@ -9,13 +9,14 @@ static void (*media_handler)(uint8_t,uint8_t*,uint16_t);
 static uint8_t (*validator)(const avdtp_stream_endpoint_t*,const uint8_t*,uint16_t);
 static avdtp_stream_endpoint_t endpoints[3];
 static unsigned endpoint_count, finalized, framework_calls, accepted, rejected, disconnected;
-static unsigned opens, claims, stops, pcm_frames, pcm_drops, codec_resets, decode_calls;
+static unsigned opens, claims, stops, pcm_frames, pcm_drops, codec_resets, decode_calls, start_requests;
 static unsigned prepares, closes, controls_sent, volume_updates;
 static unsigned lhdc_selections, aptx_selections, sbc_selections, reconnects;
 static uint8_t selected_remote;
 static bool lhdc_select_ok, aptx_select_ok, lhdc_create_ok;
 static uint8_t last_control, last_volume;
 static uint32_t now;
+static uint32_t phone_session;
 static bool output_ready, output_recovering, open_allowed, claim_allowed, secure_peer;
 static bool call_busy, usb_busy, usb_capture_busy, mic_cleanup, saved_phone_valid;
 static uint8_t establish_result;
@@ -81,6 +82,9 @@ uint8_t a2dp_sink_set_config_sbc(uint16_t cid,uint8_t local,uint8_t remote,const
 uint32_t btstack_run_loop_get_time_ms(void) {return now;}
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]) {return memcmp(address,phone_address,6)==0;}
 bool bt_hci_phone_peer_connected(const uint8_t address[6]) {return secure_peer && bt_hci_phone_peer_allowed(address);}
+uint32_t bt_hci_phone_session(const uint8_t address[6]) {
+    return saved_phone_valid && bt_hci_phone_peer_connected(address) ? phone_session : 0;
+}
 bool bt_hci_phone_address(uint8_t address[6]) {memcpy(address,phone_address,6);return saved_phone_valid;}
 bool phone_call_active(void) {return call_busy;}
 bool get_usb_streaming(void) {return usb_busy;}
@@ -120,6 +124,7 @@ bool phone_worker_submit(const uint8_t*payload,size_t length,uint8_t count) {
     return decode_ok;
 }
 bool bridge_phone_open(void) {opens++;return open_allowed;}
+void bridge_phone_start_requested(void) {++start_requests;}
 bool bridge_phone_ready(void) {return output_ready;}
 bool bridge_phone_recovering(void) {return output_recovering;}
 bool bridge_phone_start(void) {claims++;return claim_allowed;}
@@ -171,10 +176,11 @@ void a2dp_config_process_avdtp_event_handler(avdtp_role_t role,uint8_t*packet,ui
 static void fixture_codecs(bool lhdc,bool aptx,bool create_lhdc) {
     memset(&phone,0,sizeof(phone));memset(endpoints,0,sizeof(endpoints));
     memset(&call_resume,0,sizeof(call_resume));
+    memset(&bluetooth_route,0,sizeof(bluetooth_route));phone_session=1;
     initialized=lhdc_disabled=aptx_disabled=retry_codec=false;lhdc_endpoint=aptx_endpoint=sbc_endpoint=NULL;
     lhdc_seid=aptx_seid=sbc_seid=0;
     endpoint_count=finalized=framework_calls=accepted=rejected=disconnected=0;
-    opens=claims=stops=pcm_frames=pcm_drops=codec_resets=decode_calls=prepares=closes=controls_sent=volume_updates=0;
+    opens=claims=stops=pcm_frames=pcm_drops=codec_resets=decode_calls=prepares=closes=controls_sent=volume_updates=start_requests=0;
     now=0;output_ready=output_recovering=false;open_allowed=claim_allowed=secure_peer=prepare_ok=decode_ok=true;
     call_busy=usb_busy=usb_capture_busy=mic_cleanup=false;saved_phone_valid=true;establish_result=0;
     codec_ready=control_busy=false;lhdc_available=lhdc;aptx_available=aptx;desired=PHONE_CODEC_NONE;
@@ -312,8 +318,11 @@ static void test_roles_and_start_priming(void) {
     configure(false);opened();assert(opens==1 && !phone_sink_active());
     stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
     for(unsigned i=0;i<20;i++)phone_sink_poll();
+    assert(start_requests==20);
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);assert(start_requests==20);
     assert(accepted==0 && claims==0 && phone.start_pending && phone_sink_start_pending());
     output_ready=true;phone_sink_poll();assert(accepted==1 && claims==1 && phone.start_accepted);
+    assert(start_requests==21); // The bounded pending poll retries after output cleanup.
     uint8_t packet[32];unsigned size=rtp(packet,1);
     media_handler(phone.seid,packet,size);assert(decode_calls==0);
     stream_event(A2DP_SUBEVENT_STREAM_STARTED,phone.seid);
@@ -333,6 +342,15 @@ static void test_configuration_and_security(void) {
     }
     for(unsigned n=0;n<18;n++)assert(validator(sbc_endpoint,p,n)!=0);
     configure(true);secure_peer=false;opened();assert(!phone.opened && disconnected==1);
+    fixture(true);signaling(0x40,phone_address);configure(true);opened();
+    ++phone_session; // A recycled ACL must not revive the old media profile.
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
+    assert(!start_requests && !phone.start_pending);
+    fixture(true);signaling(0x40,phone_address);configure(true);opened();
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    assert(phone.start_pending && start_requests==1);
+    ++phone_session;phone_sink_poll();
+    assert(!phone.start_pending && start_requests==1 && !accepted);
 }
 static void test_codec_selection(void) {
     fixture(true);signaling(0x40,phone_address);
@@ -1099,7 +1117,113 @@ static void test_call_profile_resume(void) {
     now=500;phone_sink_resume_after_call();assert(reconnects==2);
 }
 
+static void test_bluetooth_route_excludes_usb_audio(void) {
+    fixture(true);
+    assert(!phone_sink_usb_exclusion_requested());
+    phone_avrcp_connected(0x50);
+    assert(!phone_sink_usb_exclusion_requested()); // Controls alone never remove USB audio.
+    signaling(0x40,phone_address);
+    assert(phone_sink_usb_exclusion_requested()); // Media connection selects Bluetooth before configuration.
+    configure(false);
+    usb_busy=true;
+    assert(phone_sink_usb_exclusion_requested()); // Select before Open, despite old USB OUT packets.
+    phone_sink_poll();
+    assert(!disconnected && phone_sink_usb_exclusion_requested());
+    usb_capture_busy=true;
+    assert(!phone_sink_usb_exclusion_requested()); // A current USB call keeps its microphone.
+    usb_capture_busy=false;
+    assert(phone_sink_usb_exclusion_requested());
+    phone_sink_yield();
+    assert(phone_sink_usb_exclusion_requested()); // A profile teardown does not end the phone ACL session.
+
+    fixture(true);usb_capture_busy=true;signaling(0x40,phone_address);
+    assert(!phone_sink_usb_exclusion_requested());
+    usb_capture_busy=false;
+    assert(!phone_sink_usb_exclusion_requested()); // An idle call/control link does not select Bluetooth later.
+
+    fixture(true);secure_peer=false;signaling(0x40,phone_address);
+    assert(!phone_sink_usb_exclusion_requested());
+    secure_peer=true;configure(false);
+    assert(phone_sink_usb_exclusion_requested()); // Authentication completed during media negotiation.
+
+    fixture(true);signaling(0x40,phone_address);configure(false);opened();
+    usb_busy=true;open_allowed=false;
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
+    phone_sink_poll();
+    assert(phone_sink_usb_exclusion_requested() && !disconnected && !accepted);
+    usb_busy=false;open_allowed=output_ready=true;
+    phone_sink_poll();
+    assert(accepted==1 && !disconnected); // Existing Start gate waits for USB cleanup.
+
+    fixture(true);playing(false);
+    assert(phone_sink_usb_exclusion_requested());
+    stream_event(A2DP_SUBEVENT_STREAM_SUSPENDED,phone.seid);
+    assert(phone_sink_usb_exclusion_requested()); // Pausing must not re-enumerate USB audio.
+    stream_event(A2DP_SUBEVENT_STREAM_RELEASED,phone.seid);
+    assert(phone_sink_usb_exclusion_requested());
+
+    fixture(true);playing(false);
+    phone_sink_pause_for_call();call_music_released(0x40);
+    assert(phone_sink_usb_exclusion_requested());
+    phone_sink_resume_after_call();
+    assert(phone_sink_usb_exclusion_requested());
+    now=10000;phone_sink_resume_after_call();
+    assert(phone_sink_usb_exclusion_requested()); // Keep USB absent even if the media retry times out.
+}
+
+static void test_bluetooth_route_lasts_for_phone_acl_session(void) {
+    fixture(true);signaling(0x40,phone_address);configure(false);opened();
+    phone_avrcp_connected(0x50);
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
+    now=PHONE_START_TIMEOUT_MS;phone_sink_poll();
+    assert(rejected==1 && !accepted && !phone.started);
+    call_music_released(0x40);
+    assert(phone.cid==0 && phone.avrcp_cid==0x50 && secure_peer);
+    assert(phone_sink_usb_exclusion_requested()); // Start failed, but the phone's ACL/control link remains.
+    now+=60000;phone_sink_poll();
+    assert(phone_sink_usb_exclusion_requested());
+    signaling(0x41,phone_address);configure(false);opened();
+    assert(phone_sink_usb_exclusion_requested()); // An A2DP retry keeps the same USB presentation.
+
+    secure_peer=false;
+    assert(!phone_sink_usb_exclusion_requested()); // Whole phone ACL disconnect restores USB.
+    secure_peer=true;++phone_session;
+    assert(!phone_sink_usb_exclusion_requested()); // Reconnecting only HFP/AVRCP must not inherit it.
+    call_music_released(0x41);signaling(0x42,phone_address);
+    assert(phone_sink_usb_exclusion_requested());
+    ++phone_session;
+    assert(!phone_sink_usb_exclusion_requested()); // Disconnect/reconnect between main-loop polls, same peer.
+
+    call_music_released(0x42);signaling(0x43,phone_address);
+    assert(phone_sink_usb_exclusion_requested());
+    saved_phone_valid=false;
+    assert(!phone_sink_usb_exclusion_requested()); // Selecting a different phone invalidates the old route.
+    saved_phone_valid=true;
+    assert(!phone_sink_usb_exclusion_requested());
+}
+
+static void test_closed_microphone_drain_keeps_new_route(void) {
+    fixture(true);signaling(0x40,phone_address);
+    mic_cleanup=true;
+    uint8_t configuration[18];sbc_event(configuration);
+    sink_handler(HCI_EVENT_PACKET,0,configuration,sizeof(configuration));opened();
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);
+    unsigned before=prepares;
+    phone_sink_poll();
+    assert(phone_sink_usb_exclusion_requested() && !disconnected && !accepted && prepares==before);
+    mic_cleanup=false;output_ready=true;
+    phone_sink_poll();
+    assert(accepted==1 && !disconnected && prepares==before+1);
+    mic_cleanup=true;phone_sink_yield();
+    unsigned closed=closes;
+    phone_sink_poll();
+    assert(closes>closed && phone_sink_usb_exclusion_requested()); // Teardown runs without losing the selected route.
+}
+
 int main(void) {
+    test_bluetooth_route_lasts_for_phone_acl_session();
+    test_closed_microphone_drain_keeps_new_route();
+    test_bluetooth_route_excludes_usb_audio();
     test_call_profile_resume();
     test_phone_gap_diagnostics();
     test_rtp_timestamp_diagnostics();

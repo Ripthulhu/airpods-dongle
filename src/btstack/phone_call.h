@@ -14,6 +14,8 @@ void phone_call_report(void);
 bool phone_call_active(void);
 bool phone_call_audio_requested(void);
 bool phone_call_mic_requested(void);
+// Only a real voice link/cleanup selects Bluetooth; idle HFP control does not.
+bool phone_call_usb_exclusion_requested(void);
 // Only a current, authenticated HFP phone may open a synchronous voice link.
 bool phone_call_sco_allowed(const uint8_t address[6]);
 // Called only for a validated AirPods stem PRESS, before media dispatch.

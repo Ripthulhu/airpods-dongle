@@ -53,6 +53,7 @@
 #include "../runtime_watch.h"
 #include "playback_inspect.h"
 #include "playback_eld.h"
+#include "playback_continuity.h"
 #include "playback_peer.h"
 #include "playback_format.h"
 #include "playback_options.h"
@@ -207,6 +208,7 @@ static playback_trace_t playback_trace={.stats={[TRACE_PCM_MIN]=UINT32_MAX}};
 static uint32_t usb_last_arrival_us, media_last_sent_us, packet_oldest_us;
 static bool playback_work_pending;
 static bool playback_transport_stale;
+static playback_continuity_t phone_continuity;
 static bool mic_prepare_open, mic_recovery_pending, mic_recovery_started;
 static uint32_t mic_prepare_serial, mic_prepare_session, mic_recovery_since, mic_recovery_revision;
 static uint16_t mic_recovery_cid;
@@ -259,6 +261,9 @@ uint8_t dongle_output_codec(void) {
 }
 
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+static void avrcp_reconnect_reset(void);
+static void avrcp_reconnect_schedule(bool immediate);
+static void avrcp_reconnect_poll(uint32_t now);
 static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
@@ -429,6 +434,14 @@ static void a2dp_demo_send_media_packet(void) {
         context->codec_storage,context->codec_storage_count,sent_us);
     uint32_t gap_us=media_last_sent_us?sent_us-media_last_sent_us:0;
     uint32_t receiver_ms=playback_game.changed?playback_game.target:150u;
+    if (cur_codec==4 && phone_active && phone_buffer_started && !call_active &&
+        !is_usb_streaming && aacp_audio_owned() && !aacp_mic_active() &&
+        playback_idle_phase==PLAYBACK_RUNNING && !playback_adjust_busy(&playback_adjust) &&
+        !playback_game.waiting_tx && !playback_game.waiting_report) {
+        if (playback_continuity_sent(&phone_continuity, sent_us,
+                context->codec_num_frames * 10000u, receiver_ms * 1000u))
+            playback_transport_stale=true;
+    } else playback_continuity_reset(&phone_continuity);
     if(cur_codec==4 && (is_usb_streaming || phone_active || call_active) && media_last_sent_us &&
        !playback_adjust_busy(&playback_adjust) && gap_us>receiver_ms*1000u)
         playback_transport_stale=true;
@@ -631,7 +644,14 @@ static void playback_usb_verify_sent(void) {
 static void playback_pcm_push_measured(const int16_t *src, uint32_t frames) {
     if (playback_pcm.capacity && src && frames) {
         uint32_t available=playback_pcm.capacity-playback_pcm.used;
-        if (frames>available) playback_metrics.pcm_drops+=frames-available;
+        if (frames>available) {
+            uint32_t dropped=frames-available;
+            playback_metrics.pcm_drops+=dropped;
+            if (phone_active || call_active) {
+                PB_ADD(playback_pcm.primed_on_wire?TRACE_ACTIVE_DROP:TRACE_STARTUP_DROP,dropped);
+                if (playback_pcm.primed_on_wire) PB_EVENT(TRACE_DROP,dropped,playback_pcm.used);
+            }
+        }
     }
     playback_pcm_push(&playback_pcm,src,frames);
     if (playback_pcm.used>playback_metrics.pcm_peak) playback_metrics.pcm_peak=playback_pcm.used;
@@ -1029,6 +1049,16 @@ bool bridge_phone_open(void) {
     return true;
 }
 
+void bridge_phone_start_requested(void) {
+    const uint8_t *peer = (const uint8_t *)get_device_addr();
+    if (call_opened || call_active || is_usb_streaming ||
+        aacp_mic_requested() || aacp_mic_active() || !aacp_audio_owned() || profile_pending || a2dp_connect_pending ||
+        !peer_address_valid(peer) || memcmp(peer, cur_active_device, 6)) return;
+    if (!bridge_phone_open()) return;
+    // A fresh authenticated phone Start is new demand; opening its profile is not.
+    dongle_playback_ownership_changed(true);
+}
+
 bool bridge_phone_ready(void) {
     if (!phone_opened || is_usb_streaming || aacp_mic_requested() ||
         !a2dp_is_connected_flag || !media_tracker.streaming || playback_idle_phase != PLAYBACK_RUNNING) return false;
@@ -1052,6 +1082,7 @@ bool bridge_phone_recovering(void) {
 
 bool bridge_phone_start(void) {
     if (!bridge_phone_ready()) return false;
+    playback_continuity_reset(&phone_continuity);
     critical_section_enter_blocking(&playback_pcm_lock);
     playback_pcm_clear(&playback_pcm, PHONE_PCM_CAPACITY);
     phone_clock_init(&phone_clock, acc_num_simples);
@@ -1065,6 +1096,7 @@ bool bridge_phone_start(void) {
 void bridge_phone_drop_pcm(void) {
     critical_section_enter_blocking(&playback_pcm_lock);
     if (phone_active && !call_active) {
+        playback_continuity_reset(&phone_continuity);
         playback_pcm_clear(&playback_pcm, PHONE_PCM_CAPACITY);
         phone_buffer_started = false;
         phone_clock_init(&phone_clock, acc_num_simples);
@@ -1074,6 +1106,7 @@ void bridge_phone_drop_pcm(void) {
 }
 
 void bridge_phone_stop(void) {
+    playback_continuity_reset(&phone_continuity);
     phone_output_recovery = false;
     critical_section_enter_blocking(&playback_pcm_lock);
     if (phone_active && !call_active)
@@ -1566,6 +1599,21 @@ static void playback_audio_work(uint32_t now) {
     uint32_t limit=4u*acc_num_simples;
     if(limit<PLAYBACK_USB_DEBT_LIMIT)limit=PLAYBACK_USB_DEBT_LIMIT;
     limit=limit*10u/playback_adjust_interval(&playback_adjust);
+    if(external && playback_pcm.dropped_pending) {
+        // Credit physical losses only against overdue work that would otherwise
+        // be trimmed again below. Cancelling healthy or future deadlines keeps
+        // an overflowing FIFO full by preventing the reads that would drain it.
+        uint32_t excess=!playback_pcm.priming && playback_pcm.primed_on_wire && phone_buffer_started &&
+            context->samples_ready>limit?context->samples_ready-limit:0;
+        uint32_t skipped=playback_pcm.dropped_pending<excess?playback_pcm.dropped_pending:excess;
+        context->samples_ready-=skipped;
+        playback_pcm.dropped_pending=0;
+        PB_ADD(TRACE_DEBT_DROP,skipped);
+        if(skipped) {
+            if(!phone_overrun) {PB_ADD(TRACE_RECOVERIES,1);phone_overrun=true;}
+            PB_EVENT(TRACE_RECOVERY,skipped,context->samples_ready);
+        }
+    }
     if(is_usb_streaming && !external &&
        (usb_recovery_drops || context->samples_ready>limit || playback_transport_stale)) {
         uint32_t trimmed=playback_pcm_limit(&playback_pcm,PLAYBACK_USB_MIN_FRAMES);
@@ -1634,6 +1682,8 @@ static void playback_clock_switch(a2dp_media_sending_context_t *context,uint32_t
 // Cancellation must leave both source-time debt and the timer in the normal domain.
 static void playback_adjust_cancel_stream(a2dp_media_sending_context_t *context,
                                            uint32_t now, uint8_t old_interval) {
+    if (playback_adjust_busy(&playback_adjust) || old_interval!=10)
+        playback_continuity_reset(&phone_continuity);
     if (context->streaming && old_interval!=10) {
         playback_clock_switch(context,now,old_interval,10);
         btstack_run_loop_remove_timer(&context->audio_timer);
@@ -1759,6 +1809,7 @@ static void playback_prepare_packet(a2dp_media_sending_context_t *context, uint3
 
 
 static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
+    playback_continuity_reset(&phone_continuity);
     playback_transport_stale=false;
 
     int mtu = avdtp_max_media_payload_size(context->avdtp_cid, context->local_seid);
@@ -1810,6 +1861,7 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
 }
 
 static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){
+    playback_continuity_reset(&phone_continuity);
     playback_usb_verify_cancel();
     phone_output_recovery = false;
     playback_transport_stale=false;
@@ -2054,7 +2106,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             // Resolve AACP ownership before initial Start; two powered dongles
             // may retain their transports, but only the active host sends audio.
             if (aacp_audio_owned()) playback_idle_phase = PLAYBACK_SUSPENDED;
-            avrcp_connect((uint8_t *) cur_active_device, &media_tracker.avrcp_cid);
+            avrcp_reconnect_schedule(true);
+            avrcp_reconnect_poll(btstack_run_loop_get_time_ms());
             break;
 
         case AVDTP_SUBEVENT_SIGNALING_SEP_FOUND:
@@ -2550,6 +2603,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             break;
         case AVDTP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
             if (avdtp_subevent_signaling_connection_released_get_avdtp_cid(packet) != media_tracker.avdtp_cid) break;
+            avrcp_reconnect_reset();
             mic_prepare_open=mic_recovery_pending=mic_recovery_started=false;
             a2dp_demo_timer_stop(&media_tracker);
             aacp_disconnect();
@@ -2964,6 +3018,7 @@ static int setup_aaceld_configuration(){
 
 
 bool avdtp_disconnect_and_scan(void){
+    avrcp_reconnect_reset();
     // Pair supersedes a profile reconnect, even if clearing the slot or inquiry fails.
     profile_pending = profile_reconnect = false;
     a2dp_accept_incoming = false;
@@ -3159,7 +3214,10 @@ void dongle_playback_mic_recovery_abort(void) {
 
 uint8_t dongle_playback_game_mode(bool enabled) {
     if (enabled && !playback_game_eligible()) return DONGLE_UNSUPPORTED;
-    if (playback_game.requested != enabled) playback_usb_verify_cancel();
+    if (playback_game.requested != enabled) {
+        playback_usb_verify_cancel();
+        playback_continuity_reset(&phone_continuity);
+    }
     if (playback_game.requested != enabled)
         playback_adjust_cancel_stream(&media_tracker,btstack_run_loop_get_time_ms(),
                                       playback_adjust_interval(&playback_adjust));
@@ -3259,8 +3317,10 @@ void dongle_playback_poll(void) {
     }
     if (live && !usb_game_verification.needed && playback_game.waiting_report &&
         (uint32_t)(now-playback_game.sent_since)<2000 &&
-        delay_revision!=playback_game.report_revision && reported_delay && reported_delay!=UINT16_MAX)
+        delay_revision!=playback_game.report_revision && reported_delay && reported_delay!=UINT16_MAX) {
+        playback_continuity_reset(&phone_continuity);
         playback_adjust_request(&playback_adjust,reported_delay,playback_game.target);
+    }
     // USB can adjust live; a phone source still prepares while suspended.
     bool active=!aacp_mic_requested() && !aacp_mic_active() &&
         (!media_tracker.streaming || playback_game.changed || live);
@@ -3275,6 +3335,7 @@ void dongle_playback_poll(void) {
         !playback_game.waiting_tx && !playback_game.waiting_report && !playback_game.restore_failed &&
         (aacp_receive_buffer_serial()==mic_prepare_serial || aacp_receive_buffer_last()!=150)) target=150;
     if (target) {
+        playback_continuity_reset(&phone_continuity);
         playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
         playback_game_t previous=playback_game;
         // BTstack can send synchronously; arm the receipt before enqueueing.
@@ -3301,6 +3362,7 @@ void dongle_playback_poll(void) {
     }
     playback_idle_poll(now);
     playback_reconnect_poll(now);
+    avrcp_reconnect_poll(now);
 }
 uint16_t dongle_playback_status(uint8_t *out, uint16_t capacity) {
     if (!out || capacity<20) return 0;
@@ -3410,6 +3472,57 @@ bool * get_is_bt_sink_volume_changed_ptr(void){
     return &_bt_sink_volume_changed;
 }
 
+#define AVRCP_RETRY_MS 1000u
+#define AVRCP_RETRY_ATTEMPTS 3u
+static struct {
+    bd_addr_t peer;
+    uint16_t media_cid;
+    uint32_t since;
+    uint8_t attempts;
+    bool pending;
+} avrcp_retry;
+
+static void avrcp_reconnect_reset(void) {
+    memset(&avrcp_retry, 0, sizeof(avrcp_retry));
+}
+
+static bool avrcp_reconnect_current(void) {
+    const uint8_t *selected = (const uint8_t *)get_device_addr();
+    return a2dp_accept_incoming && a2dp_is_connected_flag && !profile_pending &&
+        avrcp_retry.media_cid != 0 && avrcp_retry.media_cid == media_tracker.avdtp_cid &&
+        selected && !memcmp(selected, avrcp_retry.peer, 6) &&
+        !memcmp(cur_active_device, avrcp_retry.peer, 6);
+}
+
+static void avrcp_reconnect_schedule(bool immediate) {
+    if (avrcp_retry.media_cid != media_tracker.avdtp_cid ||
+        memcmp(avrcp_retry.peer, cur_active_device, 6)) {
+        avrcp_reconnect_reset();
+        avrcp_retry.media_cid = media_tracker.avdtp_cid;
+        memcpy(avrcp_retry.peer, cur_active_device, 6);
+    }
+    avrcp_retry.pending = false;
+    avrcp_retry.since = btstack_run_loop_get_time_ms() - (immediate ? AVRCP_RETRY_MS : 0u);
+    if (!avrcp_reconnect_current()) avrcp_reconnect_reset();
+}
+
+static void avrcp_reconnect_poll(uint32_t now) {
+    if (!avrcp_reconnect_current()) {
+        avrcp_reconnect_reset();
+        return;
+    }
+    if (media_tracker.avrcp_cid || avrcp_retry.pending ||
+        avrcp_retry.attempts >= AVRCP_RETRY_ATTEMPTS ||
+        (uint32_t)(now - avrcp_retry.since) < AVRCP_RETRY_MS) return;
+    ++avrcp_retry.attempts;
+    avrcp_retry.pending = true;
+    avrcp_retry.since = now;
+    // BTstack can already be establishing the same peer and return no new CID.
+    // Keep that setup pending; restarting it cannot safely cancel its SDP query.
+    if (avrcp_connect(avrcp_retry.peer, &media_tracker.avrcp_cid) != ERROR_CODE_SUCCESS)
+        avrcp_retry.pending = false;
+}
+
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     if (phone_sink_handle_avrcp(packet_type, channel, packet, size)) return;
     UNUSED(channel);
@@ -3425,11 +3538,17 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             if (size != 14) return;
             local_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
             status = avrcp_subevent_connection_established_get_status(packet);
+            avrcp_subevent_connection_established_get_bd_addr(packet, event_addr);
             if (status != ERROR_CODE_SUCCESS){
                 printf("AVRCP: Connection failed, local cid 0x%02x, status 0x%02x\n", local_cid, status);
+                if (a2dp_is_connected_flag && !memcmp(event_addr, cur_active_device, 6) &&
+                    ((!media_tracker.avrcp_cid && avrcp_retry.pending) ||
+                     (local_cid != 0 && local_cid == media_tracker.avrcp_cid))) {
+                    media_tracker.avrcp_cid = 0;
+                    avrcp_reconnect_schedule(false);
+                }
                 return;
             }
-            avrcp_subevent_connection_established_get_bd_addr(packet, event_addr);
             const uint8_t *expected = a2dp_is_connected_flag ? cur_active_device : (const uint8_t *)get_device_addr();
             if (!a2dp_accept_incoming || expected == NULL ||
                 memcmp(event_addr, expected, sizeof(bd_addr_t)) != 0) {
@@ -3441,6 +3560,7 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
                 avrcp_disconnect(local_cid);
                 return;
             }
+            avrcp_reconnect_reset();
             media_tracker.avrcp_cid = local_cid;
             volume_sync_connection(&sink_volume, local_cid, btstack_run_loop_get_time_ms());
             bt_volume_relay_reset(false);
@@ -3466,6 +3586,7 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             volume_sync_connection(&sink_volume, 0, btstack_run_loop_get_time_ms());
             bt_volume_relay_reset(false);
             phone_sink_volume_invalidated();
+            avrcp_reconnect_schedule(false);
             return;
         default:
             break;

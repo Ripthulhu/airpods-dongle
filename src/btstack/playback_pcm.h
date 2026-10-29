@@ -29,6 +29,7 @@ typedef struct {
     uint32_t read;
     uint32_t used;
     uint32_t capacity;
+    uint32_t dropped_pending;
     uint32_t priming;
     uint32_t fraction;
     float history[PLAYBACK_FILTER_TAPS*2];
@@ -39,7 +40,7 @@ static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
                                       bool prime) {
     if (capacity == 0 || capacity > PLAYBACK_PCM_FRAMES ||
         (prime && capacity < PLAYBACK_PRIMING_FRAMES)) return false;
-    pcm->read = pcm->used = 0;
+    pcm->read = pcm->used = pcm->dropped_pending = 0;
     pcm->fraction = 0;
     memset(pcm->history,0,sizeof(pcm->history));
     pcm->capacity = capacity;
@@ -51,20 +52,31 @@ static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
 // Changing input discards its PCM, without restarting the AirPods' warm stream.
 static inline void playback_pcm_clear(playback_pcm_t *pcm, uint32_t capacity) {
     if (capacity == 0 || capacity > PLAYBACK_PCM_FRAMES) return;
-    pcm->read = pcm->used = 0;
+    pcm->read = pcm->used = pcm->dropped_pending = 0;
     pcm->fraction = 0;
     memset(pcm->history,0,sizeof(pcm->history));
     pcm->capacity = capacity;
 }
 
 static inline void playback_pcm_sent(playback_pcm_t *pcm) {
-    if (pcm->priming == 0) pcm->primed_on_wire = true;
+    if (pcm->priming == 0 && !pcm->primed_on_wire) {
+        // Startup losses must not become overdue work in the active stream.
+        pcm->dropped_pending = 0;
+        pcm->primed_on_wire = true;
+    }
 }
 
 static inline void playback_pcm_push_data(playback_pcm_t *pcm, const void *data,
                                           uint32_t frames, bool floating) {
     const uint8_t *src=data;
     if (pcm->capacity == 0 || src == NULL) return;
+    if (frames > pcm->capacity - pcm->used) {
+        uint32_t dropped = frames - (pcm->capacity - pcm->used);
+        // Track overwritten frames so overdue work is not trimmed twice.
+        // This accounting must never cancel healthy or future output deadlines.
+        pcm->dropped_pending = dropped > UINT32_MAX - pcm->dropped_pending ?
+            UINT32_MAX : pcm->dropped_pending + dropped;
+    }
     // Overflow keeps the newest whole stereo frames, never stale audio after a stall.
     if (frames > pcm->capacity) {
         src += (size_t)(frames - pcm->capacity)*2*(floating?sizeof(float):sizeof(int16_t));

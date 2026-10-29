@@ -37,6 +37,32 @@ static bool aacp_mic_update_owner(bool changed) {
     return changed;
 }
 #include "main_mic_request.inc"
+static bool microphone_active, phone_connected;
+static unsigned phone_yields, phone_polls;
+static bool aacp_mic_active(void) {return microphone_active;}
+static bool phone_sink_connected(void) {return phone_connected;}
+static void phone_sink_yield(void) {++phone_yields;}
+static void phone_sink_poll(void) {++phone_polls;}
+enum { WATCH_PHONE };
+static void runtime_watch_set(unsigned phase) {assert(phase==WATCH_PHONE);}
+#include "main_phone_handover.inc"
+
+static void closed_microphone_drains_before_phone_prepare(void) {
+    mic_decoder_lifecycle_t state={0};ready=true;
+    usb_mic_request_set(&usb_request,false);
+    phone_connected=microphone_active=true;
+    unsigned before=releases;
+    main_phone_handover(&state);
+    assert(!phone_yields && releases==before && phone_polls==1 && ready);
+    microphone_active=false;release_ack=false;
+    main_phone_handover(&state);
+    assert(state.releasing && !phone_yields && phone_polls==1 && ready);
+    release_ack=true;main_phone_handover(&state);
+    assert(!state.releasing && !ready && phone_polls==2 && !phone_yields);
+    ready=true;microphone_active=true;usb_mic_request_set(&usb_request,true);
+    before=releases;main_phone_handover(&state);
+    assert(phone_yields==1 && releases==before && ready); // A current USB call still wins.
+}
 static void coalesced_request_reaches_playback(void) {
     mic_decoder_lifecycle_t state={0}; ready=true;
     usb_mic_request_set(&usb_request,true); main_mic_request(&state);
@@ -92,5 +118,6 @@ int main(void) {
     assert(poll(&state, true, false, true) == MIC_DECODER_READY && attempts == 4);
     assert(releases > 0);
     coalesced_request_reaches_playback();
+    closed_microphone_drains_before_phone_prepare();
     puts("microphone lifecycle: bounded failed allocation, fresh-open recovery, detach and cancellation passed");
 }

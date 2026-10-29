@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include "../src/btstack/playback_eld.h"
+#include "../src/btstack/playback_continuity.h"
 #include "../src/btstack/playback_adjust.h"
 #include "../src/btstack/playback_options.h"
 #include "playback_test_hooks.h"
@@ -14,6 +15,7 @@ static playback_inspect_t playback_inspect;
 static bool inspect_enabled;
 static playback_adjust_t playback_adjust;
 static playback_game_t playback_game;
+static playback_continuity_t phone_continuity;
 
 #define HAVE_AAC_FDK
 #define AVDTP_CODEC_SBC 1
@@ -42,7 +44,9 @@ static uint32_t now, consumed, emitted, frame_size, sample_frames, send_failures
 static unsigned encode_calls, eld_packets, eld_units;
 static uint16_t eld_sequence;
 static bool send_requested, phone_opened, recovery_reset_encoder, suspend_recovery_pending;
-static bool phone_active, phone_output_recovery;
+static bool phone_active, phone_output_recovery, phone_buffer_started;
+static bool audio_owned = true;
+static bool aacp_audio_owned(void) {return audio_owned;}
 static bool call_active, call_opened;
 static uint16_t phone_output_recovery_cid;
 static uint32_t phone_output_recovery_since;
@@ -95,6 +99,7 @@ static void *btstack_run_loop_get_timer_context(btstack_timer_source_t *t) { ret
 static uint32_t btstack_run_loop_get_time_ms(void) { return now; }
 static unsigned a2dp_sample_rate(void) { return 48000; }
 static void a2dp_demo_timer_stop(void *a) {
+    playback_continuity_reset(&phone_continuity);
     (void)a; assert(allow_recovery); media_tracker.streaming=false;
     media_tracker.samples_ready=media_tracker.acc_num_missed_samples=0;
     media_tracker.codec_ready_to_send=media_tracker.codec_storage_count=media_tracker.codec_num_frames=0;
@@ -128,7 +133,7 @@ static playback_trace_t playback_trace;
 #define PB_MAX(stat,value) do {uint32_t v=(value);if(v>playback_trace.stats[stat])playback_trace.stats[stat]=v;}while(0)
 #define PB_EVENT(kind,a,b) playback_trace_record(&playback_trace,time_us_32(),kind,a,b)
 static unsigned playback_pcm_lock,usb_recovery_drops,pcm_frame_samples=480;
-static bool is_usb_streaming=true,phone_buffer_started;
+static bool is_usb_streaming=true;
 #ifdef PLAYBACK_REAL_PHONE
 #include "btstack_resample.h"
 #include "../src/btstack/phone_clock.h"
@@ -251,6 +256,8 @@ static void drain(void) {
     }
 }
 static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigned interval, unsigned mtu) {
+    playback_continuity_reset(&phone_continuity);
+    phone_buffer_started=false;audio_owned=true;
     playback_adjust_cancel(&playback_adjust);
     playback_work_pending=playback_transport_stale=false;packet_oldest_us=media_last_sent_us=0;
     memset(&media_tracker, 0, sizeof(media_tracker));
@@ -408,5 +415,6 @@ int main(void) {
     avdtp_audio_timeout_handler(&timer);
     assert(playback_metrics.recoveries == 1 && suspend_recovery_pending && !media_tracker.streaming);
     puts("playback timing: SBC/AAC/ELD pacing, bounded debt, 15-frame headers, MTU and retries passed");
+    return 0;
 }
 #endif

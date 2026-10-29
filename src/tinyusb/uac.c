@@ -106,7 +106,49 @@
  static uint32_t speaker_last_packet_us;
  static _Atomic bool volume_notification_pending;
 
+ // Main publishes routing intent; only the USB service changes descriptors.
+ static _Atomic bool usb_bluetooth_requested;
+ static _Atomic bool usb_audio_present = true;
+ static bool usb_descriptor_audio = true;
+ static bool usb_mode_reconnecting;
+ static uint32_t usb_reconnect_at;
+ #define USB_REENUMERATE_US 250000u
+
  #define USB_PLAYBACK_IDLE_US 50000u
+
+ void usb_audio_set_bluetooth(bool requested) {
+   // A USB mic SET_INTERFACE can arrive between main's policy read and this
+   // publication. An already accepted USB recording request retains priority.
+   uint32_t saved = save_and_disable_interrupts();
+   atomic_store_explicit(&usb_bluetooth_requested,
+       requested && !usb_mic_request_wanted(&mic_request), memory_order_release);
+   restore_interrupts(saved);
+ }
+
+ bool usb_audio_available(void) {
+   return !atomic_load_explicit(&usb_bluetooth_requested, memory_order_acquire) &&
+          atomic_load_explicit(&usb_audio_present, memory_order_acquire);
+ }
+
+ static void usb_audio_mode_task(void) {
+   bool audio = !atomic_load_explicit(&usb_bluetooth_requested, memory_order_acquire);
+   if (!usb_mode_reconnecting && audio != usb_descriptor_audio) {
+     usb_mode_reconnecting = true;
+     atomic_store_explicit(&usb_audio_present, false, memory_order_release);
+     tud_disconnect();
+     // Pull-up removal alone does not clear TinyUSB's mounted state.
+     tud_umount_cb();
+     usb_reconnect_at = time_us_32() + USB_REENUMERATE_US;
+   }
+   if (usb_mode_reconnecting && (int32_t)(time_us_32() - usb_reconnect_at) >= 0) {
+     // Coalesce changes during the detach interval, without blocking audio work.
+     usb_descriptors_set_audio(audio);
+     usb_descriptor_audio = audio;
+     atomic_store_explicit(&usb_audio_present, audio, memory_order_release);
+     usb_mode_reconnecting = false;
+     tud_connect();
+   }
+ }
 
  static void usb_speaker_stop(void) {
    if (!speaker_active) return;
@@ -116,7 +158,7 @@
 
  static void usb_mic_update_request(void) {
    atomic_store_explicit(&usb_host_available, usb_mounted && !usb_suspended, memory_order_release);
-   bool wanted = usb_mounted && !usb_suspended && mic_interface_open;
+   bool wanted = usb_mounted && !usb_suspended && usb_audio_available() && mic_interface_open;
    if (!wanted && !speaker_active) usb_media_cancel_volume();
    if (wanted != usb_mic_request_wanted(&mic_request)) aacp_mic_pcm_reset();
    usb_mic_request_set(&mic_request, wanted);
@@ -131,7 +173,7 @@
  }
 
  bool usb_host_active(void) {
-   return atomic_load_explicit(&usb_host_available, memory_order_acquire);
+   return usb_audio_available() && atomic_load_explicit(&usb_host_available, memory_order_acquire);
  }
 
  uint32_t usb_volume_set_revision(void) {
@@ -180,6 +222,7 @@
 
 
  void tinyusb_task(void){
+    usb_audio_mode_task();
     tud_task(); // TinyUSB device task
     // A bus reset clears TinyUSB configuration without an unmount callback.
     if (usb_mounted && !tud_mounted()) tud_umount_cb();
@@ -200,6 +243,7 @@ void tinyusb_control_task(void){
  // Invoked when device is mounted
  void tud_mount_cb(void)
  {
+   if (usb_mode_reconnecting) return;
    usb_speaker_stop();
    speaker_interface_open = false;
    speaker_format=0;
@@ -440,6 +484,7 @@ void tinyusb_control_task(void){
  // Invoked when audio class specific get request received for an entity
  bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p_request)
  {
+   if (!usb_audio_available()) return false;
    audio_control_request_t const *request = (audio_control_request_t const *)p_request;
 
    if (request->bEntityID == UAC2_ENTITY_CLOCK)
@@ -459,6 +504,7 @@ void tinyusb_control_task(void){
  // Invoked when audio class specific set request received for an entity
  bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p_request, uint8_t *buf)
  {
+   if (!usb_audio_available()) return false;
    audio_control_request_t const *request = (audio_control_request_t const *)p_request;
 
    if (request->bEntityID == UAC2_ENTITY_SPK_FEATURE_UNIT)
@@ -480,6 +526,7 @@ void tinyusb_control_task(void){
  // USB callbacks publish intent; the main loop owns Bluetooth calls.
  bool tud_audio_set_itf_close_EP_cb(uint8_t rhport, tusb_control_request_t const *request)
  {
+   if (!usb_audio_available()) return false;
    (void)rhport;
    uint16_t itf = tu_le16toh(request->wIndex);
    uint16_t alt = tu_le16toh(request->wValue);
@@ -505,6 +552,7 @@ void tinyusb_control_task(void){
 
  bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *request)
  {
+   if (!usb_audio_available()) return false;
    (void)rhport;
    uint16_t itf = tu_le16toh(request->wIndex);
    uint16_t alt = tu_le16toh(request->wValue);
@@ -549,7 +597,7 @@ void tinyusb_control_task(void){
      return false;
    }
    if ((cur_alt_setting!=1 && cur_alt_setting!=2) || cur_alt_setting!=speaker_format || !speaker_interface_open ||
-       !usb_mounted || usb_suspended) return true;
+       !usb_mounted || usb_suspended || !usb_audio_available()) return true;
 
    if (spk_data_size)
    {
@@ -575,6 +623,7 @@ void tinyusb_control_task(void){
  // zero-fill any shortfall so the host always gets a full frame.
  bool tud_audio_tx_done_pre_load_cb(uint8_t rhport, uint8_t itf, uint8_t ep_in, uint8_t cur_alt_setting)
  {
+   if (!usb_audio_available()) return false;
    (void)rhport;
    (void)itf;
    (void)ep_in;
@@ -614,6 +663,11 @@ void tinyusb_control_task(void){
 
 void audio_control_task(void)
  {
+   if (!usb_audio_available()) {
+     atomic_store_explicit(&need_change_bt_volume, false, memory_order_release);
+     atomic_store_explicit(&volume_notification_pending, false, memory_order_release);
+     return;
+   }
    if (*get_is_bt_sink_volume_changed_ptr() && bt_volume_usb_ready() &&
        !atomic_load_explicit(&need_change_bt_volume, memory_order_acquire))
    {

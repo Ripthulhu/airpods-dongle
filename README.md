@@ -12,15 +12,40 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.42** corrects an overflow-accounting feedback loop reproduced
+with perfectly timed phone input: cancelling healthy output deadlines kept the
+full buffer from draining. It also detects accumulated output timing loss across
+short stalls and uses the existing receiver-confirmed restart, instead of letting
+playback remain silent after the sender catches up. Hearing the final candidate
+on hardware remains necessary; these are regression results, not audio acceptance.
+Both lab dongles are flashed with 0.1.42, with pairing storage preserved. All
+build checks passed, and a silent Windows stream verified actual IEEE float32
+USB input. See [0.1.42 validation and next checks](docs/VALIDATION-0.1.42.md).
+
+Version **0.1.41** keeps USB audio absent for the selected Bluetooth phone
+connection, including paused playback, failed media setup and retries. An
+authenticated Bluetooth music connection selects this mode; disconnecting the
+phone's entire Bluetooth connection restores USB audio. Idle call/control links
+alone do not select it. CDC/HID return after a brief USB re-enumeration. An
+existing USB microphone request retains priority. Its Pixel route checks passed,
+including loss of the media profile with the phone connection still present.
+Its Bluetooth playback still failed; 0.1.42 corrects the scheduling defects above.
+See the [renewed firmware audit](docs/AUDIT-0.1.39.md) for reproduced faults,
+rejected buffer-only fixes, and hardware checks still needed.
+
+Version **0.1.40** restored USB too early after a failed media startup; 0.1.41
+corrected that mode lifetime. Both versions' overflow accounting could cancel
+future output deadlines; 0.1.42 only credits losses against work already overdue.
+
 Development candidate **0.1.39** verifies USB Game Mode timing after startup
 priming and starts in normal mode; double-press BOOTSEL to enable Game Mode.
 Version **0.1.38** can confirm the receiver-buffer preparation before
 Start, then miss the live timing adjustment after its 100 ms priming. A PC hitch
 investigation found continuous host/USB/encoder data and clean playback after a
-manual off/on retune. The original PC Pico now passes short normal-mode,
+manual off/on retune. The original PC Pico passed short normal-mode,
 double-press Game Mode and automatic case-return checks on 0.1.39. Its startup
 trace confirms the fresh post-prime request and completed adjustment. The second
-Pico also runs verified 0.1.39 and passed short Pixel USB S16 stereo playback in
+Pico also passed short Pixel USB S16 stereo playback on 0.1.39 in
 normal mode after manual takeover. Extended playback, microphone and phone-call
 checks remain open. The 60 ms target and
 packet grouping are unchanged.
@@ -192,10 +217,10 @@ source commit, compiler version and `SHA256SUMS`. Downloads are retained for
 
 ## Use
 
-The dongle starts reconnecting to its saved headset on power-up. Game Mode is
-enabled by default for supported AirPods/codec combinations; other headsets keep
-normal playback. NTPods is optional: pairing, reconnects, audio, volume and stem
-media keys run in firmware. A companion toggle lasts until the next power cycle.
+The dongle starts reconnecting to its saved headset on power-up. Game Mode starts
+off; double-press BOOTSEL to enable it for supported AirPods/codec combinations.
+NTPods is optional: pairing, reconnects, audio, volume and stem
+media keys run in firmware. A mode change lasts until the next power cycle.
 Standalone Windows startup, playback and stems are verified. Earlier Pixel 10
 Pro XL USB playback and stems worked, with intermittent crackle. Its current
 firmware recheck and Symfonium USB-exclusive comparison are pending. On Windows,
@@ -213,12 +238,15 @@ Select **AirPods Dongle** as the USB playback and recording device. Hold BOOTSEL
 for at least one second but less than three and release to pair a headset already
 in pairing mode. Hold for at least three seconds to allow phone pairing for two
 minutes, then select **AirPods Dongle** in the phone's Bluetooth settings. For
-wireless use, power the Pico externally. USB playback and recording take priority
-over phone audio. See [phone bridge](docs/PHONE-TRANSPORT.md) for details.
+wireless use, power the Pico externally or leave its USB cable connected.
+Connecting the phone's Bluetooth music profile removes the USB audio device;
+disconnect the phone from the Bluetooth dongle to use USB audio again. Pausing music does not switch
+back to USB. An existing USB recording session retains priority.
+See [phone bridge](docs/PHONE-TRANSPORT.md) for details.
 The selected saved headset reconnects automatically, with 1–8 seconds between
 failed connection attempts. Pairing and codec negotiation suspend these retries.
-A single press reconnects the saved headset while idle and raises volume during
-playback. Double-press BOOTSEL to toggle Game Mode live: enabling gives two
+A single press requests audio takeover from the other paired source, reconnecting
+the selected headset if needed. Double-press BOOTSEL to toggle Game Mode live: enabling gives two
 brief LED pulses; disabling turns the LED off for three seconds. It then returns
 to the connected solid light. Hold BOOTSEL for AirPods pairing, as above.
 

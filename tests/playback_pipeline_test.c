@@ -100,7 +100,7 @@ static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
         if(phone_priming_left) {
             assert(pcm[2*i]==0);--phone_priming_left;++phone_priming_encoded;
         } else if(phone_active || call_active) {
-            assert(pcm[2*i]==signal(encoded-phone_priming_encoded+playback_trace.stats[TRACE_DEBT_DROP]));
+            assert(pcm[2*i]==signal(encoded-phone_priming_encoded+playback_metrics.pcm_drops));
         } else if(check_sequence) {
             int expected=encoded<PLAYBACK_FILTER_DELAY?0:signal(encoded-PLAYBACK_FILTER_DELAY);
             assert(pcm[2*i]==expected);
@@ -363,7 +363,7 @@ static void phone_send_wait_keeps_source_time(void) {
     request_wait=100;next_wait=500;
     while(now<10000)step();
     assert(playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
-    assert(playback_metrics.pcm_drops==playback_trace.stats[TRACE_DEBT_DROP]);
+    assert(playback_metrics.pcm_drops>=playback_trace.stats[TRACE_DEBT_DROP]);
     assert(playback_metrics.pcm_drops==playback_trace.stats[TRACE_ACTIVE_DROP]);
     assert(generated==encoded+playback_pcm.used+playback_metrics.pcm_drops);
     assert(playback_trace.stats[TRACE_RECOVERIES] && !playback_metrics.recoveries);
@@ -392,6 +392,78 @@ static void phone_late_decode_keeps_unmatched_debt(void) {
     assert(playback_pcm.fraction==12345 && playback_trace.stats[TRACE_RECOVERIES]==1);
     assert(generated==playback_pcm.used+playback_metrics.pcm_drops);
     assert(!suspend_recovery_pending && media_tracker.streaming);
+}
+static void phone_overflow_reconciles_source_time(void) {
+    fixture(0);is_usb_streaming=false;phone_active=phone_opened=phone_buffer_started=true;
+    assert(playback_pcm_reset(&playback_pcm,8192,false));playback_pcm.primed_on_wire=true;
+    generated=encoded=0;phone_ingress(8000);
+    media_tracker.samples_ready=3500;
+    media_tracker.codec_ready_to_send=1;playback_work_pending=false;
+    phone_ingress(512);
+    assert(playback_metrics.pcm_drops==320 && playback_pcm.dropped_pending==320);
+    assert(playback_trace.stats[TRACE_ACTIVE_DROP]==320);
+    playback_audio_work(now);
+    assert(media_tracker.samples_ready==2880 && !playback_pcm.dropped_pending);
+    assert(playback_metrics.pcm_drops==620 && playback_pcm.used==7892);
+    assert(playback_trace.stats[TRACE_DEBT_DROP]==620 && playback_trace.stats[TRACE_ACTIVE_DROP]==620);
+    playback_audio_work(now); // The explicit debt clamp must not create another drop credit.
+    assert(playback_metrics.pcm_drops==620 && media_tracker.samples_ready==2880);
+    audio_pcm_read(480);
+    for(unsigned i=0;i<480;++i) {
+        assert(encoder_pcm[2*i]==signal(620+i));
+        assert(encoder_pcm[2*i+1]==-signal(620+i));
+    }
+
+    playback_pcm_clear(&playback_pcm,8192);generated=0;
+    phone_ingress(8192);media_tracker.samples_ready=200;
+    phone_ingress(720);
+    playback_audio_work(now);
+    assert(media_tracker.samples_ready==200 && !playback_pcm.dropped_pending);
+    media_tracker.samples_ready=480;playback_audio_work(now);
+    assert(media_tracker.samples_ready==480 && !playback_pcm.dropped_pending);
+    assert(playback_pcm.used==8192); // Lost source samples cannot cancel current/future output deadlines.
+
+    playback_pcm.dropped_pending=120;playback_pcm.priming=480;
+    media_tracker.samples_ready=480;playback_audio_work(now);
+    assert(!playback_pcm.dropped_pending && media_tracker.samples_ready==480);
+    playback_pcm.priming=0;playback_pcm.primed_on_wire=false;
+    playback_pcm.dropped_pending=120;playback_audio_work(now);
+    assert(!playback_pcm.dropped_pending && media_tracker.samples_ready==480);
+    playback_pcm.primed_on_wire=true;phone_buffer_started=false;
+    playback_pcm.dropped_pending=120;playback_audio_work(now);
+    assert(!playback_pcm.dropped_pending && media_tracker.samples_ready==480);
+    playback_pcm_clear(&playback_pcm,7680); // The normal source-switch reset drops old credit.
+    assert(!playback_pcm.dropped_pending);
+    phone_active=phone_opened=false;is_usb_streaming=true;
+    playback_audio_work(now);
+    assert(media_tracker.samples_ready==480 && !playback_pcm.dropped_pending);
+}
+static void phone_overflow_does_not_starve_output(void) {
+    // Actual timer, PCM, sample reads and packet preparation. One early packet
+    // must not make a full FIFO cancel every future read at a healthy 48 kHz.
+    const unsigned packet_frames[]={720,960};
+    for(unsigned kind=0;kind<2;++kind) {
+        unsigned frames=packet_frames[kind],period=frames/48;
+        for(unsigned phase=0;phase<period;++phase) {
+            fixture(0);is_usb_streaming=false;phone_active=phone_opened=phone_buffer_started=true;
+            playback_game.target=150;encode_cost=0;generated=encoded=0;
+            assert(playback_pcm_reset(&playback_pcm,8192,false));playback_pcm.primed_on_wire=true;
+            phone_ingress(8096);phone_ingress(frames);
+            assert(playback_metrics.pcm_drops==frames-96);
+            playback_audio_work(now);
+            for(now=1;now<=1000;++now) {
+                if((now+phase)%period==0)phone_ingress(frames);
+                if((int32_t)(now-media_tracker.audio_timer.timeout)>=0)
+                    avdtp_audio_timeout_handler(&media_tracker.audio_timer);
+                if(send_requested) {send_requested=false;a2dp_demo_send_media_packet();}
+                playback_audio_work(now);
+            }
+            assert(encoded==48000 && !playback_metrics.pcm_underflows);
+            assert(!playback_trace.stats[TRACE_DEBT_DROP] && !playback_pcm.dropped_pending);
+            assert(generated==encoded+playback_pcm.used+playback_metrics.pcm_drops);
+            assert(playback_pcm.used<8192 && playback_metrics.pcm_drops<3*frames);
+        }
+    }
 }
 static void phone_stale_receiver_window(void) {
     fixture(0);
@@ -469,6 +541,8 @@ int main(void) {
     steady_and_stalls();clock_drift();delayed_timer_clock();send_wait_after_encoding();excessive_stall();stale_receiver_window();jitter_and_live_changes();measured_cpu_budget();
     phone_send_wait_keeps_source_time();
     phone_late_decode_keeps_unmatched_debt();
+    phone_overflow_reconciles_source_time();
+    phone_overflow_does_not_starve_output();
     phone_stale_receiver_window();
     phone_reprime_then_fresh_pcm();
     phone_packet_priming();

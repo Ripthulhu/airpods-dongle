@@ -696,6 +696,8 @@ static void aacp_drop_mic_commands(void) {
 }
 
 static void aacp_channel_failed(void) {
+    // A healthy channel starts a fresh recovery budget; incomplete handshakes do not.
+    if (aacp_control_ready()) aacp_attempts = 0;
     control_reset();
     uint16_t cid = aacp_cid;
     aacp_cid = 0;

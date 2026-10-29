@@ -67,13 +67,22 @@ static void test_overflow_and_usb_chunk_boundaries(void) {
     assert(memcmp(in + 6, out, 28) == 0);
     assert(out[14] == 0 && out[15] == 0);
     playback_pcm_push(&pcm, in, 10);
-    assert(pcm.used == 8);
+    assert(pcm.used == 8 && pcm.dropped_pending == 2);
     assert(playback_pcm_read(&pcm, out, 8) == 8);
     assert(memcmp(in + 4, out, 32) == 0);
     playback_pcm_push(&pcm, in, 7);
     playback_pcm_push(&pcm, in + 14, 3);
+    assert(pcm.dropped_pending == 4);
     assert(playback_pcm_read(&pcm, out, 8) == 8);
     assert(memcmp(in + 4, out, 32) == 0);
+    playback_pcm_clear(&pcm, 8);
+    assert(pcm.dropped_pending == 0);
+    playback_pcm_push(&pcm, in, 10);
+    assert(playback_pcm_limit(&pcm, 4) == 4 && pcm.dropped_pending == 2);
+    assert(playback_pcm_reset(&pcm, 8, false) && pcm.dropped_pending == 0);
+    pcm.dropped_pending = UINT32_MAX - 1u;
+    playback_pcm_push(&pcm, in, 10);
+    assert(pcm.dropped_pending == UINT32_MAX);
 }
 
 static void test_pcm_matches_linear_queue(void) {
@@ -242,8 +251,12 @@ static void test_prime_before_input_and_wire_ack(void) {
         if (i != 9) playback_pcm_sent(&pcm);
     }
     assert(pcm.priming == 0 && !pcm.primed_on_wire);
+    pcm.dropped_pending = 120; // Loss before the final priming packet was acknowledged.
     playback_pcm_sent(&pcm);
-    assert(pcm.primed_on_wire);
+    assert(pcm.primed_on_wire && pcm.dropped_pending == 0);
+    pcm.dropped_pending = 120;
+    playback_pcm_sent(&pcm);
+    assert(pcm.dropped_pending == 120); // Active losses remain available for overdue-work accounting.
     playback_pcm_clear(&pcm, PHONE_PCM_CAPACITY);
     playback_pcm_push(&pcm, onset, 480);
     assert(playback_pcm_read(&pcm, output, 480) == 480);

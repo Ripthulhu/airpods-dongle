@@ -4,6 +4,8 @@
 #include <string.h>
 #include "../src/btstack/playback_pcm.h"
 #include "../src/btstack/playback_eld.h"
+#include "../src/btstack/playback_continuity.h"
+static playback_continuity_t phone_continuity;
 #include "../src/btstack/playback_options.h"
 #include "../src/btstack/playback_adjust.h"
 #include "../src/btstack/playback_usb_clock.h"
@@ -298,6 +300,46 @@ static void ownership_loss_is_passive_until_explicit_claim(void) {
     playback_idle_poll(++now);assert(!starts);
     dongle_playback_ownership_changed(true);playback_idle_poll(++now);assert(starts==1);
 }
+static void fresh_phone_start_reclaims_only_owned_output(void) {
+    fixture();accept(AVDTP_SI_SUSPEND,5);
+    assert(bridge_phone_open());
+    playback_idle_poll(now+=1000);assert(!starts); // Passive Open cannot reclaim.
+    bridge_phone_stop(); // A phone pause has released its input ownership.
+    bridge_phone_start_requested();playback_idle_poll(++now);
+    assert(starts==1 && phone_opened && playback_idle_phase==PLAYBACK_STARTING);
+    bridge_phone_start_requested();playback_idle_poll(++now);assert(starts==1);
+    accept(AVDTP_SI_START,5);assert(media_tracker.streaming);
+
+    for(unsigned blocked=0;blocked<8;++blocked) {
+        fixture();accept(AVDTP_SI_SUSPEND,5);
+        switch(blocked) {
+            case 0:audio_owned=false;break;
+            case 1:is_usb_streaming=true;break;
+            case 2:mic_requested=true;break;
+            case 3:call_opened=true;break;
+            case 4:profile_pending=true;break;
+            case 5:a2dp_connect_pending=true;break;
+            case 6:++selected_peer[0];break;
+            case 7:mic_active=true;break;
+        }
+        bridge_phone_start_requested();playback_idle_poll(++now);
+        assert(!starts && !phone_opened);
+    }
+    fixture();accept(AVDTP_SI_SUSPEND,5);
+    bridge_phone_start_requested();bridge_phone_stop();playback_idle_poll(++now);
+    assert(!starts); // A canceled input leaves no deferred takeover intent.
+    for(unsigned cleanup=0;cleanup<2;++cleanup) {
+        fixture();accept(AVDTP_SI_SUSPEND,5);
+        if(cleanup==0)is_usb_streaming=true;else mic_active=true;
+        bridge_phone_start_requested();playback_idle_poll(++now);assert(!starts);
+        is_usb_streaming=mic_active=false;
+        bridge_phone_start_requested();playback_idle_poll(++now);
+        assert(starts==1 && playback_idle_phase==PLAYBACK_STARTING);
+    }
+    fixture();accept(AVDTP_SI_SUSPEND,5);bridge_phone_start_requested();
+    audio_owned=false;dongle_playback_ownership_changed(false);playback_idle_poll(++now);
+    assert(!starts && !phone_continuity.armed);
+}
 static void phone_recovery_start(void) {
     fixture(); phone_opened=phone_active=phone_buffer_started=true;
     playback_transport_stale=true;
@@ -387,6 +429,7 @@ static void call_output_ownership(void) {
 }
 
 int main(void) {
+    fresh_phone_start_reclaims_only_owned_output();
     call_output_ownership();
     phone_output_recovers_without_losing_input();
     usb_onset_survives_restart();

@@ -36,6 +36,9 @@ static bool selected_bonded;
 static bd_addr_t phone_address, phone_candidate;
 static bool phone_bonded, phone_pairing, phone_storage_supported;
 static uint32_t phone_pairing_since;
+static uint32_t phone_session_generation;
+static uint16_t phone_session_handle = HCI_CON_HANDLE_INVALID;
+static bd_addr_t phone_session_address;
 static uint16_t credit_raw_acl_count, credit_raw_acl_length;
 static bool credit_buffer_known;
 static struct {
@@ -128,6 +131,17 @@ static void credit_event(const uint8_t *p, uint16_t size) {
     }
 }
 
+static void credit_link(const uint8_t address[6], uint16_t *handle, uint8_t *role) {
+    *handle = HCI_CON_HANDLE_INVALID;
+    *role = UINT8_MAX;
+    if (!peer_address_valid(address)) return;
+    hci_connection_t *connection = hci_connection_for_bd_addr_and_type(address, BD_ADDR_TYPE_ACL);
+    if (connection == NULL || connection->state != OPEN) return;
+    *handle = connection->con_handle;
+    if (connection->role == HCI_ROLE_MASTER || connection->role == HCI_ROLE_SLAVE)
+        *role = (uint8_t)connection->role;
+}
+
 bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out) {
     if (out == NULL) return false;
     memset(out, 0, sizeof(*out));
@@ -135,6 +149,10 @@ bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out) {
     out->raw_acl_length = credit_raw_acl_length;
     out->airpods = credit_roles[0].totals;
     out->phone = credit_roles[1].totals;
+    credit_link(device_addr, &out->airpods_handle, &out->airpods_local_role);
+    credit_link(phone_address, &out->phone_handle, &out->phone_local_role);
+    if (out->phone_handle == HCI_CON_HANDLE_INVALID)
+        credit_link(phone_candidate, &out->phone_handle, &out->phone_local_role);
     if (credit_buffer_known) {
         out->effective_acl_limit = credit_raw_acl_count < MAX_NR_CONTROLLER_ACL_BUFFERS ?
             credit_raw_acl_count : MAX_NR_CONTROLLER_ACL_BUFFERS;
@@ -239,6 +257,18 @@ bool bt_hci_phone_address(uint8_t address[6]) {
     return true;
 }
 
+uint32_t bt_hci_phone_session(const uint8_t address[6]) {
+    if (!bt_hci_phone_peer_connected(address)) return 0;
+    hci_connection_t *connection = hci_connection_for_bd_addr_and_type(address, BD_ADDR_TYPE_ACL);
+    if (connection == NULL || connection->state != OPEN) return 0;
+    if (phone_session_handle != connection->con_handle || memcmp(phone_session_address, address, 6)) {
+        if (++phone_session_generation == 0) ++phone_session_generation;
+        phone_session_handle = connection->con_handle;
+        memcpy(phone_session_address, address, 6);
+    }
+    return phone_session_generation;
+}
+
 static int accept_classic_peer(bd_addr_t address, hci_link_type_t link_type) {
     if (!peer_address_valid(address)) return 0;
     if (link_type != HCI_LINK_TYPE_ACL)
@@ -302,6 +332,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             if (size < 3) return;
             ble_scan_controller_ready(btstack_event_state_get_state(packet) == HCI_STATE_WORKING);
             if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) {
+                phone_session_handle = HCI_CON_HANDLE_INVALID;
                 scan_active = false;
                 phone_pairing = false;
                 memset(phone_candidate, 0, sizeof(phone_candidate));
@@ -321,6 +352,9 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 
         case HCI_EVENT_DISCONNECTION_COMPLETE:
             if (size < 6) return;
+            if (packet[2] == ERROR_CODE_SUCCESS &&
+                (credit_u16(packet + 3) & 0x0fffu) == phone_session_handle)
+                phone_session_handle = HCI_CON_HANDLE_INVALID;
             printf("[HCI] disconnect: status=0x%02x reason=0x%02x\n", packet[2], packet[5]);
             break;
         case HCI_EVENT_COMMAND_STATUS:
@@ -443,6 +477,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 static btstack_packet_callback_registration_t hci_state_callback_registration;
 
 void bt_hci_init(void){
+    phone_session_generation = 0;
+    phone_session_handle = HCI_CON_HANDLE_INVALID;
+    memset(phone_session_address, 0, sizeof(phone_session_address));
     credit_buffer_known = false;
     credit_raw_acl_count = credit_raw_acl_length = 0;
     memset(credit_roles, 0, sizeof(credit_roles));

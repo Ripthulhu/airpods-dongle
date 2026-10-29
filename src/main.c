@@ -91,6 +91,9 @@ static void realtime_metrics_print(void) {
         (unsigned long)credits.airpods.events, (unsigned long)credits.airpods.packets,
         (unsigned long)credits.airpods.max_active_gap_ms, (unsigned long)credits.phone.events,
         (unsigned long)credits.phone.packets, (unsigned long)credits.phone.max_active_gap_ms);
+    printf("[LINKS] airpods_handle=0x%04x airpods_local_role=%u phone_handle=0x%04x phone_local_role=%u\n",
+        (unsigned)credits.airpods_handle, (unsigned)credits.airpods_local_role,
+        (unsigned)credits.phone_handle, (unsigned)credits.phone_local_role);
 }
 
 void aacp_mic_dec_wake_worker(void) {
@@ -554,6 +557,8 @@ int main() {
         runtime_watch_set(WATCH_HCI);
         bt_hci_phone_poll();
         phone_call_poll();
+        usb_audio_set_bluetooth(phone_sink_usb_exclusion_requested() ||
+                                phone_call_usb_exclusion_requested());
         runtime_watch_set(WATCH_MIC);
         if (aacp_mic_update_owner(usb_mic_take_request(&mic_wanted))) {
             // Preserve coalesced close/open revisions even when the final request stays true.
@@ -563,7 +568,7 @@ int main() {
         // session. Core 1 detaches it before core 0 frees its allocations.
         mic_decoder_lifecycle_release(&decoder,
             phone_sink_connected() && !aacp_mic_requested() && !aacp_mic_active());
-        if ((aacp_mic_requested() || aacp_mic_active() || get_usb_streaming()) && phone_sink_connected())
+        if (aacp_mic_requested() && phone_sink_connected())
             phone_sink_yield();
         runtime_watch_set(WATCH_PHONE);
         if (!decoder.releasing) phone_sink_poll();

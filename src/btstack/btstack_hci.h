@@ -22,6 +22,8 @@ bool bt_hci_phone_pairing_busy(void);
 bool bt_hci_phone_pairing_active(void);
 bool bt_hci_phone_peer_allowed(const uint8_t address[6]);
 bool bt_hci_phone_peer_connected(const uint8_t address[6]);
+// Nonzero token for this authenticated phone ACL; changes across reconnects.
+uint32_t bt_hci_phone_session(const uint8_t address[6]);
 bool bt_hci_phone_address(uint8_t address[6]);
 void bt_hci_phone_poll(void);
 
@@ -32,6 +34,9 @@ typedef struct {
     uint32_t raw_acl_count, raw_acl_length, effective_acl_limit;
     uint32_t free_acl_slots, outstanding_acl_packets, packet_buffer_reserved;
     bt_hci_credit_role_t airpods, phone;
+    uint16_t airpods_handle, phone_handle;
+    // Actual local HCI role: 0 master, 1 slave, 255 unavailable.
+    uint8_t airpods_local_role, phone_local_role;
 } bt_hci_credit_diagnostics_t;
 // Read under the Bluetooth lock; false means Read Buffer Size has not succeeded.
 bool bt_hci_credit_diagnostics(bt_hci_credit_diagnostics_t *out);
