@@ -513,6 +513,7 @@ int main() {
         printf("cyw43_arch_init() failed.\n");
         return -1;
     }
+    set_led_mode_off();
 
     uint8_t currect_slot = read_uint8_last_flash();
 
@@ -526,8 +527,6 @@ int main() {
         }
         currect_slot = read_uint8_last_flash();
     }
-
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
     if (btstack_main(0, NULL) != 0) {
         printf("Bluetooth audio services unavailable\n");
