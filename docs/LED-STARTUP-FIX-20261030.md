@@ -32,9 +32,9 @@ of pairing/settings storage was compared byte for byte with the backup. Both
 returned to their production USB interface and answered runtime diagnostics with
 no active audio, microphone or call. LibrePods was reopened on the Pixel.
 
-No new listening test or remote visual LED confirmation is claimed here. Existing
-LED tests cover pairing blink, connected indication and cancellation on disconnect;
-physical LED observation is requested from the user.
+The user confirmed the LED stays off at boot and turns off correctly when AirPods
+disconnect. Existing LED tests also cover pairing blink, connected indication and
+cancellation on disconnect. No new listening test was run for this LED-only change.
 
 The [controller research checkpoint](CYW43439-RESEARCH-CHECKPOINT-20261030.md)
 remains paused. These builds contain the normal Pi radio firmware, not the failed
