@@ -8,6 +8,10 @@ NTPods uses a separate vendor HID collection on the same interface; opening it
 does not connect Bluetooth, start audio, or enable the microphone. CDC remains
 a debug console. No custom Windows kernel driver or Test Mode is required for USB.
 
+The [AirPods CLI](CLI.md) exposes named `status`, `settings`, `get`, `set` and
+`help` commands over this same interface. It shares the host HID transport with
+the diagnostic tools and confirms setting writes through fresh device reports.
+
 ## Stem volume
 
 From 0.1.48, native AirPods gain is retained. A fresh, transaction-matched AVRCP

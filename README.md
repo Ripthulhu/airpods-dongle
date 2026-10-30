@@ -203,6 +203,8 @@ LibrePods AACP routing exchange. Short two-dongle handoff checks passed in both
 directions; extended handoff and call testing remain pending.
 Sensor streaming and case ringing are not implemented.
 The serial port remains a diagnostic console.
+For named settings commands over USB HID, see the [AirPods CLI](docs/CLI.md):
+`python tools/airpods.py help`, `get mode`, or `set mode transparency`.
 Send `t` to read USB service and main-loop Bluetooth timing maxima, the current
 phone decoder maximum and flash-cache counters. Repeated requests are coalesced;
 counter collection does not acquire audio or run a sound-producing check.

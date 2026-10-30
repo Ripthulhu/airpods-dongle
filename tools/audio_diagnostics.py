@@ -215,6 +215,15 @@ class Unsupported(RuntimeError):
     pass
 
 
+class RequestRejected(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        message = {1: 'malformed request', 2: 'busy; close competing companion controls',
+                   3: 'stale session', 4: 'AirPods disconnected', 5: 'device timeout',
+                   6: 'transport failure', 8: 'cancelled'}.get(code, str(code))
+        super().__init__('RPC failure: ' + message)
+
+
 TRACE_STATS = ('usb_packets', 'usb_frames', 'usb_gap_max_us', 'usb_bad_packets',
                'usb_short_reads', 'startup_dropped_frames', 'active_dropped_frames',
                'startup_zero_frames', 'active_zero_frames', 'timer_late_max_us',
@@ -245,13 +254,28 @@ def _transaction(device, payload):
     profile = len(payload) == 2 and payload[0] in (4, 12, 14, 18) and payload[1] in (0, 1)
     if not (read or profile):
         raise ValueError('Only diagnostic reads and explicit audio profiling controls are allowed')
-    generation = struct.unpack_from('<I', device.get(2), 8)[0]
+    response = typed_request(device, payload)
+    if read and not response:
+        raise RuntimeError('Invalid diagnostic length')
+    return response
+
+
+def typed_request(device, payload, generation=None):
+    """One bounded report-3 typed request; never retries uncertain writes."""
+    if not 1 <= len(payload) <= 42:
+        raise ValueError('Typed requests must fit one 1..42 byte HID fragment')
+    current = struct.unpack_from('<I', device.get(2), 8)[0]
+    if generation is not None and generation != current:
+        raise RuntimeError('Pico session changed; reconnect before issuing another command')
+    generation = current
     initial = device.get(3)
     if initial[21] in (1, 2):
-        raise RuntimeError('Another HID transaction is busy; close companion software')
+        raise RequestRejected(2)
     sequence = (struct.unpack_from('<I', initial, 12)[0] + 1) & 0xffffffff or 1
 
     def send(op, total=0, offset=0, payload=b''):
+        if struct.unpack_from('<I', device.get(2), 8)[0] != generation:
+            raise RuntimeError('Pico session changed during request')
         data = bytearray(64)
         data[:7] = bytes((3,)) + HEADER
         data[7] = op
@@ -262,12 +286,14 @@ def _transaction(device, payload):
     def wait(phase, offset):
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline:
+            if struct.unpack_from('<I', device.get(2), 8)[0] != generation:
+                raise RuntimeError('Pico session changed during request')
             data = device.get(3)
             if struct.unpack_from('<II', data, 8) == (generation, sequence):
                 if data[21] == 4:
                     if data[22] == 7:
-                        raise Unsupported('Firmware does not expose this diagnostic feature')
-                    raise RuntimeError('RPC failure %d' % data[22])
+                        raise Unsupported('Firmware does not support this request for this device')
+                    raise RequestRejected(data[22])
                 if data[21] == phase and struct.unpack_from('<H', data, 18)[0] == offset:
                     if data[20] > 42:
                         raise RuntimeError('Oversized HID page')
@@ -280,7 +306,7 @@ def _transaction(device, payload):
     send(6)
     page = wait(3, 0)
     total = struct.unpack_from('<H', page, 16)[0]
-    if not 0 <= total <= 4096 or (read and not total):
+    if not 0 <= total <= 4096:
         raise RuntimeError('Invalid diagnostic length')
     output = bytearray()
     while total:
