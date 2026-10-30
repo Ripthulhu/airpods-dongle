@@ -39,16 +39,24 @@ def run(command, log, timeout=180):
     return result.stdout
 
 
+def frontend_symbol(symbols):
+    candidates = re.findall(r"(?m)^[0-9a-fA-F]+\s+T\s+(_Z16FDK_deinterleavePK([il])P\2jjj)$", symbols)
+    if len(candidates) != 1:
+        raise ValueError("Expected exactly one real 32-bit FDK deinterleave frontend")
+    return candidates[0][0]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", "--build-dir", type=pathlib.Path)
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--compiler", default="g++")
     parser.add_argument("--sanitize", action="store_true")
+    parser.add_argument("--eld-cbr-bandwidth", type=int, choices=(0,16000,18000,20000), default=20000)
     args = parser.parse_args()
     if not 1 <= args.jobs <= 32:
         parser.error("jobs must be between 1 and 32")
-    for tool in ("cmake", args.compiler):
+    for tool in ("cmake", "nm", args.compiler):
         if shutil.which(tool) is None:
             parser.error(f"Missing host tool: {tool}")
     output = (args.output or ROOT / ("build/adaptive-codec-test-sanitize" if args.sanitize
@@ -69,7 +77,7 @@ def main():
     sanitizer = (["-fsanitize=address,undefined", "-fno-sanitize=shift,signed-integer-overflow",
                   "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"] if args.sanitize else [])
     for name, definition in (("encoder", "-DFDK_AIRPODS_PROFILE=1"), ("decoder", "")):
-        flags = " ".join([definition] + sanitizer)
+        flags = " ".join([definition, "-DFDK_DONGLE_PCM32=1"] + sanitizer)
         build = output / name
         run(["cmake", "-S", fdk, "-B", build, "-DBUILD_SHARED_LIBS=OFF",
              "-DBUILD_PROGRAMS=OFF", "-DCMAKE_BUILD_TYPE=Release",
@@ -78,18 +86,28 @@ def main():
         libraries[name] = build / "libfdk-aac.a"
         if not libraries[name].is_file():
             raise ValueError(f"Missing built archive: {libraries[name]}")
+    wrapped_frontend = frontend_symbol(run(["nm", "--defined-only", libraries["encoder"]], log))
+    (output / "frontend_wrap.inc").write_text(
+        f'#define FRONTEND_REAL_SYMBOL "__real_{wrapped_frontend}"\n'
+        f'#define FRONTEND_WRAP_SYMBOL "__wrap_{wrapped_frontend}"\n')
     executables = {}
     fixture = ROOT / "tools/adaptive_codec_fixture.cpp"
     for name, definition in (("encoder", "-DFDK_AIRPODS_PROFILE=1"), ("decoder", "-DADAPTIVE_CODEC_DECODER=1")):
         executable = output / f"adaptive-{name}"
         command = [args.compiler, "-std=c++11", "-O2", "-Wall", "-Wextra", definition,
+                   "-DFDK_DONGLE_PCM32=1", f"-DAACELD_CBR_BANDWIDTH={args.eld_cbr_bandwidth}",
                    "-I", output, "-I", ROOT / "src/btstack"]
         for module in ("libAACenc", "libAACdec", "libSYS"):
             command += ["-isystem", fdk / module / "include"]
         wrappers = (["-Wl,--wrap=" + name for name in ("malloc", "calloc", "realloc", "free")]
                     if name == "encoder" else [])
+        if name == "encoder":
+            wrappers += ["-Wl,--wrap=" + wrapped_frontend]
         run(command + sanitizer + [fixture, libraries[name]] + wrappers + ["-lm", "-o", executable], log)
         executables[name] = executable
+    precision = run([executables["encoder"], "frontend"], log)
+    if precision.strip() != "FRONTEND pcm_bits=32 copied=960 lower16_distinct=1 negative_rejected=1":
+        raise ValueError("Real encoder frontend did not preserve the low16 differential/negative control")
     cases = []
     for mode in (0, 1):
         ceilings = ((256000, 255200, 220000, 192000, 174000, 160000, 150400, 128000)
@@ -119,6 +137,10 @@ def main():
     if rejected.returncode == 0 or "FAIL continuity" not in rejected.stderr:
         raise ValueError("Continuity oracle did not reject deliberate encoder-history resets")
     report = {"production_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+              "encoder_archive_sha256": hashlib.sha256(libraries["encoder"].read_bytes()).hexdigest(),
+              "decoder_archive_sha256": hashlib.sha256(libraries["decoder"].read_bytes()).hexdigest(),
+              "fdk_pcm_bits":32,"eld_cbr_bandwidth_hz":args.eld_cbr_bandwidth,
+              "frontend_precision":precision.strip(),"frontend_symbol":wrapped_frontend,
               "sanitizers": sanitizer,
               "cases": cases, "history_reset_rejected": True,
               "cbr_only_wire_retune_rejected": True,

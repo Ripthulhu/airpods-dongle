@@ -17,7 +17,7 @@ CODEC_RAM_FUNCTIONS = {
     "dct": "_Z6dct_IVPliPi",
     "fft": "_Z3fftiPlPi",
     "fft_rad2": "_Z7dit_fftPliPK8FIXP_SPKi",
-    "mdct": "_Z10mdct_blockP6mdct_tPKsiPliiPK8FIXP_SPKiPs",
+    "mdct": "_Z10mdct_blockP6mdct_tPKliPliiPK8FIXP_SPKiPs",
     "scale": "_Z11scaleValuesPlii",
     "fixpoint_math": "_Z8fDivNormllPi",
     "quantize": "_Z26FDKaacEnc_QuantizeSpectrumiiiPKiPKliS0_Psi",
@@ -96,13 +96,13 @@ def verify_library(firmware, codec_sha256, label="FDK"):
         raise ValueError(f"{label} codec archive does not match the fingerprint linked into this firmware")
 
 
-def phone_worker_bytes(firmware, symbols):
-    """Read sizeof(worker_t) retained by this firmware, never the current source layout."""
+def firmware_word(firmware, symbols, name):
+    """Read a retained ARM32 word from its exact file-backed load segment."""
     firmware_heap(firmware[:52], symbols)
-    addresses = re.findall(r"^([0-9a-fA-F]+)\s+[RrDd]\s+airpods_phone_worker_storage_bytes$",
+    addresses = re.findall(r"^([0-9a-fA-F]+)\s+[RrDd]\s+" + re.escape(name) + "$",
                            symbols, re.MULTILINE)
     if len(addresses) != 1 or int(addresses[0], 16) & 3:
-        raise ValueError("Firmware must retain one aligned phone worker storage size")
+        raise ValueError(f"Firmware must retain one aligned {name}")
     address = int(addresses[0], 16)
     offset = struct.unpack_from("<I", firmware, 28)[0]
     entry_size, count = struct.unpack_from("<HH", firmware, 42)
@@ -118,9 +118,24 @@ def phone_worker_bytes(firmware, symbols):
             raise ValueError("Invalid firmware load segment")
         if virtual <= address and address + 4 <= virtual + size:
             values.append(struct.unpack_from("<I", firmware, file_offset + address - virtual)[0])
-    if len(values) != 1 or not 4096 <= values[0] <= 65536 or values[0] & 3:
-        raise ValueError("Invalid or unmapped phone worker storage size")
+    if len(values) != 1:
+        raise ValueError(f"Invalid or unmapped firmware word: {name}")
     return values[0]
+
+
+def phone_worker_bytes(firmware, symbols):
+    """Read sizeof(worker_t) retained by this firmware, never the current source layout."""
+    size = firmware_word(firmware, symbols, "airpods_phone_worker_storage_bytes")
+    if not 4096 <= size <= 65536 or size & 3:
+        raise ValueError("Invalid phone worker storage size")
+    return size
+
+
+def eld_cbr_bandwidth(firmware, symbols):
+    value = firmware_word(firmware, symbols, "airpods_eld_cbr_bandwidth_hz")
+    if value not in (0, 16000, 18000, 20000):
+        raise ValueError("Unsupported linked ELD CBR bandwidth")
+    return value
 
 
 def invalidate_outputs(firmware):
@@ -146,6 +161,7 @@ def input_hashes(firmware, library, lhdc_library):
                                            "profile_checks.h", "startup.c", "probe.ld")]
     checks += [root / "3rd-party/lhdcv5/lhdc48_bench_fixture.h", root / "tests/lhdc/music_reference.h"]
     checks += [root / "tools/check_usb_audio.py"]
+    checks += [root / "src/btstack/aaceld_quality.h"]
     return {"firmware_sha256": digest(firmware), "codec_sha256": digest(library),
             "lhdc_sha256": digest(lhdc_library),
             "validation_sha256": hashlib.sha256(b"\0".join(path.read_bytes() for path in checks)).hexdigest()}
@@ -154,7 +170,9 @@ def input_hashes(firmware, library, lhdc_library):
 def current_output(args, firmware, receipt):
     try:
         saved = json.loads(receipt.read_text())
-        if not isinstance(saved,dict) or saved.get("usb_audio_mode") != getattr(args,"usb_audio",None):
+        if (not isinstance(saved,dict) or saved.get("usb_audio_mode") != getattr(args,"usb_audio",None)
+                or saved.get("eld_cbr_bandwidth_hz") != getattr(args,"eld_cbr_bandwidth",20000)
+                or saved.get("fdk_pcm_bits") != 32):
             return False
         return isinstance(saved, dict) and saved.get("passed") is True and all(saved.get(key) == value for key, value in
             input_hashes(firmware, args.library.resolve(), args.lhdc_library.resolve()).items()) and \
@@ -218,13 +236,17 @@ def validate(args, directory, root, output, receipt, firmware):
                                    capture_output=True, text=True, timeout=10, check=True).stdout
     codec_tables = codec_ram_tables(table_symbols)
     worker_bytes = phone_worker_bytes(firmware_data, symbols)
+    bandwidth = eld_cbr_bandwidth(firmware_data, symbols)
+    if bandwidth != getattr(args, "eld_cbr_bandwidth", 20000):
+        raise ValueError("Requested ELD CBR bandwidth does not match linked firmware")
     budget = capacity - RUNTIME_RESERVE_BYTES
     fdk = root / "3rd-party" / "fdk-aac"
     command = [compiler, "-mcpu=cortex-m33", "-mthumb", "-march=armv8-m.main+fp+dsp",
                "-mfloat-abi=softfp", "-mcmse", "-O2", "-g", "-ffreestanding",
                "-Wall", "-Wextra", "-Werror", "-DFDK_AIRPODS_PROFILE=1",
+               "-DFDK_DONGLE_PCM32=1", f"-DAACELD_CBR_BANDWIDTH={bandwidth}",
                f"-DPROBE_HEAP_BYTES={budget}", f"-DPROBE_PHONE_WORKER_BYTES={worker_bytes}",
-               "-I", str(root / "3rd-party" / "lhdcv5")]
+               "-I", str(root / "3rd-party" / "lhdcv5"), "-I", str(root / "src/btstack")]
     for module in ("libAACenc", "libAACdec", "libSYS"):
         command += ["-isystem", str(fdk / module / "include")]
     command += ["-nostartfiles", f"-Wl,-T,{directory / 'probe.ld'}",
@@ -258,7 +280,15 @@ def validate(args, directory, root, output, receipt, firmware):
                                  r"gain_ppm=(\d+)/(\d+) snr_above_30db=1$", transcript, re.MULTILINE)
             complete = complete and [entry[0] for entry in quality] == ["0", "1"] and all(
                 995000 <= int(gain) <= 1005000 for entry in quality for gain in entry[1:])
-        if not complete or "CHECKS complete" not in transcript:
+        if (not complete or "CHECKS complete" not in transcript
+                or transcript.count("PCM_ABI encoder_bits=32 decoder_bits=32\n") != 1
+                or (mode == "usb_mic" and (
+                    transcript.count("HISTORICAL_FIXTURE mono_bandwidth=auto stereo_bandwidth=0\n") != 1
+                    or transcript.count("PCM_DECODER complete_q31_output=1 lower16_preserved=1\n") != 1
+                    or transcript.count("MATRIX_HISTORICAL bandwidth=0 frames=960 configurations=10 fixed_hashes=1\n") != 1
+                    or transcript.count(f"CANDIDATE_CBR bandwidth={bandwidth} rates=5 frames=480 retained_mic=1\n") != 1
+                    or transcript.count("LEGACY_LC_MIC rates=192000,256000 frame=1024 input_bits=16 frames=192 max_au=1024\n") != 1
+                    or transcript.count("PROFILE_INPUT preinit_info=1 control_state_guard=1 invalid_init=1 valid_retry=1\n") != 1))):
             raise ValueError("Codec probe did not complete every required check")
         peaks = re.findall(r"^HEAP_PEAK bytes=(\d+)$", transcript, re.MULTILINE)
         if len(peaks) != 1 or not 0 < int(peaks[0]) <= budget:
@@ -281,6 +311,8 @@ def validate(args, directory, root, output, receipt, firmware):
                "codec_ram_function_addresses": codec_ram,
                "codec_ram_table_addresses": codec_tables,
                "usb_audio_mode":usb_mode,"usb_audio_formats":usb_formats,
+               "fdk_pcm_bits":32,"eld_cbr_bandwidth_hz":bandwidth,
+               "probe_only_heap_diagnostic_bss_bytes":12,
                "runtime_reserve_bytes": RUNTIME_RESERVE_BYTES, "probe_budget_bytes": budget,
                "phone_worker_storage_bytes": worker_bytes, "modes": modes,
                "peak_codec_heap_break_bytes": peak,
@@ -308,6 +340,8 @@ def main():
     parser.add_argument("--uf2-abs-block", action="store_true", help="Pico SDK RP2350 A2 compatibility flag")
     parser.add_argument("--if-current", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--usb-audio", choices=("s16","float"), help="check linked USB descriptors before publication")
+    parser.add_argument("--eld-cbr-bandwidth", type=int, choices=(0,16000,18000,20000), default=20000,
+                        help="must match the bandwidth word retained in the linked firmware")
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     try:

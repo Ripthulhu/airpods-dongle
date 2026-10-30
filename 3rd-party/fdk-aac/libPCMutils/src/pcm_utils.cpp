@@ -1,3 +1,5 @@
+/* Third-Party Modified Version: AirPods Dongle, 2026-10-30.
+ * Q31 conversion multiplies signed PCM without shifting negative values. */
 /* -----------------------------------------------------------------------------
 Software License for The Fraunhofer FDK AAC Codec Library for Android
 
@@ -188,7 +190,11 @@ void FDK_deinterleave(const SHORT *RESTRICT pIn, LONG *RESTRICT _pOut,
     LONG *pOut = _pOut + length * ch;
     const SHORT *In = &pIn[ch];
     for (UINT sample = 0; sample < frameSize; sample++) {
+#ifdef FDK_DONGLE_PCM32
+      *pOut++ = (LONG)In[0] * 65536;
+#else
       *pOut++ = (LONG)In[0] << 16;
+#endif
       In += channels;
     }
   }

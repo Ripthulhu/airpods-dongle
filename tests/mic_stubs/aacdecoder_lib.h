@@ -4,7 +4,11 @@
 #include <stdint.h>
 typedef unsigned char UCHAR;
 typedef unsigned int UINT;
+#ifdef FDK_DONGLE_PCM32
+typedef int32_t INT_PCM;
+#else
 typedef int16_t INT_PCM;
+#endif
 typedef void *HANDLE_AACDECODER;
 typedef int AAC_DECODER_ERROR;
 typedef struct { int sampleRate, frameSize, numChannels, aot; } CStreamInfo;

@@ -1,3 +1,5 @@
+/* Third-Party Modified Version: AirPods Dongle, 2026-10-30.
+ * Fixed mono ELD shares sequential decoder and post-render gain scratch. */
 /* -----------------------------------------------------------------------------
 Software License for The Fraunhofer FDK AAC Codec Library for Android
 
@@ -1324,6 +1326,9 @@ LINKSPEC_CPP HANDLE_AACDECODER CAacDecoder_Open(
   aacDecoder_drcSetParam(self->hDrcInfo, DRC_BS_DELAY,
                          CConcealment_GetDelay(&self->concealCommonData));
   self->workBufferCore1 = (FIXP_DBL *)GetWorkBufferCore1();
+#ifdef FDK_AIRPODS_PROFILE
+  if (self->workBufferCore1 == NULL) goto bail;
+#endif
 
   self->workBufferCore2 = GetWorkBufferCore2();
   if (self->workBufferCore2 == NULL) goto bail;
@@ -1364,6 +1369,14 @@ static void CAacDecoder_DeInit(HANDLE_AACDECODER self,
         if (self->pAacDecoderChannelInfo[ch]
                 ->pComStaticData->pWorkBufferCore1 != NULL) {
           if (ch == aacChannelOffset) {
+#ifdef FDK_AIRPODS_PROFILE
+            /* A borrowed workspace survives configuration teardown. */
+            if ((void *)self->pAacDecoderChannelInfo[ch]
+                    ->pComStaticData->pWorkBufferCore1 == (void *)self->workBufferCore1) {
+              self->pAacDecoderChannelInfo[ch]
+                  ->pComStaticData->pWorkBufferCore1 = NULL;
+            } else
+#endif
             FreeWorkBufferCore1(&self->pAacDecoderChannelInfo[ch]
                                      ->pComStaticData->pWorkBufferCore1);
           }
@@ -2194,8 +2207,16 @@ CAacDecoder_Init(HANDLE_AACDECODER self, const CSAudioSpecificConfig *asc,
               if (ch == aacChannelsOffset) {
                 self->pAacDecoderChannelInfo[ch]->pComData =
                     (CAacDecoderCommonData *)GetWorkBufferCore6();
+#ifdef FDK_AIRPODS_PROFILE
+                /* The fixed ELD filterbank runs before post-render gain scratch;
+                 * self owns this allocation through every configuration change. */
+                self->pAacDecoderChannelInfo[ch]
+                    ->pComStaticData->pWorkBufferCore1 =
+                    (CWorkBufferCore1 *)self->workBufferCore1;
+#else
                 self->pAacDecoderChannelInfo[ch]
                     ->pComStaticData->pWorkBufferCore1 = GetWorkBufferCore1();
+#endif
               } else {
                 self->pAacDecoderChannelInfo[ch]->pComData =
                     (CAacDecoderCommonData *)FDKaalloc(

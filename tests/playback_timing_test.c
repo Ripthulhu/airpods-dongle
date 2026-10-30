@@ -12,6 +12,7 @@
 #include "playback_test_hooks.h"
 #include "../src/runtime_watch.h"
 #include "../src/btstack/playback_inspect.h"
+#include "../src/btstack/playback_pcm.h"
 static playback_inspect_t playback_inspect;
 static bool inspect_enabled;
 static playback_adjust_t playback_adjust;
@@ -100,7 +101,7 @@ static void critical_section_exit(void *p) {(void)p;assert(bt_locked);}
 #endif
 static struct { unsigned encoded_units, recoveries, send_failures;
     uint32_t pcm_peak,pcm_drops,pcm_underflows; } playback_metrics;
-static int16_t encoder_pcm[2048];
+static playback_encoder_pcm_t encoder_pcm;
 static struct endpoint {
     struct { struct { unsigned media_codec_type; } media_codec; } remote_configuration;
     struct { struct { adtvp_media_codec_capabilities_t media_codec; } capabilities; } sep;
@@ -176,7 +177,12 @@ static void pipeline_render(const playback_resample_t *work,int16_t *dst) {
     assert(!pcm_locked);playback_pcm_render(work,dst);
     pipeline_filter_cost();
 }
+static void pipeline_render_q31(const playback_resample_t *work,int32_t *dst) {
+    assert(!pcm_locked);playback_pcm_render_q31(work,dst);
+    pipeline_filter_cost();
+}
 #define playback_pcm_render pipeline_render
+#define playback_pcm_render_q31 pipeline_render_q31
 static void playback_prepare_packet(a2dp_media_sending_context_t *,uint32_t);
 static void playback_transport_recover(a2dp_media_sending_context_t *);
 #include "playback_pipeline.inc"

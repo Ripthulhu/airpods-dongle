@@ -34,6 +34,19 @@ static inline void playback_inspect_samples(playback_inspect_t *s,const void *da
     if(nonzero)s->stats[base+3]=us;
     if(input)s->stats[13]=us;
 }
+static inline void playback_inspect_samples_q31(playback_inspect_t *s,const void *data,
+    uint32_t count,uint32_t us) {
+    uint32_t peak=0,nonzero=0;
+    for(uint32_t i=0;i<count;++i) {
+        int32_t sample;memcpy(&sample,(const uint8_t *)data+4u*i,sizeof(sample));
+        int64_t value=sample;
+        if(value)++nonzero;
+        uint32_t magnitude=(uint32_t)((value<0?-value:value)>>16);
+        if(magnitude>peak)peak=magnitude;
+    }
+    s->stats[4]+=count;s->stats[5]+=nonzero;s->stats[6]=peak;
+    if(nonzero)s->stats[7]=us;
+}
 // Cache one AU only after its containing packet was accepted by the transport.
 static inline bool playback_inspect_media(playback_inspect_t *s,const uint8_t *p,
     uint32_t size,uint32_t us) {

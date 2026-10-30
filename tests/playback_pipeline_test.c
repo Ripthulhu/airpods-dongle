@@ -26,6 +26,14 @@ static bool sink_started;
 static unsigned phone_arrivals,phone_queued,phone_decode_due,phone_decoded;
 static bool phone_decoding,phone_output_ready;
 static unsigned phone_priming_left,phone_priming_encoded;
+static bool precise_input_fixture;
+static int16_t encoder_sample_s16(unsigned index) {
+    return cur_codec==4?playback_pcm_quantize((float)encoder_pcm.q31[index]/2147483648.0f):encoder_pcm.s16[index];
+}
+static bool encoder_matches_s16(const int16_t *expected,unsigned count) {
+    for(unsigned i=0;i<count;++i)if(encoder_sample_s16(i)!=expected[i])return false;
+    return true;
+}
 #ifdef PLAYBACK_REAL_PHONE
 static void phone_pipeline_encoded(const int16_t *pcm,unsigned frames);
 #endif
@@ -98,7 +106,25 @@ static void advance(unsigned ms) {
     }
 }
 static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
+    int16_t checked[2048];
+    assert(input->bufElSizes[0]==(encoder_job.codec==4?4:2));
+    assert(args->numInSamples<=2048);
+    if(precise_input_fixture) {
+        const int32_t *wide=input->bufs[0];
+        assert(input->bufElSizes[0]==4 && input->bufSizes[0]==3840 && args->numInSamples==960);
+        for(unsigned i=0;i<480;++i) {
+            int32_t expected=i<PLAYBACK_FILTER_DELAY?0:268435456+((i-PLAYBACK_FILTER_DELAY)%8+1)*2048;
+            assert(wide[2*i]==expected && wide[2*i+1]==-expected);
+        }
+        encoded+=480;
+        return;
+    }
     const int16_t *pcm=input->bufs[0];
+    if(input->bufElSizes[0]==4) {
+        const int32_t *wide=input->bufs[0];
+        for(unsigned i=0;i<args->numInSamples;++i)checked[i]=playback_pcm_quantize((float)wide[i]/2147483648.0f);
+        pcm=checked;
+    }
 #ifdef PLAYBACK_REAL_PHONE
     phone_pipeline_encoded(pcm,args->numInSamples/2);
     encoded+=args->numInSamples/2;
@@ -192,7 +218,7 @@ static void startup_keeps_one_filter_phase(void) {
         playback_usb_clock_t before=usb_clock;
         for(unsigned block=0;block<10;++block) {
             audio_pcm_read(480);
-            for(unsigned i=0;i<960;++i)assert(encoder_pcm[i]==0);
+            for(unsigned i=0;i<960;++i)assert(encoder_sample_s16(i)==0);
         }
         assert(!playback_pcm.priming && playback_pcm.used==1440);
         // Normal 150 ms mode sends three AUs together: priming finishes inside
@@ -203,7 +229,7 @@ static void startup_keeps_one_filter_phase(void) {
                 unsigned position=block*480u+i;
                 int16_t expected=position<PLAYBACK_FILTER_DELAY?0:
                     (int16_t)((position-PLAYBACK_FILTER_DELAY+1u)*8u);
-                assert(encoder_pcm[2*i]==expected && encoder_pcm[2*i+1]==-expected);
+                assert(encoder_sample_s16(2*i)==expected && encoder_sample_s16(2*i+1)==-expected);
             }
             if(block<2)assert(memcmp(&before,&usb_clock,sizeof(before))==0);
             if(block==1)playback_pcm_sent(&playback_pcm);
@@ -241,12 +267,12 @@ static void fractional_shortage_keeps_filter(void) {
         assert(playback_pcm_prepare_resample(&reference,&work,480,65600u*10u));
         playback_pcm_render(&work,expected);
         audio_pcm_read(480);
-        assert(memcmp(encoder_pcm,expected,sizeof(expected))==0);
-        assert(encoder_pcm[0]>=876 && encoder_pcm[0]<=878); // Raw fallback began at 1000.
+        assert(encoder_matches_s16(expected,960));
+        assert(encoder_sample_s16(0)>=876 && encoder_sample_s16(0)<=878); // Raw fallback began at 1000.
         assert(playback_pcm.used==0 && playback_pcm.fraction==reference.fraction);
         assert(memcmp(playback_pcm.history,reference.history,sizeof(reference.history))==0);
         assert(playback_metrics.pcm_underflows==1 && playback_trace.stats[TRACE_ACTIVE_ZERO]==1);
-        last=encoder_pcm[958];
+        last=encoder_sample_s16(958);
         for(unsigned i=0;i<500;++i) {
             integer[2*i]=(int16_t)(1000+8*(480+i));integer[2*i+1]=-integer[2*i];
             real[2*i]=((float)integer[2*i]+0.375f)/32768.0f;real[2*i+1]=-real[2*i];
@@ -259,8 +285,8 @@ static void fractional_shortage_keeps_filter(void) {
         assert(playback_pcm_prepare_resample(&reference,&work,480,usb_clock.rate_q16*10u));
         playback_pcm_render(&work,expected);
         audio_pcm_read(480);
-        assert(memcmp(encoder_pcm,expected,sizeof(expected))==0);
-        assert(encoder_pcm[0]-last>=4 && encoder_pcm[0]-last<=12); // Former raw→FIR jump was -115.
+        assert(encoder_matches_s16(expected,960));
+        assert(encoder_sample_s16(0)-last>=4 && encoder_sample_s16(0)-last<=12); // Former raw→FIR jump was -115.
         assert(playback_metrics.pcm_underflows==1 && playback_trace.stats[TRACE_ACTIVE_ZERO]==1);
     }
 }
@@ -437,8 +463,8 @@ static void phone_overflow_reconciles_source_time(void) {
     assert(playback_metrics.pcm_drops==620 && media_tracker.samples_ready==2880);
     audio_pcm_read(480);
     for(unsigned i=0;i<480;++i) {
-        assert(encoder_pcm[2*i]==signal(620+i));
-        assert(encoder_pcm[2*i+1]==-signal(620+i));
+        assert(encoder_sample_s16(2*i)==signal(620+i));
+        assert(encoder_sample_s16(2*i+1)==-signal(620+i));
     }
 
     playback_pcm_clear(&playback_pcm,8192);generated=0;
@@ -513,7 +539,7 @@ static void phone_reprime_then_fresh_pcm(void) {
     assert(playback_pcm_reset(&playback_pcm,8192,true));generated=encoded=0;
     for(unsigned unit=0;unit<10;++unit) {
         audio_pcm_read(480);
-        for(unsigned i=0;i<960;++i)assert(encoder_pcm[i]==0);
+        for(unsigned i=0;i<960;++i)assert(encoder_sample_s16(i)==0);
         playback_media_sent();
     }
     assert(!playback_pcm.priming && playback_pcm.primed_on_wire && !phone_buffer_started);
@@ -521,8 +547,8 @@ static void phone_reprime_then_fresh_pcm(void) {
     audio_pcm_read(480);
     assert(phone_buffer_started && playback_pcm.used==3840);
     for(unsigned i=0;i<480;++i) {
-        assert(encoder_pcm[2*i]==signal(i));
-        assert(encoder_pcm[2*i+1]==-signal(i));
+        assert(encoder_sample_s16(2*i)==signal(i));
+        assert(encoder_sample_s16(2*i+1)==-signal(i));
     }
     assert(!playback_metrics.pcm_underflows && !playback_metrics.pcm_drops);
 }
@@ -563,8 +589,24 @@ static void call_prefill_uses_call_clock(void) {
     assert(usb_clock.rate_q16==65000 && !playback_metrics.pcm_underflows);
     call_active=call_opened=false;
 }
+static void eld_low_bits_reach_encoder(void) {
+    fixture(0);encode_cost=0;
+    playback_pcm_clear(&playback_pcm,7680);
+    float input[1024*2];
+    for(unsigned i=0;i<1024;++i) {
+        input[2*i]=0.125f+(i%8+1)*0x1p-20f;input[2*i+1]=-input[2*i];
+    }
+    audio_slot_push_float(input,1024);
+    media_tracker.samples_ready=480;
+    precise_input_fixture=true;
+    assert(fill_aac_audio_buffer(&media_tracker)==480);
+    complete_test_encode();
+    precise_input_fixture=false;
+    assert(encoded==480 && encode_calls==1);
+}
 
 int main(void) {
+    eld_low_bits_reach_encoder();
     timer_interrupts_respect_bluetooth_lock();
     call_prefill_uses_call_clock();
     startup_keeps_one_filter_phase();

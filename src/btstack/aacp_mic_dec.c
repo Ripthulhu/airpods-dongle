@@ -34,7 +34,11 @@ typedef struct {
 
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_POINTER_LOCK_FREE == 2,
                "Codec queues require lock-free cursor and handle publication");
-_Static_assert(sizeof(INT_PCM) == sizeof(int16_t), "Microphone PCM must be 16-bit");
+#ifdef FDK_DONGLE_PCM32
+_Static_assert(sizeof(INT_PCM) == sizeof(int32_t), "Microphone decoder must share FDK Q31 ABI");
+#else
+_Static_assert(sizeof(INT_PCM) == sizeof(int16_t), "Microphone decoder PCM ABI");
+#endif
 _Static_assert(sizeof(mic_input_t) * MIC_INPUT_FRAMES +
                sizeof(INT_PCM) * MIC_FRAME_SAMPLES <= 4096u,
                "Core1 codec staging must fit scratch-Y");
@@ -58,6 +62,17 @@ static bool failure_reported; // Core0 only.
 static uint32_t worker_generation;
 static UINT decode_flags = AACDEC_CLRHIST;
 static INT_PCM MIC_SCRATCH_Y("mic_decode") decoded_pcm[MIC_FRAME_SAMPLES];
+static int16_t mic_pcm_s16(INT_PCM sample) {
+#ifdef FDK_DONGLE_PCM32
+    int64_t value=sample;
+    value=(value+(value<0?-32768:32768))/65536;
+    if(value>INT16_MAX)return INT16_MAX;
+    if(value<INT16_MIN)return INT16_MIN;
+    return (int16_t)value;
+#else
+    return sample;
+#endif
+}
 typedef struct {
     uint32_t ok, errors, errors_total;
     uint32_t us_sum, us_max;
@@ -192,14 +207,14 @@ static bool decode_job(HANDLE_AACDECODER decoder, const mic_input_t *job) {
     if (w - r == MIC_OUTPUT_FRAMES) return false;
     mic_output_t *frame = &output[w % MIC_OUTPUT_FRAMES];
     frame->generation = job->generation;
-    memcpy(frame->samples, decoded_pcm, sizeof(frame->samples));
+    for(unsigned i=0;i<MIC_FRAME_SAMPLES;++i)frame->samples[i]=mic_pcm_s16(decoded_pcm[i]);
     atomic_store_explicit(&output_written, w + 1u, memory_order_release);
     atomic_fetch_add_explicit(&completed, 1u, memory_order_release);
     stats.ok++;
     stats.us_sum += elapsed;
     if (elapsed > stats.us_max) stats.us_max = elapsed;
     for (unsigned i = 0; i < MIC_FRAME_SAMPLES; ++i) {
-        int32_t sample = decoded_pcm[i];
+        int32_t sample = frame->samples[i];
         stats.sq_sum += (uint64_t)((int64_t)sample * sample);
         int32_t magnitude = sample < 0 ? -sample : sample;
         if (magnitude > stats.peak) stats.peak = magnitude;

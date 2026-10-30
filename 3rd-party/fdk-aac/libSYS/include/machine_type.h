@@ -223,11 +223,20 @@ typedef unsigned long long UINT64;
 #define FDK_ASSERT(ignore)
 #endif
 
+/* Third-Party Modified Version: AirPods Dongle, 2026-10-30, coherent Q31 PCM ABI. */
+#ifdef FDK_DONGLE_PCM32
+typedef LONG INT_PCM;
+#define MAXVAL_PCM MAXVAL_DBL
+#define MINVAL_PCM MINVAL_DBL
+#define WAV_BITS 32
+#define SAMPLE_BITS 32
+#else
 typedef SHORT INT_PCM;
 #define MAXVAL_PCM MAXVAL_SGL
 #define MINVAL_PCM MINVAL_SGL
 #define WAV_BITS 16
 #define SAMPLE_BITS 16
+#endif
 #define SAMPLE_MAX ((INT_PCM)(((ULONG)1 << (SAMPLE_BITS - 1)) - 1))
 #define SAMPLE_MIN (~SAMPLE_MAX)
 

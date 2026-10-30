@@ -53,6 +53,8 @@ static uint32_t media_generation, volume_cancels, seen_set_revision, media_sent,
 static uint8_t bt_volume;
 static unsigned starts, stops, pushes, reads, fifo_clears, mic_reads, mic_resets;
 static unsigned usb_tasks, media_tasks, debug_tasks, int_attempts, notifications, bt_sets;
+static uint8_t traced_format, packet_format, packet_error;
+static uint16_t packet_frames;
 static int16_t last_bt_db256;
 static uint8_t rx_fifo[2 * CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX];
 static size_t rx_used, short_read_limit;
@@ -75,9 +77,9 @@ static void host_volume(int16_t db256);
 static uint32_t time_us_32(void) { return now; }
 static void set_usb_streaming(bool active) { if (active) ++starts; else ++stops; }
 static void dongle_playback_usb_packet(uint32_t us,uint16_t frames,uint8_t format,uint8_t error) {
-    (void)us;(void)frames;(void)format;(void)error;
+    (void)us;packet_frames=frames;packet_format=format;packet_error=error;
 }
-static void dongle_playback_usb_format(uint8_t format) {(void)format;}
+static void dongle_playback_usb_format(uint8_t format) {traced_format=format;}
 static void audio_slot_push_samples(const int16_t *pcm, uint16_t frames) {
     assert(played_samples + 2u * frames <= TU_ARRAY_SIZE(played));
     memcpy(played + played_samples, pcm, 2u * frames * sizeof(*pcm));
@@ -200,6 +202,7 @@ static void fixture(void) {
     usb_tasks = media_tasks = debug_tasks = int_attempts = notifications = bt_sets = 0;
     played_samples = rx_used = mic_available = control_reply_size = 0;
     played_float_samples=0;speaker_format=0;
+    traced_format=packet_format=packet_error=0;packet_frames=0;
     short_read_limit = SIZE_MAX;
     last_bt_db256 = 999;
     bt_volume = 127;
@@ -287,7 +290,7 @@ static void mute_preserves_volume_and_stereo(void) {
     const int16_t levels[] = {-50 * 256, -25 * 256, 0};
     const int16_t pcm[] = {32767, -32768, 1000, -1000, 17, -777};
     const float floating[] = {.12345678f, -.23456789f, .99999f, -.99999f, .0000001f, -.0000002f};
-    for (unsigned alt = 1; alt <= (AIRPODS_USB_FLOAT ? 2u : 1u); ++alt) {
+    for (unsigned alt = 1; alt <= (AIRPODS_USB_FLOAT ? 3u : 1u); ++alt) {
         fixture(); open_speaker(); interface_alt(ITF_NUM_AUDIO_STREAMING_SPK, (uint16_t)alt, false);
         for (unsigned level = 0; level < TU_ARRAY_SIZE(levels); ++level) {
             host_volume(levels[level]); tinyusb_control_task();
@@ -303,11 +306,18 @@ static void mute_preserves_volume_and_stereo(void) {
                     assert(played_samples == offset + TU_ARRAY_SIZE(pcm));
                     if (muted) expect_silence(played + offset, TU_ARRAY_SIZE(pcm));
                     else assert(memcmp(played + offset, pcm, sizeof(pcm)) == 0);
-                } else {
+                } else if (alt == 2) {
                     assert(packet(floating, sizeof(floating), sizeof(floating), 2));
                     assert(played_float_samples == offset + TU_ARRAY_SIZE(floating));
                     if (muted) for (unsigned i = 0; i < TU_ARRAY_SIZE(floating); ++i) assert(played_float[offset + i] == 0);
                     else assert(memcmp(played_float + offset, floating, sizeof(floating)) == 0);
+                } else {
+                    const uint8_t integer32[] = {1,0,0,0, 0xff,0xff,0xff,0xff, 0,0,0,0x40, 0,0,0,0xc0};
+                    const float expected[] = {0x1p-31f, -0x1p-31f, .5f, -.5f};
+                    assert(packet(integer32, sizeof(integer32), sizeof(integer32), 3));
+                    assert(played_float_samples == offset + TU_ARRAY_SIZE(expected));
+                    for (unsigned i = 0; i < TU_ARRAY_SIZE(expected); ++i)
+                        assert(played_float[offset+i] == (muted ? 0 : expected[i]));
                 }
                 assert(bt_sets == level + 1u && read_volume() == levels[level]);
             }
@@ -526,21 +536,72 @@ static void float_packets_and_switching(void) {
     assert(packet(input,8,8,2));
     assert(played_float[98]==0 && played_float[99]==0);
 }
+static void pcm32_packets_and_switching(void) {
+    fixture();open_speaker();
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,3,false);
+    assert(traced_format==3);
+    // Byte literals exercise endian decoding and sub-S16 samples independently of host layout.
+    const uint8_t input[]={1,0,0,0, 0xff,0xff,0xff,0xff,
+                          0,0,0,0x80, 0xff,0xff,0xff,0x7f,
+                          0x56,0x34,0x12,0, 0xaa,0xcb,0xed,0xff};
+    const float expected[]={0x1p-31f,-0x1p-31f,-1,1,0x123456*0x1p-31f,-0x123456*0x1p-31f};
+    assert(packet(input,sizeof(input),sizeof(input),3));
+    assert(played_float_samples==6 && !memcmp(expected,played_float,sizeof(expected)));
+    assert(packet_format==3 && packet_frames==3 && !packet_error && starts==1);
+    uint8_t largest[CFG_TUD_AUDIO_FUNC_1_FORMAT_3_EP_SZ_OUT];
+    for(unsigned i=0;i<sizeof(largest);++i)largest[i]=input[i%sizeof(input)];
+    assert(sizeof(largest)==392 && packet(largest,sizeof(largest),sizeof(largest),3));
+    assert(packet_frames==49 && played_float_samples==104 && !packet_error);
+    assert(!packet(input,12,12,3) && packet_error==1 && !rx_used);
+    uint8_t oversized[sizeof(largest)+8]={0};
+    assert(!packet(oversized,sizeof(oversized),sizeof(oversized),3) && packet_error==1 && !rx_used);
+    short_read_limit=4;
+    assert(!packet(input,8,8,3) && packet_error==2 && !rx_used);
+    short_read_limit=SIZE_MAX;
+    assert(packet(NULL,0,0,3) && pushes==2);
+    assert(packet(input,8,8,2) && played_float_samples==104); // Old float packet is not PCM32.
+    tusb_control_request_t invalid={.wIndex=ITF_NUM_AUDIO_STREAMING_SPK,.wValue=4};
+    assert(!tud_audio_set_itf_cb(0,&invalid) && !tud_audio_set_itf_close_EP_cb(0,&invalid));
+    assert(packet(input,8,8,4) && played_float_samples==104);
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,2,false);
+    assert(traced_format==2 && packet(input,8,8,3) && played_float_samples==104);
+    const float floating[]={.25f,-.125f};
+    assert(packet(floating,sizeof(floating),sizeof(floating),2));
+    assert(played_float[104]==floating[0] && played_float[105]==floating[1]);
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,3,false);
+    tud_suspend_cb(false);
+    assert(packet(input,8,8,3) && played_float_samples==106);
+    tud_resume_cb();
+    assert(packet(input,8,8,3) && played_float_samples==108);
+    mounted=false;service();
+    assert(traced_format==0 && !speaker_format);
+    assert(packet(input,8,8,3) && played_float_samples==108);
+    mount_host();interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,3,false);
+    assert(packet(input,8,8,3) && played_float_samples==110 && traced_format==3);
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,0,true);
+    assert(!speaker_format && !traced_format && !speaker_interface_open);
+}
 #endif
 static void usb_speaker_microphone_duplex(void) {
-    for(unsigned alt=1;alt<=(AIRPODS_USB_FLOAT?2u:1u);++alt) {
+    for(unsigned alt=1;alt<=(AIRPODS_USB_FLOAT?3u:1u);++alt) {
         fixture();open_speaker();interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,(uint16_t)alt,false);
         interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,1,false);
-        int16_t speaker[96];float floating[96];
-        for(unsigned i=0;i<96;++i) {speaker[i]=(int16_t)(i-48);floating[i]=(float)speaker[i]/32768.0f;}
+        int16_t speaker[96];float floating[96];uint8_t integer32[384];
+        for(unsigned i=0;i<96;++i) {
+            speaker[i]=(int16_t)(i-48);floating[i]=(float)speaker[i]/32768.0f;
+            uint32_t raw=(uint32_t)((int32_t)speaker[i]*65536);
+            for(unsigned b=0;b<4;++b)integer32[4*i+b]=(uint8_t)(raw>>(8*b));
+        }
         for(unsigned ms=0;ms<1000;++ms) {
             if(ms==500)interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,0,true);
             if(ms==600)interface_alt(ITF_NUM_AUDIO_STREAMING_MIC,1,false);
             now=ms*1000u;
             played_samples=played_float_samples=0;
-            assert(alt==1?packet(speaker,sizeof(speaker),sizeof(speaker),1):
-                          packet(floating,sizeof(floating),sizeof(floating),2));
+            assert(alt==1?packet(speaker,sizeof(speaker),sizeof(speaker),1):alt==2?
+                          packet(floating,sizeof(floating),sizeof(floating),2):
+                          packet(integer32,sizeof(integer32),sizeof(integer32),3));
             assert(alt==1?played_samples==96:played_float_samples==96);
+            if(alt==3)assert(!memcmp(floating,played_float,sizeof(floating)));
             for(unsigned i=0;i<64;++i)mic_pcm[i]=(int16_t)(ms<600?1000:2000);
             mic_available=64;
             unsigned before=mic_reads;
@@ -649,6 +710,8 @@ static void service_cadence_preserves_open_endpoints(void) {
 #if AIRPODS_USB_FLOAT
     interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,2,false);
     assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
+    interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,3,false);
+    assert(tinyusb_service_interval_us()==REALTIME_USB_SERVICE_BUDGET_US);
 #else
     interface_alt(ITF_NUM_AUDIO_STREAMING_SPK,1,false);
 #endif
@@ -755,6 +818,7 @@ int main(void) {
     confirmed_shared_readbacks_never_echo();
 #if AIRPODS_USB_FLOAT
     float_packets_and_switching();
+    pcm32_packets_and_switching();
 #endif
-    puts("UAC: control-only boot, headset presence, PCM/float, duplex, route priorities and re-enumeration wrap passed");
+    puts("UAC: control-only boot, headset presence, S16/float/PCM32, duplex, route priorities and re-enumeration wrap passed");
 }

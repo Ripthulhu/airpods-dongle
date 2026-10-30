@@ -24,6 +24,9 @@ def module(name):
 
 
 probe, stamp = module("run"), module("stamp")
+adaptive_spec = importlib.util.spec_from_file_location("adaptive", ROOT / "tools/test_adaptive_codec.py")
+adaptive = importlib.util.module_from_spec(adaptive_spec)
+adaptive_spec.loader.exec_module(adaptive)
 
 
 def elf_header():
@@ -34,28 +37,193 @@ def elf_header():
 
 
 SYMBOLS = ("20020000 B end\n2007c000 A __StackLimit\n"
-           "10001000 R airpods_phone_worker_storage_bytes\n") + "".join(
+           "10001000 R airpods_phone_worker_storage_bytes\n"
+           "10001004 R airpods_eld_cbr_bandwidth_hz\n") + "".join(
     f"{0x20001000 + index * 0x100:08x} T {name}\n"
     for index, name in enumerate(probe.CODEC_RAM_FUNCTIONS.values()))
 TABLE_SYMBOLS = "".join(
     f"{name}|{0x20003000 + index * 0x100:08x}| T |OBJECT|00000400||.data\n"
     for index, name in enumerate(probe.CODEC_RAM_TABLES.values()))
-USB_RESULT = "SUCCESS frames=16 checksum=4105af5d\nHEAP_PEAK bytes=188040\nCHECKS complete\n"
-PHONE_RESULT = ("PHONE_QUALITY cycle=0 reference_samples=819 gain_ppm=999345/1001227 snr_above_30db=1\n"
+PCM_ABI = "PCM_ABI encoder_bits=32 decoder_bits=32\n"
+USB_RESULT = (PCM_ABI + "SUCCESS frames=16 checksum=4105af5d\n"
+              "HISTORICAL_FIXTURE mono_bandwidth=auto stereo_bandwidth=0\n"
+              "PCM_DECODER complete_q31_output=1 lower16_preserved=1\n"
+              "MATRIX_HISTORICAL bandwidth=0 frames=960 configurations=10 fixed_hashes=1\n"
+              "CANDIDATE_CBR bandwidth=20000 rates=5 frames=480 retained_mic=1\n"
+              "LEGACY_LC_MIC rates=192000,256000 frame=1024 input_bits=16 frames=192 max_au=1024\n"
+              "PROFILE_INPUT preinit_info=1 control_state_guard=1 invalid_init=1 valid_retry=1\n"
+              "HEAP_PEAK bytes=188040\nCHECKS complete\n")
+PHONE_RESULT = (PCM_ABI + "PHONE_QUALITY cycle=0 reference_samples=819 gain_ppm=999345/1001227 snr_above_30db=1\n"
                 "PHONE_QUALITY cycle=1 reference_samples=819 gain_ppm=999345/1001227 snr_above_30db=1\n"
                 "PHONE_LHDC frames=64 encodes=32 worker_bytes=9772 checksum=1234abcd\n"
                 "HEAP_PEAK bytes=120000\nCHECKS complete\n")
 
 
-def firmware_image(worker_bytes=9772):
+def firmware_image(worker_bytes=9772, bandwidth=20000):
     result = elf_header()
     struct.pack_into("<I", result, 28, 52)
     struct.pack_into("<HH", result, 42, 32, 1)
-    result += struct.pack("<IIIIIIII", 1, 84, 0x10001000, 0x10001000, 4, 4, 4, 4)
-    return result + struct.pack("<I", worker_bytes)
+    result += struct.pack("<IIIIIIII", 1, 84, 0x10001000, 0x10001000, 8, 8, 4, 4)
+    return result + struct.pack("<II", worker_bytes, bandwidth)
 
 
 class CodecMemoryCheckTests(unittest.TestCase):
+    def test_historical_combined_checksum_uses_auto_bandwidth_without_narrowing_candidate_probes(self):
+        source = (ROOT / "tools/codec_probe/probe.c").read_text()
+        main = source[source.index('int main(void)'):]
+        self.assertIn('HANDLE_AACENCODER mono = encoder(1, 64000);', main)
+        self.assertIn('HANDLE_AACENCODER stereo = encoder_bandwidth(2, 256000, 0);', main)
+        self.assertNotIn('HANDLE_AACENCODER stereo = encoder(2, 256000);', main)
+        self.assertIn('if (channels == 2)\n        ENC_OK(aacEncoder_SetParam(handle, AACENC_BANDWIDTH, bandwidth));',
+                      adaptive.function(source, 'encoder_bandwidth'))
+        self.assertIn('aaceld_bandwidth(bitrate, 0)', adaptive.function(source, 'encoder'))
+        self.assertIn('HANDLE_AACENCODER handle = encoder(2, rates[mode]);',
+                      adaptive.function(source, 'check_candidate_cbr'))
+        self.assertIn('phone.encoder = encoder(2, 256000);', adaptive.function(source, 'check_phone_lhdc'))
+        self.assertIn('playback_encoder(modes[mode].aot, modes[mode].bitrate)',
+                      adaptive.function(source, 'check_lifecycle'))
+
+    def run_cpp(self, source, includes=(), sources=(), definitions=()):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "check.cpp"
+            executable = Path(directory) / ("check.exe" if shutil.which("cl") else "check")
+            path.write_text(source)
+            if shutil.which("c++"):
+                command = [shutil.which("c++"), "-std=c++11", "-O2"]
+                command += ["-D" + define for define in definitions]
+                for include in includes:
+                    command += ["-I", str(include)]
+                command += [str(path), *map(str, sources), "-o", str(executable)]
+            else:
+                command = [shutil.which("cl"), "/nologo", "/EHsc", "/std:c++17", "/O2"]
+                command += ["/D" + define for define in definitions]
+                command += ["/I" + str(include) for include in includes]
+                command += [str(path), *map(str, sources), "/Fe:" + str(executable)]
+            compiled = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=30)
+            self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            subprocess.run([str(executable)], check=True, capture_output=True, timeout=10)
+
+    @unittest.skipUnless(shutil.which("c++") or shutil.which("cl"), "native C++ compiler required")
+    def test_real_sbrk_records_denials_without_allocation_or_logging_and_preserves_budget(self):
+        text = (ROOT / "tools/codec_probe/probe.c").read_text()
+        start = text.index("void *_sbrk(")
+        body = text[start:text.index("static void report_heap", start)]
+        source = r'''
+#include <cassert>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+static char heap_memory[256];
+#define _end heap_memory[0]
+#define PROBE_HEAP_BYTES 128
+static char *heap_break;
+static size_t peak_heap_break;
+static struct { ptrdiff_t request; size_t current; unsigned count; } heap_denial;
+#define malloc allocation_forbidden_inside_sbrk
+#define calloc allocation_forbidden_inside_sbrk
+#define realloc allocation_forbidden_inside_sbrk
+#define printf logging_forbidden_inside_sbrk
+#define snprintf logging_forbidden_inside_sbrk
+#define probe_emit logging_forbidden_inside_sbrk
+''' + body + r'''
+int main() {
+    assert(_sbrk(64) == heap_memory);
+    assert(_sbrk(64) == heap_memory + 64);
+    assert(_sbrk(1) == (void *)-1 && errno == ENOMEM);
+    assert(heap_denial.count == 1 && heap_denial.request == 1 && heap_denial.current == 128);
+    assert(heap_break == heap_memory + 128 && peak_heap_break == 128);
+    assert(_sbrk(-129) == (void *)-1 && heap_denial.count == 2 && heap_denial.request == -129);
+    assert(_sbrk(-64) == heap_memory + 128 && heap_break == heap_memory + 64);
+    assert(_sbrk(32) == heap_memory + 64 && heap_break == heap_memory + 96);
+    assert(peak_heap_break == 128 && heap_denial.current == 128 && heap_denial.count == 2);
+}
+'''
+        self.run_cpp(source)
+
+    @unittest.skipUnless(shutil.which("c++") or shutil.which("cl"), "native C++ compiler required")
+    def test_workspace_expectations_match_real_aligned_allocator_getters_not_just_payload(self):
+        text = (ROOT / "tools/codec_probe/profile_checks.h").read_text()
+        helper = adaptive.function(text, "profile_workspace_bytes")
+        source = r'''
+#include "genericStds.h"
+#include <cassert>
+#include <cstdint>
+void *FDKaalloc_L(UINT, UINT, MEMORY_SECTION) { assert(false); return nullptr; }
+void FDKafree_L(void *) { assert(false); }
+C_AALLOC_MEM_L(ProbeSpectral, int32_t, 1024, SECT_DATA_L2)
+C_AALLOC_MEM_L(ProbeTime, int32_t, 960, SECT_DATA_EXTERN)
+''' + helper + r'''
+int main() {
+    assert(GetRequiredMemProbeSpectral() == profile_workspace_bytes(4096));
+    assert(GetRequiredMemProbeTime() == profile_workspace_bytes(3840));
+    assert(GetRequiredMemProbeSpectral() > 4096 && GetRequiredMemProbeTime() > 3840);
+    for (unsigned pointer_bytes = 4; pointer_bytes <= 8; pointer_bytes += 4) {
+        assert(ALGN_SIZE_EXTRES(4096 + ALIGNMENT_DEFAULT + pointer_bytes) == 4112);
+        assert(ALGN_SIZE_EXTRES(3840 + ALIGNMENT_DEFAULT + pointer_bytes) == 3856);
+    }
+}
+'''
+        self.run_cpp(source, includes=[ROOT / "3rd-party/fdk-aac/libSYS/include"])
+
+    def test_frontend_wrapper_requires_exactly_one_real_wide_copy_overload(self):
+        for kind in ("i", "l"):
+            name = f"_Z16FDK_deinterleavePK{kind}P{kind}jjj"
+            self.assertEqual(adaptive.frontend_symbol("00000000 T " + name + "\n"), name)
+        for symbols in ("", "00000000 T _Z16FDK_deinterleavePKlPsjjj\n",
+                        "00000000 T _Z16FDK_deinterleavePKlPljjj\n" * 2,
+                        "00000000 T _Z16FDK_deinterleavePKlPljjj\n00000000 T _Z16FDK_deinterleavePKiPijjj\n"):
+            self.assertRaises(ValueError, adaptive.frontend_symbol, symbols)
+
+    @unittest.skipUnless(shutil.which("c++") or shutil.which("cl"), "native C++ compiler required")
+    def test_real_frontend_preserves_low16_with_legacy_truncation_negative_control(self):
+        source = r'''
+#include "pcm_utils.h"
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+static_assert(sizeof(INT_PCM) == 4 && SAMPLE_BITS == 32, "Q31 ABI required");
+int main() {
+    const INT_PCM first[] = {65537, -65535, 98305, -32767, 131073, -131071, 163841, -98303};
+    const INT_PCM second[] = {65538, -65534, 98306, -32766, 131074, -131070, 163842, -98302};
+    INT_PCM wide[2][12]; SHORT narrow[2][12];
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        const INT_PCM *input = variant ? second : first;
+        for (unsigned n = 0; n < 12; ++n) {wide[variant][n] = 0x5a5a5a5a; narrow[variant][n] = 0x5a5a;}
+        FDK_deinterleave(input, wide[variant], 2, 4, 6);
+        FDK_deinterleave(input, narrow[variant], 2, 4, 6);
+        unsigned lost = 0;
+        for (unsigned channel = 0; channel < 2; ++channel) {
+            for (unsigned n = 0; n < 4; ++n) {
+                unsigned at = channel * 6 + n;
+                assert(wide[variant][at] == input[n * 2 + channel]);
+                lost += int64_t(narrow[variant][at]) * 65536 != input[n * 2 + channel];
+            }
+            assert(wide[variant][channel * 6 + 4] == 0x5a5a5a5a);
+            assert(wide[variant][channel * 6 + 5] == 0x5a5a5a5a);
+        }
+        assert(lost == 8);
+    }
+    assert(std::memcmp(wide[0], wide[1], sizeof(wide[0])) != 0);
+    assert(std::memcmp(narrow[0], narrow[1], sizeof(narrow[0])) == 0);
+    for (int base = -32768; base < 32768; base += 256) {
+        SHORT input[256]; INT_PCM converted[260];
+        for (unsigned n = 0; n < 256; ++n) input[n] = static_cast<SHORT>(base + static_cast<int>(n));
+        for (unsigned n = 0; n < 260; ++n) converted[n] = 0x5a5a5a5a;
+        FDK_deinterleave(input, converted, 2, 128, 130);
+        for (unsigned channel = 0; channel < 2; ++channel) {
+            for (unsigned n = 0; n < 128; ++n)
+                assert(converted[channel * 130 + n] == int64_t(input[n * 2 + channel]) * 65536);
+            assert(converted[channel * 130 + 128] == 0x5a5a5a5a);
+            assert(converted[channel * 130 + 129] == 0x5a5a5a5a);
+        }
+    }
+    return 0;
+}
+'''
+        fdk = ROOT / "3rd-party/fdk-aac"
+        self.run_cpp(source, includes=[fdk / part / "include" for part in ("libSYS", "libFDK", "libPCMutils")],
+                     sources=[fdk / "libPCMutils/src/pcm_utils.cpp"], definitions=["FDK_DONGLE_PCM32=1"])
+
     def test_encoder_rom_must_be_linked_into_main_ram(self):
         self.assertEqual(set(probe.codec_ram_tables(TABLE_SYMBOLS)), set(probe.CODEC_RAM_TABLES))
         for index, (member, name) in enumerate(probe.CODEC_RAM_TABLES.items()):
@@ -136,7 +304,7 @@ class CodecMemoryCheckTests(unittest.TestCase):
             self.assertRaises(ValueError, probe.phone_worker_bytes, image[:length], SYMBOLS)
         for offset, width, value in [(28, 4, 0), (28, 4, 0xfffffff0),
                                      (42, 2, 31), (44, 2, 0), (44, 2, 129),
-                                     (56, 4, 0xfffffff0), (68, 4, 5), (72, 4, 3)]:
+                                     (56, 4, 0xfffffff0), (68, 4, 9), (72, 4, 3)]:
             damaged = bytearray(image)
             struct.pack_into("<I" if width == 4 else "<H", damaged, offset, value)
             self.assertRaises(ValueError, probe.phone_worker_bytes, damaged, SYMBOLS)
@@ -229,6 +397,8 @@ class CodecMemoryCheckTests(unittest.TestCase):
             if "-kernel" not in command:
                 self.assertIn(str(self.active_lhdc_library), command)
                 self.assertIn("-DPROBE_PHONE_WORKER_BYTES=9772", command)
+                self.assertIn("-DFDK_DONGLE_PCM32=1", command)
+                self.assertIn("-DAACELD_CBR_BANDWIDTH=20000", command)
                 return subprocess.CompletedProcess(command, int(compile_error), "", "compile error" if compile_error else "")
             return subprocess.CompletedProcess(command, int(qemu_error),
                 phone_transcript if "phone_lhdc" in command[-1] else transcript, "")
@@ -321,6 +491,9 @@ class CodecMemoryCheckTests(unittest.TestCase):
             self.assertEqual(receipt["runtime_reserve_bytes"], 65536)
             self.assertEqual(receipt["probe_budget_bytes"], 0x5c000 - 65536)
             self.assertEqual(receipt["phone_worker_storage_bytes"], 9772)
+            self.assertEqual(receipt["fdk_pcm_bits"], 32)
+            self.assertEqual(receipt["eld_cbr_bandwidth_hz"], 20000)
+            self.assertEqual(receipt["probe_only_heap_diagnostic_bss_bytes"], 12)
             self.assertEqual(receipt["peak_codec_heap_break_bytes"], 188040)
             self.assertEqual(receipt["remaining_after_peak_bytes"], 0x5c000 - 188040)
             self.assertEqual(receipt["modes"]["usb_mic"]["peak_codec_heap_break_bytes"], 188040)
@@ -346,6 +519,74 @@ class CodecMemoryCheckTests(unittest.TestCase):
                      patch.object(probe.subprocess, "run", side_effect=self.fake_tools(phone_transcript=transcript)):
                     self.assertRaises(ValueError, probe.run, args)
                 self.assertFalse((args.output / "memory-check.json").exists())
+
+    def test_linked_bandwidth_requires_an_exact_supported_firmware_word(self):
+        for bandwidth in (0, 16000, 18000, 20000):
+            self.assertEqual(probe.eld_cbr_bandwidth(firmware_image(bandwidth=bandwidth), SYMBOLS), bandwidth)
+        for bandwidth in (1, 15500, 22000):
+            self.assertRaises(ValueError, probe.eld_cbr_bandwidth, firmware_image(bandwidth=bandwidth), SYMBOLS)
+        for symbols in (SYMBOLS.replace("10001004 R airpods_eld_cbr_bandwidth_hz\n", ""),
+                        SYMBOLS + "10001004 R airpods_eld_cbr_bandwidth_hz\n",
+                        SYMBOLS.replace("10001004 R", "10001005 R"),
+                        SYMBOLS.replace("10001004 R", "10002000 R")):
+            self.assertRaises(ValueError, probe.eld_cbr_bandwidth, firmware_image(), symbols)
+
+    def test_requested_bandwidth_mismatch_cannot_compile_or_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.inputs(directory)
+            args.eld_cbr_bandwidth = 18000
+            with patch.object(probe.shutil, "which", return_value="tool"), \
+                 patch.object(probe.subprocess, "run", side_effect=self.fake_tools()) as tools:
+                self.assertRaisesRegex(ValueError, "does not match linked", probe.run, args)
+            self.assertTrue(all("-kernel" not in call.args[0] and "-mcpu=cortex-m33" not in call.args[0]
+                                for call in tools.call_args_list))
+            self.assertFalse(args.firmware.with_suffix(".uf2").exists())
+
+    def test_old_16_bit_or_incomplete_32_bit_results_cannot_pass(self):
+        for transcript in (USB_RESULT.replace(PCM_ABI, ""), USB_RESULT.replace("encoder_bits=32", "encoder_bits=16"),
+                           USB_RESULT.replace("decoder_bits=32", "decoder_bits=16"), USB_RESULT + PCM_ABI,
+                           USB_RESULT.replace("HISTORICAL_FIXTURE mono_bandwidth=auto stereo_bandwidth=0\n", ""),
+                           USB_RESULT.replace("PCM_DECODER complete_q31_output=1 lower16_preserved=1\n", ""),
+                           USB_RESULT.replace("lower16_preserved=1", "lower16_preserved=0")):
+            with self.subTest(transcript=transcript), tempfile.TemporaryDirectory() as directory:
+                args = self.inputs(directory)
+                with patch.object(probe.shutil, "which", return_value="tool"), \
+                     patch.object(probe.subprocess, "run", side_effect=self.fake_tools(transcript)):
+                    self.assertRaises(ValueError, probe.run, args)
+                self.assertFalse(args.firmware.with_suffix(".uf2").exists())
+
+    def test_historical_only_or_wrong_bandwidth_cannot_stand_in_for_candidate_memory_coverage(self):
+        for transcript in (USB_RESULT.replace("CANDIDATE_CBR bandwidth=20000 rates=5 frames=480 retained_mic=1\n", ""),
+                           USB_RESULT.replace("CANDIDATE_CBR bandwidth=20000", "CANDIDATE_CBR bandwidth=0"),
+                           USB_RESULT.replace("MATRIX_HISTORICAL bandwidth=0 frames=960 configurations=10 fixed_hashes=1\n", ""),
+                           USB_RESULT.replace("frames=480 retained_mic=1", "frames=480 retained_mic=0")):
+            with self.subTest(transcript=transcript), tempfile.TemporaryDirectory() as directory:
+                args = self.inputs(directory)
+                with patch.object(probe.shutil, "which", return_value="tool"), \
+                     patch.object(probe.subprocess, "run", side_effect=self.fake_tools(transcript)):
+                    self.assertRaises(ValueError, probe.run, args)
+                self.assertFalse(args.firmware.with_suffix(".uf2").exists())
+
+    def test_legacy_lc_must_retain_microphone_and_s16_frontend_with_original_au_bound(self):
+        line = "LEGACY_LC_MIC rates=192000,256000 frame=1024 input_bits=16 frames=192 max_au=1024\n"
+        for replacement in ("", line.replace("256000", "128000"), line.replace("frame=1024", "frame=480"),
+                            line.replace("input_bits=16", "input_bits=32"), line.replace("max_au=1024", "max_au=2048")):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                args = self.inputs(directory)
+                with patch.object(probe.shutil, "which", return_value="tool"), \
+                     patch.object(probe.subprocess, "run", side_effect=self.fake_tools(USB_RESULT.replace(line, replacement))):
+                    self.assertRaises(ValueError, probe.run, args)
+                self.assertFalse(args.firmware.with_suffix(".uf2").exists())
+
+    def test_real_public_initialization_boundaries_cannot_be_omitted(self):
+        marker = "PROFILE_INPUT preinit_info=1 control_state_guard=1 invalid_init=1 valid_retry=1\n"
+        for replacement in ("", marker.replace("control_state_guard=1", "control_state_guard=0")):
+            with tempfile.TemporaryDirectory() as directory:
+                args = self.inputs(directory)
+                with patch.object(probe.shutil, "which", return_value="tool"), \
+                     patch.object(probe.subprocess, "run", side_effect=self.fake_tools(USB_RESULT.replace(marker, replacement))):
+                    self.assertRaises(ValueError, probe.run, args)
+                self.assertFalse(args.firmware.with_suffix(".uf2").exists())
 
     def test_failed_or_interrupted_recheck_removes_only_its_flash_artifacts(self):
         for error in (ValueError("failed"), KeyboardInterrupt(), subprocess.TimeoutExpired("qemu", 60)):
@@ -400,7 +641,7 @@ class CodecMemoryCheckTests(unittest.TestCase):
             self.assertFalse((args.output / "memory-check.json").exists())
 
     def test_missing_output_recovery_reuses_only_unchanged_validated_inputs(self):
-        for changed in (None, "firmware", "library", "lhdc_library", "uf2", "validation", "receipt"):
+        for changed in (None, "firmware", "library", "lhdc_library", "uf2", "validation", "receipt", "pcm_bits", "bandwidth"):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
                 args = self.inputs(directory)
                 with patch.object(probe.shutil, "which", return_value="tool"), \
@@ -420,6 +661,11 @@ class CodecMemoryCheckTests(unittest.TestCase):
                     receipt.write_text(json.dumps(data))
                 elif changed == "receipt":
                     (args.output / "memory-check.json").write_text("[]")
+                elif changed in ("pcm_bits", "bandwidth"):
+                    receipt = args.output / "memory-check.json"
+                    data = json.loads(receipt.read_text())
+                    data["fdk_pcm_bits" if changed == "pcm_bits" else "eld_cbr_bandwidth_hz"] = 16 if changed == "pcm_bits" else 18000
+                    receipt.write_text(json.dumps(data))
                 with patch.object(probe, "validate", side_effect=ValueError("rerun validation")) as validate:
                     if changed is None:
                         probe.run(args)

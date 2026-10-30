@@ -67,7 +67,7 @@ AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER decoder, INT_PCM *pcm
     assert(worker_thread && decoder == &info && capacity == 480);
     atomic_fetch_add(&codec_calls, 1);
     assert(atomic_load_explicit(&decoder_live, memory_order_acquire));
-    for (unsigned i = 0; i < 480; ++i) pcm[i] = (int16_t)sequence;
+    for (unsigned i = 0; i < 480; ++i) pcm[i] = (INT_PCM)(int16_t)sequence*(sizeof(INT_PCM)==4?65536:1);
     if ((sequence & 31u) == 0) sched_yield();
     assert(atomic_load_explicit(&decoder_live, memory_order_acquire));
     atomic_fetch_sub(&codec_calls, 1);

@@ -175,6 +175,50 @@ Release firmware enables float and retains S16 alt 1 compatibility in the same
 image. CI publishes that single image; regression tests exercise both formats.
 The earlier S16-only comparison images were used during the initial float rollout.
 
+### Transport quality checks
+
+A quiet eight-second Windows reference on 0.1.53 float r2 preserved all 384000 stereo
+frames (768000 float samples) bit for bit in captured USB OUT request payloads
+paired with successful completions. Both channels had unity amplitude and zero
+sample error, including the sub-S16-level section and the 19/21 kHz test tones.
+This is host USB driver evidence, not a physical-bus analyzer or an encoder-output
+measurement. Two failed transfers occurred after the complete reference window;
+the whole capture is not labeled error-free. Evidence: `pc02-quality.json` and
+`pc02-stop-tail-validation.json` in the `usb-pcm-quality-20261029` artifact set.
+
+The Android trial accepted and played the same float AudioTrack reference without
+a reported underrun increase, but its saved USB selection was alt 1 / S16_LE.
+The saved PCM status was stopped, and no USB audio payload was captured, so
+neither Android sample fidelity nor float USB transport is established by that
+trial. An offload path is a possible explanation for absent USB-monitor events,
+not a demonstrated cause. A standard S32 integer alternative is a candidate for
+hosts that do not select float; it is not implemented or validated by this test,
+and would not remove the existing S16 encoder boundary.
+
+For repeatable quality checks:
+
+1. Use known, quiet 48 kHz stereo material with a unique alignment marker,
+   separate channels, low-level samples off the S16 grid and high-frequency tones.
+   Pause other audio sources; do not compensate for gain by changing live volume.
+2. Record the selected USB alternative and its format. Filter capture to the
+   intended audio OUT endpoint and match submissions with successful completions,
+   including per-packet status. A float source or mixer format alone is insufficient.
+3. Align the complete reference and compare sample bits, channel order, gain,
+   nonfinite/clipped samples and frequency components. Keep transfer errors and
+   their positions; do not hide an error by concatenating around missing audio.
+4. If firmware configuration is observed separately, identify the exact build and
+   report that as a separate observation. Record effective encoder bitrate,
+   bandwidth, SBR and afterburner, not just requested settings.
+5. Stop bounded collectors afterward. Retain inconclusive captures as such rather
+   than treating absent packets or a mixed reference as a successful comparison.
+
+The PC result establishes preservation only within that quiet reference window.
+It does not establish full-scale clipping behavior, prepared encoder PCM,
+decoded AAC fidelity, acoustic response, or long-run continuity. Float is rounded
+to S16 before the current encoder; a separate runtime snapshot confirmed a
+16000 Hz AAC bandwidth at 255200 bits/s CBR. These are distinct downstream limits;
+see [AAC-ELD bandwidth and precision](../aac-eld-apple.md#encoder-bandwidth-and-precision).
+
 ## Trace protocol
 
 Report-3 typed feature 11 returns exactly 512 bytes. All integers are little-endian.

@@ -37,6 +37,7 @@ unsupported combinations and rates below 128 kbps are rejected.
 | PCM input | 48 kHz stereo, signed 16-bit |
 | Frame length | 480 samples per channel, 10 ms |
 | Bitrate | Requested CBR/VBR mode, bounded by the selected wire ceiling |
+| Audio bandwidth | Automatic in CBR; explicit ceiling-based selection in VBR |
 | SBR | Off |
 | Afterburner | Off |
 | Transport | Raw access units |
@@ -44,6 +45,38 @@ unsupported combinations and rates below 128 kbps are rejected.
 Changing SBR requires a separate encoder and wire check. The variable-rate
 permission does not silently enable actual VBR encoding. A host-reported PCM bit
 depth does not establish the compressed stream's effective resolution.
+
+## Encoder bandwidth and precision
+
+The USB float path retains float samples through buffering and resampling, then
+rounds and saturates once to signed 16-bit PCM at the current encoder boundary.
+Bit-exact host USB float transport therefore does not establish float precision
+through AAC. See the [transport quality checks](docs/AUDIO-CONTINUITY.md#transport-quality-checks).
+
+For stereo, 48 kHz, 480-sample CBR, FDK's automatic bandwidth table selects
+16000 Hz at 255200 bits/s. A separate running-firmware observation on 0.1.53 float r2
+confirmed that effective value, with SBR and afterburner off. The encoder applies
+the selected bandwidth to its spectrum; this is not a measured acoustic cutoff.
+At 128000 bits/s the table selects 15400 Hz; from 192000 through 255200 it selects
+16000 Hz. Intermediate interpolation is not strictly monotonic.
+
+Live CBR retuning retains the automatic bandwidth request and recomputes the
+effective bandwidth. VBR instead explicitly selects 15500 Hz for a local ceiling
+up to 128000 bits/s, 17500 Hz up to 160000, or 20000 Hz above that. This uses the
+ceiling, not the current adaptive rate; subsequent bitrate updates retain that
+explicit bandwidth until fresh encoder initialization.
+
+For inspection, `AACENC_BANDWIDTH` readback / `aacConfig.bandWidth` is the
+effective value. Requested `userBandwidth == 0` means automatic selection.
+Requested `userSbrEnabled == 255` is the default automatic sentinel, not an
+enabled flag; use `AACENC_SBR_MODE` readback or `syntaxFlags & 0x8000` for effective
+SBR state. The observed flags were `0x50` (`AC_ER | AC_ELD`), without SBR.
+
+Wider bandwidth, afterburner, or a higher-precision encoder input are separate
+quality changes. Compare encoded output and listening results, worst-case CPU
+time, packet-size limits and codec memory before changing defaults. Increasing
+bandwidth at the same bitrate also spreads the available bits across more of the
+spectrum; it is not an unconditional quality improvement.
 
 ## Packet framing
 

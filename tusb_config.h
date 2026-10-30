@@ -117,7 +117,7 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_DESC_LEN                                TUD_AUDIO_HEADSET_STEREO_DESC_LEN
 
 // Audio format type I specifications
-// Speaker alt 1 is S16, alt 2 is IEEE float32; microphone remains S16.
+// Speaker alt 1 is S16, alt 2 is IEEE float32, alt 3 is signed PCM32; mic remains S16.
 // NOTE: MAX_SAMPLE_RATE sizes the speaker (RX/OUT) endpoint. The mic (TX/IN)
 // path runs at 64 kHz (USB_MIC_SAMPLE_RATE) and sizes its EP explicitly.
 #define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE                         48000
@@ -131,6 +131,8 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_RESOLUTION_RX                  16
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_N_BYTES_PER_SAMPLE_RX          4
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_RESOLUTION_RX                  32
+#define CFG_TUD_AUDIO_FUNC_1_FORMAT_3_N_BYTES_PER_SAMPLE_RX          4
+#define CFG_TUD_AUDIO_FUNC_1_FORMAT_3_RESOLUTION_RX                  32
 
 // EP and buffer size - for isochronous EP´s, the buffer and EP size are equal (different sizes would not make sense)
 // Mic (EP IN): 64 kHz mono 16-bit — (64+1) samples/ms * 2B = 130 bytes.
@@ -147,6 +149,7 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT   TUD_AUDIO_EP_SIZE(CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
 
 #define CFG_TUD_AUDIO_FUNC_1_FORMAT_2_EP_SZ_OUT   TUD_AUDIO_EP_SIZE(CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_1_FORMAT_2_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
+#define CFG_TUD_AUDIO_FUNC_1_FORMAT_3_EP_SZ_OUT   TUD_AUDIO_EP_SIZE(CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE, CFG_TUD_AUDIO_FUNC_1_FORMAT_3_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX        (AIRPODS_USB_FLOAT ? CFG_TUD_AUDIO_FUNC_1_FORMAT_2_EP_SZ_OUT : CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT)
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ     (CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX*2)
 

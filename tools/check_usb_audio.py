@@ -77,6 +77,7 @@ def validate(data, float_enabled=True):
     }
     if float_enabled:
         expected[(1, 2)] = dict(format=4, channels=2, subslot=4, bits=32, endpoint=1, packet_bytes=392, interval=1)
+        expected[(1, 3)] = dict(format=1, channels=2, subslot=4, bits=32, endpoint=1, packet_bytes=392, interval=1)
     if formats != expected or interfaces != set(range(6)) or data[4] != 6:
         raise ValueError('Linked USB interfaces or audio alternatives do not match their contract: %r' % formats)
     return {f'{itf}:{alt}': value for (itf, alt), value in formats.items()}

@@ -4,8 +4,15 @@
 
 #include <string.h>
 
+extern unsigned profile_spectral_bytes(void) __asm__("_Z29GetRequiredMemWorkBufferCore2v");
+extern unsigned profile_time_bytes(void) __asm__("_Z29GetRequiredMemWorkBufferCore5v");
+
 static void profile_require(int condition, const char *name) {
     if (!condition) fail(name, -1);
+}
+
+static unsigned profile_workspace_bytes(unsigned payload) {
+    return ALGN_SIZE_EXTRES(payload + ALIGNMENT_DEFAULT + sizeof(void *));
 }
 
 static void profile_configure(HANDLE_AACDECODER decoder) {
@@ -26,8 +33,8 @@ static AAC_DECODER_ERROR profile_decode(HANDLE_AACDECODER decoder,
     memset(&output, 0x5a, sizeof(output));
     AAC_DECODER_ERROR error = aacDecoder_DecodeFrame(decoder, output.samples, 480, flags);
     for (unsigned i = 0; i < 8; ++i) {
-        profile_require(output.before[i] == (INT_PCM)0x5a5a &&
-                        output.after[i] == (INT_PCM)0x5a5a, "profile output canary");
+        profile_require(output.before[i] == (INT_PCM)0x5a5a5a5a &&
+                        output.after[i] == (INT_PCM)0x5a5a5a5a, "profile output canary");
     }
     if (error == AAC_DEC_OK) {
         CStreamInfo *info = aacDecoder_GetStreamInfo(decoder);
@@ -44,6 +51,14 @@ static void profile_checks(const unsigned char fixtures[16][1024],
 #error "Profile regression checks must use the firmware codec profile"
 #endif
     unsigned before = mallinfo().uordblks;
+    unsigned spectral = profile_spectral_bytes(), time = profile_time_bytes();
+    if (spectral != profile_workspace_bytes(4096) || time != profile_workspace_bytes(3840)) {
+        char diagnostic[160];
+        snprintf(diagnostic, sizeof(diagnostic), "PROFILE_WORKSPACE spectral=%u expected=%u time=%u expected=%u\n",
+                 spectral, profile_workspace_bytes(4096), time, profile_workspace_bytes(3840));
+        probe_emit(diagnostic);
+        fail("profile decoder workspace dimensions", -1);
+    }
     for (unsigned channels = 0; channels <= 8; ++channels) {
         if (channels == 1 || channels == 2) continue;
         HANDLE_AACENCODER invalid = NULL;
@@ -54,9 +69,38 @@ static void profile_checks(const unsigned char fixtures[16][1024],
     profile_require(aacEncOpen(&encoder, 0, 2) == AACENC_INVALID_CONFIG && encoder == NULL,
                     "profile encoder module guard");
     ENC_OK(aacEncOpen(&encoder, 1, 2));
+    unsigned opened = mallinfo().uordblks;
+    AACENC_InfoStruct uninitialized = {0};
+    AACENC_ERROR info_error = aacEncInfo(encoder, &uninitialized);
+    profile_require((info_error == AACENC_OK || info_error == AACENC_INIT_ERROR) &&
+                    uninitialized.frameLength == 0 && mallinfo().uordblks == opened,
+                    "profile pre-init info safety");
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_CONTROL_STATE, 0));
+    profile_require(aacEncEncode(encoder, NULL, NULL, NULL, NULL) == AACENC_INIT_ERROR &&
+                    mallinfo().uordblks == opened, "profile suppressed first init guard");
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_AOT, 39));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_SAMPLERATE, 48000));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_CHANNELMODE, MODE_2));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_GRANULE_LENGTH, 1024));
+    profile_require(aacEncEncode(encoder, NULL, NULL, NULL, NULL) == AACENC_INVALID_CONFIG &&
+                    mallinfo().uordblks == opened, "profile invalid first init allocation guard");
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_GRANULE_LENGTH, 480));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_BITRATE, 128000));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_PEAK_BITRATE, 128000));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_SBR_MODE, 0));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_BITRATEMODE, 0));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_AFTERBURNER, 0));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_TRANSMUX, TT_MP4_RAW));
+    ENC_OK(aacEncoder_SetParam(encoder, AACENC_BANDWIDTH, aaceld_bandwidth(128000, 0)));
+    ENC_OK(aacEncEncode(encoder, NULL, NULL, NULL, NULL));
+    ENC_OK(aacEncInfo(encoder, &uninitialized));
+    profile_require(uninitialized.frameLength == 480 && uninitialized.inputChannels == 2,
+                    "profile valid first init retry");
     profile_require(aacEncoder_SetParam(encoder, AACENC_CHANNELMODE, MODE_1_2) != AACENC_OK,
                     "profile encoder mode guard");
     ENC_OK(aacEncClose(&encoder));
+    profile_require(encoder == NULL && mallinfo().uordblks == before, "profile pre-init lifecycle cleanup");
+    probe_emit("PROFILE_INPUT preinit_info=1 control_state_guard=1 invalid_init=1 valid_retry=1\n");
     profile_require(aacDecoder_Open(TT_MP4_ADTS, 1) == NULL &&
                     aacDecoder_Open(TT_MP4_RAW, 0) == NULL &&
                     aacDecoder_Open(TT_MP4_RAW, 2) == NULL, "profile transport guard");

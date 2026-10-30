@@ -63,7 +63,7 @@ AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER decoder, INT_PCM *pcm
     assert(core == 1 && decoder == &info && decoder_live && capacity == 480);
     ++decoded;
     last_flags = flags;
-    for (unsigned i = 0; i < 480; ++i) pcm[i] = (int16_t)(i + 1);
+    for (unsigned i = 0; i < 480; ++i) pcm[i] = (INT_PCM)(i + 1)*(sizeof(INT_PCM)==4?65536:1);
     if (reset_in_decode) {
         // Simulate a core0 USB-close/reset while core1 is inside the codec.
         core = 0;
@@ -113,6 +113,13 @@ static void reset_and_drain(void) {
 }
 
 int main(void) {
+#ifdef FDK_DONGLE_PCM32
+    assert(mic_pcm_s16(INT32_MAX)==INT16_MAX && mic_pcm_s16(INT32_MIN)==INT16_MIN);
+    assert(mic_pcm_s16(32767)==0 && mic_pcm_s16(-32767)==0);
+    assert(mic_pcm_s16(32768)==1 && mic_pcm_s16(-32768)==-1);
+    for(int value=INT16_MIN;value<=INT16_MAX;++value)
+        assert(mic_pcm_s16((int32_t)value*65536)==value);
+#endif
     int16_t pcm[960];
     assert(!step() && !aacp_mic_dec_ready());
     assert(!aacp_mic_dec_reset_done());

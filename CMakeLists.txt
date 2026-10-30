@@ -6,8 +6,13 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 set(PICOTOOL_GIT_BRANCH 2041936441b48a3cc53ae3da9e805229fe8f4e18)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.53 LANGUAGES C CXX ASM)
-option(AIRPODS_USB_FLOAT "Expose IEEE float USB input alongside S16 compatibility" ON)
+project(airpods_dongle VERSION 0.1.54 LANGUAGES C CXX ASM)
+option(AIRPODS_USB_FLOAT "Expose float and integer PCM32 USB input alongside S16 compatibility" ON)
+set(AACELD_CBR_BANDWIDTH 20000 CACHE STRING "AAC-ELD CBR bandwidth in Hz; 0 uses FDK automatic selection")
+set_property(CACHE AACELD_CBR_BANDWIDTH PROPERTY STRINGS 0 16000 18000 20000)
+if(NOT AACELD_CBR_BANDWIDTH MATCHES "^(0|16000|18000|20000)$")
+    message(FATAL_ERROR "AACELD_CBR_BANDWIDTH must be 0, 16000, 18000 or 20000")
+endif()
 pico_sdk_init()
 
 # Bluedroid's product-packing macro deliberately wraps its signed low word.
@@ -35,7 +40,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static codec libraries" FORCE)
 set(BUILD_PROGRAMS OFF CACHE BOOL "No desktop codec tools" FORCE)
 add_subdirectory(3rd-party/fdk-aac)
-target_compile_definitions(fdk-aac PRIVATE FDK_AIRPODS_PROFILE=1)
+target_compile_definitions(fdk-aac PUBLIC FDK_DONGLE_PCM32=1 PRIVATE FDK_AIRPODS_PROFILE=1)
 file(GLOB lhdc_sources CONFIGURE_DEPENDS "3rd-party/lhdcv5/decoder/*.c")
 add_library(lhdcv5 STATIC 3rd-party/lhdcv5/lhdc48.c ${lhdc_sources})
 target_include_directories(lhdcv5 PUBLIC 3rd-party/lhdcv5
@@ -96,9 +101,11 @@ target_link_libraries(airpods_dongle PRIVATE
 )
 pico_enable_stdio_uart(airpods_dongle 0)
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_codec_fingerprint")
+target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_eld_cbr_bandwidth_hz")
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_lhdc_fingerprint"
     "-Wl,--undefined=airpods_phone_worker_storage_bytes")
 target_compile_definitions(airpods_dongle PRIVATE
+    AACELD_CBR_BANDWIDTH=${AACELD_CBR_BANDWIDTH}
     AIRPODS_USB_FLOAT=$<BOOL:${AIRPODS_USB_FLOAT}>
     CYW43_LWIP=0 CYW43_PIO_CLOCK_DIV_DYNAMIC=1 ENABLE_RIJNDAEL_DECRYPT=1 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
     PICO_CORE1_STACK_SIZE=0 PICO_STACK_SIZE=16384 PICO_USE_STACK_GUARDS=1
@@ -116,6 +123,7 @@ set(codec_check_command
     --lhdc-library "$<TARGET_FILE:lhdcv5>"
     --compiler "${CMAKE_C_COMPILER}" --nm "${CMAKE_NM}"
     --picotool "$<TARGET_FILE:picotool>" --uf2-family "${PICO_PLATFORM}"
+    --eld-cbr-bandwidth "${AACELD_CBR_BANDWIDTH}"
     --output "${CMAKE_CURRENT_BINARY_DIR}/codec-probe")
 if(AIRPODS_USB_FLOAT)
     list(APPEND codec_check_command --usb-audio float)

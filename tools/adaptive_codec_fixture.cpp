@@ -11,6 +11,12 @@
 #include "aacenc_lib.h"
 #include "aacdecoder_lib.h"
 #include "playback_eld.h"
+#include "aaceld_quality.h"
+
+#if !defined(FDK_DONGLE_PCM32) || FDK_DONGLE_PCM32 != 1
+#error Host codec fixtures must use the firmware's global Q31 ABI
+#endif
+static_assert(sizeof(INT_PCM) == 4 && SAMPLE_BITS == 32, "real codec PCM must be Q31");
 
 static void require(bool valid, const char *message) {
     if (!valid) { std::fprintf(stderr, "FAIL %s\n", message); std::exit(1); }
@@ -32,7 +38,7 @@ static bool read_u32(FILE *file, uint32_t &value) {
     return true;
 }
 
-static INT_PCM reference_sample(uint64_t sample, unsigned channel) {
+static SHORT reference_s16_sample(uint64_t sample, unsigned channel) {
     const double pi = 3.14159265358979323846;
     double time = static_cast<double>(sample) / 48000;
     double primary = channel ? 683.0 : 437.0;
@@ -40,10 +46,42 @@ static INT_PCM reference_sample(uint64_t sample, unsigned channel) {
     double envelope = 0.70 + 0.25 * std::sin(2 * pi * (channel ? 3.7 : 2.3) * time);
     double signal = envelope * (11000 * std::sin(2 * pi * primary * time) +
                                 3700 * std::sin(2 * pi * secondary * time));
-    return static_cast<INT_PCM>(std::lrint(signal));
+    return static_cast<SHORT>(std::lrint(signal));
+}
+
+static INT_PCM reference_sample(uint64_t sample, unsigned channel) {
+    return static_cast<INT_PCM>(int64_t(reference_s16_sample(sample, channel)) * 65536);
 }
 
 #ifndef ADAPTIVE_CODEC_DECODER
+#include "frontend_wrap.inc"
+struct FrontendTrace {
+    bool enabled = false, truncate = false;
+    unsigned samples = 0, mismatches = 0;
+    uint32_t hash = 2166136261u;
+};
+static FrontendTrace frontend;
+extern "C" void frontend_real(const LONG *, LONG *, UINT, UINT, UINT) __asm__(FRONTEND_REAL_SYMBOL);
+extern "C" void frontend_wrap(const LONG *, LONG *, UINT, UINT, UINT) __asm__(FRONTEND_WRAP_SYMBOL);
+extern "C" void frontend_wrap(const LONG *input, LONG *output, UINT channels, UINT frameSize, UINT stride) {
+    frontend_real(input, output, channels, frameSize, stride);
+    if (!frontend.enabled) return;
+    for (UINT channel = 0; channel < channels; ++channel) {
+        for (UINT sample = 0; sample < frameSize; ++sample) {
+            LONG &actual = output[channel * stride + sample];
+            if (frontend.truncate) {
+                // Deliberately reproduce the old LONG->SHORT frontend loss.
+                int64_t value = actual;
+                int64_t high = value >= 0 ? value / 65536 : -((-value + 65535) / 65536);
+                actual = static_cast<LONG>(high * 65536);
+            }
+            frontend.mismatches += actual != input[sample * channels + channel];
+            frontend.hash = (frontend.hash ^ static_cast<uint32_t>(actual)) * 16777619u;
+            ++frontend.samples;
+        }
+    }
+}
+
 // Linker wrappers cover the static FDK archive, not just fixture allocations.
 static bool heap_guard;
 static unsigned heap_calls[4], guarded_heap_calls[4], guarded_frames;
@@ -131,11 +169,8 @@ static void encoder_open(unsigned mode, uint32_t ceiling) {
     for (const auto &parameter : parameters)
         require(aacEncoder_SetParam(handleAAC, parameter.parameter, parameter.value) == AACENC_OK,
                 "encoder parameters");
-    if (mode) {
-        unsigned bandwidth = ceiling <= 128000 ? 15500 : ceiling <= 160000 ? 17500 : 20000;
-        require(aacEncoder_SetParam(handleAAC, AACENC_BANDWIDTH, bandwidth) == AACENC_OK,
-                "encoder bandwidth");
-    }
+    require(aacEncoder_SetParam(handleAAC, AACENC_BANDWIDTH, aaceld_bandwidth(ceiling, mode)) == AACENC_OK,
+            "encoder bandwidth");
     require(aacEncEncode(handleAAC, nullptr, nullptr, nullptr, nullptr) == AACENC_OK &&
             aacEncInfo(handleAAC, &aacinf) == AACENC_OK, "encoder initialize");
 }
@@ -150,6 +185,43 @@ static AACENC_ERROR encode_without_heap(AACENC_BufDesc *input, AACENC_BufDesc *o
             guarded_heap_calls[2] == 0 && guarded_heap_calls[3] == 0,
             "steady encode touched the heap");
     return error;
+}
+
+static FrontendTrace frontend_case(unsigned variant, bool truncate) {
+    encoder_open(0, 256000);
+    INT_PCM pcm[960]; unsigned char output[1024];
+    for (unsigned n = 0; n < 960; ++n) {
+        int base = n % 2 ? -1000 : 1000;
+        unsigned low = (variant ? 32769u : 1u) + (n * 13u) % 32766u;
+        pcm[n] = static_cast<INT_PCM>(int64_t(base) * 65536 + low);
+    }
+    void *inputs[] = {pcm}, *outputs[] = {output};
+    INT input_id = IN_AUDIO_DATA, output_id = OUT_BITSTREAM_DATA;
+    INT input_size = sizeof(pcm), output_size = sizeof(output);
+    INT input_element = sizeof(INT_PCM), output_element = 1;
+    AACENC_BufDesc in = {1, inputs, &input_id, &input_size, &input_element};
+    AACENC_BufDesc out = {1, outputs, &output_id, &output_size, &output_element};
+    AACENC_InArgs args = {960, 0}; AACENC_OutArgs result = {};
+    frontend = FrontendTrace{};
+    frontend.enabled = true; frontend.truncate = truncate;
+    AACENC_ERROR error = encode_without_heap(&in, &out, &args, &result);
+    frontend.enabled = false;
+    require(error == AACENC_OK && result.numInSamples == 960 && result.numOutBytes > 0,
+            "frontend real codec encode");
+    require(aacEncClose(&handleAAC) == AACENC_OK, "frontend encoder close");
+    return frontend;
+}
+
+static void check_frontend_precision() {
+    check_allocator_wrappers();
+    FrontendTrace first = frontend_case(0, false), second = frontend_case(1, false);
+    FrontendTrace negative = frontend_case(1, true);
+    require(first.samples == 960 && second.samples == 960 && negative.samples == 960,
+            "frontend wrapper did not observe complete real codec input");
+    require(first.mismatches == 0 && second.mismatches == 0 && first.hash != second.hash,
+            "frontend discarded lower16 differential");
+    require(negative.mismatches == 960, "frontend oracle accepted deliberate S16 truncation");
+    std::printf("FRONTEND pcm_bits=32 copied=960 lower16_distinct=1 negative_rejected=1\n");
 }
 
 static void check_lc_allocator(uint32_t bitrate) {
@@ -173,14 +245,14 @@ static void check_lc_allocator(uint32_t bitrate) {
             aacinf.frameLength == 1024 && heap_calls[0] + heap_calls[1] > 0,
             "AAC-LC initialization");
     for (unsigned frame = 0; frame < 128; ++frame) {
-        INT_PCM pcm[2048]; unsigned char output[2048];
+        SHORT pcm[2048]; unsigned char output[2048];
         for (unsigned sample = 0; sample < 1024; ++sample)
             for (unsigned channel = 0; channel < 2; ++channel)
-                pcm[2 * sample + channel] = reference_sample(uint64_t(frame) * 1024 + sample, channel);
+                pcm[2 * sample + channel] = reference_s16_sample(uint64_t(frame) * 1024 + sample, channel);
         void *inputs[] = {pcm}, *outputs[] = {output};
         INT input_id = IN_AUDIO_DATA, output_id = OUT_BITSTREAM_DATA;
         INT input_size = sizeof(pcm), output_size = sizeof(output);
-        INT input_element = sizeof(INT_PCM), output_element = 1;
+        INT input_element = sizeof(SHORT), output_element = 1;
         AACENC_BufDesc input = {1, inputs, &input_id, &input_size, &input_element};
         AACENC_BufDesc encoded = {1, outputs, &output_id, &output_size, &output_element};
         AACENC_InArgs arguments = {2048, 0}; AACENC_OutArgs result = {};
@@ -194,6 +266,10 @@ static void check_lc_allocator(uint32_t bitrate) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && std::strcmp(argv[1], "frontend") == 0) {
+        check_frontend_precision();
+        return 0;
+    }
     if (argc == 3 && std::strcmp(argv[1], "lc") == 0) {
         check_lc_allocator(std::strtoul(argv[2], nullptr, 10));
         return 0;
@@ -330,7 +406,7 @@ int main(int argc, char **argv) {
     for (unsigned delay = 0; delay <= 2048; ++delay) {
         double error = 0;
         for (unsigned sample = 4096; sample < 12288; sample += 4) {
-            double difference = decoded[2 * sample] - reference_sample(sample - delay, 0);
+            double difference = static_cast<double>(decoded[2 * sample]) - reference_sample(sample - delay, 0);
             error += difference * difference;
         }
         if (error < best_error) { best_error = error; best_delay = delay; }

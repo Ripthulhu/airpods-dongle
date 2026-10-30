@@ -193,6 +193,7 @@
  // Buffer for speaker data
  // One receive callback carries at most one descriptor-sized USB packet.
  static union {
+   uint8_t bytes[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX];
    int16_t pcm16[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(int16_t)];
    float pcm32[CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX / sizeof(float)];
  } spk_buf;
@@ -540,7 +541,7 @@ void tinyusb_control_task(void){
    uint16_t itf = tu_le16toh(request->wIndex);
    uint16_t alt = tu_le16toh(request->wValue);
    if (itf == ITF_NUM_AUDIO_STREAMING_SPK) {
-     if(alt>(AIRPODS_USB_FLOAT?2:1))return false;
+     if(alt>(AIRPODS_USB_FLOAT?3:1))return false;
      if (speaker_format!=alt) {
        blink_interval_ms = BLINK_MOUNTED;
        speaker_interface_open = false;
@@ -571,7 +572,7 @@ void tinyusb_control_task(void){
      usb_mic_update_request();
      return true;
    }
-   if (itf != ITF_NUM_AUDIO_STREAMING_SPK || alt>(AIRPODS_USB_FLOAT?2:1)) return false;
+   if (itf != ITF_NUM_AUDIO_STREAMING_SPK || alt>(AIRPODS_USB_FLOAT?3:1)) return false;
    if(speaker_format!=alt) {
      usb_speaker_stop();
      audio_slot_usb_reset();
@@ -592,8 +593,8 @@ void tinyusb_control_task(void){
    (void)func_id;
    (void)ep_out;
 
-   uint16_t frame_bytes=cur_alt_setting==2?8u:4u;
-   uint16_t maximum=cur_alt_setting==2?CFG_TUD_AUDIO_FUNC_1_FORMAT_2_EP_SZ_OUT:CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT;
+   uint16_t frame_bytes=cur_alt_setting>=2?8u:4u;
+   uint16_t maximum=cur_alt_setting>=2?CFG_TUD_AUDIO_FUNC_1_FORMAT_2_EP_SZ_OUT:CFG_TUD_AUDIO_FUNC_1_FORMAT_1_EP_SZ_OUT;
    if (n_bytes_received > sizeof(spk_buf) || n_bytes_received > maximum || n_bytes_received % frame_bytes != 0) {
      dongle_playback_usb_packet(time_us_32(),0,cur_alt_setting,1);
      (void)tud_audio_clear_ep_out_ff();
@@ -605,7 +606,7 @@ void tinyusb_control_task(void){
      (void)tud_audio_clear_ep_out_ff();
      return false;
    }
-   if ((cur_alt_setting!=1 && cur_alt_setting!=2) || cur_alt_setting!=speaker_format || !speaker_interface_open ||
+   if (cur_alt_setting<1 || cur_alt_setting>(AIRPODS_USB_FLOAT?3:1) || cur_alt_setting!=speaker_format || !speaker_interface_open ||
        !usb_mounted || usb_suspended || !usb_audio_available()) return true;
 
    if (spk_data_size)
@@ -620,7 +621,15 @@ void tinyusb_control_task(void){
     // USB mute must preserve the AirPods volume for a later unmute.
     if (atomic_load_explicit(&mute[0], memory_order_acquire))
       memset(&spk_buf, 0, spk_data_size);
-    if(cur_alt_setting==2)audio_slot_push_float(spk_buf.pcm32,sample_count);
+    if(cur_alt_setting==3) {
+      for(unsigned i=0;i<2u*sample_count;++i) {
+        const uint8_t *p=spk_buf.bytes+4u*i;
+        uint32_t raw=(uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;
+        int32_t sample=(raw&0x80000000u)?-1-(int32_t)~raw:(int32_t)raw;
+        spk_buf.pcm32[i]=(float)sample*0x1p-31f;
+      }
+    }
+    if(cur_alt_setting>=2)audio_slot_push_float(spk_buf.pcm32,sample_count);
     else audio_slot_push_samples(spk_buf.pcm16,sample_count);
    }
 

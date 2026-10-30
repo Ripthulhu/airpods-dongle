@@ -50,6 +50,8 @@
 #include "btstack_avdtp_source.h"
 #include "pico/platform/sections.h"
 #include "pico/sync.h"
+#include <aacenc_lib.h>
+#define PLAYBACK_PCM_Q31_TYPE INT_PCM
 #include "playback_pcm.h"
 #include "../runtime_watch.h"
 #include "playback_inspect.h"
@@ -57,6 +59,7 @@
 #include "playback_continuity.h"
 #include "playback_peer.h"
 #include "playback_format.h"
+#include "aaceld_quality.h"
 #include "playback_options.h"
 #include "playback_bitrate.h"
 #include "pico/time.h"
@@ -91,7 +94,8 @@ _Static_assert(PHONE_PCM_CAPACITY <= PLAYBACK_PCM_FRAMES, "Phone jitter reserve 
 #define A2DP_APPLE_CODEC_AAC_ELD 0x8001
 
 
-#include <aacenc_lib.h>
+_Static_assert(sizeof(INT_PCM)==sizeof(int32_t) && SAMPLE_BITS==32,"FDK and playback must share Q31 PCM");
+const uint32_t airpods_eld_cbr_bandwidth_hz __attribute__((used)) = AACELD_CBR_BANDWIDTH;
 
 
 #define A2DP_CODEC_VENDOR_ID_FRAUNHOFER 0x08A9
@@ -532,7 +536,8 @@ static playback_resample_t encoder_resample;
 static critical_section_t playback_pcm_lock;
 static bool playback_pcm_initialized;
 // The unused core1 bank holds this serialized buffer; the linker rejects a core1 stack here.
-static int16_t __scratch_x("encoder_pcm") encoder_pcm[AUDIO_SLOT_MAX_INT16];
+static playback_encoder_pcm_t __scratch_x("encoder_pcm") encoder_pcm;
+_Static_assert(sizeof(encoder_pcm.s16)==AUDIO_SLOT_MAX_INT16*sizeof(int16_t),"Legacy encoder staging size");
 static uint16_t pcm_frame_samples = 128;
 static uint8_t active_slot_count = AUDIO_SLOT_COUNT_SBC;
 static uint32_t audio_slot_capacity(void) {
@@ -1343,6 +1348,7 @@ void audio_slot_usb_reset(void) {
 }
 
 static void audio_pcm_read(uint16_t frames) {
+    btstack_assert(cur_codec!=4 || frames==480);
     critical_section_enter_blocking(&playback_pcm_lock);
     bool external = phone_active || call_active;
     if (playback_adjust.running) {
@@ -1350,7 +1356,8 @@ static void audio_pcm_read(uint16_t frames) {
             playback_pcm_prepare_resample(&playback_pcm,&encoder_resample,frames,
                                           (uint32_t)playback_adjust.interval*65536u)) {
             critical_section_exit(&playback_pcm_lock);
-            playback_pcm_render(&encoder_resample,encoder_pcm);
+            if(cur_codec==4)playback_pcm_render_q31(&encoder_resample,encoder_pcm.q31);
+            else playback_pcm_render(&encoder_resample,encoder_pcm.s16);
             return;
         }
         playback_adjust_cancel_stream(&media_tracker,btstack_run_loop_get_time_ms(),
@@ -1360,7 +1367,7 @@ static void audio_pcm_read(uint16_t frames) {
     if (external && !phone_buffer_started && playback_pcm.priming == 0) {
         uint32_t prefill = call_active ? (uint32_t)frames + 960u : phone_clock_prefill(acc_num_simples);
         if (playback_pcm.used < prefill) {
-            memset(encoder_pcm, 0, (size_t)frames * 2 * sizeof(*encoder_pcm));
+            memset(&encoder_pcm, 0, (size_t)frames * 2 * (cur_codec==4?sizeof(int32_t):sizeof(int16_t)));
             critical_section_exit(&playback_pcm_lock);
             return;
         }
@@ -1388,11 +1395,13 @@ static void audio_pcm_read(uint16_t frames) {
             playback_trace.stats[TRACE_CLOCK_Q16]=usb_clock.rate_q16;
         }
         critical_section_exit(&playback_pcm_lock);
-        playback_pcm_render(&encoder_resample,encoder_pcm);
+        if(cur_codec==4)playback_pcm_render_q31(&encoder_resample,encoder_pcm.q31);
+        else playback_pcm_render(&encoder_resample,encoder_pcm.s16);
         return;
     }
     uint32_t priming=playback_pcm.priming<frames ? playback_pcm.priming : frames;
-    uint32_t copied=playback_pcm_read(&playback_pcm, encoder_pcm, frames);
+    uint32_t copied=cur_codec==4?playback_pcm_read_q31(&playback_pcm,encoder_pcm.q31,frames):
+        playback_pcm_read(&playback_pcm,encoder_pcm.s16,frames);
     if (is_usb_streaming || external) playback_metrics.pcm_underflows+=frames-priming-copied;
     uint32_t missing=frames-priming-copied;
     bool active=(is_usb_streaming || external) && playback_pcm.primed_on_wire;
@@ -1455,7 +1464,7 @@ static int fill_sbc_audio_buffer(a2dp_media_sending_context_t * context){
         audio_pcm_read((uint16_t)num_audio_samples_per_sbc_buffer);
         uint32_t started=time_us_32();
         if(!context->codec_storage_count)packet_oldest_us=started;
-        btstack_sbc_encoder_process_data(encoder_pcm);
+        btstack_sbc_encoder_process_data(encoder_pcm.s16);
         playback_encode_measured(started);
         ++playback_metrics.encoded_units;
 
@@ -1509,10 +1518,8 @@ static bool aaceld_encoder_init(void) {
     for (size_t i = 0; i < sizeof(params) / sizeof(params[0]); ++i) {
         if (aacEncoder_SetParam(handleAAC, params[i].key, params[i].value) != AACENC_OK) goto fail;
     }
-    if (playback_options.rate_mode) {
-        unsigned bandwidth=aaceld_bitrate<=128000 ? 15500 : aaceld_bitrate<=160000 ? 17500 : 20000;
-        if (aacEncoder_SetParam(handleAAC,AACENC_BANDWIDTH,bandwidth)!=AACENC_OK) goto fail;
-    }
+    if (aacEncoder_SetParam(handleAAC,AACENC_BANDWIDTH,
+        aaceld_bandwidth(aaceld_bitrate,playback_options.rate_mode))!=AACENC_OK) goto fail;
     if (aacEncEncode(handleAAC, NULL, NULL, NULL, NULL) != AACENC_OK ||
         aacEncInfo(handleAAC, &aacinf) != AACENC_OK ||
         playback_aac_frame_samples(48000, aacinf.inputChannels, aacinf.frameLength, true) == 0 ||
@@ -1645,8 +1652,12 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
     critical_section_exit(&playback_pcm_lock);
     runtime_watch_set(WATCH_PCM);
     audio_pcm_read((uint16_t)frames);
-    if (inspect_enabled) playback_inspect_samples(&playback_inspect, encoder_pcm,
-        frames * aacinf.inputChannels, false, false, time_us_32());
+    if (inspect_enabled) {
+        if(cur_codec==4)playback_inspect_samples_q31(&playback_inspect,encoder_pcm.q31,
+            frames*aacinf.inputChannels,time_us_32());
+        else playback_inspect_samples(&playback_inspect,encoder_pcm.s16,
+            frames*aacinf.inputChannels,false,false,time_us_32());
+    }
     encoder_job.handle = handleAAC;
     encoder_job.samples = (uint16_t)(frames * aacinf.inputChannels);
     encoder_job.offset = context->codec_storage_count + header;
@@ -1666,11 +1677,11 @@ void dongle_playback_encode_run(void) {
     encoder_job.error = AACENC_OK; encoder_job.bytes = encoder_job.consumed = 0;
     encoder_job.encode_us = 0;
     if (encoder_job.epoch_at_prepare == atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed)) {
-        void *input_data = encoder_pcm;
+        void *input_data = encoder_job.codec==4?(void *)encoder_pcm.q31:(void *)encoder_pcm.s16;
         void *output_data = media_tracker.codec_storage + encoder_job.offset;
         int input_id = IN_AUDIO_DATA, output_id = OUT_BITSTREAM_DATA;
-        int input_size = encoder_job.samples * sizeof(*encoder_pcm), output_size = encoder_job.capacity;
-        int input_element = sizeof(*encoder_pcm), output_element = 1;
+        int input_element = encoder_job.codec==4?sizeof(int32_t):sizeof(int16_t), output_element = 1;
+        int input_size = encoder_job.samples * input_element, output_size = encoder_job.capacity;
         AACENC_BufDesc input = {1, &input_data, &input_id, &input_size, &input_element};
         AACENC_BufDesc output = {1, &output_data, &output_id, &output_size, &output_element};
         AACENC_InArgs arguments = {0}; AACENC_OutArgs result = {0};

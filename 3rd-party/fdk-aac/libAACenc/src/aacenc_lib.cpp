@@ -1250,6 +1250,10 @@ INT aacenc_SscCallback(void *self, HANDLE_FDK_BITSTREAM hBs,
   return (FDK_MpegsEnc_WriteSpatialSpecificConfig(hAacEncoder->hMpsEnc, hBs));
 }
 
+#ifdef FDK_AIRPODS_PROFILE
+#include "dongle_input_buffer.h"
+#endif
+
 static AACENC_ERROR aacEncInit(HANDLE_AACENCODER hAacEncoder, ULONG InitFlags,
                                USER_PARAM *config) {
   AACENC_ERROR err = AACENC_OK;
@@ -1258,9 +1262,14 @@ static AACENC_ERROR aacEncInit(HANDLE_AACENCODER hAacEncoder, ULONG InitFlags,
   HANDLE_SBR_ENCODER *hSbrEncoder = &hAacEncoder->hEnvEnc;
   HANDLE_AACENC_CONFIG hAacConfig = &hAacEncoder->aacConfig;
 
+#ifndef FDK_AIRPODS_PROFILE
   hAacEncoder->nZerosAppended = 0; /* count appended zeros */
+#endif
 
   INT frameLength = hAacConfig->framelength;
+#ifdef FDK_AIRPODS_PROFILE
+  const AACENC_CONFIG previousConfig = *hAacConfig;
+#endif
 
   if ((InitFlags & AACENC_INIT_CONFIG)) {
     CHANNEL_MODE prevChMode = hAacConfig->channelMode;
@@ -1276,6 +1285,19 @@ static AACENC_ERROR aacEncInit(HANDLE_AACENCODER hAacEncoder, ULONG InitFlags,
       InitFlags |= AACENC_INIT_STATES;
     }
   }
+
+#ifdef FDK_AIRPODS_PROFILE
+  /* Allocate only after valid frame settings are known; retain capacity on retune. */
+  err = fdk_dongle_input_buffer(&hAacEncoder->inputBuffer,
+                              &hAacEncoder->inputBufferSizePerChannel,
+                              &hAacEncoder->inputBufferSize,
+                              hAacEncoder->nMaxAacChannels, frameLength);
+  if (err != AACENC_OK) {
+    *hAacConfig = previousConfig;
+    return err;
+  }
+  hAacEncoder->nZerosAppended = 0; /* Retain flush progress if allocation fails. */
+#endif
 
   /* Clear input buffer */
   if (InitFlags == AACENC_INIT_ALL) {
@@ -1552,6 +1574,7 @@ AACENC_ERROR aacEncOpen(HANDLE_AACENCODER *phAacEncoder, const UINT encModules,
 
   /* In case of memory overlay, allocate memory out of libraries */
 
+#ifndef FDK_AIRPODS_PROFILE
   if (hAacEncoder->encoder_modis & (ENC_MODE_FLAG_SBR | ENC_MODE_FLAG_PS))
     hAacEncoder->inputBufferSizePerChannel = INPUTBUFFER_SIZE;
   else
@@ -1565,6 +1588,7 @@ AACENC_ERROR aacEncOpen(HANDLE_AACENCODER *phAacEncoder, const UINT encModules,
     err = AACENC_MEMORY_ERROR;
     goto bail;
   }
+#endif
 
   /* Open SBR Encoder */
   if (hAacEncoder->encoder_modis & ENC_MODE_FLAG_SBR) {
@@ -1745,6 +1769,14 @@ AACENC_ERROR aacEncEncode(const HANDLE_AACENCODER hAacEncoder,
     }
     hAacEncoder->InitFlags = AACENC_INIT_NONE;
   }
+
+#ifdef FDK_AIRPODS_PROFILE
+  /* CONTROL_STATE can suppress initialization before the first input allocation. */
+  if (hAacEncoder->inputBuffer == NULL) {
+    err = AACENC_INIT_ERROR;
+    goto bail;
+  }
+#endif
 
   if (outargs != NULL) {
     FDKmemclear(outargs, sizeof(AACENC_OutArgs));

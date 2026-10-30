@@ -8,6 +8,11 @@
 #include <string.h>
 #include <math.h>
 #include "playback_filter.h"
+#ifndef PLAYBACK_PCM_Q31_TYPE
+#define PLAYBACK_PCM_Q31_TYPE int32_t
+#endif
+typedef PLAYBACK_PCM_Q31_TYPE playback_q31_t;
+_Static_assert(sizeof(playback_q31_t)==4,"Q31 samples must be 32 bits");
 
 static inline float playback_pcm_finite(float sample) {
     return isfinite(sample)?sample:0.0f;
@@ -19,6 +24,28 @@ static inline int16_t playback_pcm_quantize(float sample) {
     float scaled=sample*32768.0f;
     return (int16_t)(scaled+(scaled<0?-0.5f:0.5f));
 }
+static inline playback_q31_t playback_pcm_quantize_q31(float sample) {
+    if(!isfinite(sample))return 0;
+    if(sample>=1.0f)return INT32_MAX;
+    if(sample<=-1.0f)return INT32_MIN;
+    float scaled=sample*2147483648.0f;
+    // Binary32 is already integral here; adding a half can round an odd integer up.
+    if(scaled>=8388608.0f || scaled<=-8388608.0f)return (playback_q31_t)scaled;
+    playback_q31_t integer=(playback_q31_t)scaled;
+    float fraction=scaled-(float)integer;
+    return integer+(fraction>=0.5f)-(fraction<=-0.5f);
+}
+static inline void playback_pcm_store(void *dst,uint32_t index,float value,bool wide) {
+    if(wide)((playback_q31_t *)dst)[index]=playback_pcm_quantize_q31(value);
+    else ((int16_t *)dst)[index]=playback_pcm_quantize(value);
+}
+
+// The 480-frame stereo ELD job and legacy S16 codecs share the same scratch bank.
+typedef union {
+    int16_t s16[2048];
+    playback_q31_t q31[480*2];
+} playback_encoder_pcm_t;
+_Static_assert(sizeof(playback_encoder_pcm_t)==4096,"Encoder staging must fit scratch-X");
 
 // One bounded stereo pool shared by USB input and the encoder. Callers serialize it.
 #define PLAYBACK_PCM_FRAMES 8192u
@@ -137,11 +164,12 @@ static inline void playback_pcm_history(playback_pcm_t *pcm,uint32_t frames) {
     }
 }
 
-static inline uint32_t playback_pcm_read(playback_pcm_t *pcm, int16_t *dst,
-                                         uint32_t frames) {
+static inline uint32_t playback_pcm_read_format(playback_pcm_t *pcm, void *dst,
+                                         uint32_t frames,bool wide) {
     uint32_t prefix = pcm->priming < frames ? pcm->priming : frames;
     pcm->priming -= prefix;
-    if (prefix) memset(dst, 0, (size_t)prefix * 2 * sizeof(*dst));
+    size_t element=wide?sizeof(int32_t):sizeof(int16_t);
+    if (prefix) memset(dst, 0, (size_t)prefix * 2 * element);
     uint32_t copied = frames - prefix;
     if (copied > pcm->used) copied = pcm->used;
     if (copied) {
@@ -149,7 +177,7 @@ static inline uint32_t playback_pcm_read(playback_pcm_t *pcm, int16_t *dst,
             uint32_t index=pcm->read+frame;
             if(index>=pcm->capacity)index-=pcm->capacity;
             for(unsigned channel=0;channel<2;++channel)
-                dst[2u*(prefix+frame)+channel]=playback_pcm_quantize(pcm->samples[2u*index+channel]);
+                playback_pcm_store(dst,2u*(prefix+frame)+channel,pcm->samples[2u*index+channel],wide);
         }
         playback_pcm_history(pcm,copied);
         pcm->read += copied;
@@ -157,9 +185,15 @@ static inline uint32_t playback_pcm_read(playback_pcm_t *pcm, int16_t *dst,
     }
     uint32_t filled = prefix + copied;
     if (filled < frames)
-        memset(dst + filled * 2, 0, (size_t)(frames - filled) * 2 * sizeof(*dst));
+        memset((uint8_t *)dst + filled * 2 * element, 0, (size_t)(frames - filled) * 2 * element);
     pcm->used -= copied;
     return copied;
+}
+static inline uint32_t playback_pcm_read(playback_pcm_t *pcm,int16_t *dst,uint32_t frames) {
+    return playback_pcm_read_format(pcm,dst,frames,false);
+}
+static inline uint32_t playback_pcm_read_q31(playback_pcm_t *pcm,playback_q31_t *dst,uint32_t frames) {
+    return playback_pcm_read_format(pcm,dst,frames,true);
 }
 
 // Fixed USB ingress needs matching resampling while the receiver fills or drains.
@@ -204,15 +238,15 @@ static inline bool playback_pcm_prepare_resample(playback_pcm_t *pcm,playback_re
                                                  uint32_t frames,uint32_t rate) {
     return playback_pcm_prepare_resample_fill(pcm,work,frames,rate,NULL);
 }
-static inline void playback_pcm_render(const playback_resample_t *work,int16_t *dst) {
+static inline void playback_pcm_render_format(const playback_resample_t *work,void *dst,bool wide) {
     const uint32_t denominator=655360u;
     // At unity rate the fractional phase and its filter are constant for the block.
     if(work->rate==denominator) {
         if(!work->fraction) {
             for(uint32_t frame=0;frame<work->frames;++frame) {
                 uint32_t index=PLAYBACK_FILTER_TAPS+frame-PLAYBACK_FILTER_DELAY;
-                dst[2*frame]=playback_pcm_quantize(work->samples[2*index]);
-                dst[2*frame+1]=playback_pcm_quantize(work->samples[2*index+1]);
+                playback_pcm_store(dst,2*frame,work->samples[2*index],wide);
+                playback_pcm_store(dst,2*frame+1,work->samples[2*index+1],wide);
             }
         } else {
             uint32_t phase=work->fraction*PLAYBACK_FILTER_PHASES;
@@ -229,7 +263,7 @@ static inline void playback_pcm_render(const playback_resample_t *work,int16_t *
                     left+=coefficients[tap]*work->samples[2*(center-tap)];
                     right+=coefficients[tap]*work->samples[2*(center-tap)+1];
                 }
-                dst[2*frame]=playback_pcm_quantize(left);dst[2*frame+1]=playback_pcm_quantize(right);
+                playback_pcm_store(dst,2*frame,left,wide);playback_pcm_store(dst,2*frame+1,right,wide);
             }
         }
         return;
@@ -251,8 +285,14 @@ static inline void playback_pcm_render(const playback_resample_t *work,int16_t *
             left+=c*work->samples[2*(center-tap)];
             right+=c*work->samples[2*(center-tap)+1];
         }
-        dst[2*frame]=playback_pcm_quantize(left);dst[2*frame+1]=playback_pcm_quantize(right);
+        playback_pcm_store(dst,2*frame,left,wide);playback_pcm_store(dst,2*frame+1,right,wide);
     }
+}
+static inline void playback_pcm_render(const playback_resample_t *work,int16_t *dst) {
+    playback_pcm_render_format(work,dst,false);
+}
+static inline void playback_pcm_render_q31(const playback_resample_t *work,playback_q31_t *dst) {
+    playback_pcm_render_format(work,dst,true);
 }
 static inline bool playback_pcm_read_scaled(playback_pcm_t *pcm,int16_t *dst,
                                             uint32_t frames,uint32_t rate) {

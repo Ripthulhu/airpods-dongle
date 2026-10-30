@@ -12,6 +12,23 @@
 #include "lhdc48.h"
 #include "lhdc48_bench_fixture.h"
 #include "lhdc_quality.h"
+#include "aaceld_quality.h"
+
+#if !defined(FDK_DONGLE_PCM32) || FDK_DONGLE_PCM32 != 1
+#error "The linked firmware codec probe requires the global Q31 ABI"
+#endif
+_Static_assert(sizeof(INT_PCM) == 4 && SAMPLE_BITS == 32, "FDK PCM ABI must be Q31");
+
+static INT_PCM from_s16(int value) {
+    return (INT_PCM)((int64_t)value * 65536);
+}
+
+// Match the old FDK limiter's rounded S16 output for its retained golden checksum.
+static int16_t historical_s16(INT_PCM value) {
+    int64_t rounded = (int64_t)value + 32768;
+    rounded = rounded >= 0 ? rounded / 65536 : -((-rounded + 65535) / 65536);
+    return (int16_t)(rounded > 32767 ? 32767 : rounded < -32768 ? -32768 : rounded);
+}
 
 #ifndef PROBE_HEAP_BYTES
 #error "Pass the firmware's linked heap capacity as PROBE_HEAP_BYTES"
@@ -28,6 +45,8 @@ extern void _exit(int code) __attribute__((noreturn));
 extern char _end;
 static char *heap_break;
 static size_t peak_heap_break;
+static struct { ptrdiff_t request; size_t current; unsigned count; } heap_denial;
+_Static_assert(sizeof(heap_denial) == 12, "ARM32 probe-only heap diagnostic storage");
 
 void *_sbrk(ptrdiff_t increment) {
     if (heap_break == NULL) heap_break = &_end;
@@ -35,6 +54,9 @@ void *_sbrk(ptrdiff_t increment) {
     if ((increment >= 0 && (size_t)increment >
          PROBE_HEAP_BYTES - (size_t)(heap_break - &_end)) ||
         (increment < 0 && increment < &_end - heap_break)) {
+        heap_denial.request = increment;
+        heap_denial.current = (size_t)(heap_break - &_end);
+        ++heap_denial.count;
         errno = ENOMEM;
         return (void *)-1;
     }
@@ -57,6 +79,12 @@ static void fail(const char *operation, int code) {
     char text[160];
     snprintf(text, sizeof(text), "FAIL %s %x\n", operation, code);
     probe_emit(text);
+    if (heap_denial.count) {
+        snprintf(text, sizeof(text), "HEAP_DENIED calls=%u request=%ld current=%u limit=%u brk=%08lx\n",
+                 heap_denial.count, (long)heap_denial.request, (unsigned)heap_denial.current,
+                 (unsigned)PROBE_HEAP_BYTES, (unsigned long)(uintptr_t)(&_end + heap_denial.current));
+        probe_emit(text);
+    }
     _exit(1);
 }
 
@@ -95,7 +123,7 @@ static void report_stack(const char *name, unsigned depth) {
     probe_emit(text);
 }
 
-static HANDLE_AACENCODER encoder(unsigned channels, unsigned bitrate) {
+static HANDLE_AACENCODER encoder_bandwidth(unsigned channels, unsigned bitrate, unsigned bandwidth) {
     HANDLE_AACENCODER handle = NULL;
     ENC_OK(aacEncOpen(&handle, 0x01, channels));
     const struct { AACENC_PARAM key; UINT value; } parameters[] = {
@@ -107,8 +135,14 @@ static HANDLE_AACENCODER encoder(unsigned channels, unsigned bitrate) {
     };
     for (unsigned i = 0; i < sizeof(parameters) / sizeof(*parameters); ++i)
         ENC_OK(aacEncoder_SetParam(handle, parameters[i].key, parameters[i].value));
+    if (channels == 2)
+        ENC_OK(aacEncoder_SetParam(handle, AACENC_BANDWIDTH, bandwidth));
     ENC_OK(aacEncEncode(handle, NULL, NULL, NULL, NULL));
     return handle;
+}
+
+static HANDLE_AACENCODER encoder(unsigned channels, unsigned bitrate) {
+    return encoder_bandwidth(channels, bitrate, aaceld_bandwidth(bitrate, 0));
 }
 
 static HANDLE_AACENCODER playback_encoder(unsigned aot, unsigned bitrate) {
@@ -127,17 +161,19 @@ static HANDLE_AACENCODER playback_encoder(unsigned aot, unsigned bitrate) {
     return handle;
 }
 
-static INT_PCM pcm[2048];
+static union { SHORT s16[2048]; INT_PCM q31[960]; } pcm;
+_Static_assert(sizeof(pcm) == 4096, "probe must retain the production encoder buffer bound");
 static unsigned char packets[16][1024];
 static unsigned packet_lengths[16];
 static unsigned checksum = 2166136261u;
 
 static void encode_pcm(HANDLE_AACENCODER handle, unsigned channels, unsigned samples,
                         unsigned char *packet, unsigned *length) {
-    void *input_buffers[] = {pcm}, *output_buffers[] = {packet};
+    INT element = samples == 1024 ? sizeof(SHORT) : sizeof(INT_PCM);
+    void *input_buffers[] = {samples == 1024 ? (void *)pcm.s16 : (void *)pcm.q31}, *output_buffers[] = {packet};
     INT input_ids[] = {IN_AUDIO_DATA}, output_ids[] = {OUT_BITSTREAM_DATA};
-    INT input_sizes[] = {samples * channels * sizeof(INT_PCM)}, output_sizes[] = {1024};
-    INT input_elements[] = {sizeof(INT_PCM)}, output_elements[] = {1};
+    INT input_sizes[] = {samples * channels * element}, output_sizes[] = {1024};
+    INT input_elements[] = {element}, output_elements[] = {1};
     AACENC_BufDesc input = {1, input_buffers, input_ids, input_sizes, input_elements};
     AACENC_BufDesc output = {1, output_buffers, output_ids, output_sizes, output_elements};
     AACENC_InArgs arguments = {0};
@@ -156,13 +192,15 @@ static void encode_frame(HANDLE_AACENCODER handle, unsigned channels, unsigned f
     AACENC_InfoStruct info = {0};
     ENC_OK(aacEncInfo(handle, &info));
     unsigned samples = info.frameLength;
-    if (channels != info.inputChannels || samples == 0 || samples > 1024 || channels > 2)
+    if (channels != info.inputChannels || (samples != 480 && samples != 1024) || channels > 2)
         fail("encoder input format", samples);
     for (unsigned sample = 0; sample < samples; ++sample) {
         int value = (sample + frame * samples) % 96;
         value = (value < 48 ? value : 96 - value) - 24;
-        for (unsigned channel = 0; channel < channels; ++channel)
-            pcm[sample * channels + channel] = (INT_PCM)(value * 100);
+        for (unsigned channel = 0; channel < channels; ++channel) {
+            if (samples == 1024) pcm.s16[sample * channels + channel] = (SHORT)(value * 100);
+            else pcm.q31[sample * channels + channel] = from_s16(value * 100);
+        }
     }
     encode_pcm(handle, channels, samples, packet, length);
 }
@@ -179,7 +217,8 @@ static void phone_pcm(const int16_t *stereo, uint16_t frames, void *context) {
     if (stereo == NULL || frames != 240 || phone->filled + frames > 480)
         fail("LHDC decoded format", frames);
     lhdc_quality_collect(&phone->quality, stereo, frames);
-    memcpy(pcm + phone->filled * 2u, stereo, frames * 2u * sizeof(*stereo));
+    for (unsigned n = 0; n < frames * 2u; ++n)
+        pcm.q31[phone->filled * 2u + n] = from_s16(stereo[n]);
     for (unsigned n = 0; n < frames * 2u; ++n) {
         uint16_t value = (uint16_t)stereo[n];
         phone->checksum = (phone->checksum ^ (value & 255u)) * 16777619u;
@@ -254,12 +293,11 @@ static void check_encoder_matrix(void) {
         {39, 174000, 20881, 0x02d55c6e}, {39, 192000, 23041, 0x7099ba4b},
         {39, 220000, 26400, 0x88655cac}, {39, 256000, 30720, 0x7d41fe7c},
     };
-    static INT_PCM input_pcm[2048];
     static unsigned char encoded[1024];
     for (unsigned c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
         unsigned aot = cases[c].aot, rate = cases[c].bitrate;
         unsigned frames = aot == 39 ? 480 : 1024;
-        HANDLE_AACENCODER handle = playback_encoder(aot, rate);
+        HANDLE_AACENCODER handle = aot == 39 ? encoder_bandwidth(2, rate, 0) : playback_encoder(aot, rate);
         unsigned hash = 2166136261u, random = 12345, bytes_total = 0;
         for (unsigned frame = 0; frame < 96; ++frame) {
             for (unsigned n = 0; n < frames * 2; ++n) {
@@ -271,12 +309,14 @@ static void check_encoder_matrix(void) {
                     case 2: if (n % 80) value = 0; break;
                     default: break;
                 }
-                input_pcm[n] = (INT_PCM)value;
+                if (aot == 39) pcm.q31[n] = from_s16(value);
+                else pcm.s16[n] = (SHORT)value;
             }
-            void *input_ptrs[] = {input_pcm}, *output_ptrs[] = {encoded};
+            INT element = aot == 39 ? sizeof(INT_PCM) : sizeof(SHORT);
+            void *input_ptrs[] = {aot == 39 ? (void *)pcm.q31 : (void *)pcm.s16}, *output_ptrs[] = {encoded};
             INT input_ids[] = {IN_AUDIO_DATA}, output_ids[] = {OUT_BITSTREAM_DATA};
-            INT input_sizes[] = {frames * 2 * sizeof(INT_PCM)}, output_sizes[] = {sizeof(encoded)};
-            INT input_elements[] = {sizeof(INT_PCM)}, output_elements[] = {1};
+            INT input_sizes[] = {frames * 2 * element}, output_sizes[] = {sizeof(encoded)};
+            INT input_elements[] = {element}, output_elements[] = {1};
             AACENC_BufDesc in = {1, input_ptrs, input_ids, input_sizes, input_elements};
             AACENC_BufDesc out = {1, output_ptrs, output_ids, output_sizes, output_elements};
             AACENC_InArgs args = {0};
@@ -293,7 +333,67 @@ static void check_encoder_matrix(void) {
         ENC_OK(aacEncClose(&handle));
         if (mallinfo().uordblks != 0) fail("encoder matrix cleanup", c);
     }
-    probe_emit("MATRIX 960 frames across ten AAC/AAC-ELD configurations match baseline hashes\n");
+    probe_emit("MATRIX_HISTORICAL bandwidth=0 frames=960 configurations=10 fixed_hashes=1\n");
+}
+
+static void check_candidate_cbr(void) {
+    static const unsigned rates[] = {128000, 174000, 192000, 220000, 256000};
+    for (unsigned mode = 0; mode < sizeof(rates) / sizeof(*rates); ++mode) {
+        HANDLE_AACDECODER decoder = aacDecoder_Open(TT_MP4_RAW, 1);
+        if (decoder == NULL) fail("candidate CBR microphone open", mode);
+        profile_configure(decoder);
+        HANDLE_AACENCODER handle = encoder(2, rates[mode]);
+        char line[128];
+        snprintf(line, sizeof(line), "candidate_CBR_%u", rates[mode]);
+        report_heap(line);
+        for (unsigned frame = 0; frame < 96; ++frame) {
+            unsigned char packet[1024];
+            unsigned length;
+            encode_frame(handle, 2, frame, packet, &length);
+            if (length == 0 || length > (rates[mode] + 799u) / 800u + 1u)
+                fail("candidate CBR frame ceiling", length);
+            DEC_OK(profile_decode(decoder, packets[frame % 16], packet_lengths[frame % 16], AACDEC_CLRHIST));
+        }
+        aacDecoder_Close(decoder);
+        ENC_OK(aacEncClose(&handle));
+        if (mallinfo().uordblks != 0) fail("candidate CBR cleanup", mode);
+    }
+    char line[128];
+    snprintf(line, sizeof(line), "CANDIDATE_CBR bandwidth=%u rates=5 frames=480 retained_mic=1\n",
+             (unsigned)AACELD_CBR_BANDWIDTH);
+    probe_emit(line);
+}
+
+static void check_legacy_lc_microphone(void) {
+    static const unsigned rates[] = {192000, 256000};
+    for (unsigned mode = 0; mode < sizeof(rates) / sizeof(*rates); ++mode) {
+        HANDLE_AACDECODER decoder = aacDecoder_Open(TT_MP4_RAW, 1);
+        if (decoder == NULL) fail("legacy LC microphone open", mode);
+        profile_configure(decoder);
+        HANDLE_AACENCODER handle = playback_encoder(2, rates[mode]);
+        AACENC_InfoStruct info = {0};
+        ENC_OK(aacEncInfo(handle, &info));
+        if (info.frameLength != 1024 || info.inputChannels != 2)
+            fail("legacy LC format", info.frameLength);
+        char line[128];
+        snprintf(line, sizeof(line), "legacy_LC_mic_%u", rates[mode]);
+        report_heap(line);
+        unsigned nonempty = 0;
+        for (unsigned frame = 0; frame < 96; ++frame) {
+            unsigned char packet[1024];
+            unsigned length;
+            // encode_frame/encode_pcm select S16 elements for the LC 1024 frame.
+            encode_frame(handle, 2, frame, packet, &length);
+            if (frame >= 3 && length == 0) fail("legacy LC empty output", frame);
+            nonempty += length != 0;
+            DEC_OK(profile_decode(decoder, packets[frame % 16], packet_lengths[frame % 16], AACDEC_CLRHIST));
+        }
+        if (nonempty < 93) fail("legacy LC frame accounting", nonempty);
+        aacDecoder_Close(decoder);
+        ENC_OK(aacEncClose(&handle));
+        if (mallinfo().uordblks != 0) fail("legacy LC microphone cleanup", mode);
+    }
+    probe_emit("LEGACY_LC_MIC rates=192000,256000 frame=1024 input_bits=16 frames=192 max_au=1024\n");
 }
 
 static void check_lifecycle(void) {
@@ -334,7 +434,7 @@ static void check_variable_encoder(void) {
     static const unsigned rates[]={128000,174000,192000,220000,256000};
     for (unsigned mode=0;mode<sizeof(rates)/sizeof(*rates);++mode) {
         unsigned peak=rates[mode]/800*800;
-        unsigned bandwidth=peak<=128000 ? 15500 : peak<=160000 ? 17500 : 20000;
+        unsigned bandwidth=aaceld_bandwidth(peak,1);
         HANDLE_AACDECODER decoder=aacDecoder_Open(TT_MP4_RAW,1);
         if (decoder==NULL) fail("VBR simultaneous microphone",mode);
         profile_configure(decoder);
@@ -357,10 +457,10 @@ static void check_variable_encoder(void) {
         for (unsigned frame=0;frame<96;++frame) {
             for (unsigned n=0;n<960;++n) {
                 unsigned value=(n+frame*960)*1103515245u+12345u;
-                pcm[n]=(INT_PCM)((frame%24<8) ? 0 : (frame%24<16) ? (int)((n%96)*500)-24000 : (int)(value>>16)-32768);
+                pcm.q31[n]=from_s16((frame%24<8) ? 0 : (frame%24<16) ? (int)((n%96)*500)-24000 : (int)(value>>16)-32768);
             }
             unsigned char output[1024];
-            void *in_ptrs[]={pcm}, *out_ptrs[]={output};
+            void *in_ptrs[]={pcm.q31}, *out_ptrs[]={output};
             INT in_ids[]={IN_AUDIO_DATA},out_ids[]={OUT_BITSTREAM_DATA};
             INT in_sizes[]={960*sizeof(INT_PCM)},out_sizes[]={sizeof(output)};
             INT in_elements[]={sizeof(INT_PCM)},out_elements[]={1};
@@ -383,6 +483,7 @@ static void check_variable_encoder(void) {
 }
 
 int main(void) {
+    probe_emit("PCM_ABI encoder_bits=32 decoder_bits=32\n");
     report_heap("baseline");
     if (PROBE_PHONE_MODE) {
         check_phone_lhdc();
@@ -405,7 +506,9 @@ int main(void) {
     report_heap("fixture_encoder_closed");
 
     watermark_start();
-    HANDLE_AACENCODER stereo = encoder(2, 256000);
+    // This AU participates in the retained historical combined checksum.
+    HANDLE_AACENCODER stereo = encoder_bandwidth(2, 256000, 0);
+    probe_emit("HISTORICAL_FIXTURE mono_bandwidth=auto stereo_bandwidth=0\n");
     report_stack("stereo_init", watermark_depth());
     report_heap("stereo_ready");
     unsigned char packet[1024];
@@ -429,13 +532,14 @@ int main(void) {
     report_heap("plus_decoder_config");
 
     INT_PCM decoded[480];
-    unsigned successful = 0, maximum_depth = 0;
+    unsigned successful = 0, maximum_depth = 0, decoder_low16_samples = 0;
     for (unsigned frame = 0; frame < 16; ++frame) {
         if (packet_lengths[frame] == 0) continue;
         UCHAR *data[] = {packets[frame]};
         UINT sizes[] = {packet_lengths[frame]}, remaining = packet_lengths[frame];
         DEC_OK(aacDecoder_Fill(decoder, data, sizes, &remaining));
         if (remaining != 0) fail("decoder input remaining", remaining);
+        memset(decoded, 0x5a, sizeof(decoded));
         watermark_start();
         DEC_OK(aacDecoder_DecodeFrame(decoder, decoded, 480,
                                       frame == 0 ? AACDEC_CLRHIST : 0));
@@ -446,7 +550,9 @@ int main(void) {
             stream->sampleRate != 48000 || stream->aot != 39)
             fail("decoded format", stream->frameSize);
         for (unsigned sample = 0; sample < 480; ++sample) {
-            uint16_t value = (uint16_t)decoded[sample];
+            if (decoded[sample] == (INT_PCM)0x5a5a5a5a) fail("decoder Q31 sample width", sample);
+            decoder_low16_samples += ((uint32_t)decoded[sample] & 65535u) != 0;
+            uint16_t value = (uint16_t)historical_s16(decoded[sample]);
             checksum = (checksum ^ (value & 255)) * 16777619u;
             checksum = (checksum ^ (value >> 8)) * 16777619u;
         }
@@ -460,9 +566,12 @@ int main(void) {
     aacDecoder_Close(decoder);
     ENC_OK(aacEncClose(&stereo));
     report_heap("closed");
-    if (successful != 16 || checksum != 0x4105af5du || mallinfo().uordblks != 0) return 1;
+    if (successful != 16 || checksum != 0x4105af5du || decoder_low16_samples == 0 || mallinfo().uordblks != 0) return 1;
+    probe_emit("PCM_DECODER complete_q31_output=1 lower16_preserved=1\n");
     profile_checks(packets, packet_lengths);
     check_encoder_matrix();
+    check_candidate_cbr();
+    check_legacy_lc_microphone();
     check_lifecycle();
     check_variable_encoder();
     snprintf(text, sizeof(text), "HEAP_PEAK bytes=%u\n", (unsigned)peak_heap_break);
