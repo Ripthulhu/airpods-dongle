@@ -12,10 +12,10 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-Saved good builds, including the startup LED correction, are available for the
-[PC (0.1.54-r7) and phone (0.1.57-r6)](docs/LED-STARTUP-FIX-20261030.md), with
-matching source, firmware, checksums and validation receipts. Both are installed
-with pairing/settings preserved. The
+One [shared firmware release, 0.1.57-r6](docs/UNIFIED-FIRMWARE-20261030.md), supports
+both dongles through USB audio and Bluetooth relay. The same checked image is
+installed on the PC and phone dongles, with pairing/settings preserved. Matching
+source, firmware, checksums and validation receipts accompany the release. The
 [controller-firmware investigation is paused](docs/CYW43439-RESEARCH-CHECKPOINT-20261030.md);
 its unsuccessful experimental firmware is not installed.
 

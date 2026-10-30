@@ -1,5 +1,9 @@
 # LED startup correction - 30 October 2026
 
+The two builds below record the initial LED deployment. Both dongles now use the
+[shared 0.1.57-r6 release](UNIFIED-FIRMWARE-20261030.md); 0.1.54-r7 is a historical
+PC rollback baseline.
+
 Startup directly drove the CYW43 LED high before an AirPods connection existed.
 A failed connection attempt left that write in effect. Startup now calls the
 existing `set_led_mode_off()` immediately after successful CYW43 initialization;

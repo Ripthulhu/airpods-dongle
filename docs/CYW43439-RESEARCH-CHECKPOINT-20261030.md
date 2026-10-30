@@ -71,6 +71,10 @@ hybrid remains an unsuccessful startup experiment, not a usable replacement.
 
 ## Separate LED correction
 
+The later [firmware consolidation](UNIFIED-FIRMWARE-20261030.md) installs the same
+normal 0.1.57-r6 image on both dongles. The versions below describe the earlier
+restoration and initial LED deployment, not two current firmware requirements.
+
 The user subsequently requested a startup LED correction. Both normal builds were
 updated with that separate application-only change: PC **0.1.54-r7** and phone
 **0.1.57-r6**. Full build/check suites passed, flashing was verified, pairing/settings
