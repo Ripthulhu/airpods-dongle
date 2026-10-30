@@ -107,7 +107,9 @@ encoding across ten AAC/AAC-ELD configurations and five ELD VBR frame ceilings. 
 Unused Bluetooth HID and network profile pools are disabled. One HFP HF
 connection, two phone RFCOMM channels sharing one multiplexer, and three HCI
 connections (two ACL plus phone SCO/eSCO) are allocated. The HFP call bridge
-remains a hardware-unverified prototype; see [phone transport](PHONE-TRANSPORT.md).
+is disabled by default after a call setup stalled the CYW43 controller; the
+prototype remains available only through an explicit experimental build option.
+See [phone transport](PHONE-TRANSPORT.md) for the evidence and limitation.
 
 Playback and microphone queues use bounded contiguous copies instead of
 per-sample division/copy loops. Malformed USB playback packets clear the FIFO,

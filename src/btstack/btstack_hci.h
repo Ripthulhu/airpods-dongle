@@ -15,6 +15,8 @@ const char * get_device_addr_string();
 bd_addr_t * get_device_addr();
 bd_addr_t * get_device_addr_from_list(uint8_t i);
 void get_link_keys();
+// Call after the selected pairing slot and key have been cleared successfully.
+void bt_hci_retire_selected_peer(void);
 
 // Phone identity is separate from the two selected AirPods slots.
 bool bt_hci_phone_pairing_start(void);

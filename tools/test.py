@@ -61,6 +61,12 @@ def usb_descriptor_sources(directory):
 
 def playback_lifecycle_sources(directory):
     source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    start = source.index("static struct {\n    uint32_t aac_calls")
+    end = source.index("\nstatic void playback_work_cancel_wait", start)
+    (directory / "playback_work_metrics.inc").write_text(source[start:end])
+    start = source.index("static void playback_work_cancel_wait(")
+    end = source.index("\n}", start) + 2
+    (directory / "playback_work_cancel.inc").write_text(source[start:end])
     start = source.index("enum { ENCODE_IDLE")
     end = source.index("\nstatic void playback_encoder_close(void);", start)
     (directory / "playback_encoder_state.inc").write_text(source[start:end])
@@ -117,7 +123,9 @@ def playback_lifecycle_sources(directory):
         clock_functions.append(source[start:end])
     (directory / "playback_cancel.inc").write_text("\n".join(clock_functions))
     functions = []
-    for signature in ["bool get_a2dp_connected_flag()", "bool avdtp_disconnect_and_scan(void)",
+    for signature in ["static int playback_encoder_failed(",
+                      "bool get_a2dp_connected_flag()", "bool avdtp_disconnect_and_scan(void)",
+                      "bool bridge_phone_open(void)",
                       "void avdtp_source_establish_stream(void)",
                       "uint8_t dongle_playback_configure(",
                       "void dongle_playback_mic_request_changed(",
@@ -148,6 +156,16 @@ def playback_lifecycle_sources(directory):
     start = source.index("\n", start) + 1
     end = source.index("        default:", start)
     (directory / "playback_release.inc").write_text(source[start:end])
+    start = source.index("        case AVDTP_SUBEVENT_STREAMING_CONNECTION_ESTABLISHED:")
+    start = source.index("\n", start) + 1
+    end = source.index("        case ", start)
+    (directory / "playback_media_established.inc").write_text(source[start:end])
+    for name, case in [("playback_reject", "AVDTP_SUBEVENT_SIGNALING_GENERAL_REJECT"),
+                       ("playback_media_released", "AVDTP_SUBEVENT_STREAMING_CONNECTION_RELEASED")]:
+        start = source.index("        case " + case + ":")
+        start = source.index("\n", start) + 1
+        end = source.index("        case ", start)
+        (directory / (name + ".inc")).write_text(source[start:end])
 
     functions = []
     for signature in ["static bool playback_encoder_scope_current(",
@@ -182,6 +200,13 @@ def playback_lifecycle_sources(directory):
     start = source.index("\nvoid bridge_phone_pcm_push(") + 1
     end = source.index("\n}", start) + 2
     (directory / "playback_phone_push.inc").write_text(shared + "\n" + source[start:end])
+    recovery = []
+    for signature in ["static bool phone_output_recovery_owned(", "bool bridge_phone_recovering(void)",
+                      "static bool playback_phone_recovery_poll("]:
+        start = source.index("\n" + signature) + 1
+        end = source.index("\n}", start) + 2
+        recovery.append(source[start:end])
+    (directory / "playback_phone_recovery.inc").write_text("\n".join(recovery))
     instrumentation = '''
 #include "playback_test_hooks.h"
 '''
@@ -209,6 +234,12 @@ def playback_lifecycle_sources(directory):
     start = source.index("                case  AVDTP_SI_START:")
     end = source.index("                case AVDTP_SI_ABORT:", start)
     (directory / "playback_accept.inc").write_text(source[start:end])
+    for name in ("playback_timing", "playback_bitrate", "playback_idle", "playback_lifecycle"):
+        path = directory / (name + ".inc")
+        prefix = '#include "playback_work_metrics.inc"\n'
+        if name != "playback_lifecycle":
+            prefix += '#include "playback_work_cancel.inc"\n'
+        path.write_text(prefix + path.read_text())
 
 
 def avrcp_reconnect_sources(directory):
@@ -315,7 +346,8 @@ def main():
         "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
-        "phone_call": ["-Itests/phone_call_stubs", "tests/phone_call_test.c"],
+        "phone_call": ["-DAIRPODS_ENABLE_BLUETOOTH_CALLS=1", "-Itests/phone_call_stubs", "tests/phone_call_test.c"],
+        "phone_call_disabled": ["-Itests/phone_call_stubs", "tests/phone_call_test.c"],
         "phone_call_audio": ["tests/phone_call_audio_test.c", "-lm"],
         "phone_worker": ["tests/phone_worker_test.c", "-pthread"],
         "phone_benchmark": ["tests/phone_benchmark_test.c"],
@@ -334,6 +366,7 @@ def main():
         "playback_timing": ["tests/playback_timing_test.c"],
         "playback_encoder_job": ["-Wno-unused-function", "tests/playback_encoder_job_test.c"],
         "phone_continuity": ["-Wno-unused-function", "tests/phone_continuity_test.c"],
+        "phone_catchup": ["-Wno-unused-function", "tests/phone_catchup_test.c"],
         "playback_trace": ["tests/playback_trace_test.c"],
         "playback_float": ["tests/playback_float_test.c", "-lm"],
         "playback_q31": ["tests/playback_q31_test.c", "-lm"],

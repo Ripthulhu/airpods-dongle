@@ -170,6 +170,10 @@ static unsigned phone_clock_update(void *clock,unsigned remaining,unsigned frame
 static void btstack_resample_set_factor(void *resampler,unsigned rate) {(void)resampler;(void)rate;}
 #endif
 static bool pcm_locked;
+static void phone_sink_record_loss(bool overflow,uint32_t frames,uint32_t fill,uint32_t debt) {
+    (void)overflow;(void)frames;(void)fill;(void)debt;
+    assert(phone_active && !call_active && !is_usb_streaming);
+}
 static void pipeline_filter_cost(void);
 static void critical_section_enter_blocking(void *p) {(void)p;assert(!pcm_locked);pcm_locked=true;}
 static void critical_section_exit(void *p) {(void)p;assert(pcm_locked);pcm_locked=false;}

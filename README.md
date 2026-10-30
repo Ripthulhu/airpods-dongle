@@ -12,6 +12,12 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Candidate **0.1.57** repairs reproduced silent packet loss when the CYW43
+host-to-controller transfer ring fills. It retains the blocked packet and retries
+through BTstack's asynchronous transport contract. This is an offline candidate;
+relay listening acceptance remains open. See the
+[transport investigation](docs/VALIDATION-0.1.57.md).
+
 Candidate **0.1.48** preserves native AirPods volume steps and publishes the
 confirmed level through USB hardware volume. It removes the relative HID key
 and gain-restoration round trip that caused an audible dip and rebound. Android
@@ -163,8 +169,8 @@ but wireless playback on 0.1.28 still crackled and could become silent. See
 - 48 kHz stereo playback, with AAC-ELD preferred and AAC/SBC fallback.
 - S16 USB compatibility plus IEEE float32 input; float processing quantizes once at the integer encoder boundary.
 - Phone Bluetooth input with guarded LHDC v5 at 48 kHz, then classic aptX/SBC fallback.
-- AACP microphone, opened by USB recording or the active phone call, with one owner at a time.
-- HFP phone calls with CVSD and stem answer/end; hardware validation pending.
+- AACP microphone, opened by USB recording, with one owner at a time.
+- Bluetooth HFP calls are disabled by default: SCO setup can stall the CYW43 controller. See [phone transport](docs/PHONE-TRANSPORT.md) for the experimental opt-in and evidence.
 - USB phone calls use the existing duplex headset interfaces and 64 kHz microphone presentation clock.
 - Phone or microphone decoding on core 1; Bluetooth, USB and playback encoding on core 0.
 - Passive BLE discovery alongside stereo playback, with bounded Apple advertisement storage.
@@ -209,8 +215,8 @@ The firmware links both Classic and BLE through one BTstack controller. The
 | Communication | Transport | Current implementation |
 | --- | --- | --- |
 | Playback and stem media controls | Classic AVDTP / AVRCP | Implemented |
-| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Model-gated settings/readback; microphone requested by USB recording or a phone call |
-| Phone calls | HFP HF / SCO or eSCO | CVSD bridge to AirPods playback and AACP microphone; not hardware-verified |
+| AirPods controls and HQ microphone | Classic AACP, PSM `0x1001` | Model-gated settings/readback; microphone requested by USB recording |
+| Bluetooth phone calls | HFP HF / SCO or eSCO | Disabled by default because SCO setup can stall the controller; experimental CVSD bridge retained for development |
 | Hearing profiles and saved diagnostics | ATT over Classic, PSM `0x001F` | Complete profile edits, saved checks, read-only hearing metadata and guarded in-case self-checks |
 | Proximity and offline advertisements | BLE | Passive cache; selected-pair nearby finder for verified proximity reports |
 | Phone app controls | Encrypted, bonded Classic RFCOMM | Same basic and settings reports as USB, with separate client transactions |
@@ -298,8 +304,11 @@ for every phone. See [Microsoft's class driver](https://learn.microsoft.com/en-u
 and [Android's USB audio baseline](https://source.android.com/docs/core/audio/usb).
 
 Select **AirPods Dongle** as the USB playback and recording device. Hold BOOTSEL
-for at least one second but less than three and release to pair a headset already
-in pairing mode. Hold for at least three seconds to allow phone pairing for two
+for at least one second but less than three and release to pair AirPods or compatible
+Apple audio already in pairing mode. Discovery skips unrelated speakers using the
+Apple Device ID, with an AirPods-name or previously authenticated identity fallback
+when Device ID is absent. A newly renamed pair without either identity must expose
+its Device ID or an AirPods name to be discovered. Hold for at least three seconds to allow phone pairing for two
 minutes, then select **AirPods Dongle** in the phone's Bluetooth settings. For
 wireless use, power the Pico externally or leave its USB cable connected.
 Connecting the phone's Bluetooth music profile removes the USB audio device;
@@ -382,8 +391,8 @@ If microphone initialization fails, reopening recording makes one fresh attempt
 after any failed worker has detached.
 
 USB audio on Android needs an OTG/power and enumeration check. Wireless stereo
-bridging also needs dual-link radio and latency checks. The HFP call bridge
-needs real incoming/outgoing call, duplex voice and controller-routing checks.
+bridging also needs dual-link radio and latency checks. The experimental HFP
+call bridge requires a working controller SCO implementation before call validation.
 
 See [implementation notes](docs/IMPLEMENTATION.md) for the reviewed differences
 and the boundaries that remain untested.

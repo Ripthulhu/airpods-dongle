@@ -61,6 +61,7 @@ static void reset(void) {
     connected_queries = 0;
     input_size = input_offset = read_calls = read_flush_calls = 0;
     atomic_store(&timing_requested, false);
+    atomic_store(&work_requested, false);
     atomic_store(&volume_trace_requested, 0);
     atomic_store(&bootsel_requested, false);
     atomic_store(&terminal_connected, false);
@@ -132,6 +133,17 @@ int main(void) {
     debug_cdc_task();
     assert(input_offset == 128u && read_calls == 2u);
     assert(debug_cdc_take_timing_request() && !debug_cdc_take_timing_request());
+
+    // Work requests coalesce, remain separate, and cannot survive a closed terminal.
+    receive("\nww");
+    assert(debug_cdc_take_work_request() && !debug_cdc_take_work_request());
+    assert(!debug_cdc_take_timing_request() && !debug_cdc_take_bootsel_request());
+    receive("\nxw\nbootselw\n");
+    assert(!debug_cdc_take_work_request() && !debug_cdc_take_bootsel_request());
+    receive("w");
+    connected = false; tud_cdc_line_state_cb(0, false, false);
+    assert(!debug_cdc_take_work_request());
+    connected = true;
 
     // Manual volume capture commands remain separate from timing and BOOTSEL.
     receive("\nv");

@@ -27,6 +27,8 @@ void debug_cdc_task(void);
 // Main context only: consumes a coalesced 't' request without printing in USB IRQ.
 // USB service clears pending input and requests when the terminal drops DTR.
 bool debug_cdc_take_timing_request(void);
+// Separate bare 'w' keeps the cumulative-work report within the bounded output ring.
+bool debug_cdc_take_work_request(void);
 
 enum { DEBUG_CDC_VOLUME_TRACE_ARM = 1, DEBUG_CDC_VOLUME_TRACE_DUMP = 2 };
 // Bare v arms/reset a 60-second capture; V freezes/dumps. IRQ publishes only.

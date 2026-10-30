@@ -50,6 +50,7 @@ jobs:
       - name: Test AVRCP volume, phone decoders and jitter handling
         run: |
           python3 tools/test_volume_sdk.py --sdk .sdk/pico-sdk --sanitize
+          python3 tools/test_cyw43_transport.py --sdk .sdk/pico-sdk --sanitize
           python3 tools/test_phone_codecs.py --sdk .sdk/pico-sdk --sanitize
           python3 tools/lhdc_probe/run.py --sanitize
       - name: Configure Release firmware

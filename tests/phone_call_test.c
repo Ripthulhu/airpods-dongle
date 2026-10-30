@@ -11,6 +11,7 @@ static bool authorized, acl_connected, usb_playing, usb_recording, output_ready,
 static bd_addr_t saved_phone_address;
 static unsigned connects, slc_releases, sco_releases, answers, hangs, opens, stops, polls;
 static unsigned media_resume_polls;
+static unsigned registrations;
 static unsigned uplinks, downlinks, requests, sends, call_changes;
 static uint32_t microphone_samples;
 static uint8_t init_result, send_result, command_result, speaker, microphone;
@@ -48,7 +49,7 @@ bool phone_call_audio_downlink(const int16_t *pcm,uint16_t frames,bool bad) {
     memcpy(last_downlink,pcm,frames*sizeof(*pcm));return true;
 }
 void phone_call_audio_uplink(int16_t *pcm,uint16_t frames) {++uplinks;for(unsigned i=0;i<frames;++i)pcm[i]=(int16_t)(0x1200+i);}
-uint8_t hfp_hf_init(uint8_t channel) {assert(channel==8);return init_result;}
+uint8_t hfp_hf_init(uint8_t channel) {++registrations;assert(channel==8);return init_result;}
 void hfp_hf_init_supported_features(uint32_t features) {configured_features=features;}
 void hfp_hf_init_codecs(uint8_t count,const uint8_t *codecs) {assert(count==1&&codecs[0]==1);}
 uint8_t hfp_hf_set_default_speaker_gain(uint8_t gain) {assert(gain==15);return 0;}
@@ -59,8 +60,8 @@ void hfp_hf_create_sdp_record_with_codecs(uint8_t *out,uint32_t handle,int chann
 }
 unsigned de_get_len(const uint8_t *record) {(void)record;return sdp_length;}
 uint32_t sdp_create_service_record_handle(void) {return 0x10009;}
-uint8_t sdp_register_service(uint8_t *record) {(void)record;return 0;}
-void hci_set_sco_voice_setting(uint16_t setting) {assert(setting==0x60);}
+uint8_t sdp_register_service(uint8_t *record) {++registrations;(void)record;return 0;}
+void hci_set_sco_voice_setting(uint16_t setting) {++registrations;assert(setting==0x60);}
 void hci_register_sco_packet_handler(btstack_packet_handler_t handler) {sco_handler=handler;}
 uint8_t hfp_hf_establish_service_level_connection(uint8_t *address) {assert(!memcmp(address,saved_phone_address,6));++connects;return 0;}
 uint8_t hfp_hf_release_service_level_connection(uint16_t handle) {assert(handle==0x20||handle==0x21);++slc_releases;return 0;}
@@ -111,6 +112,24 @@ static void indicator(const char *name,uint8_t value) {
 }
 
 int main(void) {
+    if (!AIRPODS_ENABLE_BLUETOOTH_CALLS) {
+        authorized=acl_connected=true;
+        memcpy(saved_phone_address,phone_address,6);
+        assert(phone_call_init() && phone_call_init());
+        assert(!call.initialized && !registrations && !hfp_handler && !sco_handler);
+        for (unsigned usb=0;usb<4;++usb) {
+            usb_playing=(usb&1u)!=0;usb_recording=(usb&2u)!=0;
+            for (unsigned pass=0;pass<4;++pass) { now+=30000;phone_call_poll(); }
+            assert(!phone_call_sco_allowed(phone_address));
+            assert(!phone_call_active() && !phone_call_audio_requested() && !phone_call_mic_requested());
+            assert(!phone_call_usb_exclusion_requested());
+            assert(!phone_call_media_control(AVRCP_OPERATION_ID_PLAY));
+            assert(!connects && !requests && !opens && !stops && !polls && !call_changes);
+            assert(!media_resume_polls && !answers && !hangs && !sco_releases && !slc_releases);
+        }
+        puts("phone calls disabled: no HFP advertisement, connection, SCO acceptance or USB route changes");
+        return 0;
+    }
     reset();phone_call_poll();assert(connects==1);
     bd_addr_t stranger={9,9,9,9,9,9};slc(0x21,stranger);assert(slc_releases==1&&!phone_call_sco_allowed(stranger));
     slc(0x21,phone_address);assert(slc_releases==2&&!phone_call_sco_allowed(phone_address));

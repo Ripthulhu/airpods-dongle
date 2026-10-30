@@ -44,5 +44,29 @@
       "src/classic/avrcp_controller.c": "51eb5986b718fd3ac21a52c65e6d8608d6c80d4c3108352f2bbece3078c4d11c",
       "src/classic/avrcp_controller.h": "433d7a3f5a48b38786d757a43a357f6b581e8727fb9a100be5f076323afb709b"
     }
+  },
+  "cyw43_transport": {
+    "library": "sdk",
+    "patch": "cyw43-transport.patch",
+    "original": {
+      "src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c": "61ef6cafaeea33f87c219ee3ff9fa298c800cbe91f9976c751740487576444ef",
+      "src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c": "edd6ebc07c764e99bfd4be4268f8f0e18586605b085677125da5fc7c6e264fdc",
+      "src/rp2_common/pico_cyw43_driver/include/pico/btstack_hci_transport_cyw43.h": "1e86538ffcf86dcc349d47c659ca64207dbf91b772c852d4b1eba44490f9c74d"
+    },
+    "patched": {
+      "src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c": "215635730793e9c2d9a7745f20a05cf71c829f727c8c549226e0d0b6b8590a9b",
+      "src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c": "11469f1875c05847ff36abfde61317ef88ed085387f75ecc6ae42dca370c8127",
+      "src/rp2_common/pico_cyw43_driver/include/pico/btstack_hci_transport_cyw43.h": "07abf059a1efb7ffdd35315659e3c1ad443e1d1ba858a85c5abcc081f24aecbd"
+    }
+  },
+  "cyw43_driver_transport": {
+    "library": "cyw43-driver",
+    "patch": "cyw43-driver-transport.patch",
+    "original": {
+      "src/cyw43_ctrl.c": "c87785fa3791a12068f28d0de6c057351c467414b134dd4ffe77cad58952a776"
+    },
+    "patched": {
+      "src/cyw43_ctrl.c": "7234e1399c7175642b49f860314410e7c431bfa9db0555f53025832fa79bba10"
+    }
   }
 }

@@ -176,7 +176,41 @@ static void cached_packet_scope_and_fresh_resumption(void) {
     assert(!emitted && !media_tracker.codec_storage_count && !media_tracker.codec_ready_to_send);
     assert(aaceld_frame_sequence==4095 && !media_tracker.rtp_timestamp);
 }
+static void three_ms_encode(void) { now += 3; }
+static void cumulative_output_work(void) {
+    ready_job();
+    memset(&playback_work_metrics, 0, sizeof(playback_work_metrics));
+    encode_hook=three_ms_encode;
+    run_unlocked();now+=2;dongle_playback_encode_complete();
+    assert(playback_work_metrics.aac_calls==1 && playback_work_metrics.aac_us==3000);
+    assert(playback_work_metrics.aac_jobs==1 && playback_work_metrics.aac_job_us==5000);
+    dongle_playback_encode_complete();
+    assert(playback_work_metrics.aac_jobs==1);
+    assert(fill_aac_audio_buffer(&media_tracker)==480);
+    run_unlocked();now+=2;dongle_playback_encode_complete();
+    assert(playback_work_metrics.aac_calls==2 && playback_work_metrics.aac_us==6000);
+    assert(playback_work_metrics.aac_jobs==2 && playback_work_metrics.aac_job_us==10000);
+    send_failures=1;now+=2;a2dp_demo_send_media_packet();
+    assert(!playback_work_metrics.sent_packets && !playback_work_metrics.send_wait_us);
+    now+=3;a2dp_demo_send_media_packet();
+    assert(playback_work_metrics.sent_packets==1 && playback_work_metrics.sent_samples==960);
+    assert(playback_work_metrics.send_wait_us==5000 && !playback_work_metrics.cancelled_waits);
+
+    media_tracker.codec_ready_to_send=2;media_tracker.send_wait_start=UINT32_MAX-1u;now=1;
+    playback_work_metrics.cancelled_waits=UINT32_MAX;
+    playback_work_metrics.cancelled_wait_us=UINT32_MAX-1000u;
+    playback_encoder_discard(false);
+    assert(!playback_work_metrics.cancelled_waits && playback_work_metrics.cancelled_wait_us==1999);
+    playback_encoder_discard(false);
+    assert(!playback_work_metrics.cancelled_waits && playback_work_metrics.cancelled_wait_us==1999);
+
+    ready_job();memset(&playback_work_metrics,0,sizeof(playback_work_metrics));
+    playback_encoder_invalidate();run_unlocked();now=4;dongle_playback_encode_complete();
+    assert(!playback_work_metrics.aac_calls && !playback_work_metrics.aac_us);
+    assert(playback_work_metrics.aac_jobs==1 && playback_work_metrics.aac_job_us==4000);
+}
 int main(void) {
+    cumulative_output_work();
     prepare_run_commit_is_one_unit();
     cancellation_fences_every_scope();
     lifecycle_waits_until_encode_returns();

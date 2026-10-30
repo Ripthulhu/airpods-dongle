@@ -106,6 +106,9 @@ static inline uint32_t gap_event_inquiry_result_get_class_of_device(const uint8_
 }
 static inline uint8_t gap_event_inquiry_result_get_rssi_available(const uint8_t *p) { return p[14]; }
 static inline uint8_t gap_event_inquiry_result_get_rssi(const uint8_t *p) { return p[15]; }
+static inline uint8_t gap_event_inquiry_result_get_device_id_available(const uint8_t *p) { return p[16]; }
+static inline uint16_t gap_event_inquiry_result_get_device_id_vendor_id_source(const uint8_t *p) { return (uint16_t)p[17] | (uint16_t)p[18] << 8; }
+static inline uint16_t gap_event_inquiry_result_get_device_id_vendor_id(const uint8_t *p) { return (uint16_t)p[19] | (uint16_t)p[20] << 8; }
 static inline uint8_t gap_event_inquiry_result_get_name_available(const uint8_t *p) { return p[25]; }
 static inline uint8_t gap_event_inquiry_result_get_name_len(const uint8_t *p) { return p[26]; }
 static inline const uint8_t *gap_event_inquiry_result_get_name(const uint8_t *p) { return p + 27; }

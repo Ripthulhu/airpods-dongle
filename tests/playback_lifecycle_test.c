@@ -14,14 +14,24 @@ static void playback_usb_verify_sent(void) {}
 #include "../src/tinyusb/dongle_protocol.h"
 
 #define ERROR_CODE_SUCCESS 0
+#define AVDTP_SI_DISCOVER 1
+#define AVDTP_SI_GET_CAPABILITIES 2
+#define AVDTP_SI_SET_CONFIGURATION 3
+#define AVDTP_SI_GET_CONFIGURATION 4
+#define AVDTP_SI_OPEN 6
+#define AVDTP_SI_START 7
+#define AVDTP_SI_SUSPEND 9
+#define AVDTP_SI_GET_ALL_CAPABILITIES 12
 static bool is_usb_streaming, phone_active, phone_opened, profile_pending;
-static bool call_active, call_capture;
+static bool is_streaming;
+static bool call_active, call_opened, call_capture;
 static bool a2dp_connect_pending, a2dp_is_connected_flag, profile_reconnect;
 static bool allow_switch_slot, finish_scan_avdtp_codec;
 static bool have_aaceld_codec_capabilities, finish_setup_aac, aaceld_variable_allowed;
 static playback_options_t playback_options, profile_previous;
 #include "playback_defaults.inc"
 static uint8_t address[6], profile_peer[6], game_peer[6], connected_address[6];
+static uint8_t cur_active_device[6];
 static uint8_t cur_codec, cur_capability;
 static uint32_t now, profile_since, game_session, delay_revision, actual_bitrate;
 static uint32_t reconnect_since, reconnect_delay = 1000;
@@ -53,8 +63,11 @@ static void btstack_run_loop_remove_timer(btstack_timer_source_t *timer) { (void
 static void btstack_run_loop_add_timer(btstack_timer_source_t *timer) { (void)timer; ++timer_adds; }
 static unsigned connects, disconnects, scans, keys_dropped;
 static bool slot_write_ok, inquiry_ok, slot_cleared;
+static uint8_t pair_slot = 1, slot_written;
+static unsigned selected_retirements;
 static bool game_ready, game_eligible, send_synchronously;
-static bool aacp_audio_owned(void) {return true;}
+static bool audio_owned=true;
+static bool aacp_audio_owned(void) {return audio_owned;}
 static bool model_known=true;
 static uint32_t control_session=1;
 static unsigned game_feedback_count;
@@ -83,7 +96,7 @@ static int a2dp_source_disconnect(uint16_t cid) { (void)cid; ++disconnects; retu
 static int avdtp_source_connect(uint8_t *peer, uint16_t *cid) {
     ++connects; memcpy(connected_address, peer, 6); *cid = 20; return 0;
 }
-static void a2dp_demo_timer_stop(void *p) { (void)p; media_tracker.streaming = false; }
+static void a2dp_demo_timer_stop(void *p) { (void)p; media_tracker.streaming = is_streaming = false; }
 static void aacp_disconnect(void) {game_ready=false;}
 static void aacp_mic_recovery_failed(void) {}
 static uint32_t aacp_control_session(void) { return control_session; }
@@ -107,23 +120,30 @@ static void playback_audio_work(uint32_t time) {
     if(media_tracker.codec_ready_to_send==2)playback_prepare_packet(&media_tracker,time);
 }
 static void playback_bitrate_poll(uint32_t time) {(void)time;}
+static bool suspend_recovery_pending, phone_output_recovery;
 static bool playback_phone_recovery_poll(void) {return false;}
 static void l2cap_set_flushable_local_cid(uint16_t cid) { (void)cid; }
 static void avrcp_disconnect(uint16_t cid) { (void)cid; }
 static void avrcp_reconnect_reset(void) {}
+static unsigned avrcp_schedules;
+static void avrcp_reconnect_schedule(bool immediate) {assert(immediate);++avrcp_schedules;}
 static void avrcp_reconnect_poll(uint32_t time) {(void)time;}
 static void audio_slot_queue_init(void) {}
-static uint8_t read_uint8_last_flash(void) { return 1; }
+static uint8_t read_uint8_last_flash(void) { return pair_slot; }
 static bool write_slot1_mac(const uint8_t *p) {
     static const uint8_t empty[6];
     assert(!memcmp(p, empty, 6));
-    slot_cleared = slot_write_ok; return slot_write_ok;
+    slot_written = 1; slot_cleared = slot_write_ok; return slot_write_ok;
 }
-static bool write_slot2_mac(const uint8_t *p) { return write_slot1_mac(p); }
+static bool write_slot2_mac(const uint8_t *p) {
+    bool result = write_slot1_mac(p); slot_written = 2; return result;
+}
 static void set_led_mode_off(void) {}
+static inline void set_led_mode_on(void) {}
 static void gap_drop_link_key_for_bd_addr(uint8_t *p) {
     assert(!memcmp(p, address, 6)); ++keys_dropped;
 }
+static inline void bt_hci_retire_selected_peer(void) { memset(address, 0, sizeof(address)); ++selected_retirements; }
 static bool gap_start_scanning(void) { ++scans; return inquiry_ok; }
 static uint16_t avdtp_subevent_signaling_connection_released_get_avdtp_cid(const uint16_t *p) {
     return *p;
@@ -137,6 +157,30 @@ void avdtp_source_establish_stream(void);
 #include "playback_cancel.inc"
 static void bt_hci_airpods_flush_timeout(bool enabled) {(void)enabled;}
 #include "playback_lifecycle.inc"
+static struct { struct { uint16_t l2cap_media_cid; } *local_stream_endpoint; } sc;
+static uint16_t avdtp_subevent_streaming_connection_established_get_avdtp_cid(const uint8_t *p) {
+    return (uint16_t)p[3] | (uint16_t)p[4] << 8;
+}
+static void avdtp_subevent_streaming_connection_established_get_bd_addr(const uint8_t *p, uint8_t *peer) {
+    for (unsigned i=0;i<6;++i)peer[i]=p[10-i];
+}
+static uint8_t avdtp_subevent_streaming_connection_established_get_local_seid(const uint8_t *p) {return p[11];}
+static uint8_t avdtp_subevent_streaming_connection_established_get_remote_seid(const uint8_t *p) {return p[12];}
+static uint8_t avdtp_subevent_streaming_connection_established_get_status(const uint8_t *p) {return p[13];}
+static void media_established(uint16_t cid, const uint8_t peer[6], uint8_t status_code, unsigned size) {
+    uint8_t event[14]={0xD1,12,0, (uint8_t)cid,(uint8_t)(cid>>8)};
+    for(unsigned i=0;i<6;++i)event[10-i]=peer[i];
+    event[11]=2;event[12]=3;event[13]=status_code;
+    const uint8_t *packet=event;
+    uint8_t status, address[6];
+    uint16_t avdtp_cid;
+    (void)address;(void)size;
+    switch (0) {
+        case 0:
+#include "playback_media_established.inc"
+        default:break;
+    }
+}
 static void signaling_released(uint16_t cid) {
     const uint16_t *packet = &cid;
     switch (0) {
@@ -144,6 +188,137 @@ static void signaling_released(uint16_t cid) {
 #include "playback_release.inc"
         default: break;
     }
+}
+
+static uint16_t avdtp_subevent_signaling_reject_get_avdtp_cid(const uint8_t *p) {
+    return (uint16_t)p[3] | (uint16_t)p[4] << 8;
+}
+static inline uint8_t avdtp_subevent_signaling_reject_get_is_initiator(const uint8_t *p) {return p[6];}
+static inline uint8_t avdtp_subevent_signaling_reject_get_local_seid(const uint8_t *p) {return p[5];}
+static uint8_t avdtp_subevent_signaling_reject_get_signal_identifier(const uint8_t *p) {return p[7];}
+static void signaling_rejected(uint16_t cid, uint8_t seid, uint8_t signal, uint8_t initiator, bool general, unsigned size) {
+    const uint8_t event[8]={0xD1,6,(uint8_t)(general?0x1E:0x1D),(uint8_t)cid,(uint8_t)(cid>>8),seid,initiator,signal};
+    const uint8_t *packet=event;
+    uint8_t signal_identifier;
+    (void)size;
+    switch (0) {
+        case 0:
+#include "playback_reject.inc"
+        default:break;
+    }
+}
+static uint16_t avdtp_subevent_streaming_connection_released_get_avdtp_cid(const uint8_t *p) {
+    return (uint16_t)p[3] | (uint16_t)p[4] << 8;
+}
+static inline uint8_t avdtp_subevent_streaming_connection_released_get_local_seid(const uint8_t *p) {return p[5];}
+static void media_released(uint16_t cid, uint8_t seid, unsigned size) {
+    const uint8_t event[6]={0xD1,4,0,(uint8_t)cid,(uint8_t)(cid>>8),seid};
+    const uint8_t *packet=event;
+    (void)size;
+    switch (0) {
+        case 0:
+#include "playback_media_released.inc"
+        default:break;
+    }
+}
+
+static void media_failure_fixture(void) {
+    memcpy(address,(uint8_t[]){1,2,3,4,5,6},6);
+    memcpy(cur_active_device,address,6);
+    a2dp_is_connected_flag=a2dp_accept_incoming=finish_scan_avdtp_codec=true;
+    a2dp_connect_pending=profile_pending=profile_reconnect=false;
+    is_usb_streaming=phone_active=phone_opened=mic_requested=mic_active=call_active=call_capture=false;
+    audio_owned=false;
+    media_tracker=(a2dp_media_sending_context_t){.avdtp_cid=70,.local_seid=2,.remote_seid=3};
+    playback_idle_phase=PLAYBACK_RUNNING;
+    playback_game=(playback_game_t){0};game_ready=game_eligible=false;
+    connects=disconnects=avrcp_schedules=0;reconnect_delay=1000;
+}
+
+static void startup_rejection_cannot_leave_connected_but_silent_output(void) {
+    const uint8_t signals[]={AVDTP_SI_DISCOVER,AVDTP_SI_GET_CAPABILITIES,
+        AVDTP_SI_GET_ALL_CAPABILITIES,AVDTP_SI_SET_CONFIGURATION,AVDTP_SI_OPEN,
+        AVDTP_SI_START,AVDTP_SI_SUSPEND};
+    for(unsigned general=0;general<2;++general) {
+        for(unsigned i=0;i<sizeof(signals);++i) {
+            media_failure_fixture();
+            uint8_t seid=i<3?0:2;
+            signaling_rejected(70,seid,signals[i],1,general!=0,8);
+            assert(disconnects==1 && !finish_scan_avdtp_codec && !media_tracker.streaming);
+            assert(!avrcp_schedules && !audio_owned);
+        }
+    }
+    for(unsigned stale=0;stale<5;++stale) {
+        media_failure_fixture();
+        if(stale==0)address[0]^=1;
+        signaling_rejected(stale==1?69:70,stale==4?3:2,AVDTP_SI_OPEN,stale==2?0:1,false,stale==3?7:8);
+        assert(!disconnects && finish_scan_avdtp_codec);
+    }
+    media_failure_fixture();
+    signaling_rejected(70,2,AVDTP_SI_GET_CONFIGURATION,1,false,8);
+    assert(!disconnects && finish_scan_avdtp_codec); // A read-only query rejection is not a startup failure.
+}
+
+static void media_release_cannot_leave_connected_but_silent_output(void) {
+    for(unsigned intentional_profile=0;intentional_profile<2;++intentional_profile) {
+        media_failure_fixture();
+        media_tracker.streaming=is_streaming=true;
+        profile_pending=profile_reconnect=intentional_profile!=0;
+        media_released(70,2,6);
+        assert(disconnects==1 && !finish_scan_avdtp_codec && !media_tracker.streaming && !is_streaming);
+        assert(profile_pending==(intentional_profile!=0) && profile_reconnect==(intentional_profile!=0));
+        assert(a2dp_accept_incoming && !audio_owned && !avrcp_schedules);
+    }
+    for(unsigned stale=0;stale<4;++stale) {
+        media_failure_fixture();
+        media_tracker.streaming=is_streaming=true;
+        if(stale==0)address[0]^=1;
+        media_released(stale==1?69:70,stale==2?3:2,stale==3?5:6);
+        assert(!disconnects && media_tracker.streaming && finish_scan_avdtp_codec);
+    }
+}
+
+static void media_open_failure_retires_only_the_current_output(void) {
+    (void)&playback_encoder_failed;
+    (void)&avdtp_subevent_streaming_connection_established_get_bd_addr;
+    for(unsigned active_input=0;active_input<3;++active_input) {
+        memcpy(address,(uint8_t[]){1,2,3,4,5,6},6);
+        memcpy(cur_active_device,address,6);
+        a2dp_is_connected_flag=a2dp_accept_incoming=finish_scan_avdtp_codec=true;
+        a2dp_connect_pending=profile_pending=profile_reconnect=false;
+        is_usb_streaming=active_input==1;
+        phone_active=phone_opened=active_input==2;
+        mic_requested=mic_active=false;
+        audio_owned=active_input!=0;
+        media_tracker=(a2dp_media_sending_context_t){.avdtp_cid=70,.local_seid=2,.remote_seid=3};
+        playback_idle_phase=PLAYBACK_RUNNING;
+        playback_game=(playback_game_t){0};game_ready=game_eligible=false;
+        connects=disconnects=avrcp_schedules=0;reconnect_delay=1000;
+        uint8_t other[6]={7,8,9,10,11,12};
+        media_established(69,address,0x67,14);
+        media_established(70,other,0x67,14);
+        media_established(70,address,0x67,13);
+        address[0]^=1;
+        media_established(70,cur_active_device,0x67,14);
+        address[0]^=1;
+        assert(!disconnects && finish_scan_avdtp_codec);
+        media_established(70,address,0x67,14);
+        assert(disconnects==1 && !finish_scan_avdtp_codec && !media_tracker.streaming);
+        assert(!avrcp_schedules && a2dp_accept_incoming && audio_owned==(active_input!=0));
+        now=100;dongle_playback_poll();assert(!connects);
+        signaling_released(70);
+        now=1099;dongle_playback_poll();assert(!connects);
+        now=1100;dongle_playback_poll();assert(connects==1 && a2dp_connect_pending);
+        assert(!memcmp(connected_address,address,6));
+        // A late failure from the retired CID cannot tear down its replacement.
+        a2dp_is_connected_flag=true;a2dp_connect_pending=false;finish_scan_avdtp_codec=true;
+        media_established(70,address,0x67,14);assert(disconnects==1 && finish_scan_avdtp_codec);
+        media_established(media_tracker.avdtp_cid,address,0,14);
+        assert(disconnects==1 && avrcp_schedules==1 && !media_tracker.streaming);
+        assert(playback_idle_phase==(audio_owned?PLAYBACK_SUSPENDED:PLAYBACK_RUNNING));
+        assert(audio_owned==(active_input!=0)); // Recovery never claims a standby route or sends Play.
+    }
+    audio_owned=true;is_usb_streaming=phone_active=phone_opened=false;
 }
 
 static void headset_presence_follows_current_signaling(void) {
@@ -164,6 +339,74 @@ static void headset_presence_follows_current_signaling(void) {
     assert(get_a2dp_connected_flag() && media_tracker.avdtp_cid==71 && aaceld_variable_allowed);
     signaling_released(71);
     assert(!get_a2dp_connected_flag() && media_tracker.avdtp_cid==0 && !aaceld_variable_allowed);
+}
+
+static void pairing_cannot_reconnect_an_unsaved_ram_peer(void) {
+    static const uint8_t old_peer[6] = {1, 2, 3, 4, 5, 6};
+    static const uint8_t new_peer[6] = {7, 8, 9, 10, 11, 12};
+    static const uint8_t empty[6];
+    for (unsigned slot = 1; slot <= 2; ++slot) {
+        for (unsigned stored = 0; stored <= 1; ++stored) {
+            for (unsigned inquiry = 0; inquiry <= 1; ++inquiry) {
+                pair_slot = (uint8_t)slot;
+                slot_write_ok = stored != 0; inquiry_ok = inquiry != 0;
+                slot_cleared = false; slot_written = 0;
+                connects = disconnects = scans = keys_dropped = selected_retirements = 0;
+                call_active = call_opened = call_capture = mic_requested = mic_active = is_usb_streaming = false;
+                phone_active = phone_opened = profile_pending = profile_reconnect = a2dp_connect_pending = false;
+                a2dp_is_connected_flag = a2dp_accept_incoming = true;
+                media_tracker = (a2dp_media_sending_context_t){.avdtp_cid = 10};
+                memcpy(address, old_peer, sizeof(address));
+                assert(avdtp_disconnect_and_scan() == (stored && inquiry));
+                assert(slot_written == slot && slot_cleared == (stored != 0));
+                assert(keys_dropped == stored && scans == stored);
+                assert(!memcmp(address, stored ? empty : old_peer, sizeof(address)));
+                assert(selected_retirements == stored);
+                signaling_released(10);
+                // A phone profile wake and a button/microphone reconnect share this production path.
+                assert(bridge_phone_open() == !stored);
+                avdtp_source_establish_stream();
+                assert(connects == !stored && a2dp_connect_pending == !stored);
+                if (stored) {
+                    // The HCI discovery handler may make a genuinely selected new pair connectable again.
+                    memcpy(address, new_peer, sizeof(address));
+                    assert(bridge_phone_open() && connects == 1 && a2dp_connect_pending);
+                    assert(!memcmp(connected_address, new_peer, sizeof(new_peer)));
+                }
+            }
+        }
+    }
+    pair_slot = 1;
+    call_opened = phone_opened = false;
+}
+
+static void selected_pair_waits_for_the_old_signaling_release(void) {
+    static const uint8_t old_peer[6] = {1, 2, 3, 4, 5, 6};
+    static const uint8_t new_peer[6] = {7, 8, 9, 10, 11, 12};
+    for (unsigned slot = 1; slot <= 2; ++slot) {
+        pair_slot = (uint8_t)slot;
+        slot_write_ok = inquiry_ok = true;
+        connects = disconnects = scans = keys_dropped = selected_retirements = 0;
+        call_active = call_opened = call_capture = mic_requested = mic_active = is_usb_streaming = false;
+        phone_active = phone_opened = profile_pending = profile_reconnect = a2dp_connect_pending = false;
+        a2dp_is_connected_flag = a2dp_accept_incoming = true;
+        media_tracker = (a2dp_media_sending_context_t){.avdtp_cid = 10};
+        reconnect_since = now = 0; reconnect_delay = 1000;
+        memcpy(address, old_peer, sizeof(address));
+        assert(avdtp_disconnect_and_scan());
+        avdtp_source_establish_stream(); // An empty Pair target cannot re-arm old-peer retries.
+        assert(!a2dp_accept_incoming && !connects && !a2dp_connect_pending);
+        memcpy(address, new_peer, sizeof(address)); // Genuine inquiry selection arrives before the old CID retires.
+        avdtp_source_establish_stream();
+        assert(!connects && !a2dp_connect_pending && media_tracker.avdtp_cid == 10);
+        signaling_released(10);
+        now = 1000; dongle_playback_poll();
+        assert(connects == 1 && a2dp_connect_pending);
+        assert(!memcmp(connected_address, new_peer, sizeof(new_peer)) && media_tracker.avdtp_cid == 20);
+        signaling_released(10); // A late old release cannot cancel the replacement attempt.
+        assert(a2dp_connect_pending && media_tracker.avdtp_cid == 20);
+    }
+    pair_slot = 1;
 }
 
 static void profile_then_pair(bool storage_succeeds, bool inquiry_succeeds) {
@@ -470,12 +713,18 @@ static void game_changes_reset_continuity_without_packets(void) {
     assert(!phone_continuity.armed);
 }
 
-int main(void) {
+int main(int argc,char **argv) {
+    if(argc==2 && !strcmp(argv[1],"pair_selection_race")) {selected_pair_waits_for_the_old_signaling_release();return 0;}
+    if(argc==2 && !strcmp(argv[1],"pair_retirement")) {pairing_cannot_reconnect_an_unsaved_ram_peer();return 0;}
+    if(argc==2 && !strcmp(argv[1],"startup_reject")) {startup_rejection_cannot_leave_connected_but_silent_output();return 0;}
+    if(argc==2 && !strcmp(argv[1],"media_release")) {media_release_cannot_leave_connected_but_silent_output();return 0;}
     assert(!get_a2dp_connected_flag());
     standalone_boot_connects_in_normal_mode();
     profile_then_pair(true, true);
     profile_then_pair(false, true);
     profile_then_pair(true, false);
+    pairing_cannot_reconnect_an_unsaved_ram_peer();
+    selected_pair_waits_for_the_old_signaling_release();
     game_receipts_follow_actual_send();
     game_waits_for_encoder_warmup();
     saved_pair_reconnects_with_backoff();
@@ -495,5 +744,16 @@ int main(void) {
     ++now;dongle_playback_poll();assert(!inspect_enabled);
     game_changes_reset_continuity_without_packets();
     headset_presence_follows_current_signaling();
+    media_open_failure_retires_only_the_current_output();
+    startup_rejection_cannot_leave_connected_but_silent_output();
+    media_release_cannot_leave_connected_but_silent_output();
+    memset(&playback_work_metrics,0,sizeof(playback_work_metrics));
+    now=UINT32_MAX-5u;dongle_playback_poll();
+    suspend_recovery_pending=true;dongle_playback_poll();
+    now=4;dongle_playback_poll();
+    assert(playback_work_metrics.recovery_poll_ms==10);
+    suspend_recovery_pending=false;now=7;dongle_playback_poll();
+    assert(playback_work_metrics.recovery_poll_ms==13 && !playback_work_metrics.recovery_active);
+    now=20;dongle_playback_poll();assert(playback_work_metrics.recovery_poll_ms==13);
     puts("playback lifecycle: Pair cancels pending profile reconnect, failures stay closed, fresh profile works");
 }

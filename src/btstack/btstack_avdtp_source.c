@@ -292,6 +292,21 @@ static struct {
     uint32_t pcm_peak, pcm_underflows, pcm_drops, encoded_units;
     uint32_t encoder_last_us, encoder_max_us, send_failures, recoveries;
 } playback_metrics;
+// Boot-lifetime modulo-32 totals; explicit reports do not reset them.
+static struct {
+    uint32_t aac_calls, aac_us, aac_jobs, aac_job_us;
+    uint32_t sent_packets, sent_samples, send_wait_us;
+    uint32_t cancelled_waits, cancelled_wait_us;
+    uint32_t recovery_poll_ms, recovery_last_ms;
+    bool recovery_active;
+} playback_work_metrics;
+_Static_assert(sizeof(playback_work_metrics) <= 48, "Output diagnostics must fit the existing memory reserve");
+static void playback_work_cancel_wait(a2dp_media_sending_context_t *context) {
+    if (!context->codec_ready_to_send) return;
+    ++playback_work_metrics.cancelled_waits;
+    playback_work_metrics.cancelled_wait_us +=
+        (btstack_run_loop_get_time_ms() - context->send_wait_start) * 1000u;
+}
 static playback_inspect_t playback_inspect;
 static volatile bool inspect_enabled;
 static uint32_t inspect_deadline;
@@ -470,6 +485,9 @@ static void a2dp_demo_send_media_packet(void) {
         return;
     }
     uint32_t wait_us=(btstack_run_loop_get_time_ms()-context->send_wait_start)*1000u;
+    ++playback_work_metrics.sent_packets;
+    playback_work_metrics.sent_samples += samples;
+    playback_work_metrics.send_wait_us += wait_us;
     PB_MAX(TRACE_SEND_WAIT_US,wait_us);
     uint32_t sent_us=time_us_32();
     if(cur_codec==4 && inspect_enabled)playback_inspect_media(&playback_inspect,
@@ -693,6 +711,8 @@ static void playback_pcm_push_measured(const int16_t *src, uint32_t frames) {
         if (frames>available) {
             uint32_t dropped=frames-available;
             playback_metrics.pcm_drops+=dropped;
+            if (phone_active && !call_active && !is_usb_streaming && playback_pcm.primed_on_wire)
+                phone_sink_record_loss(true, dropped, playback_pcm.used, media_tracker.samples_ready);
             if (phone_active || call_active) {
                 PB_ADD(playback_pcm.primed_on_wire?TRACE_ACTIVE_DROP:TRACE_STARTUP_DROP,dropped);
                 if (playback_pcm.primed_on_wire) PB_EVENT(TRACE_DROP,dropped,playback_pcm.used);
@@ -1407,6 +1427,8 @@ static void audio_pcm_read(uint16_t frames) {
     bool active=(is_usb_streaming || external) && playback_pcm.primed_on_wire;
     PB_ADD(active?TRACE_ACTIVE_ZERO:TRACE_STARTUP_ZERO,missing);
     if(active && missing)PB_EVENT(TRACE_ZERO,missing,playback_pcm.used);
+    if (active && missing && phone_active && !call_active && !is_usb_streaming)
+        phone_sink_record_loss(false, missing, playback_pcm.used, media_tracker.samples_ready);
     if (external) {
         if (phone_buffer_started && playback_pcm.used < playback_trace.stats[TRACE_PCM_MIN])
             playback_trace.stats[TRACE_PCM_MIN] = playback_pcm.used;
@@ -1690,6 +1712,8 @@ void dongle_playback_encode_run(void) {
         runtime_watch_set(WATCH_ENCODER);
         encoder_job.error = aacEncEncode(encoder_job.handle, &input, &output, &arguments, &result);
         encoder_job.encode_us = time_us_32() - started;
+        ++playback_work_metrics.aac_calls;
+        playback_work_metrics.aac_us += encoder_job.encode_us;
         encoder_job.bytes = result.numOutBytes;
         encoder_job.consumed = result.numInSamples;
     }
@@ -1735,6 +1759,7 @@ static void playback_encoder_discard(bool current_job) {
     uint32_t unsent_bytes = media_tracker.codec_storage_count;
     if (media_tracker.streaming && cur_codec == 4 && encoder_job.codec == 4 && encoder_job.handle == handleAAC)
         aaceld_frame_sequence = (aaceld_frame_sequence - media_tracker.codec_num_frames) & 0xfffu;
+    playback_work_cancel_wait(&media_tracker);
     media_tracker.codec_storage_count = media_tracker.codec_num_frames = media_tracker.codec_ready_to_send = 0;
     media_tracker.send_wait_start = 0;
     packet_oldest_us = media_last_sent_us = 0;
@@ -1772,6 +1797,8 @@ static bool playback_aac_packet_submit(a2dp_media_sending_context_t *context, ui
 static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 void dongle_playback_encode_complete(void) {
     if (atomic_load_explicit(&encoder_job.state, memory_order_acquire) != ENCODE_DONE) return;
+    ++playback_work_metrics.aac_jobs;
+    playback_work_metrics.aac_job_us += time_us_32() - encoder_job.unit_started;
     bool failed = false;
     // USB reset/alternate IRQs share this exclusion; an old job cannot publish after reset.
     critical_section_enter_blocking(&playback_pcm_lock);
@@ -1920,7 +1947,7 @@ static void playback_audio_work(uint32_t now) {
         if(playback_adjust_busy(&playback_adjust))playback_game.failed=true;
         playback_adjust_cancel(&playback_adjust);
         recover=true;
-    } else if(external && context->samples_ready>limit) {
+    } else if(external && (!phone_active || call_active) && context->samples_ready>limit) {
         uint32_t excess=context->samples_ready-limit;
         uint32_t keep=playback_pcm.used>excess?playback_pcm.used-excess:0;
         uint32_t skipped=playback_pcm_limit(&playback_pcm,keep);
@@ -1934,7 +1961,8 @@ static void playback_audio_work(uint32_t now) {
             if(!phone_overrun) {PB_ADD(TRACE_RECOVERIES,1);phone_overrun=true;}
             PB_EVENT(TRACE_RECOVERY,skipped,context->samples_ready);
         }
-    } else if(context->samples_ready>limit)context->samples_ready=limit;
+    } else if(!external && context->samples_ready>limit)context->samples_ready=limit;
+    // Retained phone PCM can repay a short radio stall; only actual FIFO loss retires its deadlines.
     critical_section_exit(&playback_pcm_lock);
     if(recover) { playback_transport_recover(context); return; }
     if(playback_work_pending || context->codec_ready_to_send==2 ||
@@ -2130,6 +2158,7 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
     context->samples_ready = 0;
     context->acc_num_missed_samples = 0;
     context->codec_storage_count = 0;
+    playback_work_cancel_wait(context);
     context->codec_ready_to_send = 0;
     context->streaming = 1;
     playback_usb_verify_started(context);
@@ -2143,6 +2172,7 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
 }
 
 static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){
+    playback_work_cancel_wait(context);
     playback_encoder_invalidate();
     playback_continuity_reset(&phone_continuity);
     playback_usb_verify_cancel();
@@ -2406,10 +2436,16 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             break;
         
         case AVDTP_SUBEVENT_STREAMING_CONNECTION_ESTABLISHED:
-            status = avdtp_subevent_streaming_connection_established_get_status(packet);
+            if (size != 14 || !a2dp_is_connected_flag || !media_tracker.avdtp_cid) break;
             if (avdtp_subevent_streaming_connection_established_get_avdtp_cid(packet) != media_tracker.avdtp_cid) break;
+            avdtp_subevent_streaming_connection_established_get_bd_addr(packet, address);
+            if (memcmp(address, cur_active_device, 6) ||
+                memcmp(address, (const uint8_t *)get_device_addr(), 6)) break;
+            status = avdtp_subevent_streaming_connection_established_get_status(packet);
             if (status != 0){
                 printf("Streaming connection failed: status %d\n", status);
+                // The SDK keeps signaling open after a failed media channel; retire it for normal retry.
+                playback_encoder_failed(&media_tracker);
                 break;
             }
             avdtp_cid = avdtp_subevent_streaming_connection_established_get_avdtp_cid(packet);
@@ -2919,21 +2955,29 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 
         case AVDTP_SUBEVENT_SIGNALING_REJECT:
         case AVDTP_SUBEVENT_SIGNALING_GENERAL_REJECT:
+            if (size != 8 || !a2dp_is_connected_flag || !media_tracker.avdtp_cid ||
+                avdtp_subevent_signaling_reject_get_is_initiator(packet) != 1 ||
+                memcmp(cur_active_device, (const uint8_t *)get_device_addr(), 6)) break;
             if (avdtp_subevent_signaling_reject_get_avdtp_cid(packet) != media_tracker.avdtp_cid) break;
             signal_identifier = avdtp_subevent_signaling_reject_get_signal_identifier(packet);
-            if (signal_identifier == AVDTP_SI_SUSPEND || signal_identifier == AVDTP_SI_START) {
-                a2dp_demo_timer_stop(&media_tracker);
-                aacp_disconnect();
-                a2dp_source_disconnect(media_tracker.avdtp_cid);
-            }
+            bool connection_query = signal_identifier == AVDTP_SI_DISCOVER ||
+                signal_identifier == AVDTP_SI_GET_CAPABILITIES || signal_identifier == AVDTP_SI_GET_ALL_CAPABILITIES;
+            if (!connection_query &&
+                avdtp_subevent_signaling_reject_get_local_seid(packet) != media_tracker.local_seid) break;
+            if (connection_query || signal_identifier == AVDTP_SI_SET_CONFIGURATION ||
+                signal_identifier == AVDTP_SI_OPEN || signal_identifier == AVDTP_SI_SUSPEND ||
+                signal_identifier == AVDTP_SI_START)
+                playback_encoder_failed(&media_tracker);
             break;
         case AVDTP_SUBEVENT_STREAMING_CONNECTION_RELEASED:
+            if (size != 6 || !a2dp_is_connected_flag || !media_tracker.avdtp_cid ||
+                avdtp_subevent_streaming_connection_released_get_local_seid(packet) != media_tracker.local_seid ||
+                memcmp(cur_active_device, (const uint8_t *)get_device_addr(), 6)) break;
             if (avdtp_subevent_streaming_connection_released_get_avdtp_cid(packet) != media_tracker.avdtp_cid) break;
             l2cap_set_flushable_local_cid(0);
-            a2dp_demo_timer_stop(&media_tracker);
+            // Media Close resets the SDK endpoint; a live signaling link alone cannot restart it.
+            playback_encoder_failed(&media_tracker);
             printf("Streaming connection released.\n");
-            if(a2dp_is_connected_flag)set_led_mode_on();else set_led_mode_off();
-            is_streaming = false;
             break;
         case AVDTP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
             if (avdtp_subevent_signaling_connection_released_get_avdtp_cid(packet) != media_tracker.avdtp_cid) break;
@@ -3380,15 +3424,16 @@ bool avdtp_disconnect_and_scan(void){
         return false;
     }
     gap_drop_link_key_for_bd_addr((uint8_t *) get_device_addr());
+    bt_hci_retire_selected_peer();
     //gap_delete_all_link_keys();
     return gap_start_scanning();
 }
 
 void avdtp_source_establish_stream(void) {
     const uint8_t *addr = (const uint8_t *)get_device_addr();
-    if (a2dp_is_connected_flag || a2dp_connect_pending || addr == NULL ||
-        !peer_address_valid(addr)) return;
+    if (addr == NULL || !peer_address_valid(addr)) return;
     a2dp_accept_incoming = true;
+    if (a2dp_is_connected_flag || a2dp_connect_pending) return;
     a2dp_connect_pending = true;
     uint8_t status = avdtp_source_connect((uint8_t *)addr, &media_tracker.avdtp_cid);
     if (status != ERROR_CODE_SUCCESS) {
@@ -3593,6 +3638,11 @@ static void playback_reconnect_poll(uint32_t now) {
 void dongle_playback_poll(void) {
     const uint8_t *peer=(const uint8_t *)get_device_addr();
     uint32_t now=btstack_run_loop_get_time_ms();
+    // Recovery duty time is sampled here, with one poll interval of boundary uncertainty.
+    if (playback_work_metrics.recovery_active)
+        playback_work_metrics.recovery_poll_ms += now - playback_work_metrics.recovery_last_ms;
+    playback_work_metrics.recovery_last_ms = now;
+    playback_work_metrics.recovery_active = suspend_recovery_pending || phone_output_recovery;
     (void)playback_usb_verify_poll(now); // Revoke a stale verification before worker callbacks.
     if(inspect_enabled && (int32_t)(now-inspect_deadline)>=0)inspect_enabled=false;
     playback_bitrate_poll(now);
@@ -3711,6 +3761,28 @@ void dongle_playback_poll(void) {
     playback_reconnect_poll(now);
     avrcp_reconnect_poll(now);
 }
+void dongle_playback_work_report(void) {
+    uint32_t now = btstack_run_loop_get_time_ms();
+    bool eld = cur_codec == 4 && handleAAC && a2dp_is_connected_flag;
+    printf("[OUTPUT_WORK] ms=%lu codec=%u input=%u aac_calls=%lu aac_us=%lu aac_jobs=%lu aac_job_us=%lu sent_packets=%lu sent_samples=%lu send_wait_us=%lu cancelled_waits=%lu cancelled_wait_us=%lu wait_pending=%u wait_ms=%lu recoveries=%lu recovery_poll_ms=%lu recovery_active=%u\n",
+        (unsigned long)now, (unsigned)dongle_output_codec(), (unsigned)playback_input(),
+        (unsigned long)playback_work_metrics.aac_calls, (unsigned long)playback_work_metrics.aac_us,
+        (unsigned long)playback_work_metrics.aac_jobs, (unsigned long)playback_work_metrics.aac_job_us,
+        (unsigned long)playback_work_metrics.sent_packets, (unsigned long)playback_work_metrics.sent_samples,
+        (unsigned long)playback_work_metrics.send_wait_us, (unsigned long)playback_work_metrics.cancelled_waits,
+        (unsigned long)playback_work_metrics.cancelled_wait_us, (unsigned)(media_tracker.codec_ready_to_send != 0),
+        (unsigned long)(media_tracker.codec_ready_to_send ? now - media_tracker.send_wait_start : 0),
+        (unsigned long)playback_metrics.recoveries, (unsigned long)playback_work_metrics.recovery_poll_ms,
+        (unsigned)playback_work_metrics.recovery_active);
+    printf("[OUTPUT_RATE] eld=%u current_bps=%lu target_bps=%lu ceiling_bps=%lu changes=%lu errors=%lu active=%u frozen=%u reason=%u\n",
+        (unsigned)eld, (unsigned long)(eld ? playback_bitrate.current : 0),
+        (unsigned long)(eld ? playback_bitrate.target : 0),
+        (unsigned long)(eld ? playback_bitrate.ceiling : 0), (unsigned long)playback_bitrate.changes,
+        (unsigned long)playback_bitrate.errors, (unsigned)playback_bitrate.active,
+        (unsigned)playback_bitrate.frozen, (unsigned)playback_bitrate.reason);
+    phone_sink_loss_report();
+}
+
 uint16_t dongle_playback_adaptive_snapshot(uint8_t *out, uint16_t capacity) {
     if (!out || capacity < 64) return 0;
     memset(out, 0, 64); out[0] = 1;

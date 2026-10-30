@@ -27,6 +27,7 @@ static btstack_packet_callback_registration_t hci_event_callback_registration;
 static char device_addr_string[] = "00:00:00:00:00:00";
 static bd_addr_t device_addr;
 static bd_addr_t device_addr_list[2];
+static bool device_addr_bonded[2];
 
 static bool scan_active;
 static bool selected_bonded;
@@ -744,6 +745,40 @@ static bool pairing_peer_allowed(const uint8_t address[6]) {
         (bt_hci_phone_pairing_active() && bt_hci_phone_peer_allowed(address));
 }
 
+static bool inquiry_name_word(uint8_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9');
+}
+
+static bool inquiry_airpods(const uint8_t *packet, uint16_t size, const uint8_t address[6]) {
+    if (size < 27 || !peer_address_valid(address)) return false;
+    if (gap_event_inquiry_result_get_device_id_available(packet)) {
+        uint16_t source = gap_event_inquiry_result_get_device_id_vendor_id_source(packet);
+        uint16_t vendor = gap_event_inquiry_result_get_device_id_vendor_id(packet);
+        return (source == 1 && vendor == 0x004c) || (source == 2 && vendor == 0x05ac);
+    }
+    // Keep renamed, previously authenticated peers eligible when EIR omits Device ID.
+    for (unsigned i = 0; i < 2; ++i)
+        if (device_addr_bonded[i] && memcmp(address, device_addr_list[i], 6) == 0) return true;
+    if (!gap_event_inquiry_result_get_name_available(packet)) return false;
+    const uint8_t *name = gap_event_inquiry_result_get_name(packet);
+    unsigned length = gap_event_inquiry_result_get_name_len(packet);
+    if (length > size - 27u) return false;
+    static const char airpods[] = "airpods";
+    for (unsigned i = 0; i + sizeof(airpods) - 1u <= length; ++i) {
+        if ((i && inquiry_name_word(name[i - 1])) ||
+            (i + sizeof(airpods) - 1u < length && inquiry_name_word(name[i + sizeof(airpods) - 1u]))) continue;
+        unsigned j;
+        for (j = 0; j < sizeof(airpods) - 1u; ++j) {
+            uint8_t c = name[i + j];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (uint8_t)airpods[j]) break;
+        }
+        if (j == sizeof(airpods) - 1u) return true;
+    }
+    return false;
+}
+
 
 const char * get_device_addr_string(){
     return device_addr_string;
@@ -751,6 +786,19 @@ const char * get_device_addr_string(){
 
 bd_addr_t * get_device_addr(){
     return &device_addr;
+}
+
+void bt_hci_retire_selected_peer(void) {
+    // Reusing an encrypted ACL after deleting its stored key would lose the bond at reboot.
+    hci_connection_t *connection = peer_address_valid(device_addr) ?
+        hci_connection_for_bd_addr_and_type(device_addr, BD_ADDR_TYPE_ACL) : NULL;
+    if (connection && connection->state == OPEN && connection->address_type == BD_ADDR_TYPE_ACL &&
+        !memcmp(connection->address, device_addr, 6))
+        gap_disconnect(connection->con_handle);
+    memset(device_addr, 0, sizeof(device_addr));
+    snprintf(device_addr_string, sizeof(device_addr_string), "%s", bd_addr_to_str(device_addr));
+    selected_bonded = false;
+    // Keep authenticated discovery hints for a renamed peer being explicitly repaired.
 }
 
 bd_addr_t * get_device_addr_from_list(uint8_t i){
@@ -764,7 +812,7 @@ bool gap_start_scanning(void){
     scan_active = gap_inquiry_start(A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS) == ERROR_CODE_SUCCESS;
     if (!scan_active) ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
     set_led_mode_off();
-    set_led_mode_pairing();
+    if (scan_active) set_led_mode_pairing();
     return scan_active;
 }
 
@@ -864,7 +912,8 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             }
             printf("\n");
             if (scan_active && (cod & bluetooth_speaker_cod) == bluetooth_speaker_cod &&
-                memcmp(address, phone_address, 6) != 0 && memcmp(address, phone_candidate, 6) != 0){
+                memcmp(address, phone_address, 6) != 0 && memcmp(address, phone_candidate, 6) != 0 &&
+                inquiry_airpods(packet, size, address)){
                 scan_active = false;
                 gap_inquiry_stop();
                 ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
@@ -887,7 +936,10 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             if (scan_active){
                 printf("No Bluetooth speakers found, scanning again...\n");
                 scan_active = gap_inquiry_start(A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS) == ERROR_CODE_SUCCESS;
-                if (!scan_active) ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
+                if (!scan_active) {
+                    ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
+                    set_led_mode_off();
+                }
             }
             break;
         default:
@@ -899,16 +951,16 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 void get_link_keys(void){
     read_slot1_mac(device_addr_list[0]);
     read_slot2_mac(device_addr_list[1]);
-    bool bonded[2] = {false, false};
+    memset(device_addr_bonded, 0, sizeof(device_addr_bonded));
     link_key_t link_key;
     link_key_type_t type;
     for (unsigned i = 0; i < 2; ++i) {
         if (peer_address_valid(device_addr_list[i])) {
-            bonded[i] = gap_get_link_key_for_bd_addr(device_addr_list[i], link_key, &type);
+            device_addr_bonded[i] = gap_get_link_key_for_bd_addr(device_addr_list[i], link_key, &type);
         }
     }
     // Slot identity is authoritative; key iteration order cannot identify a peer.
-    selected_bonded = peer_select(device_addr_list, bonded, read_uint8_last_flash(), device_addr);
+    selected_bonded = peer_select(device_addr_list, device_addr_bonded, read_uint8_last_flash(), device_addr);
     snprintf(device_addr_string, sizeof(device_addr_string), "%s", bd_addr_to_str(device_addr));
 }
 

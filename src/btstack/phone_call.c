@@ -11,6 +11,10 @@
 #include "btstack_aacp.h"
 #include "../tinyusb/uac.h"
 
+#ifndef AIRPODS_ENABLE_BLUETOOTH_CALLS
+#define AIRPODS_ENABLE_BLUETOOTH_CALLS 0
+#endif
+
 #define CALL_CHANNEL 8u
 #define CALL_CONNECT_MS 10000u
 #define CALL_RETRY_MS 30000u
@@ -272,6 +276,8 @@ bool phone_call_media_control(uint8_t operation) {
 }
 
 bool phone_call_init(void) {
+    // CYW43 SCO setup can stall the controller: raspberrypi/pico-sdk#1461.
+    if (!AIRPODS_ENABLE_BLUETOOTH_CALLS) return true;
     if (call.initialized) return true;
     gap_set_security_level(LEVEL_2);
     uint32_t features = (1u << HFP_HFSF_ESCO_S4) | (1u << HFP_HFSF_REMOTE_VOLUME_CONTROL);

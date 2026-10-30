@@ -1,5 +1,6 @@
 #include "pico/cyw43_arch.h"
 #include "pico/cyw43_driver.h"
+#include "pico/btstack_hci_transport_cyw43.h"
 #include "pico/stdlib.h"
 #include "btstack_run_loop.h"
 
@@ -62,7 +63,20 @@ void __attribute__((noreturn)) isr_hardfault(void) {
 // Scratch-X holds encoder PCM; give the decoder worker its own main-RAM stack.
 static uint32_t codec_stack[4096] __attribute__((aligned(8)));
 static atomic_uint codec_core_state;
-static realtime_metric_t usb_service_metric, bluetooth_main_metric;
+static realtime_metric_t usb_service_metric, bluetooth_main_metric, bluetooth_lock_metric;
+
+static void realtime_work_print(void) {
+    uint32_t irq = save_and_disable_interrupts();
+    realtime_metric_t usb = usb_service_metric, bluetooth = bluetooth_main_metric;
+    realtime_metric_t lock = bluetooth_lock_metric;
+    restore_interrupts(irq);
+    printf("[WORK] ms=%lu usb_us=%lu bt_work_us=%lu lock_wait_us=%lu lock_wait_max_us=%lu loops=%lu\n",
+           (unsigned long)to_ms_since_boot(get_absolute_time()),
+           (unsigned long)usb.total_us, (unsigned long)bluetooth.total_us,
+           (unsigned long)lock.total_us, (unsigned long)lock.max_us,
+           (unsigned long)bluetooth.count);
+    dongle_playback_work_report();
+}
 
 static void realtime_metrics_print(void) {
     // USB can preempt the main loop; take a coherent short snapshot.
@@ -95,6 +109,13 @@ static void realtime_metrics_print(void) {
     printf("[LINKS] airpods_handle=0x%04x airpods_local_role=%u phone_handle=0x%04x phone_local_role=%u\n",
         (unsigned)credits.airpods_handle, (unsigned)credits.airpods_local_role,
         (unsigned)credits.phone_handle, (unsigned)credits.phone_local_role);
+    hci_transport_cyw43_stats_t bus;
+    hci_transport_cyw43_get_stats(&bus);
+    printf("[BUS] accepted=%lu committed=%lu blocked=%lu cancelled=%lu fatal=%lu pending=%u pending_ms=%lu max_pending_ms=%lu\n",
+        (unsigned long)bus.accepted, (unsigned long)bus.committed,
+        (unsigned long)bus.blocked, (unsigned long)bus.cancelled,
+        (unsigned long)bus.fatal_errors, (unsigned)bus.pending,
+        (unsigned long)bus.pending_ms, (unsigned long)bus.max_pending_ms);
     printf("[FLUSH] desired_ms=%u confirmed_ms=%u pending=%u failed=%u status=%u\n",
         credits.media_flush_desired_ms,credits.media_flush_confirmed_ms,
         credits.media_flush_pending,credits.media_flush_failed,credits.media_flush_status);
@@ -550,8 +571,10 @@ int main() {
         bool mic_wanted;
         async_context_t *ctx = cyw43_arch_async_context();
         runtime_watch_set(WATCH_LOCK);
+        uint32_t lock_started = time_us_32();
         async_context_acquire_lock_blocking(ctx);
         uint32_t bluetooth_started = time_us_32();
+        realtime_metric_record(&bluetooth_lock_metric, lock_started, bluetooth_started, UINT32_MAX);
         dongle_playback_encode_complete();
         // Serialize SDK flash lockout with Bluetooth's interrupt-driven TLV writes.
         if ((uint32_t)(now_ms - button_sample_ms) >= 20u) {
@@ -601,7 +624,8 @@ int main() {
         runtime_watch_set(WATCH_FEATURES);
         dongle_features_poll();
         phone_control_poll();
-        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_call_report();bt_volume_report();aacp_routing_report(); }
+        if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_sink_report();phone_call_report();bt_volume_report();aacp_routing_report(); }
+        if (!debug_cdc_output_pending() && debug_cdc_take_work_request()) realtime_work_print();
         volume_trace_console_poll(&volume_console, now_ms);
         bool enter_bootsel = bootsel_request_poll(&bootsel, now_ms);
         // Snapshot under the Bluetooth lock; USB ingress keeps running in its IRQ.

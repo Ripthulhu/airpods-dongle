@@ -407,7 +407,7 @@ static void jitter_and_live_changes(void) {
 }
 static void phone_send_wait_keeps_source_time(void) {
     fixture(0);
-    playback_game.target=150; // Isolate accounting within a legitimate receiver window.
+    playback_game.target=150; // Low-level overflow accounting; phone_catchup tests the live recovery poll.
     is_usb_streaming=false;phone_active=phone_opened=phone_buffer_started=true;
     assert(playback_pcm_reset(&playback_pcm,8192,false));playback_pcm.primed_on_wire=true;
     generated=encoded=0;phone_arrivals=phone_queued=phone_decode_due=phone_decoded=0;
@@ -420,7 +420,7 @@ static void phone_send_wait_keeps_source_time(void) {
     assert(playback_metrics.pcm_drops==playback_trace.stats[TRACE_ACTIVE_DROP]);
     assert(generated==encoded+playback_pcm.used+playback_metrics.pcm_drops);
     assert(playback_trace.stats[TRACE_RECOVERIES] && !playback_metrics.recoveries);
-    assert(!suspend_recovery_pending && media_tracker.streaming); // Phone readiness never changes.
+    assert(!suspend_recovery_pending && media_tracker.streaming); // This fixture omits the recovery poll.
     request_wait=0;blocked_until=0;
     unsigned end=now+1000;
     while(now<end)step();
@@ -435,14 +435,14 @@ static void phone_late_decode_keeps_unmatched_debt(void) {
     playback_pcm.fraction=12345; // A timeline trim must not restart resampling phase.
     phone_ingress(720);
     playback_audio_work(now);
-    assert(!playback_pcm.used && media_tracker.samples_ready==4080);
-    assert(playback_metrics.pcm_drops==720 && playback_trace.stats[TRACE_DEBT_DROP]==720);
-    playback_audio_work(now); // No decoded PCM exists to match another skip yet.
-    assert(media_tracker.samples_ready==4080 && playback_metrics.pcm_drops==720);
+    assert(playback_pcm.used==720 && media_tracker.samples_ready==4800);
+    assert(!playback_metrics.pcm_drops && !playback_trace.stats[TRACE_DEBT_DROP]);
+    playback_audio_work(now); // A blocked send cannot erase retained PCM or future decode debt.
+    assert(media_tracker.samples_ready==4800 && playback_pcm.used==720);
     phone_ingress(1440);playback_audio_work(now);
-    assert(playback_pcm.used==240 && media_tracker.samples_ready==2880);
-    assert(playback_metrics.pcm_drops==1920 && playback_trace.stats[TRACE_DEBT_DROP]==1920);
-    assert(playback_pcm.fraction==12345 && playback_trace.stats[TRACE_RECOVERIES]==1);
+    assert(playback_pcm.used==2160 && media_tracker.samples_ready==4800);
+    assert(!playback_metrics.pcm_drops && !playback_trace.stats[TRACE_DEBT_DROP]);
+    assert(playback_pcm.fraction==12345 && !playback_trace.stats[TRACE_RECOVERIES]);
     assert(generated==playback_pcm.used+playback_metrics.pcm_drops);
     assert(!suspend_recovery_pending && media_tracker.streaming);
 }
@@ -456,15 +456,15 @@ static void phone_overflow_reconciles_source_time(void) {
     assert(playback_metrics.pcm_drops==320 && playback_pcm.dropped_pending==320);
     assert(playback_trace.stats[TRACE_ACTIVE_DROP]==320);
     playback_audio_work(now);
-    assert(media_tracker.samples_ready==2880 && !playback_pcm.dropped_pending);
-    assert(playback_metrics.pcm_drops==620 && playback_pcm.used==7892);
-    assert(playback_trace.stats[TRACE_DEBT_DROP]==620 && playback_trace.stats[TRACE_ACTIVE_DROP]==620);
-    playback_audio_work(now); // The explicit debt clamp must not create another drop credit.
-    assert(playback_metrics.pcm_drops==620 && media_tracker.samples_ready==2880);
+    assert(media_tracker.samples_ready==3180 && !playback_pcm.dropped_pending);
+    assert(playback_metrics.pcm_drops==320 && playback_pcm.used==8192);
+    assert(playback_trace.stats[TRACE_DEBT_DROP]==320 && playback_trace.stats[TRACE_ACTIVE_DROP]==320);
+    playback_audio_work(now); // A physical loss retires its matching deadline exactly once.
+    assert(playback_metrics.pcm_drops==320 && media_tracker.samples_ready==3180);
     audio_pcm_read(480);
     for(unsigned i=0;i<480;++i) {
-        assert(encoder_sample_s16(2*i)==signal(620+i));
-        assert(encoder_sample_s16(2*i+1)==-signal(620+i));
+        assert(encoder_sample_s16(2*i)==signal(320+i));
+        assert(encoder_sample_s16(2*i+1)==-signal(320+i));
     }
 
     playback_pcm_clear(&playback_pcm,8192);generated=0;

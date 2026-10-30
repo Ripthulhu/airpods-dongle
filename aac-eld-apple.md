@@ -2,7 +2,8 @@
 
 This describes the firmware's selected configuration. USBPods supplied the
 original vendor-codec implementation; NTPods supplies the packet-validation,
-priming and recovery reference. This revision still needs hardware validation.
+priming and recovery reference. The validation notes distinguish short PC checks
+from the outstanding Android and listening checks.
 
 ## Negotiation
 
@@ -34,10 +35,10 @@ unsupported combinations and rates below 128 kbps are rejected.
 | Encoder parameter | Selected value |
 | --- | --- |
 | Audio object type | 39, ER AAC-ELD |
-| PCM input | 48 kHz stereo, signed 16-bit |
+| PCM input | 48 kHz stereo Q31 after float buffering/resampling |
 | Frame length | 480 samples per channel, 10 ms |
 | Bitrate | Requested CBR/VBR mode, bounded by the selected wire ceiling |
-| Audio bandwidth | Automatic in CBR; explicit ceiling-based selection in VBR |
+| Audio bandwidth | Configured CBR ceiling (20 kHz default); ceiling-based VBR |
 | SBR | Off |
 | Afterburner | Off |
 | Transport | Raw access units |
@@ -48,10 +49,12 @@ depth does not establish the compressed stream's effective resolution.
 
 ## Encoder bandwidth and precision
 
-The USB float path retains float samples through buffering and resampling, then
-rounds and saturates once to signed 16-bit PCM at the current encoder boundary.
-Bit-exact host USB float transport therefore does not establish float precision
-through AAC. See the [transport quality checks](docs/AUDIO-CONTINUITY.md#transport-quality-checks).
+The following measurements describe the 0.1.53 baseline. Its USB float path
+retained float samples through buffering and resampling, then rounded and
+saturated to signed 16-bit PCM before encoding. Bit-exact host USB transport
+did not establish precision through AAC. See the
+[transport quality checks](docs/AUDIO-CONTINUITY.md#transport-quality-checks)
+and the 0.1.54 changes below.
 
 For stereo, 48 kHz, 480-sample CBR, FDK's automatic bandwidth table selects
 16000 Hz at 255200 bits/s. A separate running-firmware observation on 0.1.53 float r2
@@ -60,8 +63,9 @@ the selected bandwidth to its spectrum; this is not a measured acoustic cutoff.
 At 128000 bits/s the table selects 15400 Hz; from 192000 through 255200 it selects
 16000 Hz. Intermediate interpolation is not strictly monotonic.
 
-Live CBR retuning retains the automatic bandwidth request and recomputes the
-effective bandwidth. VBR instead explicitly selects 15500 Hz for a local ceiling
+With an automatic bandwidth request, live CBR retuning recomputes effective
+bandwidth. The 0.1.54 default instead retains its explicit 20 kHz ceiling.
+VBR explicitly selects 15500 Hz for a local ceiling
 up to 128000 bits/s, 17500 Hz up to 160000, or 20000 Hz above that. This uses the
 ceiling, not the current adaptive rate; subsequent bitrate updates retain that
 explicit bandwidth until fresh encoder initialization.
@@ -77,6 +81,58 @@ quality changes. Compare encoded output and listening results, worst-case CPU
 time, packet-size limits and codec memory before changing defaults. Increasing
 bandwidth at the same bitrate also spreads the available bits across more of the
 spectrum; it is not an unconditional quality improvement.
+
+## 0.1.54 playback precision and bandwidth
+
+The high-precision USB build retains alternate 1 (S16) and alternate 2
+(IEEE float32), and adds alternate 3: signed little-endian PCM32, stereo,
+48 kHz, four bytes per sample. This gives Android a standard integer format
+instead of requiring its USB HAL to accept IEEE float. The microphone's
+S16/64 kHz USB contract is unchanged.
+
+Playback stays in binary32 through the bounded PCM pool and resampler, then
+converts directly to Q31 for the 480-frame AAC-ELD encoder. It no longer passes
+through S16 first. Binary32 has about 24 significant bits; neither a 32-bit USB
+container nor Q31 makes the lossy AAC stream a lossless 32-bit path. Legacy
+AAC-LC/SBC still use their S16 input adapters. The FDK library and its microphone
+consumer share one coherent Q31 ABI; microphone output is explicitly rounded
+and saturated back to the existing S16 contract.
+
+`AACELD_CBR_BANDWIDTH` accepts 0, 16000, 18000 or 20000 Hz; the new default is
+20000. Zero retains FDK's automatic bandwidth selection for controlled
+comparisons. The existing VBR policy, negotiated bitrate ceilings, afterburner,
+SBR state, 480-frame units, packet grouping, queues, priming and clock controller
+are unchanged. An explicit 20 kHz ceiling does not guarantee high-frequency
+retention at a reduced adaptive bitrate.
+
+The codec memory gate still reserves 65536 bytes for the running system.
+The checked R6 build leaves 66064 bytes at the worst emulated codec allocation
+peak, only 528 bytes above that reserve. A frame-sized encoder input allocation
+preserves LC1024 capacity, while the fixed mono ELD decoder shares sequential
+scratch storage with one cleanup owner. Non-profile buffer allocation and
+ownership are unchanged.
+Do not reduce the reserve or remove microphone/LC lifecycle checks to make a
+future build fit. Historical checksum fixtures stay explicitly at automatic
+bandwidth; separate cases exercise the configured wider bandwidth.
+
+Exact R6 source SHA-256:
+`bd9ef3898397a51cba3ec8310430ea26bfb521b790393754b4d1906f88d0edfc`.
+UF2 SHA-256:
+`6cf51e92badb13bdc6a663ff40fc7942331ea8da3d23b377c5da898b05ff9ceb`.
+The build receipt, independent codec comparisons, and target observations are
+under `outputs/dongle-pcm32-quality-20261030` and
+`outputs/pcm32-codec-benchmark-r5-20261030` in the coordinating workspace.
+PC silent-stream checks verified float USB alternate 2, actual 20 kHz AAC-ELD
+configuration, unchanged physical gain 119/127, and no new active-drop,
+active-zero, transport-error or recovery counters through short normal and
+Game Mode changes. The observed encoder maximum was 6301 microseconds after
+the final fresh-connection check; the largest complete encode-unit observation
+across normal/Game Mode checks was 8005 microseconds. These
+are bounded silent checks, not listening acceptance or acoustic latency
+measurements. Android's real alternate-3 playback check remains pending: the
+phone dongle's AirPods paging timed out with both R6 and a restored 0.1.53
+control image. Its compiled descriptor and codec tests passed; that does not
+establish a running Android PCM32 route.
 
 ## Packet framing
 

@@ -3,10 +3,12 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "../src/runtime_watch.h"
+#include "../src/realtime_metrics.h"
 
 typedef unsigned async_context_t;
 static async_context_t context;
 static uint32_t now;
+static realtime_metric_t bluetooth_lock_metric;
 static unsigned lock_depth, samples, actions, deferred_irqs, tlv_writes;
 static bool pending_action, pending_irq, flash_lock;
 static uint32_t get_absolute_time(void) { return now; }
@@ -55,6 +57,7 @@ int main(void) {
     assert(samples==3 && last_sample==10);
     now=11; main_button_poll(&last_sample);
     assert(actions==3 && samples==3 && tlv_writes==3 && lock_depth==0);
+    assert(bluetooth_lock_metric.count==6 && bluetooth_lock_metric.total_us==0);
     puts("main button polling: flash lockout serialized, IRQ deferred, next-pass actions and timer wrap passed");
     return 0;
 }

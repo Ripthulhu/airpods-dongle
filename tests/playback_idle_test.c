@@ -96,7 +96,7 @@ typedef struct {
     uint8_t local_seid;
     int max_media_payload_size;
     unsigned codec_num_frames, codec_storage_count;
-    uint32_t time_audio_data_sent, samples_ready, acc_num_missed_samples;
+    uint32_t time_audio_data_sent, samples_ready, acc_num_missed_samples, send_wait_start;
     bool codec_ready_to_send, streaming;
     btstack_timer_source_t audio_timer;
 } a2dp_media_sending_context_t;
@@ -464,7 +464,19 @@ static void sbc_start_requires_one_complete_frame(void) {
     }
 }
 
+static void cancelled_wait_is_counted_once(void) {
+    fixture();memset(&playback_work_metrics,0,sizeof(playback_work_metrics));
+    media_tracker.codec_ready_to_send=true;media_tracker.send_wait_start=UINT32_MAX-1u;now=1;
+    a2dp_demo_timer_stop(&media_tracker);
+    assert(playback_work_metrics.cancelled_waits==1 && playback_work_metrics.cancelled_wait_us==3000);
+    a2dp_demo_timer_stop(&media_tracker);
+    assert(a2dp_demo_timer_start(&media_tracker));
+    assert(playback_work_metrics.cancelled_waits==1 && playback_work_metrics.cancelled_wait_us==3000);
+    a2dp_demo_timer_stop(&media_tracker);
+    assert(playback_work_metrics.cancelled_waits==1 && playback_work_metrics.cancelled_wait_us==3000);
+}
 int main(void) {
+    cancelled_wait_is_counted_once();
     sbc_start_requires_one_complete_frame();
     fresh_phone_start_reclaims_only_owned_output();
     call_output_ownership();

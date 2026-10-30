@@ -19,7 +19,7 @@ static inline uint32_t realtime_loop_idle_us(uint32_t started_us, uint32_t now_u
 // Single-writer counters. Read on the owner thread, or copy while that writer
 // is excluded; volatile alone does not synchronize an IRQ or another core.
 typedef struct {
-    uint32_t count, max_us, overruns, last_started_us, max_gap_us;
+    uint32_t count, max_us, overruns, last_started_us, max_gap_us, total_us;
 } realtime_metric_t;
 
 // Intervals must be shorter than one uint32_t timer period. UINT32_MAX disables
@@ -28,6 +28,7 @@ static inline void realtime_metric_record(realtime_metric_t *metric,
                                          uint32_t started_us, uint32_t finished_us,
                                          uint32_t budget_us) {
     uint32_t elapsed = finished_us - started_us;
+    metric->total_us += elapsed; // Modulo total: subtract snapshots over bounded intervals.
     if (metric->count != 0u) {
         uint32_t gap = started_us - metric->last_started_us;
         if (gap > metric->max_gap_us) metric->max_gap_us = gap;

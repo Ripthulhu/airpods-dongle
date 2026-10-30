@@ -1,5 +1,9 @@
 # Phone bridge
 
+Bluetooth phone calls are disabled by default on the supported Pico 2 W build.
+USB calls and Bluetooth music remain available. The HFP/SCO description below
+documents an experimental implementation, not supported Bluetooth call audio.
+
 ## USB audio presence and Bluetooth selection
 
 Starting with 0.1.44, USB boots as `CAFE:4005` with HID/CDC controls only.
@@ -52,6 +56,24 @@ USB with no sound card, persistence after disabling Media audio while the phone
 ACL survived, and restoration after full Bluetooth disconnect. Media reconnection
 removed USB audio again. The idle-HFP-only reconnect test was inconclusive because
 media became enabled too; it is covered by the host regression, not that hardware test.
+
+## Bluetooth recovery candidate 0.1.56
+
+The later [0.1.57 offline investigation](VALIDATION-0.1.57.md) reproduces a
+separate CYW43 driver fault: ring-full writes were discarded while reported as
+successful. Its asynchronous transport repair passed the full build and
+sanitizer checks, but has not been installed or accepted by listening.
+
+[0.1.56 validation](VALIDATION-0.1.56.md) records the current R3 build and phone
+deployment, bounded media-profile recovery after output loss, and retention of
+phone catch-up deadlines while PCM is still available. It also documents pairing
+RAM/ACL retirement and the new-selection/old-signaling race. These changes retain
+the existing buffer targets, codecs, volume behavior and radio policy.
+
+R1 still produced audible relay glitches. R3 passed its full offline checks and
+returned the saved AirPods with AAC-ELD after reboot, but its physical case-return
+result and relay listening acceptance remain pending. Earlier failed runs below
+remain historical evidence.
 
 ## Bluetooth continuity candidate 0.1.42
 
@@ -206,9 +228,32 @@ readings and nearby finding. See [control extensions](CONTROL-EXTENSIONS.md) for
 the UUID and wire format. These controls do not need a PC, a phone vendor-ID
 override or an audio stream.
 
-## Phone calls over Bluetooth (prototype)
+## Phone calls over Bluetooth (disabled by default)
 
-The Pico advertises an HFP Hands-Free service on RFCOMM channel 8; the companion
+The default build does not register HFP, advertise its service, connect to the
+phone's HFP service, or accept incoming SCO/eSCO links. This also rejects a phone
+attempting to reuse cached call-profile information. USB call routing and the
+Bluetooth music/AVRCP profiles are unchanged.
+
+[Raspberry Pi issue 1461](https://github.com/raspberrypi/pico-sdk/issues/1461)
+documents a CYW43 firmware failure during SCO connection setup. On 30 October
+2026, a Bluetooth call attempt on this dongle left the shared controller bus
+blocked for over 130 seconds with zero SCO receive/transmit packets; a reboot
+restored it. The pinned SDK blob identifies itself as
+`CYW4343A2_001.003.016.0065.0000_Generic_SDIO_37MHz_wlbga_BU_RPI_dl_signed`,
+matching the base `.0065` firmware reported in the issue's February 2026
+reproduction. This is closely matching evidence, not proof of the exact failed
+controller event: no packet capture of that setup attempt was available.
+
+For controlled firmware research only, configure CMake with
+`-DAIRPODS_ENABLE_BLUETOOTH_CALLS=ON`. CMake passes the numeric
+`AIRPODS_ENABLE_BLUETOOTH_CALLS` definition to the firmware sources; absent a
+definition, `phone_call.c` also defaults to disabled. Enabling this option can
+stall Bluetooth until reboot and does not make calls supported. Host tests run
+the production call module both with its default disabled policy and with an
+explicit opt-in for the existing HFP/CVSD tests.
+
+With that experimental option enabled, the Pico advertises an HFP Hands-Free service on RFCOMM channel 8; the companion
 control service keeps channel 7. The saved phone uses standard CVSD (8 kHz)
 mono voice over SCO/eSCO. The Pico converts downlink voice to its
 48 kHz stereo AirPods output and sends the AirPods AACP microphone back through
@@ -242,10 +287,8 @@ fix for the pinned SDK's partial decoder initialization; passing that test does
 not enable wideband calls on the board.
 
 **Hardware gate:** build and host tests cannot prove CYW43 voice routing or
-full-duplex radio timing. The pinned transport carries HCI SCO packets, and
-[Raspberry Pi lists HFP examples](https://github.com/raspberrypi/pico-examples),
-but [BTstack's chipset table](https://github.com/bluekitchen/btstack#supported-chipsets)
-does not confirm CYW43 SCO-over-HCI support. Before calling this supported,
+full-duplex radio timing. Keep the default disabled until the controller firmware
+limitation is resolved and verified on this board. Before calling this supported,
 verify incoming and outgoing calls, audible speech in both directions, call
 answer/end, USB takeover, call end followed by music, and radio loss/reconnect.
 No end-to-end call latency has been measured.

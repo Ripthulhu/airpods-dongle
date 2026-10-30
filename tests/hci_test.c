@@ -38,7 +38,7 @@ static uint16_t radio_opcode, radio_handle;
 static uint8_t radio_power_type, radio_result;
 static void packet_status(uint8_t status);
 static void packet_changed(uint16_t handle,uint16_t mask,uint8_t status);
-static bool ble_ready;
+static bool ble_ready, pairing_led;
 static bool fail_storage;
 static uint32_t now;
 static unsigned pin_rejections, confirmations, confirmation_rejections, passkey_rejections;
@@ -210,8 +210,8 @@ void avdtp_source_establish_stream(void) {
     assert(peer_address_valid(device_addr));
     connect_calls++;
 }
-void set_led_mode_off(void) {}
-void set_led_mode_pairing(void) {}
+void set_led_mode_off(void) { pairing_led = false; }
+void set_led_mode_pairing(void) { pairing_led = true; }
 uint8_t read_uint8_last_flash(void) { return slot; }
 void read_slot1_mac(uint8_t mac[MAC_LEN]) { memcpy(mac, saved[0], MAC_LEN); }
 void read_slot2_mac(uint8_t mac[MAC_LEN]) { memcpy(mac, saved[1], MAC_LEN); }
@@ -232,6 +232,7 @@ static void fixture(void) {
     memset(saved, 0xff, sizeof(saved));
     memset(device_addr, 0, sizeof(device_addr));
     memset(device_addr_list, 0, sizeof(device_addr_list));
+    memset(device_addr_bonded, 0, sizeof(device_addr_bonded));
     has_key[0] = has_key[1] = false;
     scan_active = selected_bonded = false;
     non_flushable = true;
@@ -246,6 +247,7 @@ static void fixture(void) {
     consume_command_credit=false;
     radio_writes=0;radio_opcode=radio_handle=0;radio_power_type=radio_result=0;
     ble_ready = false;
+    pairing_led = false;
     fail_storage = false;
     ble_pauses = 0;
     now = 0;
@@ -282,6 +284,125 @@ static void result(uint8_t *p, unsigned size, const uint8_t *address, uint32_t c
     p[9] = (uint8_t)cod;
     p[10] = (uint8_t)(cod >> 8);
     p[11] = (uint8_t)(cod >> 16);
+    p[16] = 1; // Ordinary existing fixtures represent an Apple USB Device ID.
+    p[17] = 2;
+    p[19] = 0xac;
+    p[20] = 0x05;
+}
+
+static void result_name(uint8_t *p, unsigned size, const uint8_t address[6], const char *name) {
+    result(p, size, address, 0x340404);
+    assert(strlen(name) <= size - 27u);
+    p[25] = 1;
+    p[26] = (uint8_t)strlen(name);
+    memcpy(p + 27, name, strlen(name));
+}
+
+static void test_unrelated_speaker_cannot_win_airpods_pairing(void) {
+    fixture();
+    bt_hci_init();
+    working();
+    uint8_t p[80];
+    result_name(p, sizeof(p), nearby, "Power Dynamics");
+    p[16] = 0;
+    p[14] = 1;
+    p[15] = (uint8_t)-97;
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(scan_active && pairing_led && !writes && !connect_calls && !inquiry_stops);
+    assert(!peer_address_valid(device_addr));
+    result_name(p, sizeof(p), first, "Dylan's earbuds");
+    hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
+    assert(!scan_active && writes == 1 && connect_calls == 1 && inquiry_stops == 1);
+    assert(memcmp(device_addr, first, 6) == 0 && memcmp(saved[0], first, 6) == 0);
+}
+
+static void test_pairing_device_id_name_and_authenticated_identity_fallbacks(void) {
+    fixture();
+    bt_hci_init();
+    uint8_t p[80];
+    result_name(p, sizeof(p), first, "Dylan's earbuds");
+    assert(inquiry_airpods(p, sizeof(p), first));
+    p[17] = 1;
+    p[19] = 0x4c;
+    p[20] = 0;
+    assert(inquiry_airpods(p, sizeof(p), first));
+    p[17] = 3; // Unknown Device ID namespace cannot reuse either Apple vendor number.
+    assert(!inquiry_airpods(p, sizeof(p), first));
+    result_name(p, sizeof(p), first, "AirPods Pro");
+    p[19] = 0x34;
+    p[20] = 0x12;
+    assert(!inquiry_airpods(p, sizeof(p), first));
+    p[16] = 0;
+    assert(inquiry_airpods(p, sizeof(p), first));
+    result_name(p, sizeof(p), first, "Dylan's aIrPoDs Max");
+    p[16] = 0;
+    assert(inquiry_airpods(p, sizeof(p), first));
+    result_name(p, sizeof(p), first, "NotAirPods");
+    p[16] = 0;
+    assert(!inquiry_airpods(p, sizeof(p), first));
+    p[26] = 255;
+    assert(!inquiry_airpods(p, sizeof(p), first));
+    assert(!inquiry_airpods(p, 26, first));
+
+    for (unsigned authenticated = 0; authenticated < 2; ++authenticated) {
+        fixture();
+        memcpy(saved[0], first, 6);
+        has_key[0] = authenticated != 0;
+        bt_hci_init();
+        result(p, sizeof(p), first, 0x240404);
+        p[16] = 0;
+        assert(inquiry_airpods(p, sizeof(p), first) == (authenticated != 0));
+        assert(!inquiry_airpods(p, sizeof(p), nearby));
+        p[16] = 1;
+        p[19] = 0x34;
+        p[20] = 0x12;
+        assert(!inquiry_airpods(p, sizeof(p), first));
+    }
+}
+
+static void test_retired_pair_has_no_ram_target_but_keeps_authenticated_discovery_hint(void) {
+    const uint8_t empty[6] = {0};
+    for (unsigned selected = 1; selected <= 2; ++selected) {
+        fixture();
+        memcpy(saved[0], first, 6); memcpy(saved[1], second, 6);
+        has_key[0] = has_key[1] = true; slot = selected;
+        bt_hci_init();
+        uint8_t previous[6]; memcpy(previous, device_addr, sizeof(previous));
+        assert(selected_bonded);
+        credit_connections[0] = (hci_connection_t){.con_handle = 1, .state = OPEN, .address_type = BD_ADDR_TYPE_ACL};
+        memcpy(credit_connections[0].address, previous, sizeof(previous));
+        credit_connections[1] = (hci_connection_t){.con_handle = 2, .state = OPEN, .address_type = BD_ADDR_TYPE_ACL};
+        memcpy(credit_connections[1].address, nearby, 6); // The independent phone ACL must remain untouched.
+        credit_connections[2] = (hci_connection_t){.con_handle = 3, .state = OPEN, .address_type = BD_ADDR_TYPE_ACL};
+        memcpy(credit_connections[2].address, selected == 1 ? second : first, 6);
+        assert(selected == 1 ? write_slot1_mac(empty) : write_slot2_mac(empty));
+        has_key[selected - 1u] = false; // The caller drops the cleared slot's key before retiring RAM.
+        bt_hci_retire_selected_peer();
+        assert(!selected_bonded && !memcmp(device_addr, empty, sizeof(empty)));
+        assert(disconnect_calls == 1); // The stub accepts only handle 1, belonging to the retired pair.
+        assert(credit_connections[1].state == OPEN && credit_connections[2].state == OPEN);
+        assert(!strcmp(get_device_addr_string(), "00:00:00:00:00:00"));
+        assert(!memcmp(saved[selected - 1u], empty, sizeof(empty)));
+        assert(!memcmp(saved[selected == 1 ? 1 : 0], selected == 1 ? second : first, 6));
+        assert(device_addr_bonded[0] && device_addr_bonded[1]);
+        uint8_t packet[80]; result_name(packet, sizeof(packet), previous, "Dylan's earbuds");
+        packet[16] = 0;
+        assert(inquiry_airpods(packet, sizeof(packet), previous));
+        assert(!inquiry_airpods(packet, sizeof(packet), nearby));
+        assert(writes == 1);
+    }
+    fixture();
+    memcpy(saved[0], first, 6); has_key[0] = true;
+    bt_hci_init(); missing_acl = true;
+    bt_hci_retire_selected_peer();
+    assert(!disconnect_calls && !peer_address_valid(device_addr));
+    fixture();
+    memcpy(saved[0], first, 6); has_key[0] = true;
+    bt_hci_init();
+    credit_connections[0] = (hci_connection_t){.con_handle = 1, .address_type = BD_ADDR_TYPE_ACL};
+    memcpy(credit_connections[0].address, first, 6);
+    bt_hci_retire_selected_peer();
+    assert(!disconnect_calls && !peer_address_valid(device_addr));
 }
 
 static void test_selected_bond_auto_connects(void) {
@@ -364,6 +485,7 @@ static void test_only_live_pairing_inquiry_can_select_a_peer(void) {
     inquiry_result = 1;
     gap_start_scanning();
     assert(!scan_active);
+    assert(!pairing_led);
     assert(!(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
     hci_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
     assert(writes == 1 && connect_calls == 1);
@@ -413,6 +535,7 @@ static void test_controller_off_and_failed_inquiry_release_ble_pause(void) {
     assert(inquiry_calls == calls && scan_active && (ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
     complete();
     assert(!scan_active && !(ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
+    assert(!pairing_led);
     inquiry_result = 0;
     gap_start_scanning();
     assert(scan_active && (ble_pauses & BLE_SCAN_PAUSE_INQUIRY));
@@ -1281,6 +1404,9 @@ static void test_radio_stale_malformed_replies_and_policy_priority(void) {
 }
 
 int main(void) {
+    test_retired_pair_has_no_ram_target_but_keeps_authenticated_discovery_hint();
+    test_unrelated_speaker_cannot_win_airpods_pairing();
+    test_pairing_device_id_name_and_authenticated_identity_fallbacks();
     test_radio_sampling_is_sparse_read_only_and_cached();
     test_radio_pressure_counts_only_the_selected_acl_and_reads_do_not_reset();
     test_radio_errors_unsupported_and_timeouts_stop_without_retry_spam();

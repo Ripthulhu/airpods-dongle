@@ -1,0 +1,25 @@
+diff --git a/src/cyw43_ctrl.c b/src/cyw43_ctrl.c
+--- a/src/cyw43_ctrl.c
++++ b/src/cyw43_ctrl.c
+@@ -43,6 +43,7 @@
+ 
+ #if CYW43_ENABLE_BLUETOOTH
+ #include "cyw43_btbus.h"
++#include "cybt_shared_bus_driver.h"
+ #endif
+ 
+ #if !CYW43_USE_SPI
+@@ -802,10 +803,9 @@
+         return ret;
+     }
+     ret = cyw43_btbus_write(buf, len);
+-    if (ret) {
++    if (ret && ret != CYBT_ERR_QUEUE_FULL) {
+         CYW43_PRINTF("cyw43_bluetooth_hci_write: failed to write to shared bus\n");
+-        return ret;
+-    }
+-    return 0;
++    }
++    return ret;
+ }
+ #endif

@@ -19,13 +19,14 @@ static bool lhdc_select_ok, aptx_select_ok, lhdc_create_ok;
 static uint8_t last_control, last_volume;
 static uint32_t now;
 static uint32_t phone_session;
-static bool output_ready, output_recovering, open_allowed, claim_allowed, secure_peer;
+static bool output_ready, output_recovering, output_connected, open_allowed, claim_allowed, secure_peer;
 static bool call_busy, usb_busy, usb_capture_busy, mic_cleanup, saved_phone_valid;
 static bool audio_owned;
 static uint8_t establish_result;
 static bool lhdc_available, aptx_available, prepare_ok, codec_ready, decode_ok, control_busy;
 static bool prepare_waiting, close_waiting;
 static bool async_worker, worker_pending, submit_ok;
+static bool worker_output_ready;
 static bool confirmed_volume_known, volume_request_ok, target_volume_busy, target_support_busy;
 static uint8_t confirmed_volume, last_bridge_volume, target_volume;
 static unsigned bridge_volume_attempts, bridge_volume_requests, target_volume_attempts, target_support_attempts;
@@ -91,6 +92,7 @@ uint32_t bt_hci_phone_session(const uint8_t address[6]) {
 bool bt_hci_phone_address(uint8_t address[6]) {memcpy(address,phone_address,6);return saved_phone_valid;}
 bool phone_call_active(void) {return call_busy;}
 bool get_usb_streaming(void) {return usb_busy;}
+bool get_a2dp_connected_flag(void) {return output_connected;}
 bool usb_mic_requested(void) {return usb_capture_busy;}
 bool aacp_mic_active(void) {return mic_cleanup;}
 bool aacp_audio_owned(void) {return audio_owned;}
@@ -112,7 +114,7 @@ bool phone_worker_ready(void) {return codec_ready;}
 uint32_t phone_worker_last_decode_us(void) {return codec_ready ? 1250u : 0u;}
 uint32_t phone_worker_max_decode_us(void) {return codec_ready ? 2500u : 0u;}
 phone_worker_queue_snapshot_t phone_worker_queue_snapshot(void) {
-    return (phone_worker_queue_snapshot_t){async_worker && worker_pending ? 1u : 0u, false};
+    return (phone_worker_queue_snapshot_t){async_worker && worker_pending ? 1u : 0u, worker_output_ready};
 }
 void phone_worker_reset(void) {codec_resets++;worker_pending=false;}
 bool phone_worker_submit(const uint8_t*payload,size_t length,uint8_t count) {
@@ -187,7 +189,7 @@ static void fixture_codecs(bool lhdc,bool aptx,bool create_lhdc) {
     endpoint_count=finalized=framework_calls=accepted=rejected=disconnected=0;
     control_disconnects=control_disconnect_cid=0;
     opens=claims=stops=pcm_frames=pcm_drops=codec_resets=decode_calls=prepares=closes=controls_sent=volume_updates=start_requests=0;
-    now=0;output_ready=output_recovering=false;open_allowed=claim_allowed=secure_peer=prepare_ok=decode_ok=true;
+    now=0;output_ready=output_recovering=false;output_connected=true;open_allowed=claim_allowed=secure_peer=prepare_ok=decode_ok=true;
     call_busy=usb_busy=usb_capture_busy=mic_cleanup=false;saved_phone_valid=audio_owned=true;establish_result=0;
     codec_ready=control_busy=false;lhdc_available=lhdc;aptx_available=aptx;desired=PHONE_CODEC_NONE;
     prepare_waiting=close_waiting=false;
@@ -757,6 +759,43 @@ static uint32_t phone_diagnostic_field(const uint8_t *data, unsigned field) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
+static void test_accepted_media_byte_counters(void) {
+    for (unsigned codec=0;codec<3;++codec) {
+        if (codec==1) lhdc_playing_async();
+        else {fixture(true);playing(codec==2);async_worker=true;}
+        uint8_t packet[40]={0};
+        unsigned size=4,payload=4;
+        if (codec!=2) {
+            // Two CSRCs, one extension word and two padding bytes are media overhead.
+            packet[0]=0xb2;packet[1]=96;packet[11]=1;packet[23]=1;
+            packet[28]=codec==1?4:1;
+            unsigned offset=codec==1?30:29;
+            packet[offset]=0xa5;packet[offset+1]=0x5a;
+            size=offset+4;packet[size-1]=2;payload=2;
+        }
+        now=100;media_handler(phone.seid,packet,(uint16_t)size);
+        assert(phone.packets==1 && phone.payload_bytes==payload && phone.media_bytes==size);
+        if (codec!=2) {
+            media_handler(phone.seid,packet,(uint16_t)size); // RTP duplicate.
+            assert(phone.packets==1 && phone.payload_bytes==payload && phone.media_bytes==size);
+        }
+        media_handler((uint8_t)(phone.seid+1),packet,(uint16_t)size);
+        media_handler(phone.seid,packet,3); // Invalid RTP or partial aptX codeword.
+        assert(phone.packets==1 && phone.payload_bytes==payload && phone.media_bytes==size);
+        packet[3]=1;if(codec==1)packet[29]=1;
+        submit_ok=false;media_handler(phone.seid,packet,(uint16_t)size);
+        assert(phone.submit_failures==1 && phone.packets==1 && phone.payload_bytes==payload && phone.media_bytes==size);
+        submit_ok=true;packet[3]=2;if(codec==1)packet[29]=2;
+        phone.packets=UINT32_MAX;
+        phone.payload_bytes=UINT32_MAX-payload+1u;phone.media_bytes=UINT32_MAX-size+1u;
+        now=200;media_handler(phone.seid,packet,(uint16_t)size);
+        assert(!phone.packets && !phone.payload_bytes && !phone.media_bytes);
+        phone_sink_poll();assert(phone.decoded_frames==240);
+        unsigned char before[sizeof(phone)];memcpy(before,&phone,sizeof(phone));
+        phone_sink_report();assert(memcmp(before,&phone,sizeof(phone))==0);
+    }
+}
+
 static void test_read_only_phone_diagnostics(void) {
     fixture(true);playing(true);async_worker=true;
     uint8_t data[65], packet[64], raw[4]={1,2,3,4};
@@ -1220,6 +1259,135 @@ static void test_call_profile_resume(void) {
     now=500;phone_sink_resume_after_call();assert(reconnects==2);
 }
 
+static void test_output_return_reconnects_only_the_existing_phone_profile(void) {
+    fixture(true);playing(false);phone_avrcp_connected(0x50);
+    output_connected=output_ready=false;
+    phone_sink_poll();
+    assert(disconnected==1 && !phone.started);
+    release_signaling();
+    now=60000;phone_sink_resume_after_call();
+    assert(!reconnects && phone_sink_usb_exclusion_requested());
+    output_connected=true;
+    phone_sink_poll(); // Relay recovery must not depend on HFP initialization.
+    assert(reconnects==1 && !controls_sent && !phone.started);
+    signaling(0x41,phone_address);configure(false);opened();
+    phone_sink_resume_after_call();
+    assert(reconnects==1 && accepted==1 && !phone.started && !controls_sent);
+    output_ready=true;
+    stream_event(A2DP_SUBEVENT_START_STREAM_REQUESTED,phone.seid);phone_sink_poll();
+    assert(accepted==2 && !controls_sent);
+}
+
+static void lost_output_fixture(void) {
+    fixture(true);playing(false);
+    output_connected=output_ready=false;
+    phone_sink_poll();release_signaling();
+    assert(call_resume.pending && call_resume.output_lost && !reconnects);
+}
+
+static void test_output_profile_recovery_cancels_on_session_or_input_change(void) {
+    for(unsigned reason=0;reason<9;++reason) {
+        lost_output_fixture();
+        switch(reason) {
+            case 0:++phone_session;break;
+            case 1:secure_peer=false;break;
+            case 2:saved_phone_valid=false;break;
+            case 3:usb_busy=true;break;
+            case 4:usb_capture_busy=true;break;
+            case 5:mic_cleanup=true;break;
+            case 6:call_busy=true;break;
+            case 7:phone_sink_yield();break;
+            case 8:phone_sink_pause_for_takeover();break;
+        }
+        phone_sink_resume_after_call();
+        assert(!call_resume.pending && !reconnects && !controls_sent);
+        output_connected=secure_peer=saved_phone_valid=true;
+        usb_busy=usb_capture_busy=mic_cleanup=call_busy=false;
+        now+=60000;phone_sink_resume_after_call();
+        assert(!reconnects && !controls_sent);
+    }
+    fixture(true);playing(false);release_signaling(); // A deliberate media disconnect is not an output failure.
+    output_connected=output_ready=false;phone_sink_poll();
+    output_connected=true;phone_sink_resume_after_call();
+    assert(!call_resume.pending && !reconnects);
+
+    lost_output_fixture();output_connected=true;audio_owned=false;
+    phone_sink_resume_after_call();
+    assert(call_resume.pending && !reconnects);
+    phone_sink_pause_for_takeover();audio_owned=true;phone_sink_resume_after_call();
+    assert(!call_resume.pending && !reconnects);
+}
+
+static void test_output_profile_recovery_retries_are_bounded_and_scoped(void) {
+    lost_output_fixture();
+    now=UINT32_MAX-1000u;phone_sink_resume_after_call();assert(!reconnects);
+    output_connected=true;phone_sink_resume_after_call();assert(reconnects==1);
+    now+=2499;phone_sink_resume_after_call();assert(reconnects==1);
+    ++now;phone_sink_resume_after_call();assert(reconnects==2);
+    now+=2500;phone_sink_resume_after_call();assert(reconnects==3);
+    now+=2500;phone_sink_resume_after_call();assert(!call_resume.pending);
+    now+=60000;phone_sink_resume_after_call();assert(reconnects==3 && !controls_sent);
+
+    lost_output_fixture();output_connected=true;establish_result=1;
+    phone_sink_resume_after_call();assert(reconnects==1 && !call_resume.cid);
+    now=499;phone_sink_resume_after_call();assert(reconnects==1);
+    now=500;phone_sink_resume_after_call();assert(reconnects==2);
+
+    fixture(true);playing(false);output_connected=output_ready=false;phone_sink_poll();
+    output_connected=true;phone_sink_resume_after_call();
+    now=10000;phone_sink_resume_after_call();
+    assert(!call_resume.pending && !reconnects); // The old profile never released.
+
+    lost_output_fixture();output_connected=true;phone_sink_resume_after_call();
+    assert(reconnects==1 && call_resume.cid==0x41);
+    ++phone_session;signaling(0x41,phone_address);
+    unsigned before=disconnected;phone_sink_resume_after_call();
+    assert(!call_resume.pending && disconnected==before && phone.cid==0x41);
+}
+
+static void test_output_recovery_waits_for_media_open_and_retries_partial_setup(void) {
+    lost_output_fixture();output_connected=true;phone_sink_poll();
+    assert(reconnects==1);
+    signaling(0x41,phone_address);phone_sink_poll();
+    assert(call_resume.pending && !phone.configured && !phone.opened);
+    now=PHONE_OPEN_TIMEOUT_MS-1;phone_sink_poll();
+    assert(!phone.disconnecting && call_resume.pending);
+    ++now;phone_sink_poll();
+    assert(phone.disconnecting && call_resume.pending && disconnected==2);
+    uint8_t late[18];sbc_event(late);
+    assert(validator(sbc_endpoint,late,sizeof(late))!=0);
+    sink_handler(HCI_EVENT_PACKET,0,late,sizeof(late));opened();phone_sink_poll();
+    assert(phone.disconnecting && call_resume.pending && !phone.configured && !phone.opened);
+    release_signaling();
+    assert(reconnects==2 && call_resume.pending);
+    signaling(0x41,phone_address);configure(false);opened();phone_sink_poll();
+    assert(!call_resume.pending && phone.opened && !phone.started && !controls_sent);
+
+    lost_output_fixture();output_connected=true;phone_sink_poll();
+    signaling(0x41,phone_address);configure(false);phone_sink_poll();
+    assert(call_resume.pending && phone.configured && !phone.opened);
+    reject_open(phone.cid,phone.seid,true);phone_sink_poll();
+    assert(phone.disconnecting && call_resume.pending);
+    release_signaling();now=500;phone_sink_poll();
+    assert(reconnects==2 && call_resume.pending && !controls_sent);
+
+    lost_output_fixture();output_connected=true;phone_sink_poll();
+    for(unsigned attempt=0;attempt<3;++attempt) {
+        signaling(0x41,phone_address);phone_sink_poll();
+        assert(call_resume.pending && !phone.disconnecting);
+        now+=PHONE_OPEN_TIMEOUT_MS;phone_sink_poll();
+        assert(phone.disconnecting);
+        release_signaling();
+    }
+    assert(reconnects==3 && !call_resume.pending && !controls_sent);
+
+    lost_output_fixture();output_connected=true;phone_sink_poll();
+    now=9000;signaling(0x41,phone_address);phone_sink_poll();
+    assert(call_resume.pending && !phone.disconnecting);
+    now=10000;phone_sink_poll();
+    assert(!call_resume.pending && phone.disconnecting && reconnects==1);
+}
+
 static void test_bluetooth_route_excludes_usb_audio(void) {
     fixture(true);
     assert(!phone_sink_usb_exclusion_requested());
@@ -1323,7 +1491,44 @@ static void test_closed_microphone_drain_keeps_new_route(void) {
     assert(closes>closed && phone_sink_usb_exclusion_requested()); // Teardown runs without losing the selected route.
 }
 
+static void test_retained_loss_context(void) {
+    memset(phone_losses,0,sizeof(phone_losses));
+    phone.started=true;bluetooth_route.session=17;
+    phone.media_gap_armed=phone.pcm_gap_armed=true;
+    now=1000;phone.last_media_ms=840;phone.last_pcm_ms=850;
+    async_worker=true;worker_pending=worker_output_ready=false;
+    phone_sink_record_loss(false,480,0,960);
+    assert(phone_losses[0].serial==1 && phone_losses[0].frames==480);
+    assert(phone_losses[0].media_age==160 && phone_losses[0].pcm_age==150);
+    assert(!phone_losses[0].queued && !phone_losses[0].ready && phone_losses[0].session==17);
+    // A later catch-up overflow must not erase the starvation context.
+    now=1100;phone.last_media_ms=1099;phone.last_pcm_ms=1100;
+    worker_pending=worker_output_ready=true;
+    phone_sink_record_loss(true,128,8192,480);
+    assert(phone_losses[1].serial==1 && phone_losses[1].fill==8192);
+    assert(phone_losses[1].media_age==1 && phone_losses[1].pcm_age==0);
+    assert(phone_losses[1].queued==1 && phone_losses[1].ready==1);
+    assert(phone_losses[0].ms==1000 && phone_losses[0].debt==960);
+    // Publication backlog differs from empty ingress even at the same zero fill.
+    phone_sink_record_loss(false,96,0,480);
+    assert(phone_losses[0].serial==2 && phone_losses[0].queued==1 && phone_losses[0].ready==1);
+    assert(phone_losses[1].ms==1100 && phone_losses[1].frames==128);
+    phone.started=false;phone_sink_record_loss(false,480,0,0);
+    phone.started=true;phone_sink_record_loss(false,0,0,0);
+    assert(phone_losses[0].serial==2);
+    now=3;phone.last_media_ms=UINT32_MAX-4u;phone.pcm_gap_armed=false;
+    bluetooth_route.session=18;phone_sink_record_loss(false,1,0,0);
+    assert(phone_losses[0].media_age==8 && phone_losses[0].pcm_age==UINT32_MAX);
+    assert(phone_losses[0].session==18 && phone_losses[1].session==17);
+    worker_output_ready=false;
+}
+
 int main(void) {
+    test_retained_loss_context();
+    test_output_return_reconnects_only_the_existing_phone_profile();
+    test_output_profile_recovery_cancels_on_session_or_input_change();
+    test_output_profile_recovery_retries_are_bounded_and_scoped();
+    test_output_recovery_waits_for_media_open_and_retries_partial_setup();
     test_queued_takeover_pause_cannot_reach_fresh_media();
     test_takeover_pause_precedes_teardown();
     test_takeover_pause_session_cancellation();
@@ -1335,6 +1540,7 @@ int main(void) {
     test_rtp_timestamp_diagnostics();
     test_output_recovery_keeps_phone_stream();
     test_queue_congestion_preserves_pending_audio();
+    test_accepted_media_byte_counters();
     test_read_only_phone_diagnostics();
     test_precommit_remote_endpoint();
     test_unknown_phone_volume_is_not_intent();

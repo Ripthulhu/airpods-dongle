@@ -1,5 +1,41 @@
 # USB audio continuity and float transport
 
+## 0.1.54 precision candidate, 30 October 2026
+
+R6 adds integer PCM32 USB alternate 3 and removes the S16 conversion before
+AAC-ELD. Its CBR bandwidth is explicitly 20 kHz; the frame size, buffering,
+clock controller, priming and volume paths are unchanged. Details and exact
+build identities are in [the codec protocol notes](../aac-eld-apple.md#0154-playback-precision-and-bandwidth).
+
+The full build, sanitizer, real-codec, volume SDK, phone-codec, LHDC and ARM
+memory checks passed. The worst emulated allocation leaves 66064 bytes, retaining
+the required 65536-byte reserve. Both physical dongles were loaded with the same
+verified UF2; each flash used a private full backup and byte comparison of the
+last 64 KiB before reboot, preserving saved pairing storage.
+
+The PC's bounded quiet-reference runs encoded real audio in normal mode and
+through Game Mode on/off without new active discard, zero-fill, bad USB input,
+short read, scheduling-debt discard, timeline recovery or controller flush.
+The observed encoder maximum was 6301 us; the largest complete encode-unit
+observation across normal/Game checks was 8005 us, below one 10000 us ELD frame. Physical
+gain stayed at the original 119/127. The old baseline's lifetime maximum is not
+an isolated CPU comparison. Requested buffer settings and delay reports do not
+measure final acoustic latency.
+
+The first R6 attempt with two hosts connected was passive and encoded no audio;
+exclude it from successful playback evidence. Isolation and a fresh connection
+were required for the subsequent PC measurements. Total PCM-drop counters during
+start/stop were nonzero in both old and new firmware; the active counters above
+remained unchanged. Do not describe the entire experiment as lossless playback.
+
+Android live PCM32 and listening checks remain open. The phone dongle could not
+page the AirPods after reconnect, including with the known-good 0.1.53 control
+image and identical saved pairing storage. R6 was restored afterward. This blocks
+its live-format check; compiled alternate-3 descriptors alone are not proof that
+Android actually selected S32_LE. Resume after a case cycle with awake buds.
+No microphone recording or listening acceptance occurred overnight. The native
+microphone's S16 USB interface is deliberately unchanged.
+
 ## Acceptance status, 28 October 2026
 
 Firmware 0.1.36 fixes a reproduced waveform discontinuity in USB playback.
@@ -191,9 +227,10 @@ a reported underrun increase, but its saved USB selection was alt 1 / S16_LE.
 The saved PCM status was stopped, and no USB audio payload was captured, so
 neither Android sample fidelity nor float USB transport is established by that
 trial. An offload path is a possible explanation for absent USB-monitor events,
-not a demonstrated cause. A standard S32 integer alternative is a candidate for
-hosts that do not select float; it is not implemented or validated by this test,
-and would not remove the existing S16 encoder boundary.
+not a demonstrated cause. At the time of this 0.1.53 test, a standard S32 integer
+alternative was only a candidate and the encoder still had an S16 boundary.
+0.1.54 implements both wider input and the Q31 encoder path; its actual Android
+route remains unverified as described above.
 
 For repeatable quality checks:
 
@@ -214,9 +251,9 @@ For repeatable quality checks:
 
 The PC result establishes preservation only within that quiet reference window.
 It does not establish full-scale clipping behavior, prepared encoder PCM,
-decoded AAC fidelity, acoustic response, or long-run continuity. Float is rounded
-to S16 before the current encoder; a separate runtime snapshot confirmed a
-16000 Hz AAC bandwidth at 255200 bits/s CBR. These are distinct downstream limits;
+decoded AAC fidelity, acoustic response, or long-run continuity. In 0.1.53, float
+was rounded to S16 before encoding; a separate runtime snapshot confirmed a
+16000 Hz AAC bandwidth at 255200 bits/s CBR. These were distinct downstream limits;
 see [AAC-ELD bandwidth and precision](../aac-eld-apple.md#encoder-bandwidth-and-precision).
 
 ## Trace protocol

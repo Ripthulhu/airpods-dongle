@@ -26,6 +26,11 @@ bool phone_sink_owns_controls(void);
 bool phone_sink_usb_exclusion_requested(void);
 // Read-only version-2 snapshot: 4-byte header followed by fifteen LE uint32 fields.
 uint16_t phone_sink_diagnostics(uint8_t *out, uint16_t capacity);
+// Explicit timing request only; cumulative uint32 counters wrap for interval deltas.
+void phone_sink_report(void);
+// Core0 under the Bluetooth lock; safe inside PCM exclusion, takes no locks.
+void phone_sink_record_loss(bool overflow, uint32_t frames, uint32_t fill, uint32_t debt);
+void phone_sink_loss_report(void);
 
 // Shared AVRCP dispatchers call these first and skip their AirPods path if handled.
 bool phone_sink_handle_avrcp(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size);

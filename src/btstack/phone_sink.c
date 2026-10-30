@@ -45,9 +45,11 @@ static struct {
     bd_addr_t peer;
     uint16_t cid;
     uint8_t attempts;
-    bool pending, clock_started, waiting;
-    uint32_t since_ms, attempt_ms;
+    bool pending, clock_started, waiting, output_lost;
+    uint32_t since_ms, attempt_ms, session;
 } call_resume;
+static void call_resume_cancel_attempt(void);
+static void cancel_output_resume(void);
 
 static struct {
     bd_addr_t address;
@@ -69,6 +71,7 @@ static struct {
     uint8_t decode_failures;
     uint32_t ssrc, pending_since_ms;
     uint32_t packets, malformed, sequence_gaps;
+    uint32_t payload_bytes, media_bytes;
     uint32_t submit_failures, total_decode_failures, buffer_resets, decoded_frames, last_packet_ms;
     uint32_t last_media_ms, last_pcm_ms, max_media_gap_ms, max_pcm_gap_ms;
     uint32_t next_timestamp, timestamp_discontinuities;
@@ -170,6 +173,39 @@ static void diagnostic_gap(uint32_t now, uint32_t *last, uint32_t *maximum, bool
 
 static void diagnostic_disarm(void) {
     phone.media_gap_armed = phone.pcm_gap_armed = phone.timestamp_valid = false;
+}
+
+// Retain each loss kind separately: frequent timer events overwrite the short trace.
+static struct {
+    uint32_t serial, ms, frames, fill, debt, media_age, pcm_age, queued, ready, session;
+} phone_losses[2];
+_Static_assert(sizeof(phone_losses) == 80, "Bound retained loss diagnostics storage");
+
+void phone_sink_record_loss(bool overflow, uint32_t frames, uint32_t fill, uint32_t debt) {
+    if (!phone.started || !frames) return;
+    unsigned index = overflow ? 1u : 0u;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    phone_worker_queue_snapshot_t queue = phone_worker_queue_snapshot();
+    ++phone_losses[index].serial;
+    phone_losses[index].ms = now;
+    phone_losses[index].frames = frames;
+    phone_losses[index].fill = fill;
+    phone_losses[index].debt = debt;
+    phone_losses[index].media_age = phone.media_gap_armed ? now - phone.last_media_ms : UINT32_MAX;
+    phone_losses[index].pcm_age = phone.pcm_gap_armed ? now - phone.last_pcm_ms : UINT32_MAX;
+    phone_losses[index].queued = queue.queued_packets;
+    phone_losses[index].ready = queue.output_ready;
+    phone_losses[index].session = bluetooth_route.session;
+}
+
+void phone_sink_loss_report(void) {
+    for (unsigned i = 0; i < 2; ++i)
+        printf("[PHONE_LOSS] overflow=%u serial=%lu ms=%lu frames=%lu fill=%lu debt=%lu media_age_ms=%lu pcm_age_ms=%lu queued=%lu ready=%lu session=%lu\n",
+            i, (unsigned long)phone_losses[i].serial, (unsigned long)phone_losses[i].ms,
+            (unsigned long)phone_losses[i].frames, (unsigned long)phone_losses[i].fill,
+            (unsigned long)phone_losses[i].debt, (unsigned long)phone_losses[i].media_age,
+            (unsigned long)phone_losses[i].pcm_age, (unsigned long)phone_losses[i].queued,
+            (unsigned long)phone_losses[i].ready, (unsigned long)phone_losses[i].session);
 }
 
 static void reset_phone_buffer(void) {
@@ -323,6 +359,13 @@ static void phone_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet
         phone.select_codec = false;
         phone.requested_codec = PHONE_CODEC_NONE;
         select_bluetooth_route();
+        if (call_resume.pending && call_resume.output_lost &&
+            bt_hci_phone_session(address) == call_resume.session) {
+            if (call_resume.cid != cid) call_resume_cancel_attempt();
+            call_resume.cid = cid;
+            call_resume.waiting = false;
+            call_resume.attempt_ms = btstack_run_loop_get_time_ms();
+        }
         return;
     }
     if (size < 5 || little_endian_read_16(packet, 3) != phone.cid || phone.cid == 0) return;
@@ -552,6 +595,8 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
             return;
         }
         phone.packets++;
+        phone.payload_bytes += size;
+        phone.media_bytes += size;
         return;
     }
     if (packet == NULL || size < 12 || packet[0] >> 6 != 2) {
@@ -626,6 +671,8 @@ static void phone_media_handler(uint8_t seid, uint8_t *packet, uint16_t size) {
         return;
     }
     phone.packets++;
+    phone.payload_bytes += length;
+    phone.media_bytes += size;
 }
 
 bool phone_sink_init(void) {
@@ -678,6 +725,7 @@ static uint8_t send_control(uint8_t operation) {
 }
 
 void phone_sink_pause_for_takeover(void) {
+    cancel_output_resume();
     if (phone.takeover_pause_pending || !phone.controls_owned || !phone.avrcp_cid ||
         phone.disconnecting || !phone_media_session_current()) return;
     phone.takeover_pause_pending = true;
@@ -729,6 +777,7 @@ static bool takeover_pause_poll(void) {
 }
 
 void phone_sink_poll(void) {
+    if (call_resume.output_lost) phone_sink_resume_after_call();
     if (takeover_pause_poll()) return;
     // A closed USB microphone may still be draining; keep the new route, but
     // do not allocate its decoder until main has released the microphone's.
@@ -777,6 +826,14 @@ void phone_sink_poll(void) {
     }
     if ((phone.started || phone.start_accepted) && !bridge_phone_ready() && !bridge_phone_recovering()) {
         printf("[PHONE] output lost or USB took ownership\n");
+        if (!call_resume.pending && phone_media_session_current() && !phone_call_active() &&
+            !get_usb_streaming() && !usb_mic_requested() && !aacp_mic_active() &&
+            (aacp_audio_owned() || !get_a2dp_connected_flag())) {
+            memset(&call_resume, 0, sizeof(call_resume));
+            memcpy(call_resume.peer, phone.address, 6);
+            call_resume.session = bluetooth_route.session;
+            call_resume.pending = call_resume.output_lost = true;
+        }
         disconnect_phone();
     }
     if (phone.start_accepted &&
@@ -828,22 +885,38 @@ void phone_sink_poll(void) {
 }
 
 void phone_sink_yield(void) {
+    cancel_output_resume();
     retry_codec = false;
     if (!phone.disconnecting) disconnect_phone();
     phone_worker_close();
 }
 
 static void call_resume_cancel_attempt(void) {
-    if (call_resume.cid != 0) a2dp_sink_disconnect(call_resume.cid);
+    // A replacement authenticated session may already have reused this CID.
+    bool replaced = phone.cid == call_resume.cid && phone_media_session_current() &&
+        bt_hci_phone_session(phone.address) != call_resume.session;
+    if (call_resume.cid != 0 && !replaced) {
+        if (phone.cid == call_resume.cid) {
+            if (!phone.disconnecting) disconnect_phone();
+        } else a2dp_sink_disconnect(call_resume.cid);
+    }
     call_resume.cid = 0;
     call_resume.waiting = false;
 }
 
+static void cancel_output_resume(void) {
+    if (!call_resume.output_lost) return;
+    call_resume_cancel_attempt();
+    memset(&call_resume, 0, sizeof(call_resume));
+}
+
 void phone_sink_pause_for_call(void) {
+    cancel_output_resume();
     if (phone.cid != 0 && !phone.disconnecting && bt_hci_phone_peer_connected(phone.address)) {
         if (call_resume.cid != phone.cid) call_resume_cancel_attempt();
         memset(&call_resume, 0, sizeof(call_resume));
         memcpy(call_resume.peer, phone.address, 6);
+        call_resume.session = bt_hci_phone_session(phone.address);
         call_resume.pending = true;
     } else call_resume_cancel_attempt();
     call_resume.clock_started = false;
@@ -852,6 +925,19 @@ void phone_sink_pause_for_call(void) {
 
 void phone_sink_resume_after_call(void) {
     if (!call_resume.pending) return;
+    if (call_resume.output_lost) {
+        if (bt_hci_phone_session(call_resume.peer) != call_resume.session || phone_call_active() ||
+            get_usb_streaming() || usb_mic_requested() || aacp_mic_active()) {
+            cancel_output_resume();
+            return;
+        }
+        // Reuse the bounded profile retry after output returns; never issue Play.
+        if (!get_a2dp_connected_flag() || !aacp_audio_owned()) {
+            call_resume_cancel_attempt();
+            call_resume.clock_started = false;
+            return;
+        }
+    }
     if (phone_call_active() || get_usb_streaming() || usb_mic_requested() || aacp_mic_active()) {
         call_resume_cancel_attempt();
         call_resume.clock_started = false;
@@ -865,6 +951,17 @@ void phone_sink_resume_after_call(void) {
         return;
     }
     if (phone.cid != 0 && !phone.disconnecting) {
+        if (call_resume.output_lost && (!phone.configured || !phone.opened)) {
+            uint32_t now = btstack_run_loop_get_time_ms();
+            if (!call_resume.clock_started) {
+                call_resume.clock_started = true;
+                call_resume.since_ms = now;
+            }
+            if ((uint32_t)(now - call_resume.since_ms) >= 10000u) cancel_output_resume();
+            else if ((uint32_t)(now - call_resume.attempt_ms) >= PHONE_OPEN_TIMEOUT_MS)
+                call_resume_cancel_attempt();
+            return;
+        }
         if (call_resume.cid != 0 && call_resume.cid != phone.cid) call_resume_cancel_attempt();
         memset(&call_resume, 0, sizeof(call_resume));
         return;
@@ -899,6 +996,13 @@ bool phone_sink_connected(void) { return phone.cid != 0; }
 bool phone_sink_active(void) { return phone.started || phone.start_accepted; }
 bool phone_sink_start_pending(void) { return phone.start_pending; }
 bool phone_sink_owns_controls(void) { return phone.controls_owned; }
+
+void phone_sink_report(void) {
+    printf("[PHONE_RATE] ms=%lu codec=%u packets=%lu payload_bytes=%lu media_bytes=%lu decoded_frames=%lu\n",
+        (unsigned long)btstack_run_loop_get_time_ms(), (unsigned)phone.codec,
+        (unsigned long)phone.packets, (unsigned long)phone.payload_bytes,
+        (unsigned long)phone.media_bytes, (unsigned long)phone.decoded_frames);
+}
 
 bool phone_sink_usb_exclusion_requested(void) {
     if (bluetooth_route.session == 0) return false;

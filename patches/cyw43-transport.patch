@@ -1,0 +1,228 @@
+diff --git a/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c b/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c
+--- a/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c
++++ b/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c
+@@ -204,7 +204,6 @@
+     length = ROUNDUP(length, 4);
+     cybt_get_bt_buf_index(&fw_membuf_info);
+     uint32_t buf_space = CIRC_BUF_SPACE(fw_membuf_info.host2bt_in_val, fw_membuf_info.host2bt_out_val);
+-    assert(length <= buf_space); // queue full?
+     if (length > buf_space) {
+         return CYBT_ERR_QUEUE_FULL;
+     }
+@@ -347,10 +346,10 @@
+     cybt_debug("cyw43_btbus_write: %d\n", cmd_len);
+     DUMP_BYTES(buf, size); // dump header and data
+ 
+-    cybt_hci_write_buf(buf, size);
++    cybt_result_t result = cybt_hci_write_buf(buf, size);
+     cybt_bus_release();
+ 
+-    return 0;
++    return result;
+ }
+ 
+ static bool cybt_hci_read_packet(uint8_t *buf, uint32_t max_buf_size, uint32_t *size) {
+diff --git a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c b/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c
+--- a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c
++++ b/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c
+@@ -5,12 +5,14 @@
+  */
+ 
+ #include "pico.h"
++#include <string.h>
+ #include "cyw43.h"
+ #include "btstack_config.h"
+ #include "hci.h"
+ #include "hci_transport.h"
+ #include "pico/btstack_hci_transport_cyw43.h"
+ #include "pico/btstack_chipset_cyw43.h"
++#include "cybt_shared_bus/cybt_shared_bus_driver.h"
+ 
+ // cyw43_bluetooth_hci_write and cyw43_bluetooth_hci_read require a custom 4-byte packet header in front of the actual HCI packet
+ // the HCI packet type is stored in the fourth byte of the packet header
+@@ -54,6 +56,35 @@
+ 
+ static btstack_data_source_t transport_data_source;
+ static bool hci_transport_ready;
++static uint8_t *pending_packet;
++static uint32_t pending_size, pending_since;
++static btstack_timer_source_t retry_timer;
++static bool retry_armed;
++static hci_transport_cyw43_stats_t transport_stats;
++
++static void counter_inc(uint32_t *value) {
++    if (*value != UINT32_MAX) ++*value;
++}
++
++static void hci_transport_retry(btstack_timer_source_t *timer) {
++    (void) timer;
++    retry_armed = false;
++    if (hci_transport_ready && pending_packet) btstack_run_loop_poll_data_sources_from_irq();
++}
++
++static void hci_transport_cancel_retry(void) {
++    if (retry_armed) btstack_run_loop_remove_timer(&retry_timer);
++    retry_armed = false;
++}
++
++void hci_transport_cyw43_get_stats(hci_transport_cyw43_stats_t *stats) {
++    CYW43_THREAD_ENTER
++    *stats = transport_stats;
++    stats->pending = pending_packet != NULL;
++    stats->pending_ms = pending_packet ? btstack_run_loop_get_time_ms() - pending_since : 0;
++    if (stats->pending_ms > stats->max_pending_ms) stats->max_pending_ms = stats->pending_ms;
++    CYW43_THREAD_EXIT
++}
+ 
+ // Forward declaration
+ static void hci_transport_cyw43_process(void);
+@@ -89,6 +120,10 @@
+     btstack_run_loop_set_data_source_handler(&transport_data_source, &hci_transport_data_source_process);
+     btstack_run_loop_enable_data_source_callbacks(&transport_data_source, DATA_SOURCE_CALLBACK_POLL);
+     btstack_run_loop_add_data_source(&transport_data_source);
++    pending_packet = NULL;
++    retry_armed = false;
++    memset(&transport_stats, 0, sizeof(transport_stats));
++    btstack_run_loop_set_timer_handler(&retry_timer, hci_transport_retry);
+     hci_transport_ready = true;
+ 
+     return 0;
+@@ -98,6 +133,9 @@
+     btstack_run_loop_disable_data_source_callbacks(&transport_data_source, DATA_SOURCE_CALLBACK_POLL);
+     btstack_run_loop_remove_data_source(&transport_data_source);
+     hci_transport_ready = false;
++    hci_transport_cancel_retry();
++    if (pending_packet) counter_inc(&transport_stats.cancelled);
++    pending_packet = NULL;
+ 
+     return 0;
+ }
+@@ -106,24 +144,49 @@
+     hci_transport_cyw43_packet_handler = handler;
+ }
+ 
++static int hci_transport_cyw43_can_send_packet_now(uint8_t packet_type) {
++    (void) packet_type;
++    return hci_transport_ready && pending_packet == NULL;
++}
++
+ static int hci_transport_cyw43_send_packet(uint8_t packet_type, uint8_t *packet, int size) {
+-    // store packet type before actual data and increase size
+-    // This relies on HCI_OUTGOING_PRE_BUFFER_SIZE being set
+-    uint8_t *buffer = &packet[-CYW43_PACKET_HEADER_SIZE];
+-    uint32_t buffer_size = size + CYW43_PACKET_HEADER_SIZE;
+-    buffer[3] = packet_type;
+-
+-    CYW43_THREAD_ENTER
+-    int err = cyw43_bluetooth_hci_write(buffer, buffer_size);
+-
++    CYW43_THREAD_LOCK_CHECK
++    if (!hci_transport_ready || pending_packet || size < 0 || size > (int)BTSDIO_FWBUF_SIZE - 8)
++        panic("Invalid cyw43 transport submission");
++    // BTstack retains its reserved outgoing buffer until TRANSPORT_PACKET_SENT.
++    pending_packet = &packet[-CYW43_PACKET_HEADER_SIZE];
++    pending_size = (uint32_t)size + CYW43_PACKET_HEADER_SIZE;
++    pending_packet[3] = packet_type;
++    pending_since = btstack_run_loop_get_time_ms();
++    counter_inc(&transport_stats.accepted);
++    btstack_run_loop_poll_data_sources_from_irq();
++    return 0;
++}
++
++static void hci_transport_cyw43_try_send(void) {
++    if (!hci_transport_ready || pending_packet == NULL) return;
++    int err = cyw43_bluetooth_hci_write(pending_packet, pending_size);
++    if (err == CYBT_ERR_QUEUE_FULL) {
++        counter_inc(&transport_stats.blocked);
++        if (!retry_armed) {
++            btstack_run_loop_set_timer(&retry_timer, 1);
++            btstack_run_loop_add_timer(&retry_timer);
++            retry_armed = true;
++        }
++        return;
++    }
+     if (err != 0) {
+-        CYW43_PRINTF("Failed to send cyw43 hci packet: %d\n", err);
+-        assert(false);
+-    } else {
+-        BT_DEBUG("bt sent %lu\n", buffer_size);
+-    }
+-    CYW43_THREAD_EXIT
+-    return err;
++        counter_inc(&transport_stats.fatal_errors);
++        panic("Failed to send cyw43 hci packet: %d", err);
++    }
++    uint32_t elapsed = btstack_run_loop_get_time_ms() - pending_since;
++    if (elapsed > transport_stats.max_pending_ms) transport_stats.max_pending_ms = elapsed;
++    counter_inc(&transport_stats.committed);
++    pending_packet = NULL;
++    hci_transport_cancel_retry();
++    // The callback may immediately submit another packet or close the transport.
++    uint8_t event[] = { HCI_EVENT_TRANSPORT_PACKET_SENT, 0 };
++    hci_transport_cyw43_packet_handler(HCI_EVENT_PACKET, event, sizeof(event));
+ }
+ 
+ // configure and return hci transport singleton
+@@ -133,7 +196,7 @@
+         /* int    (*open)(void); */                                     &hci_transport_cyw43_open,
+         /* int    (*close)(void); */                                    &hci_transport_cyw43_close,
+         /* void   (*register_packet_handler)(void (*handler)(...); */   &hci_transport_cyw43_register_packet_handler,
+-        /* int    (*can_send_packet_now)(uint8_t packet_type); */       NULL,
++        /* int    (*can_send_packet_now)(uint8_t packet_type); */       &hci_transport_cyw43_can_send_packet_now,
+         /* int    (*send_packet)(...); */                               &hci_transport_cyw43_send_packet,
+         /* int    (*set_baudrate)(uint32_t baudrate); */                NULL,
+         /* void   (*reset_link)(void); */                               NULL,
+@@ -147,6 +210,7 @@
+ // Called to perform bt work from a data source
+ static void hci_transport_cyw43_process(void) {
+     CYW43_THREAD_LOCK_CHECK
++    if (!hci_transport_ready) return;
+     uint32_t len = 0;
+     bool has_work;
+ #ifdef PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT
+@@ -157,6 +221,7 @@
+         BT_DEBUG("bt in len=%lu err=%d\n", len, err);
+         if (err == 0 && len > 0) {
+             hci_transport_cyw43_packet_handler(cyw43_receive_buffer[3], &cyw43_receive_buffer[CYW43_PACKET_HEADER_SIZE], len - CYW43_PACKET_HEADER_SIZE);
++            if (!hci_transport_ready) return;
+             has_work = true;
+         } else {
+             has_work = false;
+@@ -168,6 +233,7 @@
+         }
+ #endif
+     } while (has_work);
++    hci_transport_cyw43_try_send();
+ }
+ 
+ // This is called from cyw43_poll_func.
+diff --git a/src/rp2_common/pico_cyw43_driver/include/pico/btstack_hci_transport_cyw43.h b/src/rp2_common/pico_cyw43_driver/include/pico/btstack_hci_transport_cyw43.h
+--- a/src/rp2_common/pico_cyw43_driver/include/pico/btstack_hci_transport_cyw43.h
++++ b/src/rp2_common/pico_cyw43_driver/include/pico/btstack_hci_transport_cyw43.h
+@@ -6,6 +6,10 @@
+ 
+ #ifndef _PICO_BTSTACK_HCI_TRANSPORT_CYW43_H
+ #define _PICO_BTSTACK_HCI_TRANSPORT_CYW43_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "hci_transport.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -24,6 +28,15 @@
+  */
+ const hci_transport_t *hci_transport_cyw43_instance(void);
+ 
++// Snapshot under the CYW43 lock; counters saturate and reset when opened.
++typedef struct {
++    uint32_t accepted, committed, blocked, cancelled, fatal_errors;
++    uint32_t max_pending_ms, pending_ms;
++    bool pending;
++} hci_transport_cyw43_stats_t;
++void hci_transport_cyw43_get_stats(hci_transport_cyw43_stats_t *stats);
++
++
+ #ifdef __cplusplus
+ }
+ #endif
