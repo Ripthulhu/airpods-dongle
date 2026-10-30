@@ -12,6 +12,13 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
+Saved good builds, including the startup LED correction, are available for the
+[PC (0.1.54-r7) and phone (0.1.57-r6)](docs/LED-STARTUP-FIX-20261030.md), with
+matching source, firmware, checksums and validation receipts. Both are installed
+with pairing/settings preserved. The
+[controller-firmware investigation is paused](docs/CYW43439-RESEARCH-CHECKPOINT-20261030.md);
+its unsuccessful experimental firmware is not installed.
+
 Candidate **0.1.57** repairs reproduced silent packet loss when the CYW43
 host-to-controller transfer ring fills. It retains the blocked packet and retries
 through BTstack's asynchronous transport contract. This is an offline candidate;
