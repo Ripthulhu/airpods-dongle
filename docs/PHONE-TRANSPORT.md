@@ -185,7 +185,20 @@ two-dongle listening test.
 
 With a saved AirPods pair, a single BOOTSEL press requests takeover. A double
 press still toggles Game Mode, and the existing long holds still open pairing.
+In 0.1.58, startup and periodic retries remain passive until a button or app Connect
+request. That peer-bound outgoing permission lasts ten seconds; it is consumed
+when takeover completes and is not renewed by proximity, playback, recording or a
+disconnect. Saved-headset incoming connections remain accepted, so an AirPods-initiated
+case return does not require an outgoing reconnect loop. First pairing discovery
+also requires the button/app action. An owned codec-profile reconfiguration can
+finish its existing bounded reconnect; changing an offline preference does not connect.
+Standby routing sends no automatic NearbyAudioScore/TIPI introductions. The explicit
+OWN/media/Hijackv2 button exchange is unchanged.
 The button claims the audio route; it does not send Play to a paused player.
+In 0.1.59, app Connect creates the same permission as the physical button.
+The [routing extension](CONTROL-EXTENSIONS.md#explicit-routing-handover) adds
+confirmed non-destructive release and intent-fenced acquisition for a host
+coordinator. It does not turn background playback into takeover permission.
 Already-playing input can resume once ownership and the stream are confirmed.
 The routing exchange uses Control Command `0x09`, property `0x06` (ownership),
 Audio Source `0x0E`, Connected Devices `0x2E`, and targeted routing messages

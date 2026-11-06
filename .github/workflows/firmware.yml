@@ -27,11 +27,18 @@ jobs:
           sudo apt-get install --no-install-recommends -y build-essential cmake ninja-build python3
       - name: Run regression tests with ASan and UBSan
         run: python3 tools/test.py --sanitize
+      - name: Test experimental .0076 startup and native adapter
+        run: |
+          python3 tools/test_radio0076.py
+          printf 'y\ny\n' | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --channel=1 --install "ndk;30.0.14904198"
+          python3 -m venv "$RUNNER_TEMP/radio0076-tests"
+          "$RUNNER_TEMP/radio0076-tests/bin/pip" install -r tests/radio0076/native/requirements.txt
+          "$RUNNER_TEMP/radio0076-tests/bin/python" tools/test_radio0076_native.py --toolchain "$ANDROID_HOME/ndk/30.0.14904198/toolchains/llvm/prebuilt/linux-x86_64/bin"
       - name: Verify live bitrate changes with the real AAC encoder and decoder
         run: python3 tools/test_adaptive_codec.py --sanitize
 
   firmware:
-    name: Pico 2 W firmware
+    name: Unified Pico 2 W firmware (.0076)
     needs: tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -58,7 +65,8 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DAIRPODS_USB_FLOAT=ON
+            -DAIRPODS_USB_FLOAT=ON \
+            -DAIRPODS_EXPERIMENTAL_RADIO0076=ON
       - name: Build and validate firmware
         run: cmake --build build --parallel 2
       - name: Package checked outputs

@@ -1,0 +1,9 @@
+# Frozen provenance hashes include exact source bytes, including line endings.
+* whitespace=trailing-space,space-before-tab,cr-at-eol
+cyw43_btfw_43439.h -text
+expected.h -text
+shared_bridge_blob.h -text
+shared_bridge_guards.h -text
+calibration_words.h -text
+readback.c -text
+readback.h -text

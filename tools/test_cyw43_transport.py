@@ -32,6 +32,9 @@ def main():
     parser.add_argument('--cc', default=os.environ.get('CC', 'cc'))
     parser.add_argument('--sanitize', action='store_true')
     args = parser.parse_args()
+    main_source = (ROOT / 'src/main.c').read_text().split('int main()', 1)[1]
+    if not main_source.index('watchdog_enable(8000, true);') < main_source.index('btstack_main(0, NULL)'):
+        raise ValueError('The queue-stall recovery watchdog must be armed before HCI startup')
     sdk = args.sdk.resolve()
     subprocess.run(['python3', str(ROOT / 'tools/prepare_sdk.py'), '--sdk', str(sdk), '--check'], check=True)
     driver = sdk / 'src/rp2_common/pico_cyw43_driver'

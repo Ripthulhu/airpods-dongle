@@ -3,8 +3,8 @@
 The [version-1 USB reports](USB-CONTROL.md) provide phone
 controls, device settings, output profiles, Game Mode, performance readings and
 nearby finding. The implementation and host tests are complete; Pico/AirPods
-hardware verification is pending. Audio ownership is unchanged. No PC/phone
-handoff commands are added.
+hardware verification is pending. Explicit routing operations preserve the
+passive connection policy; polling never requests ownership.
 
 All integer fields are little-endian. Layout lengths below are exact.
 
@@ -56,6 +56,53 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 17: USB host volume authority | action u8, token u32, level u8 | 24-byte status; USB client only; capability 128 |
 | 18: diagnostic Game Mode flush comparison | enabled u8 (0/1) | empty; USB client only; see below |
 | 19: radio and adaptive bitrate | none | read-only, cached 128-byte version-1 snapshot; USB or phone |
+| 20: routing status | none | 32-byte version-1 snapshot; capability 512 |
+| 21: authorized handover | action u8 (0 release, 1 acquire), expected intent revision u32, nonzero request nonce u32 | routing snapshot; capability 512 |
+
+## Explicit routing handover
+
+Firmware 0.1.59 adds capability 512. The basic Connect command now requests the
+same bounded takeover as a physical button press. Source release uses feature 21,
+never the destructive Pair command. Both routing operations retain the selected
+pair and its saved keys. Release refuses microphone/call use, codec transitions,
+media recovery and pending Game Mode writes/restoration. A confirmed active Game
+Mode first restores normal buffering and the local clock on that same owned
+connection before release; its requested preference is retained. A release disables incoming
+media until a later explicit acquisition or button request. This hold is volatile;
+a firmware restart requires a new host session and fresh policy checks.
+
+Feature 21 requires the current intent revision from feature 20. Acceptance
+advances that revision and records the request nonce and action. Repeating the
+old revision or reusing the current receipt's nonce is stale; hosts must not
+retry the operation. Physical button, basic Connect and Pair choices advance the
+revision and clear the automatic receipt, including coalesced takeover presses.
+Source playback and routing policy remain host responsibilities: audio packets,
+proximity and notification sounds do not authorize acquisition.
+
+| Snapshot offset | Field |
+| --- | --- |
+| 0–1 | Version 1, length 32 |
+| 2 | Flags: ownership known 1, owned 2, takeover pending 4, released 8, release pending 16, A2DP connected 32, AACP ready 64, microphone/call busy 128 |
+| 3 | Takeover stage |
+| 4–7 | Nonzero intent revision |
+| 8–11 | AACP control session |
+| 12–17 | Selected AirPods Classic address |
+| 18 | Last automatic action: none/manual 0, release 1, acquire 2 |
+| 19 | Reserved zero |
+| 20–23 | Local monotonic uptime in milliseconds |
+| 24–27 | Pending takeover age in milliseconds, otherwise zero |
+| 28–31 | Last accepted automatic request nonce, otherwise zero |
+
+An accepted release is not its completion. Released requires actual signaling
+closure, no pending media connection and no local audio authority. While closure
+is pending, automatic acquisition returns busy; a newer manual choice can still
+supersede it. Acquisition requires positive remote ownership evidence through
+the existing routing exchange before the host reports success. AACP session and
+report-2 generation may change during release. Hosts recover its receipt using
+fresh feature 20 reads tied to the same USB session, selected pair, new intent
+revision and exact echoed nonce/action. A missing receipt never authorizes a
+retry or source reconnection. Settings workflow leases block routing writes,
+including writes from their owner; read-only routing status remains available.
 
 The explicit [host volume authority contract](HOST-VOLUME.md) coordinates a host
 that actually delegates its mixer volume to the AirPods. It suppresses standalone
@@ -72,6 +119,12 @@ the selected AirPods ACL's normal Game Mode timeout already confirmed at 60 ms;
 otherwise it returns busy. A phone client returns unsupported. Success means
 the local policy was accepted, not that the controller acknowledged the change.
 Use the existing HCI `FLUSH` desired/confirmed values to verify each phase.
+
+From 0.1.62 ordinary Game Mode retains the normal 200 ms controller timeout,
+matching Android's baseline-preserving policy. Feature 18 keeps its original
+meaning and 60 ms admission check, so it normally returns busy because the
+baseline already matches. It is not reinterpreted as a request for 60 ms.
+Cancellation, expiry and late acknowledgements restore 200 ms.
 
 The override expires after 120 seconds, including across timer wrap. Repeated
 enable requests and playback polling do not renew it. Disable, selected-peer or

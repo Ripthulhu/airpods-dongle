@@ -1,0 +1,9 @@
+{
+  "cyw43_btfw_43439.h": "acc5f69a8e1a9b796d2ce9b05d18c37ed2dffe6d51eaa3a172f93f7c8643a2b4",
+  "expected.h": "0e1180d8bb2a2508667565d3a6677b3e7cac32b099166cc552903e7dbc4107df",
+  "shared_bridge_blob.h": "d6ca5e1326e0dbca1811fe7b2cd17d39251fc8503ddd8259841f7f5949c1514d",
+  "shared_bridge_guards.h": "8bdb8c8e286a059207fa42fff5bb68e795c5b3eeaad9d6e23653c0b89f6218c9",
+  "calibration_words.h": "cb7f28c86b11299dae6c36392447277c6cfb4bcd78e477c36c4d0d64bd394b0d",
+  "readback.c": "a63ac16ee6f8c37c15fde6cb4dc84826391d80d707a348be0d739293549fd597",
+  "readback.h": "b082ff795a64236065a615e7dc50461b6adf0dbfd1ec3015d33551f1ece03aa7"
+}

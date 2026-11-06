@@ -31,7 +31,7 @@ void bt_hci_phone_poll(void);
 // Selected AirPods Game Mode link policy; retiring live links restore their confirmed packet baseline.
 // Media alone is flushable; signaling/AACP and the phone ACL keep their existing policy.
 void bt_hci_airpods_flush_timeout(bool low_latency);
-// Temporarily compare 200-ms controller flush with unchanged Game Mode; expires after 120 seconds.
+// Legacy bounded 200-ms baseline comparison; normal Game Mode now retains that baseline.
 bool bt_hci_airpods_flush_comparison(bool enabled);
 
 typedef struct {

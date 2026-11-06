@@ -107,6 +107,14 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
         case 19:
             if(size!=1)return 1;
             *length=radio_snapshot(out,capacity);return *length?0:7;
+        case 20:
+            if(size!=1)return 1;
+            *length=dongle_routing_snapshot(out,capacity);return *length?0:7;
+        case 21:
+            if(size!=10 || capacity<32)return 1;
+            result=dongle_routing_request(p[1],dongle_u32(p+2),dongle_u32(p+6));
+            if(result!=DONGLE_ACCEPTED)return error(result);
+            *length=dongle_routing_snapshot(out,capacity);return *length?0:7;
         default:return 7;
     }
 }

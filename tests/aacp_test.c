@@ -5,6 +5,7 @@
 static uint32_t now;
 static uint16_t next_cid, last_disconnected;
 static unsigned connects, disconnects, sends, starts, stops, decoded, resets;
+static unsigned modern_init_sends,legacy_init_sends,capability_sends;
 static unsigned setting_sends;
 static unsigned buffer_send_callbacks;
 static uint8_t create_result, send_result;
@@ -36,6 +37,8 @@ static const uint8_t local_host[6] = {10,11,12,13,14,15};
 static unsigned ownership_changes, route_claims, route_media, route_hijacks;
 void gap_local_bd_addr(bd_addr_t address) {memcpy(address,local_host,6);}
 void dongle_playback_ownership_changed(bool owned) {(void)owned;++ownership_changes;}
+static unsigned connect_requests;
+void dongle_playback_connect_requested(void) {++connect_requests;}
 
 void btstack_run_loop_remove_timer(btstack_timer_source_t *timer) { timer->active = false; }
 void btstack_run_loop_set_timer_handler(btstack_timer_source_t *timer,
@@ -65,6 +68,9 @@ uint8_t l2cap_send(uint16_t cid, uint8_t *data, uint16_t len) {
     assert(cid == aacp_cid && len != 0);
     if (send_result != 0) return send_result;
     sends++;
+    if (data==aacp_handshake) ++modern_init_sends;
+    if (data==aacp_handshake_legacy) ++legacy_init_sends;
+    if (data==aacp_request_capabilities) ++capability_sends;
     if (data == aacp_mic_start_bytes) starts++;
     if (data == aacp_mic_stop_bytes) stops++;
     if (data == setting_tx) setting_sends++;
@@ -152,6 +158,7 @@ static void fixture(void) {
     next_cid = 0x40;
     last_disconnected = 0;
     connects = disconnects = sends = starts = stops = decoded = resets = 0;
+    modern_init_sends=legacy_init_sends=capability_sends=0;
     setting_sends = 0;
     ownership_changes=route_claims=route_media=route_hijacks=0;
     atomic_store(&audio_authority,true); // Existing capture fixtures assume a resolved sole host.
@@ -192,6 +199,130 @@ static void capture(void) {
     request_capture();
     drain();
     assert(aacp_mic_active());
+}
+
+static void service_response(uint16_t cid,uint8_t version) {
+    uint8_t response[18]={1,0,4,0,0,0,1,0,version,0};
+    aacp_packet_handler(L2CAP_DATA_PACKET,cid,response,sizeof(response));
+}
+static void test_startup_wire_and_service_acceptance(void) {
+    static const uint8_t modern[]={0,0,4,0,1,0,3,0,0,0,0,0,0,0,0,0};
+    static const uint8_t legacy[]={0,0,4,0,1,0,2,0,0,0,0,0,0,0,0,0};
+    static const uint8_t flags[]={4,0,4,0,0x4d,0,0xff,0,0,0,0,0,0,0};
+    static const uint8_t capabilities[]={4,0,4,0,1,0,8};
+    assert(sizeof(aacp_handshake)==sizeof(modern) && !memcmp(aacp_handshake,modern,sizeof(modern)));
+    assert(sizeof(aacp_handshake_legacy)==sizeof(legacy) && !memcmp(aacp_handshake_legacy,legacy,sizeof(legacy)));
+    assert(sizeof(aacp_set_feature_flags)==sizeof(flags) && !memcmp(aacp_set_feature_flags,flags,sizeof(flags)));
+    assert(sizeof(aacp_request_capabilities)==sizeof(capabilities) && !memcmp(aacp_request_capabilities,capabilities,sizeof(capabilities)));
+    fixture();connect_open();
+    const uint8_t *order[]={aacp_handshake,aacp_set_feature_flags,aacp_request_notifications,
+                            aacp_request_capabilities,aacp_request_keys};
+    assert(aacp_tx_count==5 && aacp_tx_count<=AACP_TX_QUEUE_LEN-2);
+    for(unsigned i=0;i<5;++i)assert(aacp_tx_queue[(aacp_tx_head+i)%AACP_TX_QUEUE_LEN].data==order[i]);
+    service_response(aacp_cid,3);
+    assert(aacp_got_control && !aacp_control_ready()); // Peer acceptance cannot replace local setup.
+    for(unsigned i=0;i<4;++i) {
+        event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+        assert(!aacp_control_ready()); // Capability/key setup belongs to this publication too.
+    }
+    drain();assert(aacp_control_ready() && modern_init_sends==1 && capability_sends==1);
+    assert(!aacp_audio_owned() && !route_claims && !route_media && !route_hijacks && !starts);
+    now=AACP_INIT_RETRY_MS;aacp_poll();
+    assert(!aacp_init_retried && !aacp_tx_count && !legacy_init_sends);
+    uint8_t failure[18]={1,0,4,0,0x85,0,1,0,3,0};
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,failure,sizeof(failure));
+    assert(aacp_control_ready()); // A later duplicate rejection cannot revoke accepted service.
+
+    fixture();connect_open();drain();service_response(aacp_cid,2);
+    assert(aacp_control_ready() && !aacp_audio_owned());
+}
+static void test_startup_rejects_unparsed_readiness(void) {
+    fixture();connect_open();drain();
+    uint8_t response[19]={1,0,4,0,0,0,1,0,3,0};
+    for(unsigned n=0;n<18;++n)aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,response,(uint16_t)n);
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,response,sizeof(response));
+    for(unsigned byte=0;byte<10;++byte) {
+        uint8_t bad[18];memcpy(bad,response,sizeof(bad));bad[byte]^=0x80;
+        aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,bad,sizeof(bad));
+    }
+    assert(!aacp_got_control && !aacp_control_ready());
+    uint8_t unknown[]={4,0,4,0,0xfe,0,1};
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,unknown,sizeof(unknown));
+    uint8_t caps[]={4,0,4,0,2,0,2,6,1,2,3,4,0x11,1};
+    for(unsigned n=6;n<sizeof(caps);++n)
+        aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,caps,(uint16_t)n);
+    uint8_t unknown_cap[]={4,0,4,0,2,0,1,0xfe,1};
+    uint8_t duplicate[]={4,0,4,0,2,0,2,0x11,1,0x11,1};
+    uint8_t trailing[]={4,0,4,0,2,0,1,0x11,1,0};
+    uint8_t invalid_control[]={4,0,4,0,9,0,0x0d,99,0,0,0};
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,unknown_cap,sizeof(unknown_cap));
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,duplicate,sizeof(duplicate));
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,trailing,sizeof(trailing));
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,invalid_control,sizeof(invalid_control));
+    assert(!aacp_got_control && !starts && !aacp_audio_owned());
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,caps,sizeof(caps));
+    assert(aacp_control_ready() && !aacp_audio_owned());
+
+    fixture();connect_open();drain();
+    uint8_t battery[]={4,0,4,0,4,0,1,4,0,98,1,0};
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,battery,sizeof(battery));
+    assert(aacp_control_ready() && !aacp_audio_owned());
+
+    fixture();connect_open();drain();
+    uint8_t holds[]={4,0,4,0,9,0,0x16,2,5,0,0xff};
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,holds,sizeof(holds));
+    assert(!aacp_control_ready()); // Masking metadata must not admit invalid current actions.
+    holds[7]=1; // Actual received 04000400090016010500ff report.
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,holds,sizeof(holds));
+    assert(aacp_control_ready() && setting_report_is(&settings,0x16,0x0501));
+    assert(!setting_value_valid(0x16,0xff000501));
+    assert(aacp_setting_write(0x16,0xff000501)==DONGLE_MALFORMED && !aacp_tx_count);
+    now=AACP_INIT_RETRY_MS;aacp_poll();
+    assert(aacp_control_ready() && !aacp_init_retried && !aacp_tx_count);
+}
+static void test_startup_fallback_is_bounded_and_preserves_queue_room(void) {
+    fixture();connect_open();drain();
+    now=AACP_INIT_RETRY_MS-1;aacp_poll();assert(!aacp_init_retried && !aacp_tx_count);
+    ++now;aacp_poll();assert(aacp_init_retried && aacp_tx_count==4);
+    assert(aacp_tx_queue[aacp_tx_head].data==aacp_handshake_legacy);
+    drain();assert(legacy_init_sends==1 && capability_sends==2 && !aacp_got_control);
+    ++now;aacp_poll();assert(!aacp_tx_count && legacy_init_sends==1);
+    service_response(aacp_cid,2);assert(aacp_control_ready());
+    now=AACP_CHANNEL_TIMEOUT_MS;aacp_poll();assert(aacp_control_ready());
+
+    fixture();connect_open();drain();
+    for(unsigned i=0;i<3;++i)assert(aacp_tx_enqueue(control_anc,sizeof(control_anc)));
+    now=AACP_INIT_RETRY_MS;aacp_poll();assert(!aacp_init_retried && aacp_tx_count==3);
+    event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);aacp_poll();
+    assert(aacp_init_retried && aacp_tx_count==6); // Four retries plus two retained controls, two slots free.
+    assert(aacp_tx_enqueue(aacp_mic_stop_bytes,sizeof(aacp_mic_stop_bytes)) && !playback_aborts);
+    drain();assert(stops==1 && legacy_init_sends==1);
+
+    fixture();connect_open();drain();
+    assert(aacp_tx_enqueue(aacp_mic_stop_bytes,sizeof(aacp_mic_stop_bytes)));
+    now=AACP_INIT_RETRY_MS;aacp_poll();assert(aacp_tx_count==5);
+    event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+    assert(stops==1 && !legacy_init_sends); // Retried discovery never jumps a queued Stop.
+    drain();assert(legacy_init_sends==1 && !playback_aborts);
+
+    fixture();connect_open();drain();now=AACP_INIT_RETRY_MS;aacp_poll();
+    service_response(aacp_cid,3);drain();
+    assert(aacp_control_ready() && !legacy_init_sends); // Do not renegotiate after a late modern success.
+
+    fixture();connect_open();drain();now=AACP_INIT_RETRY_MS;aacp_poll();drain();
+    now=AACP_CHANNEL_TIMEOUT_MS;aacp_poll();
+    assert(!aacp_connected && !aacp_cid && aacp_connect_timer.active && legacy_init_sends==1);
+}
+static void test_startup_retired_channel_cannot_accept_or_retry(void) {
+    fixture();connect_open();drain();uint16_t previous=aacp_cid;
+    now=AACP_INIT_RETRY_MS;aacp_poll();assert(aacp_init_retried);
+    aacp_disconnect();service_response(previous,3);aacp_poll();
+    event(L2CAP_EVENT_CAN_SEND_NOW,previous);
+    assert(!aacp_got_control && !aacp_init_retried && !aacp_tx_count && !legacy_init_sends);
+    connect_open();uint16_t current=aacp_cid;
+    service_response(previous,3);assert(!aacp_got_control && aacp_tx_count==5);
+    drain();service_response(current,3);assert(aacp_control_ready());
+    event(L2CAP_EVENT_CHANNEL_CLOSED,previous);assert(aacp_control_ready());
 }
 static unsigned audio(uint8_t *p, uint16_t cid, unsigned size) {
     aacp_packet_handler(L2CAP_DATA_PACKET, cid, p, (uint16_t)size);
@@ -1099,8 +1230,9 @@ static void test_routing_authority_and_explicit_takeover(void) {
     uint8_t anc[]={4,0,4,0,9,0,0x0d,3,0,0,0};
     aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,anc,sizeof(anc));
     assert(aacp_control_ready() && !aacp_audio_owned());
+    unsigned passive_sends=sends;
     route_devices(true);route_steps();
-    assert(!aacp_audio_owned() && !route_claims); // Passive introductions do not claim audio.
+    assert(!aacp_audio_owned() && sends==passive_sends); // Standby never advertises a takeover score.
     assert(aacp_is_connected() && aacp_control_readback()->anc==3);
     route_owned(true);assert(aacp_audio_owned());
     route_owned(false);assert(!aacp_audio_owned() && routing.relinquished);
@@ -1186,7 +1318,56 @@ static void test_routing_authority_and_explicit_takeover(void) {
     assert(aacp_audio_owned());
 }
 
+static void test_connection_permission_is_peer_bound_and_expires(void) {
+    fixture();
+    aacp_routing_state_t state=aacp_routing_state();assert(state.revision && !state.nonce && !state.action);
+    uint32_t revision=state.revision;
+    assert(!aacp_takeover_pending(peer) && !aacp_takeover_pending(NULL));
+    now=UINT32_MAX-4999u;
+    assert(aacp_takeover_request(peer) && aacp_takeover_pending(peer));
+    assert(aacp_routing_state().revision==revision+1 && connect_requests);
+    aacp_routing_receipt(77,2);
+    state=aacp_routing_state();assert(state.nonce==77 && state.action==2 && (state.flags&4));
+    aacp_disconnect();
+    assert(aacp_routing_state().nonce==77 && aacp_routing_state().revision==revision+1);
+    assert(aacp_takeover_request(peer));
+    assert(!aacp_routing_state().nonce && !aacp_routing_state().action);
+    revision=aacp_routing_state().revision;
+    aacp_routing_receipt(88,1);
+    assert(aacp_takeover_request(peer) && aacp_routing_state().revision==revision+1);
+    assert(!aacp_routing_state().nonce && !aacp_routing_state().action);
+    aacp_routing_override();
+    assert(!aacp_takeover_pending(peer) && aacp_routing_state().revision==revision+2);
+    assert(aacp_takeover_request(peer));
+    const uint8_t other[6]={9,8,7,6,5,4};
+    assert(!aacp_takeover_pending(other));
+    now=4999;assert(aacp_takeover_pending(peer));
+    assert(aacp_takeover_request(peer) && routing.since==UINT32_MAX-4999u);
+    now=5000;assert(!aacp_takeover_pending(peer)); // Expiry works before the next main-loop poll.
+    assert(aacp_takeover_request(peer) && routing.since==5000 && aacp_takeover_pending(peer));
+    aacp_poll();now+=AACP_TAKEOVER_MS;aacp_poll();
+    assert(!aacp_takeover_pending(peer));
+    // An old media release may race the button/Pair request for its replacement.
+    fixture();ready();assert(aacp_takeover_request(peer));
+    uint32_t since=routing.since;++now;
+    aacp_media_disconnected();
+    assert(aacp_takeover_pending(peer) && routing.since==since);
+    now=since+AACP_TAKEOVER_MS;
+    aacp_media_disconnected();assert(!aacp_takeover_pending(peer));
+    fixture();ready();assert(aacp_takeover_request(peer));aacp_poll();drain();
+    assert(routing.stage==1);
+    aacp_media_disconnected();assert(!aacp_takeover_pending(peer)); // Never replay an already-sent claim.
+    assert(aacp_takeover_request(peer));aacp_disconnect();
+    assert(!aacp_takeover_pending(peer)); // Explicit Pair/cancel still clears the request.
+    routing_revision=UINT32_MAX;aacp_routing_receipt(99,1);aacp_routing_override();
+    assert(aacp_routing_state().revision==1 && !aacp_routing_state().nonce);
+}
 int main(void) {
+    test_startup_wire_and_service_acceptance();
+    test_startup_rejects_unparsed_readiness();
+    test_startup_fallback_is_bounded_and_preserves_queue_room();
+    test_startup_retired_channel_cannot_accept_or_retry();
+    test_connection_permission_is_peer_bound_and_expires();
     test_recovery_budget_counts_consecutive_failures();
     test_routing_authority_and_explicit_takeover();
     test_microphone_consumer_ownership();
@@ -1218,6 +1399,6 @@ int main(void) {
     test_typed_setting_timeout_reset_and_retry();
     test_settings_invalid_replacement_and_stale_ear_events();
     test_pair_keys_and_receive_buffer_policy();
-    puts("AACP lifecycle and packet validation: 24 groups passed");
+    puts("AACP startup, lifecycle and packet validation passed");
     return 0;
 }

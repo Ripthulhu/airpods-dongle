@@ -11,6 +11,9 @@ static uint16_t reported_delay,buffer_last,queued_target;
 static bool defer_send,control_ready,admission_busy;
 static unsigned admission_attempts;
 static bool low_latency_flush;
+static bool playback_released,playback_release_pending;
+// This focused USB suite never initiates handover; its full lifecycle is tested separately.
+static void playback_release_close(void) {assert(false);}
 static void bt_hci_airpods_flush_timeout(bool enabled) {low_latency_flush=enabled;}
 static void verification_test_buffer_cancel(void) {queued_target=0;}
 #define DONGLE_ACCEPTED 0

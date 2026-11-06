@@ -27,6 +27,17 @@ static unsigned phone_arrivals,phone_queued,phone_decode_due,phone_decoded;
 static bool phone_decoding,phone_output_ready;
 static unsigned phone_priming_left,phone_priming_encoded;
 static bool precise_input_fixture;
+static bool waveform_fixture,waveform_float,waveform_antiphase,waveform_sub_lsb;
+static double waveform_hz[2];
+static float waveform_output[48000*10][2];
+static unsigned waveform_frames;
+static unsigned waveform_tempo_cost,waveform_tempo_jobs;
+static unsigned waveform_tempo_hundredths,waveform_encoder_hundredths;
+static unsigned waveform_tempo_remainder,waveform_encoder_remainder;
+static unsigned waveform_previous_tempo_ms,waveform_previous_tempo_interval;
+static uint32_t waveform_previous_tempo_generation;
+static unsigned stale_tempo_kind,stale_tempo_hooks;
+static uint32_t stale_tempo_read,stale_tempo_used;
 static int16_t encoder_sample_s16(unsigned index) {
     return cur_codec==4?playback_pcm_quantize((float)encoder_pcm.q31[index]/2147483648.0f):encoder_pcm.s16[index];
 }
@@ -50,6 +61,21 @@ static int16_t signal(uint32_t frame) {
 static void ingress(unsigned frames) {
     int16_t input[100];
     assert(frames<=50);
+    if(waveform_fixture) {
+        float samples[100];
+        for(unsigned i=0;i<frames;++i) {
+            double phase=(double)generated++*6.2831853071795864769/48000.0;
+            samples[2*i]=waveform_sub_lsb?0.125f+0x1p-20f:
+                (float)(0.3*sin(phase*waveform_hz[0]));
+            samples[2*i+1]=waveform_antiphase?-samples[2*i]:
+                (float)(0.3*sin(phase*waveform_hz[1]));
+            input[2*i]=playback_pcm_quantize(samples[2*i]);
+            input[2*i+1]=playback_pcm_quantize(samples[2*i+1]);
+        }
+        if(waveform_float)audio_slot_push_float(samples,(uint16_t)frames);
+        else audio_slot_push_samples(input,(uint16_t)frames);
+        return;
+    }
     for(unsigned i=0;i<frames;++i) {
         input[2*i]=signal(generated++);
         input[2*i+1]=(int16_t)-input[2*i];
@@ -105,10 +131,39 @@ static void advance(unsigned ms) {
         }
     }
 }
+static unsigned waveform_fractional_ms(unsigned hundredths,unsigned *remainder) {
+    *remainder+=hundredths;
+    unsigned whole=*remainder/100;
+    *remainder%=100;
+    return whole;
+}
 static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
     int16_t checked[2048];
     assert(input->bufElSizes[0]==(encoder_job.codec==4?4:2));
     assert(args->numInSamples<=2048);
+    if(waveform_fixture) {
+        const int32_t *wide=input->bufs[0];
+        unsigned frames=args->numInSamples/2;
+        assert(input->bufElSizes[0]==4 && !bt_locked && !pcm_locked);
+        if(encoder_job.tempo) {
+            unsigned interval=encoder_tempo_job.interval;
+            if(interval!=10 && interval==waveform_previous_tempo_interval &&
+               tempo_generation==waveform_previous_tempo_generation)
+                assert((uint32_t)(now-waveform_previous_tempo_ms)>=interval);
+            waveform_previous_tempo_ms=now;
+            waveform_previous_tempo_interval=interval;
+            waveform_previous_tempo_generation=tempo_generation;
+            ++waveform_tempo_jobs;
+            advance(waveform_tempo_cost+waveform_fractional_ms(waveform_tempo_hundredths,&waveform_tempo_remainder));
+        }
+        assert(waveform_frames+frames<=sizeof(waveform_output)/sizeof(waveform_output[0]));
+        for(unsigned i=0;i<frames;++i)for(unsigned channel=0;channel<2;++channel)
+            waveform_output[waveform_frames+i][channel]=(float)((double)wide[2*i+channel]/2147483648.0);
+        waveform_frames+=frames;encoded+=frames;
+        advance((variable_cost?5u+now%4u:encode_cost)+
+            waveform_fractional_ms(waveform_encoder_hundredths,&waveform_encoder_remainder));
+        return;
+    }
     if(precise_input_fixture) {
         const int32_t *wide=input->bufs[0];
         assert(input->bufElSizes[0]==4 && input->bufSizes[0]==3840 && args->numInSamples==960);
@@ -138,7 +193,7 @@ static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
         } else if(check_sequence) {
             int expected=encoded<PLAYBACK_FILTER_DELAY?0:signal(encoded-PLAYBACK_FILTER_DELAY);
             assert(pcm[2*i]==expected);
-        } else if(have_previous && encoded>64) {
+        } else if(have_previous && encoded>64 && !encoder_job.tempo) {
             int delta=pcm[2*i]-(int)previous;
             if(delta< -2 || delta>2)fprintf(stderr,"discontinuity ms=%u encoded=%u sample=%u delta=%d phase=%u interval=%u used=%u debt=%u drops=%u zeros=%u recoveries=%u\n",
                 now,encoded,i,delta,playback_pcm.fraction,playback_adjust_interval(&playback_adjust),playback_pcm.used,
@@ -152,6 +207,12 @@ static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
 }
 static void pipeline_filter_cost(void) { advance(filter_cost); }
 static void fixture(int ppm) {
+    waveform_fixture=waveform_sub_lsb=false;
+    waveform_tempo_cost=waveform_tempo_jobs=0;
+    waveform_tempo_hundredths=waveform_encoder_hundredths=0;
+    waveform_tempo_remainder=waveform_encoder_remainder=0;
+    waveform_previous_tempo_ms=waveform_previous_tempo_interval=0;
+    waveform_previous_tempo_generation=0;
     initialize(4,480,324,10,986);
     is_usb_streaming=true;phone_active=phone_buffer_started=false;
     playback_game.changed=true;playback_game.target=60;
@@ -605,7 +666,309 @@ static void eld_low_bits_reach_encoder(void) {
     assert(encoded==480 && encode_calls==1);
 }
 
+static void waveform_start(double left,double right,bool antiphase,bool floating) {
+    fixture(0);
+    waveform_fixture=true;waveform_float=floating;waveform_antiphase=antiphase;
+    waveform_hz[0]=left;waveform_hz[1]=right;waveform_frames=0;
+    playback_pcm_clear(&playback_pcm,7680);playback_pcm.primed_on_wire=true;
+    generated=0;
+    for(unsigned i=0;i<20;++i)ingress(48);
+    while(now<600)step();
+}
+
+static double waveform_power(unsigned first,unsigned count,unsigned channel,double hz) {
+    double real=0,imaginary=0;
+    for(unsigned i=0;i<count;++i) {
+        double angle=6.2831853071795864769*i/count;
+        double sample=waveform_output[first+i][channel]*(0.5-0.5*cos(angle));
+        double phase=6.2831853071795864769*hz*i/48000.0;
+        real+=sample*cos(phase);imaginary+=sample*sin(phase);
+    }
+    return real*real+imaginary*imaginary;
+}
+
+static void waveform_check_pitch(unsigned first,unsigned end) {
+    assert(end>first+12000);
+    first+=960;end-=960;
+    for(unsigned channel=0;channel<2;++channel) {
+        double hz=waveform_hz[channel];
+        double desired=waveform_power(first,end-first,channel,hz);
+        double lower=waveform_power(first,end-first,channel,hz*0.9);
+        double upper=waveform_power(first,end-first,channel,hz*1.1);
+        if(desired<=9*lower || desired<=9*upper)
+            fprintf(stderr,"pitch channel=%u hz=%.1f frames=%u wanted=%.3f lower=%.3f upper=%.3f\n",
+                channel,hz,end-first,desired,lower,upper);
+        assert(desired>9*lower && desired>9*upper);
+        double squares=0,first_cross=0,last_cross=0;
+        unsigned crossings=0;
+        for(unsigned i=first;i<end;++i) {
+            double sample=waveform_output[i][channel];squares+=sample*sample;
+            if(i>first && waveform_output[i-1][channel]<=0 && sample>0) {
+                double previous_sample=waveform_output[i-1][channel];
+                double crossing=i-1-previous_sample/(sample-previous_sample);
+                if(!crossings)first_cross=crossing;
+                last_cross=crossing;++crossings;
+            }
+        }
+        assert(crossings>=4);
+        double measured=(crossings-1)*48000.0/(last_cross-first_cross);
+        if(fabs(measured/hz-1)>0.01) {
+            double peak_hz=0,peak_power=0;
+            for(double test=hz*0.88;test<hz*1.12;test+=hz*0.001) {
+                double power=waveform_power(first,end-first,channel,test);
+                if(power>peak_power){peak_power=power;peak_hz=test;}
+            }
+            if(fabs(peak_hz/hz-1)>0.01)
+                fprintf(stderr,"pitch channel=%u wanted=%.1f crossing=%.4f peak=%.4f first=%u end=%u\n",channel,hz,measured,peak_hz,first,end);
+            measured=peak_hz;
+        }
+        assert(fabs(measured/hz-1)<=0.01);
+        assert(squares/(end-first)>0.025 && squares/(end-first)<0.065);
+    }
+}
+
+static void waveform_check_joins(unsigned first,unsigned end) {
+    for(unsigned channel=0;channel<2;++channel) {
+        double limit=0.6*sin(3.14159265358979323846*waveform_hz[channel]/48000.0)+0.012;
+        for(unsigned i=first+1;i<end;++i) {
+            assert(isfinite(waveform_output[i][channel]));
+            assert(fabs(waveform_output[i][channel])<=0.301);
+            if(fabs(waveform_output[i][channel]-waveform_output[i-1][channel])>limit)
+                fprintf(stderr,"join channel=%u hz=%.1f frame=%u jump=%.6f limit=%.6f\n",channel,
+                    waveform_hz[channel],i,(double)waveform_output[i][channel]-waveform_output[i-1][channel],limit);
+            assert(fabs(waveform_output[i][channel]-waveform_output[i-1][channel])<=limit);
+        }
+    }
+    if(waveform_antiphase)for(unsigned i=first;i<end;++i)
+        assert(fabs(waveform_output[i][0]+waveform_output[i][1])<=0x1p-23);
+    assert(!playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
+    assert(!playback_trace.stats[TRACE_RECOVERIES] && !sink_underruns);
+}
+
+static void game_transition_waveforms(void) {
+    const double tones[][2]={
+        {20,200},{40,997},{80,120},{997,1403},{100,100},
+        {20,997},{30,401},{40,1403},{55,809},{80,997},{97,1103},
+        {150,997},{220,1403},{997,2003},{3001,5003},{12001,14003},{16001,19001}
+    };
+    for(unsigned kind=0;kind<sizeof(tones)/sizeof(tones[0]);++kind) {
+        waveform_start(tones[kind][0],tones[kind][1],kind==4,kind%2==0);
+        for(unsigned restore=0;restore<2;++restore) {
+            unsigned first=waveform_frames;
+            sink_frames=(restore?60u:150u)*48u;sink_started=true;
+            playback_adjust_request(&playback_adjust,restore?600:1500,restore?150:60);
+            playback_game.target=restore?150:60;
+            unsigned deadline=now+2500;
+            do step();while(playback_adjust_busy(&playback_adjust) && now<deadline);
+            assert(!playback_adjust_busy(&playback_adjust) && !playback_adjust.failed);
+            unsigned end=waveform_frames;
+            waveform_check_pitch(first,end);
+            deadline=now+100;
+            while(now<deadline)step();
+            waveform_check_joins(first,waveform_frames);
+        }
+    }
+    waveform_fixture=false;
+}
+
+static void game_transition_cancel_and_reverse(void) {
+    waveform_start(40,997,false,true);
+    sink_frames=150*48;sink_started=true;
+    unsigned first=waveform_frames;
+    for(unsigned change=0;change<8;++change) {
+        uint8_t old=playback_adjust_interval(&playback_adjust);
+        playback_adjust_cancel_stream(&media_tracker,now,old);
+        playback_adjust_request(&playback_adjust,change%2?600:1500,change%2?150:60);
+        playback_game.target=change%2?150:60;
+        unsigned until=now+80;
+        while(now<until)step();
+    }
+    playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
+    unsigned until=now+200;
+    while(now<until)step();
+    assert(!playback_adjust_busy(&playback_adjust) && !playback_adjust.failed);
+    waveform_check_joins(first,waveform_frames);
+    waveform_fixture=false;
+}
+
+static void game_transition_retains_float_precision(void) {
+    waveform_start(100,100,true,true);waveform_sub_lsb=true;
+    unsigned until=now+100;
+    while(now<until)step();
+    for(unsigned restore=0;restore<2;++restore) {
+        unsigned first=waveform_frames;
+        playback_adjust_request(&playback_adjust,restore?600:1500,restore?150:60);
+        playback_game.target=restore?150:60;
+        unsigned deadline=now+2500;
+        do step();while(playback_adjust_busy(&playback_adjust) && now<deadline);
+        assert(!playback_adjust_busy(&playback_adjust) && !playback_adjust.failed);
+        for(unsigned i=first;i<waveform_frames;++i) {
+            assert(fabs(waveform_output[i][0]-(0.125f+0x1p-20f))<=0x1p-23f);
+            assert(waveform_output[i][0]==-waveform_output[i][1]);
+        }
+    }
+    waveform_fixture=false;
+}
+
+static void game_transition_cpu_budget(void) {
+    for(unsigned encoder_ms=5;encoder_ms<=6;++encoder_ms)for(unsigned tempo_ms=0;tempo_ms<=2;++tempo_ms) {
+        waveform_start(100,100,true,true);
+        encode_cost=encoder_ms;waveform_tempo_cost=tempo_ms;
+        unsigned first=waveform_frames;
+        for(unsigned restore=0;restore<2;++restore) {
+            sink_frames=(restore?60u:150u)*48u;sink_started=true;
+            playback_adjust_request(&playback_adjust,restore?600:1500,restore?150:60);
+            playback_game.target=restore?150:60;
+            unsigned deadline=now+2500;
+            do step();while(playback_adjust_busy(&playback_adjust) && now<deadline);
+            if(playback_adjust_busy(&playback_adjust) || playback_adjust.failed)
+                fprintf(stderr,"tempo budget encoder_ms=%u tempo_ms=%u restore=%u failed=%u\n",
+                    encoder_ms,tempo_ms,restore,playback_adjust.failed);
+            assert(!playback_adjust_busy(&playback_adjust) && !playback_adjust.failed);
+            deadline=now+100;
+            while(now<deadline)step();
+        }
+        assert(waveform_tempo_jobs>100);
+        waveform_check_joins(first,waveform_frames);
+    }
+    waveform_fixture=false;
+}
+
+static void invalidate_tempo_snapshot(void) {
+    assert(!bt_locked && !pcm_locked);
+    pcm_lock_hook=NULL;++stale_tempo_hooks;
+    if(stale_tempo_kind==0)playback_pcm_discontinuity(&playback_pcm);
+    else if(stale_tempo_kind==1)assert(playback_pcm_consume(&playback_pcm,48));
+    else ++usb_playback_revision;
+    stale_tempo_read=playback_pcm.read;stale_tempo_used=playback_pcm.used;
+}
+
+static void game_transition_stale_snapshot(void) {
+    for(stale_tempo_kind=0;stale_tempo_kind<3;++stale_tempo_kind) {
+        waveform_start(100,100,true,true);
+        dongle_playback_encode_complete();
+        if(send_requested) {send_requested=false;a2dp_demo_send_media_packet();}
+        playback_adjust_request(&playback_adjust,1500,60);
+        playback_adjust_start(&playback_adjust,now);
+        media_tracker.samples_ready=480;
+        assert(fill_aac_audio_buffer(&media_tracker)==480 && encoder_job.tempo);
+        assert(atomic_load(&encoder_job.state)==ENCODE_PREPARED);
+        playback_tempo_state_t previous_state=encoder_tempo_state;
+        unsigned previous_calls=encode_calls,previous_packets=eld_packets;
+        stale_tempo_hooks=0;pcm_lock_hook=invalidate_tempo_snapshot;
+        bt_locked=false;dongle_playback_encode_run();bt_locked=true;
+        assert(stale_tempo_hooks==1 && !pcm_lock_hook);
+        assert(playback_pcm.read==stale_tempo_read && playback_pcm.used==stale_tempo_used);
+        assert(encode_calls==previous_calls && eld_packets==previous_packets);
+        assert(!encoder_tempo_job.rendered && !encoder_job.bytes && !encoder_job.consumed);
+        dongle_playback_encode_complete();
+        assert(atomic_load(&encoder_job.state)==ENCODE_IDLE);
+        assert(!media_tracker.codec_storage_count && !media_tracker.codec_num_frames && !media_tracker.codec_ready_to_send);
+        assert(encoder_tempo_state.active==previous_state.active &&
+            encoder_tempo_state.offset==previous_state.offset && encoder_tempo_state.fraction==previous_state.fraction);
+        assert(memcmp(encoder_tempo_state.history,previous_state.history,sizeof previous_state.history)==0);
+    }
+    waveform_fixture=false;
+}
+
+static void game_transition_measured_pressure(void) {
+    for(unsigned encoder_fraction=0;encoder_fraction<=30;encoder_fraction+=30) {
+        waveform_start(40,997,false,true);
+        encode_cost=6;waveform_encoder_hundredths=encoder_fraction;
+        waveform_tempo_cost=3;waveform_tempo_hundredths=37;
+        playback_pcm.fraction=634880;
+        for(unsigned restore=0;restore<2;++restore) {
+            waveform_frames=0;
+            sink_frames=(restore?60u:150u)*48u;sink_started=true;
+            playback_adjust_request(&playback_adjust,restore?600:1500,restore?150:60);
+            playback_game.target=restore?150:60;
+            unsigned started=now,deadline=now+8000;
+            bool stall_pending=encoder_fraction==30 && !restore;
+            do {
+                if(stall_pending && playback_adjust.running && now-started>=100) {
+                    blocked_until=now+40;stall_pending=false;
+                }
+                step();
+            } while(playback_adjust_busy(&playback_adjust) && now<deadline);
+            fprintf(stderr,"measured tempo budget encoder=6.%02u tempo=3.37 restore=%u elapsed=%u failed=%u drops=%u missing=%u recoveries=%u sent=%u goal=%u used=%u C=%u ready=%u\n",
+                encoder_fraction,restore,now-started,playback_adjust.failed,playback_metrics.pcm_drops,
+                playback_metrics.pcm_underflows,playback_trace.stats[TRACE_RECOVERIES],playback_adjust.sent_frames,
+                playback_adjust.goal_frames,playback_pcm.used,encoder_tempo_job.consumed,media_tracker.samples_ready);
+            assert(!playback_adjust_busy(&playback_adjust) && !playback_adjust.failed);
+            assert(!playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
+            assert(!playback_trace.stats[TRACE_RECOVERIES]);
+            waveform_check_pitch(0,waveform_frames);
+            deadline=now+100;
+            while(now<deadline)step();
+            waveform_check_joins(0,waveform_frames);
+            assert(playback_pcm.used<=1920 && media_tracker.samples_ready<=960);
+        }
+    }
+    waveform_fixture=false;
+}
+
+static void game_transition_ingress_debt(void) {
+    static const struct { int32_t arrived; uint16_t consumed; } cases[]={
+        {449,448},{1057,528},{1,384},{-17,384},{450,450}
+    };
+    for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);++i) {
+        waveform_start(100,100,true,true);
+        playback_adjust_request(&playback_adjust,1500,60);playback_game.target=60;
+        unsigned deadline=now+100;
+        while(!encoder_tempo_state.active && now<deadline)step();
+        assert(encoder_tempo_state.active);
+        dongle_playback_encode_complete();
+        if(send_requested) {send_requested=false;a2dp_demo_send_media_packet();}
+        advance(11);
+        assert(atomic_load(&encoder_job.state)==ENCODE_IDLE);
+        uint32_t origin=usb_ingress_frames-(uint32_t)cases[i].arrived;
+        encoder_tempo_ingress=origin;
+        media_tracker.samples_ready=960;
+        uint32_t read_before=playback_pcm.read,used_before=playback_pcm.used;
+        assert(fill_aac_audio_buffer(&media_tracker)==480 && encoder_job.tempo);
+        assert(encoder_tempo_job.consumed==cases[i].consumed);
+        assert(encoder_tempo_ingress==origin && tempo_ingress_after==origin+cases[i].consumed);
+        assert(playback_pcm.read==read_before && playback_pcm.used==used_before);
+        bt_locked=false;dongle_playback_encode_run();bt_locked=true;
+        dongle_playback_encode_complete();
+        assert(encoder_tempo_ingress==origin+cases[i].consumed);
+        assert((int32_t)(usb_ingress_frames-encoder_tempo_ingress)==
+            cases[i].arrived-(int32_t)cases[i].consumed+48*(int32_t)encode_cost);
+        assert(!playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
+    }
+    waveform_fixture=false;
+}
+
+static void game_transition_insufficient_throughput(void) {
+    waveform_start(40,997,false,true);
+    encode_cost=7;waveform_tempo_cost=3;
+    playback_pcm.fraction=634880;
+    sink_frames=60*48;sink_started=true;
+    playback_adjust_request(&playback_adjust,600,150);playback_game.target=150;
+    unsigned started=now,deadline=now+11000;
+    do {waveform_frames=0;step();}while(playback_adjust_busy(&playback_adjust) && now<deadline);
+    fprintf(stderr,"insufficient tempo throughput elapsed=%u failed=%u drops=%u missing=%u recoveries=%u\n",
+        now-started,playback_game.failed,playback_metrics.pcm_drops,
+        playback_metrics.pcm_underflows,playback_trace.stats[TRACE_RECOVERIES]);
+    assert(!playback_adjust_busy(&playback_adjust) && playback_game.failed);
+    assert(now-started>=10000 && now<deadline);
+    assert(!playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
+    assert(!playback_trace.stats[TRACE_RECOVERIES]);
+    waveform_frames=0;deadline=now+200;
+    while(now<deadline)step();
+    waveform_check_joins(0,waveform_frames);
+    waveform_fixture=false;
+}
+
 int main(void) {
+    game_transition_waveforms();
+    game_transition_cancel_and_reverse();
+    game_transition_retains_float_precision();
+    game_transition_cpu_budget();
+    game_transition_stale_snapshot();
+    game_transition_ingress_debt();
+    game_transition_measured_pressure();
+    game_transition_insufficient_throughput();
     eld_low_bits_reach_encoder();
     timer_interrupts_respect_bluetooth_lock();
     call_prefill_uses_call_clock();
@@ -619,6 +982,6 @@ int main(void) {
     phone_stale_receiver_window();
     phone_reprime_then_fresh_pcm();
     phone_packet_priming();
-    puts("production USB pipeline: real PCM, measured CPU budget, 1..40ms stalls, 10-minute clocks and bounded recovery passed");
+    puts("production USB pipeline: pitch, stereo, precision, cancellation, 1..40ms stalls, 10-minute clocks and bounded recovery passed");
     return 0;
 }

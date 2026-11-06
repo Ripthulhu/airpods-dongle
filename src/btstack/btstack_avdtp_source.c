@@ -1,4 +1,7 @@
 #include <sys/cdefs.h>
+#if AIRPODS_EXPERIMENTAL_RADIO0076
+#include "../radio0076/radio0076.h"
+#endif
 /*
  * Copyright (C) 2016 BlueKitchen GmbH
  *
@@ -53,6 +56,7 @@
 #include <aacenc_lib.h>
 #define PLAYBACK_PCM_Q31_TYPE INT_PCM
 #include "playback_pcm.h"
+#include "playback_tempo.h"
 #include "../runtime_watch.h"
 #include "playback_inspect.h"
 #include "playback_eld.h"
@@ -145,6 +149,7 @@ typedef struct {
     uint32_t time_audio_data_sent; // ms
     uint32_t acc_num_missed_samples;
     uint32_t samples_ready;
+    uint64_t sample_debt;
     btstack_timer_source_t audio_timer;
     uint8_t  streaming;
     int      max_media_payload_size;
@@ -175,8 +180,14 @@ static struct {
     uint16_t samples, offset, capacity, reset_cid;
     int error, bytes, consumed;
     uint8_t codec, input, deferred_size, deferred_event[40], deferred_peer[6];
-    bool close_pending, reset_pending;
+    bool close_pending, reset_pending, tempo;
 } encoder_job = {.epoch = 1};
+static playback_tempo_state_t encoder_tempo_state;
+static playback_tempo_job_t encoder_tempo_job;
+static uint32_t encoder_tempo_epoch, encoder_tempo_generation;
+static uint32_t tempo_read, tempo_fraction, tempo_generation;
+static uint32_t usb_ingress_frames, encoder_tempo_ingress, tempo_ingress_after;
+static uint32_t encoder_tempo_prepared_ms, tempo_prepared_ms;
 _Static_assert(sizeof(encoder_job) <= 128, "AAC job must not consume another audio buffer");
 static bool playback_encoder_busy(void) {
     return atomic_load_explicit(&encoder_job.state, memory_order_acquire) != ENCODE_IDLE;
@@ -372,6 +383,11 @@ static uint8_t is_cmd_triggered_localy = 0;
 static bool a2dp_is_connected_flag = false;
 static bool a2dp_connect_pending;
 static bool a2dp_accept_incoming = true;
+static bool playback_released;
+static uint8_t release_peer[6];
+static bool playback_release_pending;
+static uint32_t release_revision, release_session;
+static uint16_t release_cid;
 
 static bool finish_scan_avdtp_codec = false;
 
@@ -550,7 +566,11 @@ static uint16_t get_codec_id(const uint8_t *codec_info) {
 }
 
 static playback_pcm_t playback_pcm;
-static playback_resample_t encoder_resample;
+static union {
+    playback_resample_t resample;
+    playback_tempo_work_t tempo;
+} encoder_work;
+#define encoder_resample encoder_work.resample
 static critical_section_t playback_pcm_lock;
 static bool playback_pcm_initialized;
 // The unused core1 bank holds this serialized buffer; the linker rejects a core1 stack here.
@@ -1330,6 +1350,7 @@ static void audio_slot_queue_configure_with_count(uint16_t samples_per_slot, uin
 static void audio_slot_push_data(const void *src, uint16_t stereo_pair_count, bool floating) {
     critical_section_enter_blocking(&playback_pcm_lock);
     if (!phone_active && !call_active && src && stereo_pair_count) {
+        usb_ingress_frames+=stereo_pair_count;
         if(inspect_enabled)playback_inspect_samples(&playback_inspect,src,2u*stereo_pair_count,floating,true,time_us_32());
         if(floating) {
             uint32_t available=playback_pcm.capacity-playback_pcm.used;
@@ -1367,22 +1388,51 @@ void audio_slot_usb_reset(void) {
     critical_section_exit(&playback_pcm_lock);
 }
 
+static const float *playback_tempo_source(void *context,int32_t frame) {
+    const playback_pcm_t *pcm=context;
+    btstack_assert(frame>=-(int32_t)pcm->valid_past && frame<(int32_t)pcm->used);
+    int32_t index=(int32_t)pcm->read+frame;
+    if(index<0)index+=(int32_t)pcm->capacity;
+    else if((uint32_t)index>=pcm->capacity)index-=(int32_t)pcm->capacity;
+    return pcm->samples+2u*(uint32_t)index;
+}
+
 static void audio_pcm_read(uint16_t frames) {
     btstack_assert(cur_codec!=4 || frames==480);
     critical_section_enter_blocking(&playback_pcm_lock);
     bool external = phone_active || call_active;
-    if (playback_adjust.running) {
-        if (is_usb_streaming && !external &&
-            playback_pcm_prepare_resample(&playback_pcm,&encoder_resample,frames,
-                                          (uint32_t)playback_adjust.interval*65536u)) {
+    encoder_job.tempo=false;
+    if(encoder_tempo_epoch!=encoder_job.epoch_at_prepare ||
+       encoder_tempo_generation!=playback_pcm.generation) encoder_tempo_state.active=false;
+    if (playback_adjust.running || encoder_tempo_state.active) {
+        uint32_t prepared_ms=btstack_run_loop_get_time_ms();
+        uint8_t interval=playback_adjust_interval(&playback_adjust);
+        uint16_t consumed=(uint16_t)(48u*interval);
+        uint32_t origin=encoder_tempo_state.active?encoder_tempo_ingress:usb_ingress_frames-consumed;
+        if(encoder_tempo_state.active && interval!=10) {
+            int32_t arrived=(int32_t)(usb_ingress_frames-origin);
+            if(arrived<384)arrived=384;
+            if(arrived>528)arrived=528;
+            consumed=(uint16_t)((uint32_t)arrived&~1u);
+        }
+        if (cur_codec==4 && frames==480 && is_usb_streaming && !external &&
+            playback_tempo_prepare(&encoder_work.tempo,&encoder_tempo_job,&encoder_tempo_state,
+                interval,consumed,playback_pcm.fraction,playback_pcm.valid_past,playback_pcm.used,
+                playback_tempo_source,&playback_pcm)) {
+            tempo_read=playback_pcm.read;tempo_fraction=playback_pcm.fraction;
+            tempo_generation=playback_pcm.generation;
+            tempo_prepared_ms=prepared_ms;
+            // Retain odd-frame and clamped source debt instead of resetting to the latest arrival.
+            tempo_ingress_after=origin+consumed;
+            encoder_job.tempo=true;
             critical_section_exit(&playback_pcm_lock);
-            if(cur_codec==4)playback_pcm_render_q31(&encoder_resample,encoder_pcm.q31);
-            else playback_pcm_render(&encoder_resample,encoder_pcm.s16);
             return;
         }
-        playback_adjust_cancel_stream(&media_tracker,btstack_run_loop_get_time_ms(),
-                                      playback_adjust_interval(&playback_adjust));
-        playback_adjust.failed = true;
+        encoder_tempo_state.active=false;
+        if(playback_adjust.running) {
+            playback_adjust_cancel_stream(&media_tracker,btstack_run_loop_get_time_ms(),interval);
+            playback_adjust.failed = true;
+        }
     }
     if (external && !phone_buffer_started && playback_pcm.priming == 0) {
         uint32_t prefill = call_active ? (uint32_t)frames + 960u : phone_clock_prefill(acc_num_simples);
@@ -1652,10 +1702,19 @@ static void playback_bitrate_poll(uint32_t now) {
         known ? radio.flush_events : playback_bitrate.last_flushes, bitrate_pressure);
 }
 
+static void playback_clock_accrue(a2dp_media_sending_context_t *,uint32_t);
+static void playback_clock_debit(a2dp_media_sending_context_t *,uint32_t,uint8_t);
+
 static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
     if (playback_encoder_busy()) return 0;
+    // Source credit is not permission to exceed the requested receiver clock.
+    if(playback_adjust.running && encoder_tempo_state.active &&
+       encoder_tempo_epoch==atomic_load_explicit(&encoder_job.epoch,memory_order_relaxed) &&
+       encoder_tempo_generation==playback_pcm.generation &&
+       (uint32_t)(btstack_run_loop_get_time_ms()-encoder_tempo_prepared_ms)<playback_adjust.interval) return 0;
     (void)playback_encoder_packet_current();
     if (cur_codec == 4 && !playback_bitrate_apply(context)) return playback_encoder_failed(context);
+    if(playback_adjust.running)playback_clock_accrue(context,btstack_run_loop_get_time_ms());
     unsigned frames = acc_num_simples;
     unsigned header = cur_codec == 4 ? PLAYBACK_ELD_HEADER_SIZE : 0;
     unsigned minimum = cur_codec == 4 ? playback_eld_au_ceiling(aaceld_bitrate,
@@ -1674,7 +1733,7 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
     critical_section_exit(&playback_pcm_lock);
     runtime_watch_set(WATCH_PCM);
     audio_pcm_read((uint16_t)frames);
-    if (inspect_enabled) {
+    if (inspect_enabled && !encoder_job.tempo) {
         if(cur_codec==4)playback_inspect_samples_q31(&playback_inspect,encoder_pcm.q31,
             frames*aacinf.inputChannels,time_us_32());
         else playback_inspect_samples(&playback_inspect,encoder_pcm.s16,
@@ -1686,10 +1745,32 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
     encoder_job.capacity = (uint16_t)(context->max_media_payload_size - encoder_job.offset);
     encoder_job.codec = cur_codec;
     // The timer can accrue more debt while encoding; debit this unit exactly once.
-    context->samples_ready -= frames;
+    if(encoder_job.tempo) {
+        playback_clock_accrue(context,btstack_run_loop_get_time_ms());
+        playback_clock_debit(context,encoder_tempo_job.consumed,encoder_tempo_job.interval);
+    } else context->samples_ready -= frames;
     if (!context->codec_storage_count) packet_oldest_us = encoder_job.unit_started;
     atomic_store_explicit(&encoder_job.state, ENCODE_PREPARED, memory_order_release);
     return (int)frames;
+}
+
+// Search outside the Bluetooth/USB locks; consume only the still-current source snapshot.
+static bool playback_encoder_tempo_run(void) {
+    if(!encoder_job.tempo)return true;
+    playback_tempo_search(&encoder_work.tempo,&encoder_tempo_job);
+    critical_section_enter_blocking(&playback_pcm_lock);
+    bool current=playback_encoder_scope_current() && playback_pcm.read==tempo_read &&
+        playback_pcm.fraction==tempo_fraction && playback_pcm.generation==tempo_generation &&
+        playback_pcm.valid_past>=encoder_tempo_job.valid_past && playback_pcm.used>=encoder_tempo_job.future;
+    if(current)current=playback_tempo_select(&encoder_work.tempo,&encoder_tempo_job,
+        playback_tempo_source,&playback_pcm) && playback_pcm_consume(&playback_pcm,encoder_tempo_job.consumed);
+    critical_section_exit(&playback_pcm_lock);
+    if(!current) {playback_encoder_invalidate();return false;}
+    playback_tempo_render_q31(&encoder_work.tempo,&encoder_tempo_job,&encoder_pcm);
+    if(!encoder_tempo_job.rendered) {playback_encoder_invalidate();return false;}
+    if(inspect_enabled)playback_inspect_samples_q31(&playback_inspect,encoder_pcm.q31,
+        encoder_job.samples,time_us_32());
+    return true;
 }
 
 // Main thread only, after releasing the CYW43 lock. Lifecycle requests pin this handle.
@@ -1698,7 +1779,8 @@ void dongle_playback_encode_run(void) {
     atomic_store_explicit(&encoder_job.state, ENCODE_RUNNING, memory_order_release);
     encoder_job.error = AACENC_OK; encoder_job.bytes = encoder_job.consumed = 0;
     encoder_job.encode_us = 0;
-    if (encoder_job.epoch_at_prepare == atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed)) {
+    if (encoder_job.epoch_at_prepare == atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed) &&
+        playback_encoder_tempo_run()) {
         void *input_data = encoder_job.codec==4?(void *)encoder_pcm.q31:(void *)encoder_pcm.s16;
         void *output_data = media_tracker.codec_storage + encoder_job.offset;
         int input_id = IN_AUDIO_DATA, output_id = OUT_BITSTREAM_DATA;
@@ -1816,6 +1898,13 @@ void dongle_playback_encode_complete(void) {
             else media_tracker.codec_storage_count += (uint16_t)encoder_job.bytes;
             if (!failed) { ++media_tracker.codec_num_frames; ++playback_metrics.encoded_units; }
         }
+        if(!failed && encoder_job.tempo && playback_pcm.generation==tempo_generation) {
+            playback_tempo_commit(&encoder_tempo_state,&encoder_tempo_job,&encoder_work.tempo);
+            encoder_tempo_epoch=encoder_job.epoch_at_prepare;
+            encoder_tempo_generation=playback_pcm.generation;
+            encoder_tempo_ingress=tempo_ingress_after;
+            encoder_tempo_prepared_ms=tempo_prepared_ms;
+        } else if(encoder_job.tempo) encoder_tempo_state.active=false;
         playback_work_pending = true;
     } else playback_encoder_discard(true);
     critical_section_exit(&playback_pcm_lock);
@@ -1939,6 +2028,7 @@ static void playback_audio_work(uint32_t now) {
         PB_EVENT(TRACE_RECOVERY,skipped,context->samples_ready);
         context->samples_ready=0;
         context->acc_num_missed_samples=0;
+        context->sample_debt=0;
         context->time_audio_data_sent=now;
         usb_recovery_drops=0;
         playback_transport_stale=false;
@@ -1974,22 +2064,33 @@ static void playback_audio_work(uint32_t now) {
 
 static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context);
 
+static void playback_clock_store(a2dp_media_sending_context_t *context,int64_t balance) {
+    context->sample_debt=balance<0?(uint64_t)-balance:0;
+    uint64_t credit=balance>0?(uint64_t)balance:0;
+    context->samples_ready=(uint32_t)(credit/99000u);
+    context->acc_num_missed_samples=(uint32_t)(credit%99000u);
+}
 static void playback_clock_accrue(a2dp_media_sending_context_t *context,uint32_t now) {
-    uint32_t elapsed=now-context->time_audio_data_sent;
-    context->samples_ready+=playback_adjust_samples(playback_adjust_interval(&playback_adjust),
-        elapsed,a2dp_sample_rate(),&context->acc_num_missed_samples);
+    uint32_t added=playback_adjust_samples(playback_adjust_interval(&playback_adjust),
+        now-context->time_audio_data_sent,a2dp_sample_rate(),&context->acc_num_missed_samples);
+    int64_t balance=(int64_t)(((uint64_t)context->samples_ready+added)*99000u+
+        context->acc_num_missed_samples)-(int64_t)context->sample_debt;
+    playback_clock_store(context,balance);
     context->time_audio_data_sent=now;
+}
+// Debit actual source time; retain a fractional/negative balance until the next USB tick.
+static void playback_clock_debit(a2dp_media_sending_context_t *context,uint32_t consumed,uint8_t interval) {
+    int64_t balance=(int64_t)((uint64_t)context->samples_ready*99000u+
+        context->acc_num_missed_samples)-(int64_t)context->sample_debt;
+    playback_clock_store(context,balance-(int64_t)((uint64_t)consumed*10u*(99000u/interval)));
 }
 static void playback_clock_switch(a2dp_media_sending_context_t *context,uint32_t now,
                                    uint8_t old_interval,uint8_t next_interval) {
-    // Re-express already owed source time; clearing it leaves stale PCM queued.
-    uint32_t elapsed=now-context->time_audio_data_sent;
-    context->samples_ready+=playback_adjust_samples(old_interval,elapsed,a2dp_sample_rate(),
-                                                   &context->acc_num_missed_samples);
-    uint64_t debt=(uint64_t)context->samples_ready*99000u+context->acc_num_missed_samples;
-    debt=debt*old_interval/next_interval;
-    context->samples_ready=(uint32_t)(debt/99000u);
-    context->acc_num_missed_samples=(uint32_t)(debt%99000u);
+    uint32_t added=playback_adjust_samples(old_interval,now-context->time_audio_data_sent,
+        a2dp_sample_rate(),&context->acc_num_missed_samples);
+    int64_t balance=(int64_t)(((uint64_t)context->samples_ready+added)*99000u+
+        context->acc_num_missed_samples)-(int64_t)context->sample_debt;
+    playback_clock_store(context,balance*old_interval/next_interval);
     context->time_audio_data_sent=now;
 }
 
@@ -2157,6 +2258,7 @@ static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){
     context->time_audio_data_sent = btstack_run_loop_get_time_ms();
     context->samples_ready = 0;
     context->acc_num_missed_samples = 0;
+    context->sample_debt = 0;
     context->codec_storage_count = 0;
     playback_work_cancel_wait(context);
     context->codec_ready_to_send = 0;
@@ -2185,6 +2287,7 @@ static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context){
     btstack_run_loop_remove_timer(&suspend_recovery_timer);
     context->time_audio_data_sent = 0;
     context->acc_num_missed_samples = 0;
+    context->sample_debt = 0;
     context->samples_ready = 0;
     context->streaming = 0;
     context->codec_num_frames = 0;
@@ -2985,7 +3088,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             avrcp_reconnect_reset();
             mic_prepare_open=mic_recovery_pending=mic_recovery_started=false;
             a2dp_demo_timer_stop(&media_tracker);
-            aacp_disconnect();
+            aacp_media_disconnected();
             l2cap_set_flushable_local_cid(0);
             audio_slot_queue_init();
             playback_encoder_close();
@@ -3399,6 +3502,8 @@ static int setup_aaceld_configuration(){
 
 
 bool avdtp_disconnect_and_scan(void){
+    aacp_routing_override();
+    playback_released=playback_release_pending=false;
     avrcp_reconnect_reset();
     // Pair supersedes a profile reconnect, even if clearing the slot or inquiry fails.
     profile_pending = profile_reconnect = false;
@@ -3432,6 +3537,10 @@ bool avdtp_disconnect_and_scan(void){
 void avdtp_source_establish_stream(void) {
     const uint8_t *addr = (const uint8_t *)get_device_addr();
     if (addr == NULL || !peer_address_valid(addr)) return;
+    // Opening A2DP can displace another host before AACP reports ownership.
+    if (!aacp_takeover_pending(addr) &&
+        !(profile_pending && !memcmp(profile_peer, addr, 6) &&
+          (uint32_t)(btstack_run_loop_get_time_ms() - profile_since) < 15000u)) return;
     a2dp_accept_incoming = true;
     if (a2dp_is_connected_flag || a2dp_connect_pending) return;
     a2dp_connect_pending = true;
@@ -3444,6 +3553,73 @@ void avdtp_source_establish_stream(void) {
 
 void a2dp_source_reconnect(void) {
     avdtp_source_establish_stream();
+}
+
+void dongle_playback_connect_requested(void) {
+    playback_released=playback_release_pending=false;
+    a2dp_accept_incoming=true;
+}
+
+static void playback_release_close(void) {
+    playback_release_pending=false;
+    avrcp_reconnect_reset();
+    a2dp_demo_timer_stop(&media_tracker);
+    aacp_disconnect();
+    l2cap_set_flushable_local_cid(0);
+    if (media_tracker.avdtp_cid) a2dp_source_disconnect(media_tracker.avdtp_cid);
+    if (media_tracker.avrcp_cid) avrcp_disconnect(media_tracker.avrcp_cid);
+}
+
+uint16_t dongle_routing_snapshot(uint8_t *out, uint16_t capacity) {
+    if (!out || capacity<32) return 0;
+    const uint8_t *peer=(const uint8_t *)get_device_addr();
+    aacp_routing_state_t state=aacp_routing_state();
+    bool held=playback_released && peer && !memcmp(peer,release_peer,6);
+    bool released=held && !aacp_audio_owned() && !a2dp_is_connected_flag && !a2dp_connect_pending && !media_tracker.avdtp_cid;
+    memset(out,0,32);out[0]=1;out[1]=32;
+    out[2]=state.flags|(released?8u:0u)|(held&&!released?16u:0u)|
+        (a2dp_is_connected_flag?32u:0u)|(aacp_control_ready()?64u:0u)|
+        ((aacp_mic_requested()||aacp_mic_active()||call_active||call_opened)?128u:0u);
+    out[3]=state.stage;dongle_put32(out+4,state.revision);
+    dongle_put32(out+8,aacp_control_session());
+    if(peer)memcpy(out+12,peer,6);
+    out[18]=state.action;dongle_put32(out+20,btstack_run_loop_get_time_ms());
+    dongle_put32(out+24,state.age_ms);dongle_put32(out+28,state.nonce);
+    return 32;
+}
+
+uint8_t dongle_routing_request(uint8_t action, uint32_t expected, uint32_t nonce) {
+    if (action>1 || !expected || !nonce) return DONGLE_MALFORMED;
+    aacp_routing_state_t state=aacp_routing_state();
+    if (state.revision!=expected || state.nonce==nonce) return DONGLE_STALE;
+    const uint8_t *peer=(const uint8_t *)get_device_addr();
+    if (!peer || !peer_address_valid(peer)) return DONGLE_DISCONNECTED;
+    if (state.flags&4) return DONGLE_BUSY;
+    if (aacp_mic_requested() || aacp_mic_active() || call_active || call_opened ||
+        profile_pending || profile_reconnect || a2dp_connect_pending ||
+        (playback_released && (a2dp_is_connected_flag || media_tracker.avdtp_cid)) || mic_prepare_open ||
+        mic_recovery_pending || phone_output_recovery || suspend_recovery_pending ||
+        (playback_game.changed && (action || playback_game.phase!=GAME_CONFIRMED)) ||
+        playback_game.waiting_tx || playback_game.waiting_report ||
+        playback_game.restore_failed) return DONGLE_BUSY;
+    if (action) {
+        if (!aacp_takeover_request(peer)) return DONGLE_BUSY;
+        aacp_routing_receipt(nonce,2);
+        avdtp_source_establish_stream();
+        return DONGLE_ACCEPTED;
+    }
+    aacp_routing_override();
+    aacp_routing_receipt(nonce,1);
+    memcpy(release_peer,peer,6);playback_released=true;a2dp_accept_incoming=false;
+    if (playback_game.changed) {
+        // Restore only this owned receiver before closing; retain its requested preference.
+        playback_release_pending=true;release_revision=aacp_routing_state().revision;
+        release_session=aacp_control_session();release_cid=media_tracker.avdtp_cid;
+        playback_usb_verify_cancel();
+        playback_adjust_cancel_stream(&media_tracker,btstack_run_loop_get_time_ms(),playback_adjust_interval(&playback_adjust));
+        playback_game.phase=GAME_RESTORING;
+    } else playback_release_close();
+    return DONGLE_ACCEPTED;
 }
 
 
@@ -3544,21 +3720,17 @@ uint8_t dongle_playback_configure(uint8_t codec, uint8_t rate_mode, uint32_t bit
     const uint8_t *peer=(const uint8_t *)get_device_addr();
     if (!peer || !peer_address_valid(peer)) return DONGLE_DISCONNECTED;
     if (!playback_profile_preflight(next,peer)) return DONGLE_UNSUPPORTED;
+    if (!a2dp_is_connected_flag) { playback_options=next; return DONGLE_ACCEPTED; }
+    if (!aacp_audio_owned()) return DONGLE_BUSY;
     profile_previous=playback_options; playback_options=next;
     memcpy(profile_peer,peer,sizeof(profile_peer));
     profile_pending=true;
     profile_since=btstack_run_loop_get_time_ms();
-    if (a2dp_is_connected_flag) {
-        if (a2dp_source_disconnect(media_tracker.avdtp_cid)!=ERROR_CODE_SUCCESS) {
-            playback_options=profile_previous; profile_pending=false; return DONGLE_BUSY;
-        }
-        profile_reconnect=true;
-        a2dp_demo_timer_stop(&media_tracker);
-    } else {
-        profile_reconnect=false;
-        avdtp_source_establish_stream();
-        if (!a2dp_connect_pending) { playback_options=profile_previous; profile_pending=false; return DONGLE_DISCONNECTED; }
+    if (a2dp_source_disconnect(media_tracker.avdtp_cid)!=ERROR_CODE_SUCCESS) {
+        playback_options=profile_previous; profile_pending=false; return DONGLE_BUSY;
     }
+    profile_reconnect=true;
+    a2dp_demo_timer_stop(&media_tracker);
     return DONGLE_ACCEPTED;
 }
 
@@ -3626,6 +3798,7 @@ static void playback_reconnect_poll(uint32_t now) {
     const uint8_t *peer = (const uint8_t *)get_device_addr();
     if (a2dp_is_connected_flag) reconnect_delay = 1000;
     if (a2dp_is_connected_flag || a2dp_connect_pending || !a2dp_accept_incoming ||
+        !aacp_takeover_pending(peer) ||
         profile_pending || profile_reconnect || !peer || !peer_address_valid(peer)) {
         reconnect_since = now;
         return;
@@ -3638,6 +3811,13 @@ static void playback_reconnect_poll(uint32_t now) {
 void dongle_playback_poll(void) {
     const uint8_t *peer=(const uint8_t *)get_device_addr();
     uint32_t now=btstack_run_loop_get_time_ms();
+    if (playback_release_pending && (!playback_released || !peer || memcmp(peer,release_peer,6) ||
+        aacp_routing_state().revision!=release_revision || aacp_control_session()!=release_session ||
+        media_tracker.avdtp_cid!=release_cid)) playback_release_pending=playback_released=false;
+    if (playback_release_pending && (aacp_mic_requested() || aacp_mic_active() || call_active || call_opened)) {
+        playback_release_pending=playback_released=false;
+        aacp_routing_override();
+    }
     // Recovery duty time is sampled here, with one poll interval of boundary uncertainty.
     if (playback_work_metrics.recovery_active)
         playback_work_metrics.recovery_poll_ms += now - playback_work_metrics.recovery_last_ms;
@@ -3699,7 +3879,7 @@ void dongle_playback_poll(void) {
         playback_game_session_lost(&playback_game); game_session=session;
     }
     // USB/Game Mode receive-buffer policy; suspended preparation remains unchanged.
-    bool live=is_usb_streaming && !phone_active && !call_active && media_tracker.streaming && playback_pcm_warm() &&
+    bool live=!playback_released && is_usb_streaming && !phone_active && !call_active && media_tracker.streaming && playback_pcm_warm() &&
         playback_game_eligible() && aacp_control_ready() && !aacp_mic_requested() && !aacp_mic_active();
     if (!live) playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
     uint8_t previous_interval=playback_adjust_interval(&playback_adjust);
@@ -3715,7 +3895,7 @@ void dongle_playback_poll(void) {
         playback_adjust_request(&playback_adjust,reported_delay,playback_game.target);
     }
     // USB can adjust live; a phone source still prepares while suspended.
-    bool active=!aacp_mic_requested() && !aacp_mic_active() &&
+    bool active=!playback_released && !aacp_mic_requested() && !aacp_mic_active() &&
         (!media_tracker.streaming || playback_game.changed || live);
     bool available=!profile_pending && !a2dp_connect_pending &&
         aacp_control_ready() && aacp_audio_owned();
@@ -3753,6 +3933,9 @@ void dongle_playback_poll(void) {
         else if (playback_game.phase==GAME_PENDING && playback_game.changed)
             playback_game.phase=GAME_CONFIRMED;
     }
+    if (playback_release_pending && !playback_game.changed && !playback_game.waiting_tx &&
+        !playback_game.waiting_report && !playback_game.restore_failed && !playback_adjust_busy(&playback_adjust))
+        playback_release_close();
     bt_hci_airpods_flush_timeout(available && playback_game_eligible() &&
         playback_game.requested && playback_game.low_latency_confirmed &&
         !playback_game.failed && !playback_game.restore_failed &&
@@ -4136,6 +4319,9 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 
 int btstack_main(int argc, const char * argv[]){
 
+#if AIRPODS_EXPERIMENTAL_RADIO0076
+    radio0076_register_gate();
+#endif
     l2cap_init();
     rfcomm_init();
     aacp_init();

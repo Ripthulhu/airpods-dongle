@@ -47,6 +47,10 @@ int main(void){
     const uint8_t setting[]={1,0x28,1,0,0,0};
     transact(1,7,setting,sizeof(setting));assert(clients[1].failure==BUSY);
     const uint8_t snapshot[]={2};transact(1,7,snapshot,sizeof(snapshot));assert(clients[1].phase==COMPLETE);
+    const uint8_t routing[]={20};transact(1,7,routing,sizeof(routing));assert(clients[1].phase==COMPLETE);
+    const uint8_t handover[]={21,0,1,0,0,0,17,0,0,0};
+    transact(1,7,handover,sizeof(handover));assert(clients[1].failure==BUSY && lease_owner==0);
+    transact(0,7,handover,sizeof(handover));assert(clients[0].failure==BUSY && lease_owner==0);
     raw(0);complete();raw(0);complete();assert(att_sent==3);
     lease(1,2,tokens[0]);assert(clients[1].failure==STALE && lease_owner==0);
     lease(0,2,tokens[0]);assert(clients[0].phase==COMPLETE && lease_owner<0);

@@ -13,7 +13,11 @@
 #include "../src/runtime_watch.h"
 #include "../src/btstack/playback_inspect.h"
 #include "../src/btstack/playback_pcm.h"
+#include "../src/btstack/playback_tempo.h"
 static playback_inspect_t playback_inspect;
+static playback_pcm_t playback_pcm;
+static union { playback_resample_t resample; playback_tempo_work_t tempo; } encoder_work;
+#define encoder_resample encoder_work.resample
 static bool inspect_enabled;
 static playback_adjust_t playback_adjust;
 static playback_game_t playback_game;
@@ -80,6 +84,7 @@ typedef unsigned avdtp_media_codec_type_t;
 typedef struct {
     unsigned avdtp_cid, local_seid;
     uint32_t time_audio_data_sent, acc_num_missed_samples, samples_ready;
+    uint64_t sample_debt;
     btstack_timer_source_t audio_timer;
     bool streaming;
     int max_media_payload_size;
@@ -121,7 +126,7 @@ static void a2dp_demo_timer_stop(void *a) {
     playback_encoder_invalidate();
     playback_continuity_reset(&phone_continuity);
     (void)a; assert(allow_recovery); media_tracker.streaming=false;
-    media_tracker.samples_ready=media_tracker.acc_num_missed_samples=0;
+    media_tracker.samples_ready=media_tracker.acc_num_missed_samples=0;media_tracker.sample_debt=0;
     media_tracker.codec_ready_to_send=media_tracker.codec_storage_count=media_tracker.codec_num_frames=0;
 }
 static unsigned avdtp_source_suspend(unsigned a, unsigned b) { (void)a; (void)b; assert(allow_recovery); return 0; }
@@ -136,15 +141,16 @@ static void btstack_sbc_encoder_process_data(void *a) { (void)a; }
 static unsigned time_us_32(void) { return now*1000u; }
 static void playback_encode_measured(unsigned a) { (void)a; }
 #ifndef PLAYBACK_PIPELINE
+static bool playback_encoder_tempo_run(void) {assert(!encoder_job.tempo);(void)tempo_read;(void)tempo_fraction;return true;}
 static void audio_pcm_read(unsigned frames) {
+    encoder_job.tempo=false;
     consumed += frames;
     source_consumed += frames * playback_adjust_interval(&playback_adjust) / 10;
     if(pcm_read_hook)pcm_read_hook();
 }
 #else
 #include "../src/btstack/playback_pcm.h"
-static playback_pcm_t playback_pcm;
-static playback_resample_t encoder_resample;
+
 static playback_usb_clock_t usb_clock;
 static playback_trace_t playback_trace;
 #undef PB_ADD
@@ -175,7 +181,7 @@ static void phone_sink_record_loss(bool overflow,uint32_t frames,uint32_t fill,u
     assert(phone_active && !call_active && !is_usb_streaming);
 }
 static void pipeline_filter_cost(void);
-static void critical_section_enter_blocking(void *p) {(void)p;assert(!pcm_locked);pcm_locked=true;}
+static void critical_section_enter_blocking(void *p) {(void)p;if(pcm_lock_hook)pcm_lock_hook();assert(!pcm_locked);pcm_locked=true;}
 static void critical_section_exit(void *p) {(void)p;assert(pcm_locked);pcm_locked=false;}
 static void pipeline_render(const playback_resample_t *work,int16_t *dst) {
     assert(!pcm_locked);playback_pcm_render(work,dst);
@@ -188,6 +194,7 @@ static void pipeline_render_q31(const playback_resample_t *work,int32_t *dst) {
 #define playback_pcm_render pipeline_render
 #define playback_pcm_render_q31 pipeline_render_q31
 static void playback_prepare_packet(a2dp_media_sending_context_t *,uint32_t);
+static bool playback_encoder_scope_current(void);
 static void playback_transport_recover(a2dp_media_sending_context_t *);
 #include "playback_pipeline.inc"
 static void pipeline_encode(AACENC_BufDesc *,AACENC_InArgs *);
@@ -336,6 +343,7 @@ static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigne
     encode_error = encode_consumed_delta = 0;last_configuration = 0;
     pcm_read_hook = pcm_lock_hook = NULL;
     control_session = usb_playback_revision = 1;
+    usb_ingress_frames=encoder_tempo_ingress=tempo_ingress_after=0;
     playback_continuity_reset(&phone_continuity);
     phone_buffer_started=false;audio_owned=true;
     playback_adjust_cancel(&playback_adjust);
@@ -460,7 +468,31 @@ static void rate_boundaries_preserve_source_time(void) {
     }
 }
 #if !defined(PLAYBACK_PIPELINE) && !defined(PLAYBACK_ENCODER_JOB)
+static void signed_source_credit(void) {
+    initialize(4,480,324,10,986);
+    playback_adjust.running=true;playback_adjust.interval=9;
+    media_tracker.samples_ready=480;
+    playback_clock_debit(&media_tracker,450,9);
+    assert(!media_tracker.samples_ready && media_tracker.sample_debt==20u*99000u);
+    playback_clock_accrue(&media_tracker,1);
+    assert(media_tracker.samples_ready==33 && media_tracker.acc_num_missed_samples==33000 && !media_tracker.sample_debt);
+    initialize(4,480,324,10,986);
+    media_tracker.samples_ready=480;
+    playback_clock_debit(&media_tracker,450,9);
+    playback_clock_switch(&media_tracker,0,9,10);
+    assert(media_tracker.sample_debt==18u*99000u);
+    playback_clock_accrue(&media_tracker,1);
+    assert(media_tracker.samples_ready==30 && !media_tracker.acc_num_missed_samples && !media_tracker.sample_debt);
+    initialize(4,480,324,10,986);
+    playback_adjust.running=true;playback_adjust.interval=9;
+    media_tracker.samples_ready=480;
+    playback_clock_debit(&media_tracker,528,9);
+    assert(media_tracker.sample_debt==10560000u);
+    playback_clock_accrue(&media_tracker,2);
+    assert(!media_tracker.samples_ready && !media_tracker.acc_num_missed_samples && !media_tracker.sample_debt);
+}
 int main(void) {
+    signed_source_credit();
     phone_packet_groups();
     rate_boundaries_preserve_source_time();
     fixed_deadlines();

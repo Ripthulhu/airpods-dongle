@@ -18,6 +18,8 @@ dongle_att_result_t dongle_att_take(uint8_t *p,uint16_t cap,uint16_t *n) {
 uint8_t dongle_playback_configure(uint8_t c,uint8_t r,uint32_t b) {(void)c;(void)r;(void)b;return DONGLE_UNSUPPORTED;}
 uint8_t dongle_playback_game_mode(bool e) {(void)e;return DONGLE_UNSUPPORTED;}
 uint16_t dongle_playback_status(uint8_t *p,uint16_t n) {(void)p;(void)n;return 0;}
+uint16_t dongle_routing_snapshot(uint8_t *p,uint16_t n) {(void)p;(void)n;return 0;}
+uint8_t dongle_routing_request(uint8_t a,uint32_t r,uint32_t token) {(void)a;(void)r;(void)token;return DONGLE_UNSUPPORTED;}
 uint16_t dongle_playback_diagnostics(uint8_t *p,uint16_t n) {(void)p;(void)n;return 0;}
 uint16_t phone_sink_diagnostics(uint8_t *p,uint16_t n) {(void)p;(void)n;return 0;}
 uint16_t dongle_playback_trace(uint8_t *p,uint16_t n) {(void)p;(void)n;return 0;}

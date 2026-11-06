@@ -27,6 +27,8 @@ void aacp_connect(bd_addr_t addr);
 
 // Tear down the AACP channel if open.
 void aacp_disconnect(void);
+// A retiring media link must retain a fresh, unsent button request for its replacement.
+void aacp_media_disconnected(void);
 
 // Service deferred capture and bounded channel deadlines from the main loop,
 // with the same async-context lock used for START/STOP.
@@ -38,9 +40,19 @@ bool aacp_is_connected(void);
 // Audio authority is separate from the retained control connection. Unknown or
 // relinquished ownership cannot start media or change physical volume.
 bool aacp_audio_owned(void);
-// Explicit physical-button intent, bound to the selected saved AirPods peer.
+// Explicit button/app Connect intent, bound to the selected saved AirPods peer.
 // Bounded transmission is not a remote acknowledgment; repeated presses coalesce.
 bool aacp_takeover_request(const uint8_t peer[6]);
+// Outgoing media connections require a current, peer-bound user request.
+bool aacp_takeover_pending(const uint8_t peer[6]);
+typedef struct {
+    uint32_t revision, age_ms, nonce;
+    uint8_t flags, stage, action;
+} aacp_routing_state_t;
+aacp_routing_state_t aacp_routing_state(void);
+// Manual choices retire automatic receipts even when the takeover itself coalesces.
+void aacp_routing_override(void);
+void aacp_routing_receipt(uint32_t nonce, uint8_t action);
 void aacp_routing_report(void);
 // Cancel only unsent receiver-buffer changes when another host owns audio.
 void aacp_receive_buffer_cancel(void);

@@ -11,6 +11,8 @@ static bool pairing_ok = true;
 static bool pairing_busy;
 static bool settings_busy;
 static unsigned reconnects, pairs, phone_pairs, anc_writes;
+static bool takeover_authorized, takeover_allowed=true;
+static unsigned takeover_requests;
 static dongle_readback_t readback;
 static bool case_fallback;
 void dongle_case_battery_poll(void) {}
@@ -35,7 +37,11 @@ uint32_t aacp_control_session(void) { return test_session; }
 bool aacp_control_ready(void) { return ready; }
 const dongle_readback_t *aacp_control_readback(void) { return &readback; }
 bool aacp_control_anc(uint8_t mode) { assert(mode == 2 || mode == 3); anc_writes++; return true; }
-void a2dp_source_reconnect(void) { reconnects++; }
+bool aacp_takeover_request(const uint8_t peer[6]) {
+    assert(!memcmp(peer,test_address,6));++takeover_requests;
+    return takeover_authorized=takeover_allowed;
+}
+void a2dp_source_reconnect(void) { assert(takeover_authorized);takeover_authorized=false;reconnects++; }
 bool avdtp_disconnect_and_scan(void) { if (pairing_ok) { pairs++; test_address[0]++; test_session++; } return pairing_ok; }
 bool bt_hci_phone_pairing_start(void) { if (pairing_ok) phone_pairs++; return pairing_ok; }
 bool bt_hci_phone_pairing_busy(void) { return pairing_busy; }
@@ -62,7 +68,7 @@ int main(void) {
     assert(controls[0].status[42] & 32); // Whole-workflow settings lease support.
     assert(controls[0].status[42] & 64); // Presence and case provenance extension.
     assert(controls[0].status[42] & 128); // Explicit USB host volume authority.
-    assert(controls[0].status[43] == 1); // Active-audio runtime update, capability 256.
+    assert(controls[0].status[43] == 3); // Active-audio update and explicit routing handover.
     uint32_t same_generation=controls[0].generation;
     case_fallback=true; dongle_control_poll();
     assert(controls[0].generation==same_generation);
@@ -125,5 +131,12 @@ int main(void) {
     assert(dongle_control_client_generation(1)==phone_generation && controls[1].last_sequence==1);
     dongle_control_client_available(1,false);dongle_control_poll();
     assert(!controls[1].last_sequence && dongle_control_client_generation(1)!=phone_generation);
+    dongle_control_available(true);dongle_control_poll();
+    unsigned previous_requests=takeover_requests,previous_reconnects=reconnects;
+    takeover_allowed=false;request(r,1,1);send(r);
+    assert(takeover_requests==previous_requests+1 && reconnects==previous_reconnects && controls[0].last_result==DONGLE_BUSY);
+    send(r);assert(takeover_requests==previous_requests+1); // A denied duplicate cannot authorize later.
+    takeover_allowed=true;request(r,1,2);send(r);
+    assert(takeover_requests==previous_requests+2 && reconnects==previous_reconnects+1);
     puts("dongle controls: silent discovery, target generations, duplicate commands, backpressure and USB loss passed");
 }

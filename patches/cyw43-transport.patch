@@ -97,7 +97,7 @@ diff --git a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c b/sr
  
      return 0;
  }
-@@ -106,24 +144,49 @@
+@@ -106,24 +144,54 @@
      hci_transport_cyw43_packet_handler = handler;
  }
  
@@ -134,6 +134,11 @@ diff --git a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c b/sr
 +    int err = cyw43_bluetooth_hci_write(pending_packet, pending_size);
 +    if (err == CYBT_ERR_QUEUE_FULL) {
 +        counter_inc(&transport_stats.blocked);
++        // A wedged controller must stop the application feeding its watchdog.
++        if ((uint32_t)(btstack_run_loop_get_time_ms() - pending_since) >= 2000u) {
++            counter_inc(&transport_stats.fatal_errors);
++            panic("cyw43 transmit queue stalled for 2000 ms");
++        }
 +        if (!retry_armed) {
 +            btstack_run_loop_set_timer(&retry_timer, 1);
 +            btstack_run_loop_add_timer(&retry_timer);
@@ -163,7 +168,7 @@ diff --git a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c b/sr
  }
  
  // configure and return hci transport singleton
-@@ -133,7 +196,7 @@
+@@ -133,7 +201,7 @@
          /* int    (*open)(void); */                                     &hci_transport_cyw43_open,
          /* int    (*close)(void); */                                    &hci_transport_cyw43_close,
          /* void   (*register_packet_handler)(void (*handler)(...); */   &hci_transport_cyw43_register_packet_handler,
@@ -172,7 +177,7 @@ diff --git a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c b/sr
          /* int    (*send_packet)(...); */                               &hci_transport_cyw43_send_packet,
          /* int    (*set_baudrate)(uint32_t baudrate); */                NULL,
          /* void   (*reset_link)(void); */                               NULL,
-@@ -147,6 +210,7 @@
+@@ -147,6 +215,7 @@
  // Called to perform bt work from a data source
  static void hci_transport_cyw43_process(void) {
      CYW43_THREAD_LOCK_CHECK
@@ -180,7 +185,7 @@ diff --git a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c b/sr
      uint32_t len = 0;
      bool has_work;
  #ifdef PICO_BTSTACK_CYW43_MAX_HCI_PROCESS_LOOP_COUNT
-@@ -157,6 +221,7 @@
+@@ -157,6 +226,7 @@
          BT_DEBUG("bt in len=%lu err=%d\n", len, err);
          if (err == 0 && len > 0) {
              hci_transport_cyw43_packet_handler(cyw43_receive_buffer[3], &cyw43_receive_buffer[CYW43_PACKET_HEADER_SIZE], len - CYW43_PACKET_HEADER_SIZE);
@@ -188,7 +193,7 @@ diff --git a/src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c b/sr
              has_work = true;
          } else {
              has_work = false;
-@@ -168,6 +233,7 @@
+@@ -168,6 +238,7 @@
          }
  #endif
      } while (has_work);

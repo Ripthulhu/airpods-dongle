@@ -6,9 +6,10 @@ set(PICO_BOARD pico2_w CACHE STRING "Board type")
 set(PICOTOOL_FORCE_FETCH_FROM_GIT 1)
 set(PICOTOOL_GIT_BRANCH 2041936441b48a3cc53ae3da9e805229fe8f4e18)
 include(pico_sdk_import.cmake)
-project(airpods_dongle VERSION 0.1.57 LANGUAGES C CXX ASM)
+project(airpods_dongle VERSION 0.1.62 LANGUAGES C CXX ASM)
 option(AIRPODS_USB_FLOAT "Expose float and integer PCM32 USB input alongside S16 compatibility" ON)
 option(AIRPODS_ENABLE_BLUETOOTH_CALLS "Experimental HFP/SCO calls; CYW43 firmware can stall (pico-sdk issue 1461)" OFF)
+option(AIRPODS_EXPERIMENTAL_RADIO0076 "Offline-review .0076 radio preview; not hardware-qualified" OFF)
 set(AACELD_CBR_BANDWIDTH 20000 CACHE STRING "AAC-ELD CBR bandwidth in Hz; 0 uses FDK automatic selection")
 set_property(CACHE AACELD_CBR_BANDWIDTH PROPERTY STRINGS 0 16000 18000 20000)
 if(NOT AACELD_CBR_BANDWIDTH MATCHES "^(0|16000|18000|20000)$")
@@ -100,6 +101,29 @@ target_link_libraries(airpods_dongle PRIVATE
     pico_cyw43_arch_threadsafe_background pico_btstack_sbc_encoder pico_btstack_sbc_decoder
     tinyusb_device tinyusb_board fdk-aac lhdcv5
 )
+if(AIRPODS_EXPERIMENTAL_RADIO0076)
+    set(radio0076_dir "${CMAKE_CURRENT_LIST_DIR}/src/radio0076")
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/check_radio0076.py"
+        RESULT_VARIABLE radio0076_check)
+    if(NOT radio0076_check EQUAL 0)
+        message(FATAL_ERROR "Frozen .0076 inputs failed identity checks")
+    endif()
+    target_sources(airpods_dongle PRIVATE
+        "${radio0076_dir}/radio0076.c" "${radio0076_dir}/hci_gate.c" "${radio0076_dir}/readback.c"
+        "${radio0076_dir}/preboot_patch.c" "${radio0076_dir}/calibration.c"
+        "${radio0076_dir}/shared_bridge.c")
+    target_include_directories(airpods_dongle BEFORE PRIVATE "${radio0076_dir}"
+        "${PICO_SDK_PATH}/src/rp2_common/pico_cyw43_driver/cybt_shared_bus")
+    target_compile_definitions(airpods_dongle PRIVATE AIRPODS_EXPERIMENTAL_RADIO0076=1 EXTERNAL_PI_TRANSPORT=1)
+    target_link_options(airpods_dongle PRIVATE -Wl,--wrap=cybt_fw_download
+        -Wl,--wrap=cyw43_ll_write_backplane_mem -Wl,--wrap=cybt_set_host_ready)
+    add_custom_command(TARGET airpods_dongle POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/tools/check_radio0076.py"
+            --elf "$<TARGET_FILE:airpods_dongle>" --nm "${CMAKE_NM}"
+        COMMENT "Verifying linked .0076 radio identity before UF2 publication" VERBATIM)
+    set_property(TARGET airpods_dongle APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_LIST_DIR}/tools/check_radio0076.py" "${radio0076_dir}/frozen.json")
+endif()
 pico_enable_stdio_uart(airpods_dongle 0)
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_codec_fingerprint")
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_eld_cbr_bandwidth_hz")
@@ -117,6 +141,9 @@ pico_add_linker_script_override_path(airpods_dongle "${dongle_linker}"
     default_text_excludes.incl default_rodata_excludes.incl)
 pico_set_program_name(airpods_dongle "AirPods Dongle")
 pico_set_program_version(airpods_dongle "${PROJECT_VERSION}")
+if(AIRPODS_EXPERIMENTAL_RADIO0076)
+    pico_set_program_version(airpods_dongle "${PROJECT_VERSION}-experimental-radio0076")
+endif()
 pico_init_picotool()
 include(tools/codec_probe/publish.cmake)
 set(codec_check_command

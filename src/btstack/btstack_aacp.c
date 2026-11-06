@@ -93,6 +93,7 @@ uint32_t aacp_mic_call_read(int16_t *pcm, uint32_t frames) { return mic_read(AAC
 #define AACP_CONNECT_DELAY_MS 1500   // let A2DP settle before opening the channel
 #define AACP_RETRY_DELAY_MS   3000   // delay between connect retries
 #define AACP_MAX_ATTEMPTS     3      // initial attempt + retries per A2DP session
+#define AACP_INIT_RETRY_MS    3000u
 
 // Mic lifecycle: the ONLY trigger is the USB alt setting — main.c calls
 // aacp_mic_start()/aacp_mic_stop() when the host opens/closes the recording
@@ -102,8 +103,12 @@ uint32_t aacp_mic_call_read(int16_t *pcm, uint32_t frames) { return mic_read(AAC
 
 // --- Fixed init byte sequences (verbatim from librepods) ---
 
-// 1) Handshake: 16 bytes sent raw (the 04 00 04 00 data header is part of it).
+// Service 4 version 1.3, with one bounded 1.2 fallback for older peers.
 static const uint8_t aacp_handshake[] = {
+    0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x03, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const uint8_t aacp_handshake_legacy[] = {
     0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
@@ -120,6 +125,7 @@ static const uint8_t aacp_request_notifications[] = {
     0xFF, 0xFF, 0xFF, 0xFF
 };
 static const uint8_t aacp_request_keys[] = {4,0,4,0,0x30,0,5,0};
+static const uint8_t aacp_request_capabilities[] = {4,0,4,0,1,0,8};
 
 // --- Mic stream control byte sequences (verbatim from librepods) ---
 
@@ -173,10 +179,12 @@ static uint32_t control_session;
 // One immutable queued packet at a time, not a new packet queue or audio buffer.
 static struct {
     uint8_t peer[6], other[6];
-    uint8_t tx[144], stage, introduction, tx_kind;
+    uint8_t tx[144], stage, tx_kind;
     bool have_other, known, relinquished, pending, queued, confirmed;
     uint32_t since;
 } routing;
+static uint32_t routing_revision = 1, routing_nonce;
+static uint8_t routing_action;
 #define AACP_TAKEOVER_MS 10000u
 static void routing_poll(uint32_t now);
 static void routing_packet(const uint8_t *packet, uint16_t size);
@@ -190,7 +198,7 @@ static void control_reset(void) {
     dongle_readback_clear(&control_readback);
     settings_reset(&settings);
     routing.queued = routing.confirmed = routing.known = routing.have_other = false;
-    routing.introduction = routing.stage = 0;
+    routing.stage = 0;
     routing_authority(false);
     for (unsigned i = 0; i < sizeof(reports) / sizeof(reports[0]); ++i) {
         reports[i].length = 0;
@@ -206,7 +214,7 @@ static void control_reset(void) {
     }
 }
 static uint16_t aacp_cid;
-static bool aacp_session, aacp_connected, aacp_got_control, aacp_init_sent;
+static bool aacp_session, aacp_connected, aacp_got_control, aacp_init_sent, aacp_init_retried;
 static bd_addr_t aacp_addr;
 static uint8_t aacp_attempts;
 static uint32_t aacp_channel_since_ms, aacp_tx_since_ms;
@@ -256,7 +264,7 @@ void aacp_disconnect(void) {
     uint16_t cid = aacp_cid;
     aacp_session = false;
     aacp_cid = 0;
-    aacp_connected = aacp_got_control = aacp_init_sent = false;
+    aacp_connected = aacp_got_control = aacp_init_sent = aacp_init_retried = false;
     aacp_mic_remote_active = false;
     aacp_mic_stopping = false;
     aacp_mic_restore_required=aacp_mic_restore_started=aacp_mic_restore_complete=false;
@@ -266,8 +274,17 @@ void aacp_disconnect(void) {
     if (cid != 0) l2cap_disconnect(cid);
 }
 
+void aacp_media_disconnected(void) {
+    bool requested = routing.stage == 0 && aacp_takeover_pending(routing.peer);
+    uint32_t since = routing.since;
+    aacp_disconnect();
+    routing.pending = requested;
+    routing.since = since;
+}
+
 void aacp_init(void) {
     memset(&routing, 0, sizeof(routing));
+    routing_revision=1; routing_nonce=0; routing_action=0;
     atomic_store_explicit(&audio_authority, false, memory_order_release);
     pair_irk_known=false;
     pair_case_supported=false;
@@ -304,7 +321,7 @@ static void aacp_schedule_retry(void) {
 
 void aacp_connect(bd_addr_t addr) {
     if (aacp_session && memcmp(aacp_addr, addr, sizeof(bd_addr_t)) == 0) return;
-    bool requested = routing.pending && !memcmp(routing.peer, addr, 6);
+    bool requested = aacp_takeover_pending(addr);
     uint32_t requested_since = routing.since;
     aacp_disconnect();
     if (memcmp(routing.peer, addr, 6)) {
@@ -347,6 +364,27 @@ static bool aacp_tx_enqueue(const uint8_t *data, uint16_t len) {
     return true;
 }
 
+// Publish the complete batch before requesting a callback, retaining two urgent-control slots.
+static bool aacp_startup_enqueue(bool legacy) {
+    const aacp_pkt_t packets[] = {
+        {legacy ? aacp_handshake_legacy : aacp_handshake, sizeof(aacp_handshake)},
+        {aacp_set_feature_flags, sizeof(aacp_set_feature_flags)},
+        {aacp_request_notifications, sizeof(aacp_request_notifications)},
+        {aacp_request_capabilities, sizeof(aacp_request_capabilities)},
+        {aacp_request_keys, sizeof(aacp_request_keys)}
+    };
+    unsigned count=legacy ? 4u : 5u;
+    if (!aacp_session || !aacp_connected || !aacp_cid ||
+        aacp_tx_count>AACP_TX_QUEUE_LEN-count-2u) return false;
+    if (!aacp_tx_count) aacp_tx_since_ms=btstack_run_loop_get_time_ms();
+    for (unsigned i=0;i<count;++i)
+        aacp_tx_queue[(aacp_tx_head+aacp_tx_count+i)%AACP_TX_QUEUE_LEN]=packets[i];
+    aacp_tx_count=(uint8_t)(aacp_tx_count+count);
+    if (legacy) { aacp_init_retried=true; aacp_init_sent=false; }
+    l2cap_request_can_send_now_event(aacp_cid);
+    return true;
+}
+
 static void routing_cancel(void) {
     unsigned kept = 0;
     for (unsigned i = 0; i < aacp_tx_count; ++i) {
@@ -370,7 +408,6 @@ void aacp_receive_buffer_cancel(void) {
 }
 
 static void routing_authority(bool allowed) {
-    if (allowed) routing.introduction = 0;
     bool previous = atomic_exchange_explicit(&audio_authority, allowed, memory_order_acq_rel);
     if (previous != allowed) dongle_playback_ownership_changed(allowed);
 }
@@ -378,7 +415,12 @@ static void routing_authority(bool allowed) {
 bool aacp_takeover_request(const uint8_t peer[6]) {
     if (!peer || !peer_address_valid(peer) || usb_mic_requested() ||
         phone_call_mic_requested() || aacp_mic_active()) return false;
-    if (routing.pending) return !memcmp(peer, routing.peer, 6);
+    if (routing.pending && !aacp_takeover_pending(routing.peer)) routing_cancel();
+    if (routing.pending && memcmp(peer, routing.peer, 6)) return false;
+    if (!++routing_revision) ++routing_revision;
+    routing_nonce=0; routing_action=0;
+    dongle_playback_connect_requested();
+    if (routing.pending) return true;
     if (memcmp(peer, routing.peer, 6)) {
         routing_cancel();
         memset(&routing, 0, sizeof(routing));
@@ -386,11 +428,33 @@ bool aacp_takeover_request(const uint8_t peer[6]) {
         atomic_store_explicit(&audio_authority, false, memory_order_release);
     }
     routing.pending = true;
-    routing.introduction = 0;
     routing.confirmed = false;
     routing.stage = 0;
     routing.since = btstack_run_loop_get_time_ms();
     return true;
+}
+
+bool aacp_takeover_pending(const uint8_t peer[6]) {
+    return peer && routing.pending && !memcmp(peer, routing.peer, 6) &&
+           (uint32_t)(btstack_run_loop_get_time_ms() - routing.since) < AACP_TAKEOVER_MS;
+}
+
+aacp_routing_state_t aacp_routing_state(void) {
+    bool pending=aacp_takeover_pending(routing.peer);
+    return (aacp_routing_state_t){routing_revision,
+        pending ? btstack_run_loop_get_time_ms()-routing.since : 0, routing_nonce,
+        (routing.known?1u:0u)|(aacp_audio_owned()?2u:0u)|(pending?4u:0u),
+        routing.stage, routing_action};
+}
+
+void aacp_routing_override(void) {
+    if (!++routing_revision) ++routing_revision;
+    routing_nonce=0; routing_action=0;
+    routing_cancel();
+}
+
+void aacp_routing_receipt(uint32_t nonce, uint8_t action) {
+    routing_nonce=nonce; routing_action=action;
 }
 
 static void routing_poll(uint32_t now) {
@@ -417,15 +481,12 @@ static void routing_poll(uint32_t now) {
         if (routing.stage && !routing.have_other) { routing.stage = 3; return; }
         kind = routing.stage == 0 ? AACP_ROUTE_OWN :
                routing.stage == 1 ? AACP_ROUTE_MEDIA : AACP_ROUTE_HIJACK;
-    } else if (routing.have_other && routing.introduction && !aacp_audio_owned()) {
-        kind = (routing.introduction & 1u) ? AACP_ROUTE_NEW_INFO : AACP_ROUTE_TIPI;
     } else return;
     uint16_t length = (uint16_t)aacp_route_build(routing.tx, sizeof(routing.tx), kind, local, routing.other);
     if (!length) return;
     if (length > l2cap_get_remote_mtu_for_local_cid(aacp_cid)) {
         if (routing.pending && !aacp_audio_owned()) routing.relinquished = true;
         routing_cancel();
-        routing.introduction = 0;
         return;
     }
     // Enqueue may dispatch CAN_SEND synchronously: publish immutable buffer state first.
@@ -462,7 +523,6 @@ static void routing_packet(const uint8_t *packet, uint16_t size) {
         }
         memcpy(routing.other, other, 6);
         routing.have_other = aacp_route_address_valid(other);
-        if (changed) routing.introduction = routing.have_other && !routing.pending && !aacp_audio_owned() ? 3 : 0;
         if (sole && !routing.relinquished && !routing.pending) routing_authority(true);
         if (sole && routing.pending && routing.stage) routing.confirmed = true;
     } else if (aacp_route_source(packet, size, source, &type) && type) {
@@ -701,7 +761,7 @@ static void aacp_channel_failed(void) {
     control_reset();
     uint16_t cid = aacp_cid;
     aacp_cid = 0;
-    aacp_connected = aacp_got_control = aacp_init_sent = false;
+    aacp_connected = aacp_got_control = aacp_init_sent = aacp_init_retried = false;
     aacp_mic_remote_active = false;
     aacp_mic_stopping = false;
     aacp_tx_head = aacp_tx_count = 0;
@@ -823,6 +883,13 @@ static void aacp_handle_can_send_now(void) {
     if (!aacp_connected || aacp_tx_count == 0) return;
     aacp_pkt_t p = aacp_tx_queue[aacp_tx_head];
     uint32_t now=btstack_run_loop_get_time_ms();
+    // A late positive response can make the still-unsent fallback handshake unnecessary.
+    if (p.data==aacp_handshake_legacy && aacp_got_control) {
+        aacp_tx_head=(uint8_t)((aacp_tx_head+1u)%AACP_TX_QUEUE_LEN);
+        --aacp_tx_count;
+        if (aacp_tx_count) l2cap_request_can_send_now_event(aacp_cid);
+        return;
+    }
     if ((p.data==setting_tx || p.data==research_tx) &&
         (!dongle_rpc_transport_current() || aacp_mic_requested() || aacp_mic_active() ||
          (uint32_t)(now-(p.data==setting_tx ? setting_since : research_since))>=3000u)) {
@@ -884,12 +951,11 @@ static void aacp_handle_can_send_now(void) {
         if (routing.tx_kind == AACP_ROUTE_OWN) routing.stage = 1;
         else if (routing.tx_kind == AACP_ROUTE_MEDIA) routing.stage = 2;
         else if (routing.tx_kind == AACP_ROUTE_HIJACK) routing.stage = 3;
-        else if (routing.tx_kind == AACP_ROUTE_NEW_INFO) routing.introduction &= (uint8_t)~1u;
-        else if (routing.tx_kind == AACP_ROUTE_TIPI) routing.introduction &= (uint8_t)~2u;
     }
     aacp_tx_since_ms = btstack_run_loop_get_time_ms();
     if (p.data == research_tx) { research_pending = false; research_result = 1; }
-    if (p.data == aacp_request_notifications) aacp_init_sent = true;
+    if (p.data==aacp_request_keys || (aacp_init_retried && p.data==aacp_request_capabilities))
+        aacp_init_sent = true;
     if (p.data == aacp_mic_start_bytes) {
         aacp_mic_preparing = false;
         aacp_mic_running = true;
@@ -943,6 +1009,10 @@ void aacp_poll(void) {
         aacp_channel_failed();
         return;
     }
+    // Never restart a healthy service or extend the existing channel deadline.
+    if (aacp_session && aacp_connected && aacp_init_sent && !aacp_got_control &&
+        !aacp_init_retried && (uint32_t)(now-aacp_channel_since_ms)>=AACP_INIT_RETRY_MS)
+        (void)aacp_startup_enqueue(true);
     // A successful write is not proof the uplink stopped; drain before restarting.
     if (aacp_mic_stopping) {
         if ((uint32_t)(now - aacp_last_uplink_ms) >= AACP_MIC_QUIET_MS) {
@@ -989,6 +1059,55 @@ void aacp_poll(void) {
 
 static bool aacp_has_header(const uint8_t *sdu, uint16_t size) {
     return size >= 6 && sdu[0] == 4 && sdu[1] == 0 && sdu[2] == 4 && sdu[3] == 0;
+}
+
+static bool aacp_connect_accepted(const uint8_t *p,uint16_t n) {
+    static const uint8_t prefix[]={1,0,4,0,0,0,1,0};
+    return n==18 && !memcmp(p,prefix,sizeof(prefix)) && (p[8]==2 || p[8]==3) && !p[9];
+}
+
+// Known entry widths match Android Capability.kt; unknown IDs cannot prove service readiness.
+static unsigned aacp_capability_width(uint8_t id) {
+    if ((id>=3 && id<=8) || id==0x30) return 4;
+    if (id==1 || id==2 || (id>=9 && id<=0x0d) || (id>=0x0f && id<=0x19) ||
+        (id>=0x20 && id<=0x26) || id==0x28 || id==0x29 || (id>=0x31 && id<=0x38)) return 1;
+    switch(id) {
+        case 0x40: case 0x50: case 0x60: case 0x80: case 0x90: case 0xa0:
+        case 0xb0: case 0xc0: case 0xd0: case 0xe0: case 0xf0: return 1;
+        default: return 0;
+    }
+}
+static bool aacp_capabilities_valid(const uint8_t *p,uint16_t n) {
+    if (n<7 || n>327 || p[4]!=2 || p[5]) return false;
+    uint8_t seen[32]={0};
+    unsigned offset=7;
+    for (unsigned i=0;i<p[6];++i) {
+        if (offset>=n) return false;
+        uint8_t id=p[offset++],bit=(uint8_t)(1u<<(id&7));
+        unsigned width=aacp_capability_width(id);
+        if (!width || (seen[id/8]&bit) || width>n-offset) return false;
+        seen[id/8]|=bit;offset+=width;
+    }
+    return offset==n;
+}
+static bool aacp_legacy_control_valid(const uint8_t *p,uint16_t n) {
+    if (p[5]) return false;
+    if (p[4]==9 && n==11) {
+        bool owned;
+        uint32_t value=dongle_u32(p+7);
+        if (p[6]==0x16) value&=0xffff; // Received upper bytes are previous actions, as in settings_packet.
+        return aacp_route_ownership(p,n,&owned) ||
+            (setting_index(p[6])>=0 && setting_value_valid(p[6],value));
+    }
+    if (p[4]!=4 || n<7 || !p[6] || p[6]>3 || n!=7u+5u*p[6]) return false;
+    unsigned seen=0;
+    for (unsigned i=0;i<p[6];++i) {
+        const uint8_t *battery=p+7+5*i;
+        unsigned bit=battery[0]==4 ? 1u : battery[0]==2 ? 2u : battery[0]==8 ? 4u : 0u;
+        if (!bit || (seen&bit) || (battery[2]>100 && battery[2]!=255)) return false;
+        seen|=bit;
+    }
+    return true;
 }
 
 // Validate the entire SDU before decoding any AU, as in NTPods aap::for_each_au.
@@ -1046,8 +1165,13 @@ static void aacp_handle_audio_sdu(const uint8_t *sdu, uint16_t size) {
 
 static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size) {
     if (type == L2CAP_DATA_PACKET) {
-        if (!aacp_session || !aacp_connected || channel != aacp_cid ||
-            !aacp_has_header(packet, size)) return;
+        if (!aacp_session || !aacp_connected || channel != aacp_cid) return;
+        if (aacp_connect_accepted(packet,size)) {
+            aacp_got_control=true;
+            aacp_try_mic_start();
+            return;
+        }
+        if (!aacp_has_header(packet,size)) return;
         // All microphone messages, including malformed ones, stay out of control readiness.
         if (little_endian_read_16(packet, 4) == 0x58) {
             aacp_handle_audio_sdu(packet, size);
@@ -1063,7 +1187,9 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
             }
             research_cache(packet, size);
             dongle_readback_packet(&control_readback, packet, size, dongle_uptime_ms());
-            aacp_got_control = true;
+            if (aacp_capabilities_valid(packet,size) || aacp_legacy_control_valid(packet,size) ||
+                (packet[4]==0x1d && !packet[5] && settings.profile && settings.firmware_major))
+                aacp_got_control = true;
             aacp_try_mic_start();
         }
         return;
@@ -1086,12 +1212,9 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
                 return;
             }
             aacp_connected = true;
-            aacp_got_control = aacp_init_sent = false;
+            aacp_got_control = aacp_init_sent = aacp_init_retried = false;
             aacp_channel_since_ms = btstack_run_loop_get_time_ms();
-            aacp_tx_enqueue(aacp_handshake, sizeof(aacp_handshake));
-            aacp_tx_enqueue(aacp_set_feature_flags, sizeof(aacp_set_feature_flags));
-            aacp_tx_enqueue(aacp_request_notifications, sizeof(aacp_request_notifications));
-            aacp_tx_enqueue(aacp_request_keys, sizeof(aacp_request_keys));
+            if (!aacp_startup_enqueue(false)) aacp_channel_failed();
             break;
         }
         case L2CAP_EVENT_CAN_SEND_NOW:

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include "pico/stdlib.h"
 
 #include "btstack_hci.h"
 #include "peer_address.h"
@@ -92,6 +93,11 @@ static struct {
     bool active, timed_out;
 } radio_pending;
 static uint32_t radio_epoch;
+// Keep late-reply fencing past the 30-second LMP response window, then recover.
+static void controller_reply_wait(uint32_t since) {
+    if ((uint32_t)(btstack_run_loop_get_time_ms() - since) >= 35000u)
+        panic("Controller command reply stalled for 35000 ms");
+}
 static const uint16_t radio_opcodes[5]={HCI_OPCODE_HCI_READ_RSSI,HCI_OPCODE_HCI_READ_LINK_QUALITY,
     HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL,HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL,0x1406};
 static const hci_cmd_t radio_read_afh_map={0x1406,"H"};
@@ -149,7 +155,8 @@ static void media_flush_policy(void) {
     if (!media_flush.low_latency || (media_flush.comparison &&
         (uint32_t)(btstack_run_loop_get_time_ms() - media_flush.comparison_since) >= MEDIA_FLUSH_COMPARISON_MS))
         media_flush.comparison = false;
-    uint16_t desired = media_flush.low_latency && !media_flush.comparison ? 60 : 200;
+    // Retain the native-tested retransmission baseline in both Game Mode states.
+    uint16_t desired = 200;
     if (desired != media_flush.desired_ms) {
         media_flush.desired_ms = desired;
         media_flush.failed = false;
@@ -183,6 +190,7 @@ static void media_flush_poll(void) {
     hci_connection_t *connection = media_flush_bind();
     media_flush_policy();
     if (media_flush_pending.active) {
+        controller_reply_wait(media_flush_pending.since);
         if ((uint32_t)(btstack_run_loop_get_time_ms() - media_flush_pending.since) >= 1000u &&
             media_flush_pending.epoch == media_flush.epoch) {
             media_flush.failed = true;
@@ -326,6 +334,7 @@ static void media_packet_poll(void) {
         }
     }
     if (media_packet_pending.active) {
+        controller_reply_wait(media_packet_pending.since);
         int index = media_packet_index(media_packet_pending.handle);
         if (index >= 0 && media_packets[index].epoch == media_packet_pending.epoch &&
             (uint32_t)(btstack_run_loop_get_time_ms() - media_packet_pending.since) >= 1000u) {
@@ -436,6 +445,7 @@ static void radio_poll(void) {
     bool connected=radio_bind();
     uint32_t now=btstack_run_loop_get_time_ms();
     if (radio_pending.active) {
+        controller_reply_wait(radio_pending.since);
         if (!radio_pending.timed_out && (uint32_t)(now-radio_pending.since)>=1000u) {
             radio_error(UINT8_MAX);radio_pending.timed_out=true;
         }
@@ -807,6 +817,7 @@ bd_addr_t * get_device_addr_from_list(uint8_t i){
 
 bool gap_start_scanning(void){
     if (scan_active) return true;
+    aacp_routing_override();
     printf("Start scanning...\n");
     ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, true);
     scan_active = gap_inquiry_start(A2DP_SOURCE_DEMO_INQUIRY_DURATION_1280MS) == ERROR_CODE_SUCCESS;
@@ -849,12 +860,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             }
             // Control must remain reliable when only media is allowed to expire.
             gap_enable_link_watchdog(hci_non_flushable_packet_boundary_flag_supported() ? 200 : 0);
-            if (selected_bonded) {
-                avdtp_source_establish_stream();
-            } else if (!peer_address_valid(device_addr_list[0]) &&
-                       !peer_address_valid(device_addr_list[1])) {
-                gap_start_scanning();
-            }
+            // Startup is passive; the saved AirPods may initiate their own return.
             break;
 
         case HCI_EVENT_DISCONNECTION_COMPLETE:
@@ -929,7 +935,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 memcpy(device_addr, address, 6);
                 snprintf(device_addr_string, sizeof(device_addr_string), "%s", bd_addr_to_str(address));
                 printf("Bluetooth speaker detected, trying to connect to %s...\n", bd_addr_to_str(device_addr));
-                avdtp_source_establish_stream();
+                if (aacp_takeover_request(device_addr)) avdtp_source_establish_stream();
             }
             break;
         case GAP_EVENT_INQUIRY_COMPLETE:

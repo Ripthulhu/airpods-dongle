@@ -27,6 +27,7 @@ static inline void playback_adjust_request(playback_adjust_t *s, uint16_t delay,
     if (!delay || delay == UINT16_MAX) return;
     uint32_t ms = delay / 10u;
     uint32_t drift = ms > target ? ms - target : target - ms;
+    if (drift > 500u) { s->failed = true; return; }
     if (target != 150 && drift > 10) drift -= 10;
     if (!drift) return;
     s->pending = true; s->target = target;

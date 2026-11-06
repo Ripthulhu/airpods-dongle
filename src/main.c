@@ -51,6 +51,9 @@
 #include "radio_clock.h"
 #include "realtime_metrics.h"
 #include "runtime_watch.h"
+#if AIRPODS_EXPERIMENTAL_RADIO0076
+#include "radio0076/radio0076.h"
+#endif
 
 // Preserve fault status for the watchdog reboot; do not attempt to resume a fault.
 void __attribute__((noreturn)) isr_hardfault(void) {
@@ -509,10 +512,20 @@ int main() {
     // Keep radio SPI independent of the inherited CPU overclock.
     uint32_t radio_divider256 = radio_clock_divider256(clock_get_hz(clk_sys));
     cyw43_set_pio_clkdiv_int_frac8(radio_divider256 >> 8, (uint8_t)radio_divider256);
+#if AIRPODS_EXPERIMENTAL_RADIO0076
+    radio0076_begin();
+#endif
     if (cyw43_arch_init()) {
         printf("cyw43_arch_init() failed.\n");
         return -1;
     }
+#if AIRPODS_EXPERIMENTAL_RADIO0076
+    if (!radio0076_start()) {
+        printf("Experimental .0076 startup failed: %s\n", radio0076_error());
+        cyw43_arch_deinit();
+        return -1;
+    }
+#endif
     set_led_mode_off();
 
     uint8_t currect_slot = read_uint8_last_flash();
@@ -528,6 +541,8 @@ int main() {
         currect_slot = read_uint8_last_flash();
     }
 
+    // Codec benchmarking and slot writes are finished; cover HCI startup too.
+    watchdog_enable(8000, true);
     if (btstack_main(0, NULL) != 0) {
         printf("Bluetooth audio services unavailable\n");
         return 1;
@@ -551,10 +566,6 @@ int main() {
         printf("USB service timer unavailable\n");
         return 1;
     }
-
-    // Enable watchdog — auto-resets if the main loop stops feeding it.
-    // Allow bounded codec initialization and flash operations to finish.
-    watchdog_enable(8000, true);
 
     mic_decoder_lifecycle_t decoder = {0};
     bootsel_request_t bootsel = {0};

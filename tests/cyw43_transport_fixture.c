@@ -167,7 +167,22 @@ static void sco_backpressure_preserves_packet(void) {
     hci_transport_cyw43_process();CHECK(commits==1&&events==1);
     puts("SCO backpressure: payload retained, all packet types gated, receive progress and one completion after commit");
 }
+static void stalled_queue_is_bounded(void) {
+    setup();indices.host2bt_in_val=4092;submit();
+    for(now=0;now<2000;++now) hci_transport_cyw43_process();
+    CHECK(!panics&&!events&&!writes&&pending_packet==first);
+    if(!setjmp(panic_jump)){hci_transport_cyw43_process();CHECK(false);}
+    CHECK(panics==1&&transport_stats.fatal_errors==1&&!events&&!writes&&pending_packet==first);
+    setup();indices.host2bt_in_val=4092;submit();now=2000;indices.host2bt_out_val=4092;
+    hci_transport_cyw43_process();CHECK(!panics&&commits==1&&events==1);
+    setup();now=UINT32_MAX-999;indices.host2bt_in_val=4092;submit();
+    now+=1999;hci_transport_cyw43_process();CHECK(!panics&&!events&&!writes);
+    ++now;if(!setjmp(panic_jump)){hci_transport_cyw43_process();CHECK(false);}
+    CHECK(panics==1&&transport_stats.fatal_errors==1&&!events&&!writes&&pending_packet==first);
+    puts("stalled queue: deadline and clock wrap fail without packet loss or false completion; ready queue still commits");
+}
 int main(void) {
+    stalled_queue_is_bounded();
     sco_backpressure_preserves_packet();
     setup();submit();CHECK(!writes&&!events);hci_transport_cyw43_process();CHECK(commits==1&&events==1);CHECK(!pending_packet);
     setup();indices.host2bt_in_val=4092;submit();hci_transport_cyw43_process();CHECK(!writes&&!events&&armed_timer&&pending_packet==first);

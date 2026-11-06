@@ -13,6 +13,14 @@ static unsigned flush_comparison_calls;
 static bool flush_comparison_active,flush_comparison_ready=true;
 uint32_t btstack_run_loop_get_time_ms(void) {return 12345;}
 static unsigned radio_reads,adaptive_reads;
+static unsigned routing_reads,routing_writes;
+uint16_t dongle_routing_snapshot(uint8_t *out,uint16_t capacity) {
+    ++routing_reads;if(capacity<32)return 0;
+    memset(out,0,32);out[0]=1;out[1]=32;return 32;
+}
+uint8_t dongle_routing_request(uint8_t action,uint32_t expected,uint32_t nonce) {
+    assert(action==1 && expected==17 && nonce==999);++routing_writes;return result;
+}
 bool bt_hci_radio_diagnostics(bt_hci_radio_diagnostics_t *out) {
     ++radio_reads;memset(out,0,sizeof(*out));
     out->epoch=17;out->handle=0x123;out->active=true;out->pending=true;
@@ -198,5 +206,17 @@ int main(void) {
     assert(dongle_features_request(0,comparison,2,out,64,&n)==0 && flush_comparison_active);
     dongle_features_disconnect(0);
     assert(!flush_comparison_active && stops==3 && volume_disconnects==2);
+    p[0]=20;
+    assert(dongle_features_request(0,p,2,out,64,&n)==1);
+    assert(dongle_features_request(0,p,1,out,31,&n)==7);
+    assert(dongle_features_request(0,p,1,out,32,&n)==0 && n==32 && out[1]==32);
+    uint8_t route[32]={21,1,17,0,0,0,0xe7,3,0,0};
+    for(unsigned size=1;size<10;++size)assert(dongle_features_request(0,route,size,out,64,&n)==1);
+    assert(!routing_writes);
+    assert(dongle_features_request(0,route,10,out,31,&n)==1 && !routing_writes);
+    assert(dongle_features_request(0,route,10,route,32,&n)==0 && n==32 && routing_writes==1);
+    uint8_t route_busy[]={21,1,17,0,0,0,0xe7,3,0,0};result=DONGLE_BUSY;
+    assert(dongle_features_request(1,route_busy,10,out,64,&n)==2 && !n && routing_writes==2);
+    assert(routing_reads==3);
     puts("typed features: validation, exact integer values, aliased buffers, bounded responses and result mapping passed");
 }

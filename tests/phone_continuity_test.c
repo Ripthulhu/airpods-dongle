@@ -13,6 +13,8 @@ static void fixture_phone(void) {
 static void packet(unsigned elapsed_ms) {
     now+=elapsed_ms;
     media_tracker.samples_ready+=960;
+    // This fixture injects the credited packet directly instead of running the source timer.
+    media_tracker.time_audio_data_sent=now;
     drain();
 }
 static void cumulative_stalls_recover(void) {
@@ -48,6 +50,7 @@ static void aggregation_and_wrap_stay_continuous(void) {
         unsigned frames=(elapsed/10000u)%2u?960u:720u;
         now+=frames/48u;elapsed+=frames/48u;
         media_tracker.samples_ready+=frames;
+        media_tracker.time_audio_data_sent=now;
         drain();
         assert(!playback_transport_stale);
     }
@@ -65,11 +68,17 @@ static void inactive_epochs_do_not_accumulate(void) {
             case 2:is_usb_streaming=true;break;
             case 3:call_active=true;break;
             case 4:playback_game.waiting_report=true;break;
-            case 5:playback_adjust.running=true;playback_adjust.interval=10;break;
+            case 5:
+                playback_adjust_request(&playback_adjust,1500,60);
+                playback_adjust_start(&playback_adjust,now);
+                assert(playback_adjust.running && playback_adjust.interval==11);
+                break;
         }
         packet(20);assert(!phone_continuity.armed);
+        if(reason==5)assert(playback_adjust.running);
         phone_buffer_started=audio_owned=true;is_usb_streaming=call_active=false;
-        playback_game.waiting_report=false;playback_adjust_cancel(&playback_adjust);
+        playback_game.waiting_report=false;
+        playback_adjust_cancel_stream(&media_tracker,now,playback_adjust_interval(&playback_adjust));
         packet(20);assert(phone_continuity.armed && !phone_continuity.deficit_us);
         assert(!playback_transport_stale);
     }

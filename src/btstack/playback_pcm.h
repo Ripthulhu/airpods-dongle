@@ -44,6 +44,7 @@ static inline void playback_pcm_store(void *dst,uint32_t index,float value,bool 
 typedef union {
     int16_t s16[2048];
     playback_q31_t q31[480*2];
+    float f32[1024];
 } playback_encoder_pcm_t;
 _Static_assert(sizeof(playback_encoder_pcm_t)==4096,"Encoder staging must fit scratch-X");
 
@@ -59,14 +60,22 @@ typedef struct {
     uint32_t dropped_pending;
     uint32_t priming;
     uint32_t fraction;
+    uint32_t valid_past, generation;
     float history[PLAYBACK_FILTER_TAPS*2];
     bool primed_on_wire;
 } playback_pcm_t;
+
+// Zero-initialize before first reset; generation fences unlocked input snapshots.
+static inline void playback_pcm_discontinuity(playback_pcm_t *pcm) {
+    pcm->valid_past=0;
+    if(++pcm->generation==0)++pcm->generation;
+}
 
 static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
                                       bool prime) {
     if (capacity == 0 || capacity > PLAYBACK_PCM_FRAMES ||
         (prime && capacity < PLAYBACK_PRIMING_FRAMES)) return false;
+    playback_pcm_discontinuity(pcm);
     pcm->read = pcm->used = pcm->dropped_pending = 0;
     pcm->fraction = 0;
     memset(pcm->history,0,sizeof(pcm->history));
@@ -79,6 +88,7 @@ static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
 // Changing input discards its PCM, without restarting the AirPods' warm stream.
 static inline void playback_pcm_clear(playback_pcm_t *pcm, uint32_t capacity) {
     if (capacity == 0 || capacity > PLAYBACK_PCM_FRAMES) return;
+    playback_pcm_discontinuity(pcm);
     pcm->read = pcm->used = pcm->dropped_pending = 0;
     pcm->fraction = 0;
     memset(pcm->history,0,sizeof(pcm->history));
@@ -99,6 +109,7 @@ static inline void playback_pcm_push_data(playback_pcm_t *pcm, const void *data,
     if (pcm->capacity == 0 || src == NULL) return;
     if (frames > pcm->capacity - pcm->used) {
         uint32_t dropped = frames - (pcm->capacity - pcm->used);
+        playback_pcm_discontinuity(pcm);
         // Track overwritten frames so overdue work is not trimmed twice.
         // This accounting must never cancel healthy or future output deadlines.
         pcm->dropped_pending = dropped > UINT32_MAX - pcm->dropped_pending ?
@@ -133,6 +144,9 @@ static inline void playback_pcm_push_data(playback_pcm_t *pcm, const void *data,
         }
     }
     pcm->used += frames;
+    // New input overwrites old consumed samples before it overwrites unread PCM.
+    uint32_t retained=pcm->capacity-pcm->used;
+    if(pcm->valid_past>retained)pcm->valid_past=retained;
 }
 static inline void playback_pcm_push(playback_pcm_t *pcm,const int16_t *src,uint32_t frames) {
     playback_pcm_push_data(pcm,src,frames,false);
@@ -145,6 +159,7 @@ static inline void playback_pcm_push_float(playback_pcm_t *pcm,const float *src,
 static inline uint32_t playback_pcm_limit(playback_pcm_t *pcm, uint32_t frames) {
     if (pcm->used <= frames) return 0;
     uint32_t drop = pcm->used - frames;
+    playback_pcm_discontinuity(pcm);
     pcm->read += drop;
     if (pcm->read >= pcm->capacity) pcm->read -= pcm->capacity;
     pcm->used = frames;
@@ -164,6 +179,17 @@ static inline void playback_pcm_history(playback_pcm_t *pcm,uint32_t frames) {
     }
 }
 
+static inline bool playback_pcm_consume(playback_pcm_t *pcm,uint32_t frames) {
+    if(!pcm->capacity || frames>pcm->used)return false;
+    playback_pcm_history(pcm,frames);
+    pcm->read+=frames;
+    if(pcm->read>=pcm->capacity)pcm->read-=pcm->capacity;
+    pcm->used-=frames;
+    pcm->valid_past+=frames;
+    if(pcm->valid_past>pcm->capacity-pcm->used)pcm->valid_past=pcm->capacity-pcm->used;
+    return true;
+}
+
 static inline uint32_t playback_pcm_read_format(playback_pcm_t *pcm, void *dst,
                                          uint32_t frames,bool wide) {
     uint32_t prefix = pcm->priming < frames ? pcm->priming : frames;
@@ -179,14 +205,13 @@ static inline uint32_t playback_pcm_read_format(playback_pcm_t *pcm, void *dst,
             for(unsigned channel=0;channel<2;++channel)
                 playback_pcm_store(dst,2u*(prefix+frame)+channel,pcm->samples[2u*index+channel],wide);
         }
-        playback_pcm_history(pcm,copied);
-        pcm->read += copied;
-        if (pcm->read >= pcm->capacity) pcm->read -= pcm->capacity;
+        (void)playback_pcm_consume(pcm,copied);
     }
     uint32_t filled = prefix + copied;
-    if (filled < frames)
+    if (filled < frames) {
         memset((uint8_t *)dst + filled * 2 * element, 0, (size_t)(frames - filled) * 2 * element);
-    pcm->used -= copied;
+        playback_pcm_discontinuity(pcm);
+    }
     return copied;
 }
 static inline uint32_t playback_pcm_read(playback_pcm_t *pcm,int16_t *dst,uint32_t frames) {
@@ -232,6 +257,9 @@ static inline bool playback_pcm_prepare_resample_fill(playback_pcm_t *pcm,playba
     pcm->read+=copied;
     if(pcm->read>=pcm->capacity)pcm->read-=pcm->capacity;
     pcm->used-=copied;pcm->fraction=end%denominator;
+    pcm->valid_past+=copied;
+    if(pcm->valid_past>pcm->capacity-pcm->used)pcm->valid_past=pcm->capacity-pcm->used;
+    if(needed>available)playback_pcm_discontinuity(pcm);
     return true;
 }
 static inline bool playback_pcm_prepare_resample(playback_pcm_t *pcm,playback_resample_t *work,

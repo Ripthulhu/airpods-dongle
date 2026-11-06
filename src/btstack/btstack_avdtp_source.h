@@ -60,6 +60,9 @@ uint8_t dongle_playback_configure(uint8_t codec, uint8_t rate_mode, uint32_t bit
 uint8_t dongle_playback_game_mode(bool enabled);
 uint8_t dongle_playback_game_toggle(void);
 uint16_t dongle_playback_status(uint8_t *out, uint16_t capacity);
+void dongle_playback_connect_requested(void);
+uint16_t dongle_routing_snapshot(uint8_t *out, uint16_t capacity);
+uint8_t dongle_routing_request(uint8_t action, uint32_t expected, uint32_t nonce);
 uint16_t dongle_playback_diagnostics(uint8_t *out, uint16_t capacity);
 uint16_t dongle_playback_adaptive_snapshot(uint8_t *out, uint16_t capacity);
 // Main thread under the Bluetooth lock; cumulative diagnostics for an explicit w request.

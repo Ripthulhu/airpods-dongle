@@ -95,6 +95,9 @@ int main(void) {
     playback_adjust_request(&s,600,60); assert(!s.pending);
     playback_adjust_request(&s,0,60); assert(!s.pending);
     playback_adjust_request(&s,UINT16_MAX,60); assert(!s.pending);
+    playback_adjust_request(&s,65534,60); assert(!s.pending && s.failed);
+    playback_adjust_request(&s,5610,60); assert(!s.pending && s.failed);
+    playback_adjust_request(&s,5600,60); assert(s.pending && !s.failed);
     playback_adjust_request(&s,1500,60); assert(s.goal_frames==80*48 && s.interval==11);
     playback_adjust_start(&s,UINT32_MAX-500);
     playback_adjust_poll(&s,9498); assert(s.running);

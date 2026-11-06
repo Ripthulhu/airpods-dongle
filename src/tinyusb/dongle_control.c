@@ -71,6 +71,7 @@ static void execute(control_client_t *c, const uint8_t *p) {
     else if (p[7] == 1) {
         static const uint8_t empty[6];
         if (!memcmp(selected, empty, 6)) c->last_result = DONGLE_DISCONNECTED;
+        else if (!aacp_takeover_request(selected)) c->last_result = DONGLE_BUSY;
         else a2dp_source_reconnect();
     } else if (p[7] == 2) {
         if (usb_mic_requested() || phone_sink_connected() || get_usb_streaming()) c->last_result = DONGLE_BUSY;
@@ -132,7 +133,7 @@ void dongle_control_poll(void) {
         dongle_put32(next + 36, c->last_sequence);
         next[40] = c->last_result; next[41] = c->last_opcode;
         next[42] = 1 | 4 | 8 | 16 | 32 | 64 | 128 | (readback->anc ? 2 : 0);
-        next[43] = 1; // Capability 256: explicit runtime BOOTSEL may interrupt active audio.
+        next[43] = 3; // Capabilities 256: BOOTSEL; 512: confirmed routing handover.
         next[44] = present;
         next[45] = case_source;
         irq = save_and_disable_interrupts();

@@ -136,6 +136,7 @@ static void handle(unsigned client,const uint8_t *p,uint32_t now) {
             (c->payload[0]==1 || c->payload[0]==3 || c->payload[0]==4)){
             fail(client,BUSY);return;
         }
+        if(c->operation==7 && c->payload[0]==21 && lease_owner>=0){fail(client,BUSY);return;}
         if(c->operation!=3 && c->operation!=7 && (usb_mic_requested() || aacp_mic_active())){fail(client,BUSY);return;}
         c->phase=RUNNING; c->touched=now;c->dirty=true;
         if(c->operation==1){

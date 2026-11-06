@@ -12,18 +12,16 @@ with protocol and recovery fixes from NTPods. Source revisions are pinned in
 
 ## Status
 
-One [shared firmware release, 0.1.57-r6](docs/UNIFIED-FIRMWARE-20261030.md), supports
-both dongles through USB audio and Bluetooth relay. The same checked image is
-installed on the PC and phone dongles, with pairing/settings preserved. Matching
-source, firmware, checksums and validation receipts accompany the release. The
-[controller-firmware investigation is paused](docs/CYW43439-RESEARCH-CHECKPOINT-20261030.md);
-its unsuccessful experimental firmware is not installed.
+Version **0.1.62** targets one unified .0076 firmware image for both PC and
+phone dongles through USB audio and Bluetooth relay. It combines the
+[pitch-preserving Game Mode transition](docs/GAME-TRANSITION.md) with the
+[Android/dongle protocol alignment](docs/ANDROID-PROTOCOL-PARITY.md). CI publishes
+one checked image; a successful build is not a hardware listening acceptance.
 
-Candidate **0.1.57** repairs reproduced silent packet loss when the CYW43
-host-to-controller transfer ring fills. It retains the blocked packet and retries
-through BTstack's asynchronous transport contract. This is an offline candidate;
-relay listening acceptance remains open. See the
-[transport investigation](docs/VALIDATION-0.1.57.md).
+The earlier [0.1.57-r6 release](docs/UNIFIED-FIRMWARE-20261030.md) and
+[controller research checkpoint](docs/CYW43439-RESEARCH-CHECKPOINT-20261030.md)
+remain historical references. The shared transport repairs and their evidence
+are documented in the [transport investigation](docs/VALIDATION-0.1.57.md).
 
 Candidate **0.1.48** preserves native AirPods volume steps and publishes the
 confirmed level through USB hardware volume. It removes the relative HID key
@@ -167,8 +165,9 @@ case-return reconnect have been exercised with Pro 3 firmware 9A348. Game Mode
 starts off at power-up. A prior visual/listening test with it enabled measured
 approximately 60 ms total speaker latency. With a saved AirPods pair, a single BOOTSEL press requests audio
 takeover; without one, it starts discovery. Double-pressing BOOTSEL toggles Game Mode: two LED pulses on enable,
-three seconds dark on disable. Live switching retains the accepted brief pitch
-change while latency adjusts. Pixel Bluetooth pairing and LHDC playback work,
+three seconds dark on disable. The 0.1.61 preview replaces the former live-switch
+pitch bend with a [pitch-preserving USB transition](docs/GAME-TRANSITION.md);
+its hardware listening acceptance is pending. Pixel Bluetooth pairing and LHDC playback work,
 but wireless playback on 0.1.28 still crackled and could become silent. See
 [phone bridge](docs/PHONE-TRANSPORT.md) for that investigation and
 [audio continuity](docs/AUDIO-CONTINUITY.md) for the accepted USB checks.
@@ -257,7 +256,7 @@ Ubuntu 24.04/WSL.
 
 ```sh
 python3 tools/prepare_sdk.py --sdk .sdk/pico-sdk
-cmake -S . -B build -G Ninja -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -G Ninja -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" -DCMAKE_BUILD_TYPE=Release -DAIRPODS_EXPERIMENTAL_RADIO0076=ON
 cmake --build build --parallel
 ```
 
@@ -287,7 +286,9 @@ picotool, including the existing codec, memory and USB descriptor checks. Format
 regression tests still exercise float32 and S16 input.
 
 Open a successful run and download the **airpods-dongle-pico2w-float** artifact.
-It contains the standard firmware with float32 and S16 USB input.
+It contains the single unified .0076 firmware for both PC and phone dongles,
+with float32, S32 and S16 USB input. CI explicitly enables the reviewed .0076
+radio path; it does not publish a second legacy-radio image.
 
 The ZIP contains the UF2 to flash, BIN/ELF/map files, the memory-check receipt,
 source commit, compiler version and `SHA256SUMS`. Downloads are retained for
@@ -326,8 +327,12 @@ AirPods are connected. With no AirPods connection, USB remains control-only.
 Pausing music does not switch
 back to USB. An existing USB recording session retains priority.
 See [phone bridge](docs/PHONE-TRANSPORT.md) for details.
-The selected saved headset reconnects automatically, with 1–8 seconds between
-failed connection attempts. Pairing and codec negotiation suspend these retries.
+Startup and proximity do not initiate a headset connection. A short BOOTSEL press
+or the app's Connect action requests the selected saved AirPods, with retries
+limited to that ten-second request. The saved AirPods may initiate a connection
+themselves, including when their case opens; that choice belongs to the AirPods.
+After a disconnect, the dongle waits for another explicit request or an incoming
+connection. Playback, recording and offline codec preferences do not claim the buds.
 A single press requests audio takeover from the other paired source, reconnecting
 the selected headset if needed. Double-press BOOTSEL to toggle Game Mode live: enabling gives two
 brief LED pulses; disabling turns the LED off for three seconds. It then returns

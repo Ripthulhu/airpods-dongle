@@ -1,0 +1,114 @@
+{
+  "base": 866560,
+  "length": 4788,
+  "sha256": "c63e482e377d295ff3bb822345a5ac9cf883094d9671563f5f1ad3211394e54e",
+  "symbols": {
+    "sco_inbound.c": 0,
+    "$t": 871224,
+    "ring_span": 868469,
+    "busy": 866864,
+    "rx": 867328,
+    "sco_outbound.c": 0,
+    "send_pending": 870161,
+    "native_ring.c": 0,
+    "bridge_native.c": 0,
+    "lock": 870497,
+    "unlock": 870503,
+    "drop_notify": 870509,
+    "tx_scratch": 867840,
+    "sco_credit_vendor.c": 0,
+    "type3": 866606,
+    "native_command": 866572,
+    "retry": 866654,
+    "original_dispatch": 866680,
+    "$d": 871272,
+    "sco_message": 866720,
+    "original_report": 871260,
+    "sco_inbound_command": 868353,
+    "sco_bridge_reset": 870645,
+    "sco_inbound_enable_cpu_mode": 868557,
+    "sco_inbound_stats": 866816,
+    "sco_inbound_process": 868689,
+    "sco_outbound_send": 869257,
+    "sco_outbound_cancel": 870285,
+    "sco_native_b2h_preflight": 870321,
+    "sco_native_b2h_commit": 870465,
+    "sco_native_b2h_wake": 870481,
+    "sco_out_transport_context": 866948,
+    "sco_bridge_state": 866868,
+    "sco_outbound_env": 871280,
+    "sco_bridge_observe_control": 870681,
+    "sco_outbound_state": 866892,
+    "sco_credit_vendor_recount": 870769,
+    "sco_credit_vendor_stats": 866952,
+    "sco_parser_thunk": 866561,
+    "native_type2_test": 391849,
+    "native_type1": 391859,
+    "native_commit": 392131,
+    "native_return": 392269,
+    "dispatch_7074_thunk": 866661,
+    "native_dispatch_forward": 278863,
+    "native_dispatch_equal": 278873,
+    "native_dispatch_resume": 278817,
+    "serializer_7074_thunk": 866697,
+    "native_serializer_resume": 392513,
+    "sco_credit_vendor_thunk": 871225,
+    "native_credit_report_resume": 228105
+  },
+  "hooks": [
+    {
+      "slot": 41,
+      "address": 391844,
+      "expected": 3489933569,
+      "patch": 3207393395,
+      "target": 866560,
+      "name": "sco_parser_thunk"
+    },
+    {
+      "slot": 42,
+      "address": 278812,
+      "expected": 3491447440,
+      "patch": 3156406415,
+      "target": 866660,
+      "name": "dispatch_7074_thunk"
+    },
+    {
+      "slot": 43,
+      "address": 392508,
+      "expected": 1749202192,
+      "patch": 3190091891,
+      "target": 866696,
+      "name": "serializer_7074_thunk"
+    },
+    {
+      "slot": 44,
+      "address": 228100,
+      "expected": 3023063973,
+      "patch": 3088642205,
+      "target": 871224,
+      "name": "sco_credit_vendor_thunk"
+    }
+  ],
+  "sections": {
+    ".thunks": {
+      "address": 866560,
+      "length": 172
+    },
+    ".state": {
+      "address": 866816,
+      "length": 176
+    },
+    ".rx": {
+      "address": 867328,
+      "length": 258
+    },
+    ".tx": {
+      "address": 867840,
+      "length": 260
+    },
+    ".text": {
+      "address": 868352,
+      "length": 2996
+    }
+  }
+}

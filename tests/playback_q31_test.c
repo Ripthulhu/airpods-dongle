@@ -136,8 +136,107 @@ static void inspect_keeps_its_q15_contract(void) {
     assert(inspect.stats[4]==7 && inspect.stats[5]==6 && !inspect.stats[6] && inspect.stats[7]==124);
 }
 
+static float past(unsigned offset) {
+    assert(offset && offset<=pcm.valid_past);
+    return pcm.samples[2*((pcm.read+pcm.capacity-offset)%pcm.capacity)];
+}
+
+static void retained_raw_history(void) {
+    float input[40];
+    int32_t output[32];
+    for(unsigned i=0;i<20;++i) {input[2*i]=(float)(i+1)/32;input[2*i+1]=-input[2*i];}
+    assert(playback_pcm_reset(&pcm,16,false));
+    uint32_t generation=pcm.generation;
+    assert(generation && !pcm.valid_past);
+    playback_pcm_push_float(&pcm,input,8);
+    assert(playback_pcm_read_q31(&pcm,output,6)==6);
+    assert(pcm.valid_past==6 && pcm.used==2 && pcm.generation==generation);
+    for(unsigned i=1;i<=6;++i)assert(past(i)==(float)(7-i)/32);
+    playback_pcm_push_float(&pcm,input+16,6);
+    assert(pcm.valid_past==6 && pcm.used==8 && pcm.generation==generation);
+    playback_pcm_push_float(&pcm,input+28,4); // Wrap overwrites only the oldest consumed frames.
+    assert(pcm.valid_past==4 && pcm.used==12 && pcm.generation==generation);
+    for(unsigned i=1;i<=4;++i)assert(past(i)==(float)(7-i)/32);
+    playback_pcm_push_float(&pcm,input+36,2);
+    assert(pcm.valid_past==2 && pcm.used==14 && pcm.generation==generation);
+    assert(!playback_pcm_consume(&pcm,15));
+    assert(pcm.valid_past==2 && pcm.used==14 && pcm.read==6 && pcm.generation==generation);
+    assert(playback_pcm_consume(&pcm,10));
+    assert(pcm.valid_past==12 && pcm.used==4 && pcm.read==0 && pcm.generation==generation);
+    for(unsigned i=1;i<=12;++i)assert(past(i)==(float)(17-i)/32);
+    assert(playback_pcm_consume(&pcm,0));
+    assert(pcm.valid_past==12 && pcm.generation==generation);
+    playback_pcm_push_float(&pcm,input,20);
+    assert(!pcm.valid_past && pcm.used==16 && pcm.generation!=generation);
+    generation=pcm.generation;
+    assert(playback_pcm_limit(&pcm,4)==12 && !pcm.valid_past && pcm.generation!=generation);
+    generation=pcm.generation;
+    assert(playback_pcm_limit(&pcm,8)==0 && pcm.generation==generation);
+    assert(playback_pcm_consume(&pcm,4) && pcm.valid_past==4);
+    playback_pcm_clear(&pcm,16);
+    assert(!pcm.valid_past && !pcm.used && pcm.generation!=generation);
+    generation=pcm.generation;
+    assert(!playback_pcm_reset(&pcm,0,false) && pcm.generation==generation);
+    playback_pcm_clear(&pcm,0);
+    assert(pcm.generation==generation);
+    assert(playback_pcm_reset(&pcm,16,false) && pcm.generation!=generation);
+    pcm.generation=UINT32_MAX;
+    playback_pcm_clear(&pcm,16);
+    assert(pcm.generation==1 && !pcm.valid_past);
+}
+
+static void resampled_raw_history(void) {
+    float input[1200]={0};
+    int32_t output[32];
+    assert(playback_pcm_reset(&pcm,1024,false));
+    uint32_t generation=pcm.generation;
+    playback_pcm_push_float(&pcm,input,600);
+    assert(playback_pcm_prepare_resample(&pcm,&work,480,655360));
+    assert(pcm.valid_past==480 && pcm.used==120 && pcm.generation==generation);
+    assert(!playback_pcm_prepare_resample(&pcm,&work,480,9u*65536u));
+    assert(pcm.valid_past==480 && pcm.used==120 && pcm.generation==generation);
+    assert(playback_pcm_reset(&pcm,1024,false));
+    generation=pcm.generation;
+    playback_pcm_push_float(&pcm,input,432);
+    pcm.fraction=634880;
+    uint32_t missing=0;
+    assert(playback_pcm_prepare_resample_fill(&pcm,&work,480,9u*65536u,&missing));
+    assert(missing==1 && !pcm.valid_past && pcm.used==0 && pcm.generation!=generation);
+    assert(pcm.fraction==634880); // A missing lookahead retires raw matching, not FIR phase.
+    assert(memcmp(pcm.history,work.samples+432*2,sizeof(pcm.history))==0);
+    assert(playback_pcm_reset(&pcm,1024,false));
+    generation=pcm.generation;
+    playback_pcm_push_float(&pcm,input,100);
+    assert(playback_pcm_prepare_resample_fill(&pcm,&work,480,655360,&missing));
+    assert(missing==380 && !pcm.valid_past && !pcm.used && pcm.read==100 && pcm.generation!=generation);
+    assert(!pcm.fraction && memcmp(pcm.history,work.samples+480*2,sizeof(pcm.history))==0);
+    assert(playback_pcm_reset(&pcm,8192,true));
+    generation=pcm.generation;
+    playback_pcm_push_float(&pcm,input,24);
+    assert(playback_pcm_read_q31(&pcm,output,16)==0 && !pcm.valid_past && pcm.used==24);
+    assert(pcm.generation==generation); // Deliberate priming is not a source shortage.
+}
+
+static void raw_shortage_retires_history(void) {
+    float input[32];
+    int32_t output[32];
+    for(unsigned i=0;i<16;++i) {input[2*i]=(i+1)/32.0f;input[2*i+1]=-input[2*i];}
+    assert(playback_pcm_reset(&pcm,64,false));
+    uint32_t generation=pcm.generation;
+    playback_pcm_push_float(&pcm,input,16);
+    assert(playback_pcm_read_q31(&pcm,output,8)==8 && pcm.valid_past==8 && pcm.generation==generation);
+    assert(playback_pcm_read_q31(&pcm,output,16)==8 && !pcm.valid_past && !pcm.used && pcm.generation!=generation);
+    for(unsigned i=0;i<8;++i)assert(output[2*i]==(int32_t)(i+9)*67108864 && output[2*i+1]==-output[2*i]);
+    for(unsigned i=16;i<32;++i)assert(!output[i]);
+    assert(memcmp(pcm.history+(PLAYBACK_FILTER_TAPS-16)*2,input,sizeof(input))==0);
+    generation=pcm.generation;
+    playback_pcm_push_float(&pcm,input,16);
+    assert(playback_pcm_read_q31(&pcm,output,8)==8 && pcm.valid_past==8 && pcm.generation==generation);
+}
+
 int main(void) {
     numeric_boundaries();rounding_neighbors();ring_and_channels();fractional_precision();inspect_keeps_its_q15_contract();
-    puts("Q31 PCM: low bits, numeric boundaries, S16 equivalence, stereo, priming, FIR precision and scratch bound passed");
+    retained_raw_history();resampled_raw_history();raw_shortage_retires_history();
+    puts("Q31 PCM: precision, stereo, priming, FIR, scratch bound and retained raw history passed");
     return 0;
 }

@@ -35,6 +35,7 @@ enum { PLAYBACK_RUNNING, PLAYBACK_SUSPENDING };
 static unsigned playback_idle_phase;
 typedef struct { bool streaming; uint16_t codec_storage_count,codec_num_frames;
     uint8_t codec_ready_to_send; uint32_t samples_ready,rtp_timestamp,time_audio_data_sent,acc_num_missed_samples,send_wait_start;
+    uint64_t sample_debt;
     unsigned audio_timer; } a2dp_media_sending_context_t;
 static a2dp_media_sending_context_t media_tracker;
 static unsigned cur_codec;

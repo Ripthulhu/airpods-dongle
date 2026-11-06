@@ -103,7 +103,10 @@ def playback_lifecycle_sources(directory):
         bitrate_functions.append(source[start:end])
     (directory / "playback_bitrate.inc").write_text("\n".join(bitrate_functions))
     defaults = []
-    for declaration in ["static playback_game_t playback_game", "static bool a2dp_accept_incoming"]:
+    for declaration in ["static playback_game_t playback_game", "static bool a2dp_accept_incoming",
+                        "static bool playback_released", "static uint8_t release_peer",
+                        "static bool playback_release_pending", "static uint32_t release_revision",
+                        "static uint16_t release_cid"]:
         start = source.index(declaration)
         defaults.append(source[start:source.index(";", start) + 1])
     (directory / "playback_defaults.inc").write_text("\n".join(defaults))
@@ -114,7 +117,7 @@ def playback_lifecycle_sources(directory):
     end = source.index("\n}", start) + 2
     (directory / "playback_buttons.inc").write_text(source[start:end])
     clock_functions = []
-    for signature in ["static void playback_clock_switch(", "static void playback_adjust_cancel_stream("]:
+    for signature in ["static void playback_clock_store(", "static void playback_clock_switch(", "static void playback_adjust_cancel_stream("]:
         match = re.search(r"(?m)^" + re.escape(signature) + r"[^;]*?\{", source)
         if match is None:
             raise ValueError("Missing playback clock function: " + signature)
@@ -127,6 +130,9 @@ def playback_lifecycle_sources(directory):
                       "bool get_a2dp_connected_flag()", "bool avdtp_disconnect_and_scan(void)",
                       "bool bridge_phone_open(void)",
                       "void avdtp_source_establish_stream(void)",
+                      "void dongle_playback_connect_requested(void)",
+                      "static void playback_release_close(void)",
+                      "uint16_t dongle_routing_snapshot(", "uint8_t dongle_routing_request(",
                       "uint8_t dongle_playback_configure(",
                       "void dongle_playback_mic_request_changed(",
                       "bool dongle_playback_mic_ready(", "bool dongle_playback_mic_recover(",
@@ -171,6 +177,7 @@ def playback_lifecycle_sources(directory):
     for signature in ["static bool playback_encoder_scope_current(",
                       "static void playback_encoder_discard(",
                       "static bool playback_encoder_packet_current(",
+                      "static void playback_clock_store(", "static void playback_clock_debit(",
                       "static void playback_clock_accrue(", "static void playback_clock_switch(",
                       "static void playback_adjust_cancel_stream(",
                       "static void playback_transport_recover(",
@@ -187,7 +194,8 @@ def playback_lifecycle_sources(directory):
         end = source.index("\n}", start) + 2
         functions.append(source[start:end])
     production_pcm = []
-    for signature in ["static void playback_pcm_push_measured(", "static void audio_slot_push_data(",
+    for signature in ["static const float *playback_tempo_source(", "static bool playback_encoder_tempo_run(",
+                      "static void playback_pcm_push_measured(", "static void audio_slot_push_data(",
                       "void audio_slot_push_samples(", "void audio_slot_push_float(",
                       "static void audio_pcm_read(", "static void playback_audio_work("]:
         start = source.index("\n" + signature) + 1
@@ -360,19 +368,20 @@ def main():
         "playback_options": ["tests/playback_options_test.c"],
         "playback_bitrate": ["tests/playback_bitrate_test.c"],
         "playback_adjust": ["tests/playback_adjust_test.c"],
+        "playback_tempo": ["tests/playback_tempo_test.c", "-lm"],
         "playback_delay": ["tests/playback_delay_test.c"],
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],
         "playback_buttons": ["tests/playback_buttons_test.c"],
         "playback_timing": ["tests/playback_timing_test.c"],
         "playback_encoder_job": ["-Wno-unused-function", "tests/playback_encoder_job_test.c"],
         "phone_continuity": ["-Wno-unused-function", "tests/phone_continuity_test.c"],
-        "phone_catchup": ["-Wno-unused-function", "tests/phone_catchup_test.c"],
+        "phone_catchup": ["-Wno-unused-function", "tests/phone_catchup_test.c", "-lm"],
         "playback_trace": ["tests/playback_trace_test.c"],
         "playback_float": ["tests/playback_float_test.c", "-lm"],
         "playback_q31": ["tests/playback_q31_test.c", "-lm"],
         "fdk_input_buffer": ["tests/fdk_input_buffer_test.c"],
         "fdk_input_buffer_q31": ["-DFDK_DONGLE_PCM32=1", "tests/fdk_input_buffer_test.c"],
-        "playback_pipeline": ["-Wno-unused-function", "tests/playback_pipeline_test.c"],
+        "playback_pipeline": ["-Wno-unused-function", "tests/playback_pipeline_test.c", "-lm"],
         "playback_idle": ["tests/playback_idle_test.c"],
         "usb_game_verification": ["tests/usb_game_verification_test.c"],
         "aacp": ["-Itests/aacp_stubs", "tests/aacp_test.c"],

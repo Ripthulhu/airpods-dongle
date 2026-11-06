@@ -1,0 +1,2 @@
+# The ROM fixture hash covers exact bytes on every host.
+rom-fixture.json -text

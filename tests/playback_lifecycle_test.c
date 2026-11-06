@@ -50,6 +50,7 @@ typedef struct {
     bool streaming;
     uint8_t codec_ready_to_send;
     uint32_t time_audio_data_sent, samples_ready, acc_num_missed_samples;
+    uint64_t sample_debt;
     btstack_timer_source_t audio_timer;
 } a2dp_media_sending_context_t;
 static a2dp_media_sending_context_t media_tracker;
@@ -68,6 +69,20 @@ static unsigned selected_retirements;
 static bool game_ready, game_eligible, send_synchronously;
 static bool audio_owned=true;
 static bool aacp_audio_owned(void) {return audio_owned;}
+static bool connection_requested=true;
+static bool aacp_takeover_pending(const uint8_t *peer) {return peer && peer[0] && connection_requested;}
+typedef struct {uint32_t revision,age_ms,nonce;uint8_t flags,stage,action;} aacp_routing_state_t;
+static aacp_routing_state_t routing_state={.revision=1};
+static aacp_routing_state_t aacp_routing_state(void) {
+    aacp_routing_state_t state=routing_state;
+    state.flags=(audio_owned?2:0)|(connection_requested?4:0);return state;
+}
+static void aacp_routing_override(void) {
+    if(!++routing_state.revision)++routing_state.revision;
+    routing_state.nonce=routing_state.action=0;connection_requested=false;
+}
+static void aacp_routing_receipt(uint32_t nonce,uint8_t action) {routing_state.nonce=nonce;routing_state.action=action;}
+void dongle_playback_connect_requested(void);
 static bool model_known=true;
 static uint32_t control_session=1;
 static unsigned game_feedback_count;
@@ -86,6 +101,10 @@ static bool mic_requested, mic_active;
 static bool aacp_mic_requested(void) { return mic_requested || call_capture; }
 static bool aacp_mic_active(void) { return mic_active; }
 static bool aacp_mic_uplink_active(void) {return mic_active;}
+static bool aacp_takeover_request(const uint8_t *peer) {
+    if(!peer || !peer[0] || mic_requested || mic_active)return false;
+    aacp_routing_override();connection_requested=true;dongle_playback_connect_requested();return true;
+}
 static bool peer_address_valid(const uint8_t *p) { return p[0] != 0; }
 static bool playback_profile_preflight(playback_options_t p, const uint8_t *peer) {
     (void)p; (void)peer; return true;
@@ -98,6 +117,7 @@ static int avdtp_source_connect(uint8_t *peer, uint16_t *cid) {
 }
 static void a2dp_demo_timer_stop(void *p) { (void)p; media_tracker.streaming = is_streaming = false; }
 static void aacp_disconnect(void) {game_ready=false;}
+static void aacp_media_disconnected(void) {aacp_disconnect();}
 static void aacp_mic_recovery_failed(void) {}
 static uint32_t aacp_control_session(void) { return control_session; }
 static uint32_t aacp_receive_buffer_serial(void) { return buffer_serial; }
@@ -363,13 +383,15 @@ static void pairing_cannot_reconnect_an_unsaved_ram_peer(void) {
                 assert(!memcmp(address, stored ? empty : old_peer, sizeof(address)));
                 assert(selected_retirements == stored);
                 signaling_released(10);
-                // A phone profile wake and a button/microphone reconnect share this production path.
+                // A failed Pair cannot leave its old automatic permission alive.
                 assert(bridge_phone_open() == !stored);
                 avdtp_source_establish_stream();
-                assert(connects == !stored && a2dp_connect_pending == !stored);
+                assert(!connects && !a2dp_connect_pending);
+                if(!stored){assert(aacp_takeover_request(address));avdtp_source_establish_stream();assert(connects==1);}
                 if (stored) {
                     // The HCI discovery handler may make a genuinely selected new pair connectable again.
                     memcpy(address, new_peer, sizeof(address));
+                    assert(aacp_takeover_request(address));
                     assert(bridge_phone_open() && connects == 1 && a2dp_connect_pending);
                     assert(!memcmp(connected_address, new_peer, sizeof(new_peer)));
                 }
@@ -397,6 +419,7 @@ static void selected_pair_waits_for_the_old_signaling_release(void) {
         avdtp_source_establish_stream(); // An empty Pair target cannot re-arm old-peer retries.
         assert(!a2dp_accept_incoming && !connects && !a2dp_connect_pending);
         memcpy(address, new_peer, sizeof(address)); // Genuine inquiry selection arrives before the old CID retires.
+        assert(aacp_takeover_request(address));
         avdtp_source_establish_stream();
         assert(!connects && !a2dp_connect_pending && media_tracker.avdtp_cid == 10);
         signaling_released(10);
@@ -508,6 +531,7 @@ static void game_receipts_follow_actual_send(void) {
 }
 
 static void saved_pair_reconnects_with_backoff(void) {
+    connection_requested=true;
     playback_game=(playback_game_t){0}; game_ready=game_eligible=false;
     a2dp_is_connected_flag=a2dp_connect_pending=profile_pending=profile_reconnect=false;
     a2dp_accept_incoming=true; address[0]=1;
@@ -541,10 +565,17 @@ static void saved_pair_reconnects_with_backoff(void) {
     }
 }
 
-static void standalone_boot_connects_in_normal_mode(void) {
+static void standalone_boot_waits_for_explicit_connect_in_normal_mode(void) {
     assert(a2dp_accept_incoming && !playback_game.requested && playback_game.phase==GAME_OFF);
+    connection_requested=false;
     address[0]=1; now=1000;
     dongle_playback_poll();
+    avdtp_source_establish_stream();
+    assert(!connects && !a2dp_connect_pending);
+    now+=60000;dongle_playback_poll();
+    assert(!connects && a2dp_accept_incoming); // The saved buds may still initiate their own return.
+    connection_requested=true;
+    avdtp_source_establish_stream();
     assert(connects==1 && a2dp_connect_pending);
     a2dp_is_connected_flag=game_ready=game_eligible=send_synchronously=true;
     a2dp_connect_pending=false; now+=1000;
@@ -713,13 +744,111 @@ static void game_changes_reset_continuity_without_packets(void) {
     assert(!phone_continuity.armed);
 }
 
+static void idle_inputs_and_preferences_do_not_reclaim_the_buds(void) {
+    connection_requested=false;audio_owned=false;
+    a2dp_is_connected_flag=a2dp_connect_pending=profile_pending=profile_reconnect=false;
+    a2dp_accept_incoming=true;address[0]=1;
+    is_usb_streaming=phone_active=phone_opened=call_opened=call_active=call_capture=mic_requested=mic_active=false;
+    playback_options=(playback_options_t){0};playback_game=(playback_game_t){0};
+    media_tracker=(a2dp_media_sending_context_t){0};
+    reconnect_since=now=connects=disconnects=0;reconnect_delay=1000;
+    assert(bridge_phone_open() && !connects);phone_opened=false;
+    avdtp_source_establish_stream();assert(!connects);
+    is_usb_streaming=true;
+    for(unsigned i=0;i<20;++i){now+=8000;dongle_playback_poll();assert(!connects);}
+    is_usb_streaming=false;
+    assert(dongle_playback_configure(2,0,174000)==DONGLE_ACCEPTED);
+    assert(playback_options.codec==2 && !connects && !profile_pending);
+    // A short-lived button request permits connection; it is not a standing reconnect policy.
+    connection_requested=true;avdtp_source_establish_stream();assert(connects==1 && a2dp_connect_pending);
+    connection_requested=false;a2dp_connect_pending=false;
+    for(unsigned i=0;i<20;++i){now+=8000;dongle_playback_poll();assert(connects==1);}
+    // A control-only standby connection cannot turn a codec change into a takeover.
+    a2dp_is_connected_flag=true;
+    assert(dongle_playback_configure(3,0,128000)==DONGLE_BUSY);
+    assert(!disconnects && !profile_pending && a2dp_accept_incoming);
+    connection_requested=audio_owned=true;
+}
+
+static void handover_release_preserves_pairing_and_requires_a_current_intent(void) {
+    uint8_t out[32];
+    address[0]=1;memset(address+1,0,5);
+    playback_released=profile_pending=profile_reconnect=a2dp_connect_pending=false;
+    mic_requested=mic_active=mic_prepare_open=mic_recovery_pending=false;
+    phone_output_recovery=suspend_recovery_pending=call_active=call_opened=false;
+    playback_game=(playback_game_t){0};game_ready=true;audio_owned=true;
+    a2dp_is_connected_flag=true;a2dp_accept_incoming=true;
+    media_tracker=(a2dp_media_sending_context_t){.avdtp_cid=20,.avrcp_cid=21,.streaming=true};
+    connection_requested=false;
+    routing_state=(aacp_routing_state_t){.revision=10};
+    unsigned original_scans=scans,original_keys=keys_dropped,original_retirements=selected_retirements;
+    unsigned original_disconnects=disconnects;
+    assert(dongle_routing_snapshot(out,31)==0);
+    assert(dongle_routing_snapshot(out,32)==32 && out[0]==1 && out[1]==32 && (out[2]&32));
+    assert(dongle_routing_request(0,9,123)==DONGLE_STALE && disconnects==original_disconnects);
+    assert(dongle_routing_request(0,10,0)==DONGLE_MALFORMED);
+    mic_active=true;
+    assert(dongle_routing_request(0,10,123)==DONGLE_BUSY && routing_state.revision==10);
+    mic_active=false;playback_game.changed=true;
+    assert(dongle_routing_request(0,10,123)==DONGLE_BUSY);
+    playback_game.changed=false;
+    assert(dongle_routing_request(0,10,123)==DONGLE_ACCEPTED);
+    audio_owned=false; // The production AACP teardown revokes authority immediately.
+    assert(disconnects==original_disconnects+1 && !a2dp_accept_incoming && playback_released);
+    assert(scans==original_scans && keys_dropped==original_keys && selected_retirements==original_retirements && address[0]==1);
+    assert(dongle_routing_snapshot(out,32)==32 && (out[2]&16) && !(out[2]&8));
+    assert(dongle_u32(out+4)==11 && dongle_u32(out+28)==123 && out[18]==1);
+    assert(dongle_routing_request(0,10,123)==DONGLE_STALE && disconnects==original_disconnects+1);
+    assert(dongle_routing_request(0,11,123)==DONGLE_STALE && disconnects==original_disconnects+1);
+    assert(dongle_routing_request(1,11,124)==DONGLE_BUSY);
+    // Clearing only the cached connection flag is not a release receipt.
+    a2dp_is_connected_flag=false;
+    assert(dongle_routing_snapshot(out,32)==32 && (out[2]&16));
+    media_tracker.avdtp_cid=0;
+    assert(dongle_routing_snapshot(out,32)==32 && (out[2]&8) && !(out[2]&16));
+    unsigned original_connects=connects;
+    now+=60000;dongle_playback_poll();avdtp_source_establish_stream();
+    assert(connects==original_connects && !a2dp_accept_incoming);
+    assert(dongle_routing_request(1,11,124)==DONGLE_ACCEPTED);
+    assert(connects==original_connects+1 && a2dp_accept_incoming && !playback_released);
+    assert(dongle_routing_snapshot(out,32)==32 && out[18]==2 && dongle_u32(out+28)==124 && dongle_u32(out+4)==12);
+    aacp_routing_override(); // Physical Pair/manual override invalidates the automatic receipt.
+    assert(dongle_routing_request(0,12,125)==DONGLE_STALE);
+    assert(!aacp_routing_state().nonce && !aacp_routing_state().action);
+}
+
+static void handover_restores_game_mode_only_on_its_original_owner(void) {
+    for(unsigned override=0;override<3;++override){
+        address[0]=1;memset(address+1,0,5);
+        playback_released=playback_release_pending=profile_pending=profile_reconnect=a2dp_connect_pending=false;
+        mic_requested=mic_active=mic_prepare_open=mic_recovery_pending=false;
+        phone_output_recovery=suspend_recovery_pending=call_active=call_opened=false;
+        game_ready=game_eligible=audio_owned=a2dp_is_connected_flag=a2dp_accept_incoming=true;
+        connection_requested=false;is_usb_streaming=true;phone_active=false;
+        media_tracker=(a2dp_media_sending_context_t){.avdtp_cid=40,.local_seid=1,.streaming=true};
+        routing_state=(aacp_routing_state_t){.revision=20};
+        playback_adjust=(playback_adjust_t){0};buffer_result=0;send_synchronously=true;
+        playback_game=(playback_game_t){.requested=true,.changed=true,.target=60,.phase=GAME_CONFIRMED,.low_latency_confirmed=true};
+        unsigned before=disconnects;now+=100;
+        assert(dongle_routing_request(0,20,200+override)==DONGLE_ACCEPTED);
+        assert(playback_release_pending && disconnects==before && playback_game.requested);
+        dongle_playback_poll();
+        assert(buffer_target==150 && playback_game.waiting_report && disconnects==before);
+        if(override==1)assert(aacp_takeover_request(address));
+        if(override==2)++control_session;
+        ++delay_revision;reported_delay=1500;++now;dongle_playback_poll();
+        assert(!playback_release_pending && playback_game.requested);
+        assert(disconnects==before+(override==0));
+        if(override)assert(!playback_released);
+    }
+}
 int main(int argc,char **argv) {
     if(argc==2 && !strcmp(argv[1],"pair_selection_race")) {selected_pair_waits_for_the_old_signaling_release();return 0;}
     if(argc==2 && !strcmp(argv[1],"pair_retirement")) {pairing_cannot_reconnect_an_unsaved_ram_peer();return 0;}
     if(argc==2 && !strcmp(argv[1],"startup_reject")) {startup_rejection_cannot_leave_connected_but_silent_output();return 0;}
     if(argc==2 && !strcmp(argv[1],"media_release")) {media_release_cannot_leave_connected_but_silent_output();return 0;}
     assert(!get_a2dp_connected_flag());
-    standalone_boot_connects_in_normal_mode();
+    standalone_boot_waits_for_explicit_connect_in_normal_mode();
     profile_then_pair(true, true);
     profile_then_pair(false, true);
     profile_then_pair(true, false);
@@ -755,5 +884,8 @@ int main(int argc,char **argv) {
     suspend_recovery_pending=false;now=7;dongle_playback_poll();
     assert(playback_work_metrics.recovery_poll_ms==13 && !playback_work_metrics.recovery_active);
     now=20;dongle_playback_poll();assert(playback_work_metrics.recovery_poll_ms==13);
-    puts("playback lifecycle: Pair cancels pending profile reconnect, failures stay closed, fresh profile works");
+    idle_inputs_and_preferences_do_not_reclaim_the_buds();
+    handover_release_preserves_pairing_and_requires_a_current_intent();
+    handover_restores_game_mode_only_on_its_original_owner();
+    puts("playback lifecycle: passive boot, bounded explicit reconnect, unchanged incoming/profile recovery and Pair cancellation passed");
 }

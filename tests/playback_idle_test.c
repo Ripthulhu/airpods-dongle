@@ -97,6 +97,7 @@ typedef struct {
     int max_media_payload_size;
     unsigned codec_num_frames, codec_storage_count;
     uint32_t time_audio_data_sent, samples_ready, acc_num_missed_samples, send_wait_start;
+    uint64_t sample_debt;
     bool codec_ready_to_send, streaming;
     btstack_timer_source_t audio_timer;
 } a2dp_media_sending_context_t;

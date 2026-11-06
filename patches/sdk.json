@@ -55,7 +55,7 @@
     },
     "patched": {
       "src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c": "215635730793e9c2d9a7745f20a05cf71c829f727c8c549226e0d0b6b8590a9b",
-      "src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c": "11469f1875c05847ff36abfde61317ef88ed085387f75ecc6ae42dca370c8127",
+      "src/rp2_common/pico_cyw43_driver/btstack_hci_transport_cyw43.c": "6714bf3c656021b5e0e25e138448eaa55ebe3d25e0787b4bd86ce99aae41dfd1",
       "src/rp2_common/pico_cyw43_driver/include/pico/btstack_hci_transport_cyw43.h": "07abf059a1efb7ffdd35315659e3c1ad443e1d1ba858a85c5abcc081f24aecbd"
     }
   },
