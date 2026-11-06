@@ -16,6 +16,37 @@
     "version": "2.3.1",
     "revision": "2041936441b48a3cc53ae3da9e805229fe8f4e18"
   },
+  "radio0076": {
+    "upstream_repository": "https://github.com/Infineon/ifx-linux-bluetooth",
+    "upstream_branch": "Longma",
+    "upstream_revision": "e5f0a31b95d51bbeb7ea5ef152ab0ff563961ff8",
+    "original_firmware": {
+      "path": "fw/CYW4343A2_001.003.016.0076.0000_Generic_UART_26MHz_wlbga_BU_dl_signed.hcd",
+      "bytes": 16640,
+      "sha256": "7c18b92e0d1340cc664738c4b4cc79a2edf2cd10318602e5252ad630dff39387"
+    },
+    "vendor_license": {
+      "name": "Infineon End User License Agreement",
+      "upstream_path": "LICENSE.txt",
+      "upstream_git_blob": "2de699ab127fdadba781d7c0dcad6107e4221c19",
+      "sha256": "a897bb8282351e03edd9ed9382829ef11761c56afd50af0d4e98856b3602cd1d",
+      "retained_copy": "src/radio0076/LICENSE.vendor.txt",
+      "scope": "Vendor firmware input; retaining these terms does not grant additional modification or redistribution rights for the port"
+    },
+    "pico_port": {
+      "origin_bundle": "cyw43439-sco-shared-bridge-v6-20261101",
+      "description": "Frozen Pico shared-bus port, not an unmodified UART image or a claim of vendor signature validity",
+      "container_header": "src/radio0076/cyw43_btfw_43439.h",
+      "container_header_sha256": "acc5f69a8e1a9b796d2ce9b05d18c37ed2dffe6d51eaa3a172f93f7c8643a2b4",
+      "container_bytes": 24936,
+      "container_sha256": "34382f9453009e485ebedede2ec1e7b79d8f868d75829997932175e3aa7b137c",
+      "native_adapter_bytes": 4788,
+      "native_adapter_sha256": "c63e482e377d295ff3bb822345a5ac9cf883094d9671563f5f1ad3211394e54e",
+      "native_sources": "src/radio0076/native",
+      "frozen_input_manifest": "src/radio0076/frozen.json",
+      "reference": "src/radio0076/README.md"
+    }
+  },
   "case_ble_layout": {
     "repository": "https://github.com/stuffz/airpods",
     "revision": "8bd035451668388860e62fcc0a4a624a608d9d3a",

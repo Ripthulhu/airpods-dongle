@@ -1,13 +1,15 @@
 # AirPods command line
 
-Use a checkout of `main`, or download `airpods-cli.zip` from the
-[shared release](https://github.com/Ripthulhu/airpods-dongle/releases/tag/v0.1.57-r6-bw20000)
-and open a terminal in its extracted `airpods-cli` directory.
+Use a checkout of `main`, or [download the CLI ZIP](https://github.com/Ripthulhu/airpods-dongle/releases/latest/download/airpods-cli.zip)
+and open a terminal in its extracted `airpods-cli` directory. This repository is
+private; GitHub sign-in with repository access is required for downloads.
 
 Run from the repository root with Python 3.10 or newer. The CLI uses the existing
 USB HID protocol through Windows' built-in HID driver or Linux/Android `hidraw`.
-There are no extra Python dependencies and no firmware update is needed for the
-shared 0.1.57-r6 release. Linux/Android requires access to the dongle's hidraw node.
+There are no extra Python dependencies. Use the
+[current firmware release](https://github.com/Ripthulhu/airpods-dongle/releases/latest)
+for the supported control protocol. Linux/Android requires access to the
+dongle's hidraw node.
 
 ```powershell
 python tools/airpods.py help

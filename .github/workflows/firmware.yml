@@ -8,15 +8,14 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: firmware-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   tests:
     name: C sanitizers and Python tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    concurrency:
+      group: firmware-tests-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,6 +26,10 @@ jobs:
           sudo apt-get install --no-install-recommends -y build-essential cmake ninja-build python3
       - name: Run regression tests with ASan and UBSan
         run: python3 tools/test.py --sanitize
+      - name: Test release packaging and safe publication
+        run: |
+          python3 .github/scripts/package_firmware.py --self-test
+          python3 .github/scripts/publish_firmware_release.py --self-test
       - name: Test experimental .0076 startup and native adapter
         run: |
           python3 tools/test_radio0076.py
@@ -42,6 +45,13 @@ jobs:
     needs: tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    concurrency:
+      group: firmware-build-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      commit: ${{ steps.package.outputs.commit }}
+      version: ${{ steps.package.outputs.version }}
+      release_tag: ${{ steps.package.outputs.release_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,20 +80,40 @@ jobs:
       - name: Build and validate firmware
         run: cmake --build build --parallel 2
       - name: Package checked outputs
-        run: |
-          mkdir -p build/artifact
-          cp build/airpods_dongle.uf2 build/airpods_dongle.bin \
-            build/airpods_dongle.elf build/airpods_dongle.elf.map \
-            build/codec-probe/memory-check.json build/artifact/
-          git rev-parse HEAD > build/artifact/COMMIT.txt
-          arm-none-eabi-gcc --version > build/artifact/COMPILER.txt
-          cd build/artifact
-          sha256sum airpods_dongle.uf2 airpods_dongle.bin airpods_dongle.elf \
-            airpods_dongle.elf.map memory-check.json COMMIT.txt COMPILER.txt > SHA256SUMS
+        id: package
+        run: python3 .github/scripts/package_firmware.py --sdk .sdk/pico-sdk
       - name: Upload firmware download
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: airpods-dongle-pico2w-float
+          name: airpods-dongle-pico2w
           path: build/artifact/
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish unified firmware
+    if: github.repository == 'Ripthulhu/airpods-dongle' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: firmware
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: firmware-github-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.firmware.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: airpods-dongle-pico2w
+          path: artifacts
+      - name: Publish complete preview as Latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.firmware.outputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.firmware.outputs.commit }}
+          FIRMWARE_VERSION: ${{ needs.firmware.outputs.version }}
+        run: python3 .github/scripts/publish_firmware_release.py artifacts

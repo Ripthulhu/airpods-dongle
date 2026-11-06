@@ -1,8 +1,20 @@
-# Experimental CYW43439 .0076 startup
+# CYW43439 .0076 build and validation
 
-This is an opt-in, flash-backed review build. Default production builds retain the
-existing radio firmware. Nothing in this directory installs firmware on a device.
-Use `-DAIRPODS_EXPERIMENTAL_RADIO0076=ON` only in a separate build directory.
+The normal CI release enables this frozen .0076 path for the single unified PC
+and phone firmware. The legacy `AIRPODS_EXPERIMENTAL_RADIO0076` option name is
+retained; its local CMake default remains OFF, so a local reproduction must pass
+`-DAIRPODS_EXPERIMENTAL_RADIO0076=ON` explicitly. Use a separate build directory
+when changing that option. CI packaging validates the selected build flags and
+linked radio identity. Nothing in this directory installs firmware on a device.
+
+The original UART .0076 image is from Infineon's `ifx-linux-bluetooth` repository;
+[`SOURCES.json`](../../SOURCES.json) pins its commit, path and hash separately from
+the modified Pico container. The exact vendor [EULA](LICENSE.vendor.txt) is
+retained. Its section 2(b) distinguishes source-provided modification rights
+from binary firmware distribution on Infineon hardware, and section 4 limits
+modification and reverse engineering except where otherwise permitted. These
+terms remain specific to the vendor input; its attribution and frozen hashes do
+not grant additional rights for the modified container or relicense it as GPL.
 
 The container and native shared-SCO adapter are copied byte-for-byte from the
 qualified `cyw43439-sco-shared-bridge-v6-20261101` test bundle. `frozen.json` pins
@@ -49,7 +61,9 @@ The test harness used diagnostic fatal/allocator hooks in slots 39/40. This buil
 omits those hooks and leaves their enable bits clear, reserves their slot numbers,
 and keeps the four native adapter hooks in slots 41–44. The resulting enable mask
 is `1c001e7f`; the next slot remains 45. This small policy difference and the
-production threaded transport have **not been hardware-qualified**.
+production threaded transport do not inherit full hardware qualification from
+the earlier test bundle. A passing CI build does not establish listening,
+latency, long-run radio behavior or two-way call acceptance.
 
 `python3 tools/test_radio0076.py` runs bounded host tests with ASan/UBSan for
 readback, bootstrap identity/publication order, calibration guards/masked writes,
@@ -57,10 +71,11 @@ native installation/publication order, idle-only configuration, fail-closed
 download/ready ordering and HCI event gating. Existing regression, SDK transport,
 volume and codec/resource checks remain required.
 CI runs these tests and the native rebuild, then explicitly enables this path
-for its single unified PC/phone firmware artifact, `airpods-dongle-pico2w-float`.
-It does not publish a second legacy-radio image. The local CMake default remains
-OFF; CI selection alone does not change that default or replace hardware
-qualification.
+for the normal `airpods-dongle-pico2w` artifact and release download. That
+same image serves PC USB, phone USB and Bluetooth relay; no second legacy-radio
+image is published. Preserve the SDK, compiler, build-option, source and memory
+receipts when reproducing a release. The local CMake default and hardware
+qualification boundary remain separate from CI's release selection.
 It also runs the [native instruction-level behavior proofs](../../tests/radio0076/native/README.md)
 through `tools/test_radio0076_native.py`: 963 credit cases, 23 inbound groups,
 17 outbound groups and four reset/glue groups, using production sources and a
@@ -69,9 +84,11 @@ bounded code-only ROM fixture.
 This adapter is tied to the exact frozen .0076 container and reviewed ROM words.
 It supports only the qualified 60-byte CVSD host / 120-byte native SCO geometry.
 Bluetooth calls remain disabled by default. A media listening/latency/stability
-comparison is required before release; synthetic SCO success does not prove it.
+comparison is separate from CI; synthetic SCO success does not establish call
+audio or replace those media checks.
 
 The application still uses its existing flash bond database and can update
-AirPods-side settings. Installation needs separate approval and a verified
-backup/restoration plan for both flash and actual receiver state. Do not treat
-this experimental UF2 as a RAM-only test or a production release.
+AirPods-side settings. Before installation, verify the board identity and retain
+a backup/restoration plan for flash pairings and actual receiver settings. The
+UF2 is flash firmware, not a RAM-only test; publishing a normal release does not
+expand the hardware results recorded above.

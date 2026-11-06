@@ -1,6 +1,14 @@
 # One firmware for both dongles
 
-The current shared release is [0.1.57-r6-bw20000](https://github.com/Ripthulhu/airpods-dongle/releases/tag/v0.1.57-r6-bw20000).
+This is the historical validation record for the accepted **0.1.57-r6** baseline.
+For the current firmware, use the [latest release](https://github.com/Ripthulhu/airpods-dongle/releases/latest)
+or [download the current UF2](https://github.com/Ripthulhu/airpods-dongle/releases/latest/download/airpods_dongle.uf2).
+
+The controller-research pause described below belongs to that historical
+checkpoint. The current `.0076` path is documented in the
+[radio notes](../src/radio0076/README.md).
+
+The recorded shared release is [0.1.57-r6-bw20000](https://github.com/Ripthulhu/airpods-dongle/releases/tag/v0.1.57-r6-bw20000).
 Use its single `airpods_dongle.uf2` for either Pico 2 W. USB audio and Bluetooth
 relay are runtime paths in the same application, not different device builds.
 
