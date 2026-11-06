@@ -1,7 +1,7 @@
 # AirPods dongle
 
 AirPods USB audio and Bluetooth phone relay for **Raspberry Pi Pico 2 W**.
-One unified firmware image serves both PC and phone dongles, with the CYW43439
+With the CYW43439
 `.0076` radio path and float32, S32 and S16 USB input.
 
 ## Download firmware
