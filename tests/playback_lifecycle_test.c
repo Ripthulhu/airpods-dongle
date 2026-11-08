@@ -97,7 +97,8 @@ static uint16_t buffer_target;
 static uint8_t buffer_result;
 void dongle_playback_receive_buffer_sent(uint32_t now);
 
-static bool mic_requested, mic_active;
+static bool mic_requested, mic_active, usb_mic_wanted;
+static bool usb_mic_requested(void) {return usb_mic_wanted;}
 static bool aacp_mic_requested(void) { return mic_requested || call_capture; }
 static bool aacp_mic_active(void) { return mic_active; }
 static bool aacp_mic_uplink_active(void) {return mic_active;}
@@ -150,6 +151,22 @@ static void avrcp_reconnect_schedule(bool immediate) {assert(immediate);++avrcp_
 static void avrcp_reconnect_poll(uint32_t time) {(void)time;}
 static void audio_slot_queue_init(void) {}
 static uint8_t read_uint8_last_flash(void) { return pair_slot; }
+static uint8_t saved_address[6]={1};
+static bool bonded=true, policy_storage_ready=true, stored_automatic, policy_write_ok=true;
+static unsigned policy_reads, policy_writes;
+static bool read_reconnect_policy(bool *automatic) {
+    ++policy_reads;*automatic=policy_storage_ready && stored_automatic;return policy_storage_ready;
+}
+static bool write_reconnect_policy(bool automatic) {
+    ++policy_writes;if(!policy_write_ok)return false;stored_automatic=automatic;return true;
+}
+static void read_slot1_mac(uint8_t *peer) {memcpy(peer,saved_address,6);}
+static void read_slot2_mac(uint8_t *peer) {read_slot1_mac(peer);}
+typedef uint8_t link_key_t[16];
+typedef uint8_t link_key_type_t;
+static bool gap_get_link_key_for_bd_addr(const uint8_t *peer,link_key_t key,link_key_type_t *type) {
+    (void)key;(void)type;return bonded && !memcmp(peer,saved_address,6);
+}
 static bool write_slot1_mac(const uint8_t *p) {
     static const uint8_t empty[6];
     assert(!memcmp(p, empty, 6));
@@ -842,6 +859,92 @@ static void handover_restores_game_mode_only_on_its_original_owner(void) {
         if(override)assert(!playback_released);
     }
 }
+static void reconnect_policy_fixture(void) {
+    is_usb_streaming=phone_opened=phone_active=call_active=call_opened=call_capture=false;
+    usb_mic_wanted=mic_requested=mic_active=profile_pending=profile_reconnect=a2dp_connect_pending=a2dp_is_connected_flag=false;
+    mic_prepare_open=mic_recovery_pending=phone_output_recovery=suspend_recovery_pending=false;
+    playback_released=playback_release_pending=reconnect_auto_intent=connection_requested=false;
+    a2dp_accept_incoming=true;playback_game=(playback_game_t){0};playback_adjust=(playback_adjust_t){0};
+    media_tracker=(a2dp_media_sending_context_t){0};playback_idle_phase=PLAYBACK_RUNNING;
+    memset(address,0,6);address[0]=1;memcpy(saved_address,address,6);pair_slot=1;bonded=true;
+    policy_storage_ready=policy_write_ok=true;stored_automatic=false;policy_reads=policy_writes=0;
+    connects=0;now=0;reconnect_since=0;reconnect_delay=1000;playback_reconnect_policy_load();
+}
+
+static void reconnect_policy_is_verified_and_respects_manual_release(void) {
+    bool automatic=true;
+    reconnect_policy_fixture();
+    assert(dongle_reconnect_policy(false,false,&automatic)==DONGLE_ACCEPTED && !automatic);
+    for(unsigned i=0;i<2000;++i)playback_reconnect_poll(++now);
+    assert(!connects && policy_reads==1); // Never read flash in the audio poll.
+    assert(dongle_reconnect_policy(true,true,&automatic)==DONGLE_ACCEPTED && automatic);
+    assert(!connects && !connection_requested); // Saving a preference is not a Connect action.
+    now+=1000;playback_reconnect_poll(now);
+    assert(connects==1 && reconnect_auto_intent && connection_requested);
+    assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_BUSY); // Physical connect is still in flight.
+    a2dp_connect_pending=false;
+    assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_ACCEPTED && !automatic && !connection_requested);
+    now+=60000;playback_reconnect_poll(now);assert(connects==1);
+    assert(aacp_takeover_request(address) && !reconnect_auto_intent);
+    assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_ACCEPTED && connection_requested);
+    now+=reconnect_delay;playback_reconnect_poll(now);assert(connects==2); // Manual still honors explicit requests.
+
+    reconnect_policy_fixture();
+    playback_released=true;a2dp_accept_incoming=false;memcpy(release_peer,address,6);
+    assert(dongle_reconnect_policy(true,true,&automatic)==DONGLE_ACCEPTED && playback_released && !a2dp_accept_incoming);
+    now+=60000;playback_reconnect_poll(now);assert(!connects);
+    a2dp_accept_incoming=true;now+=60000;playback_reconnect_poll(now);assert(!connects);
+    playback_released=false;a2dp_accept_incoming=false;now+=60000;playback_reconnect_poll(now);assert(!connects);
+    assert(aacp_takeover_request(address));now+=1000;playback_reconnect_poll(now);assert(connects==1);
+
+    reconnect_policy_fixture();stored_automatic=true;playback_reconnect_policy_load();
+    now=1000;playback_reconnect_poll(now);a2dp_connect_pending=connection_requested=false;
+    assert(reconnect_auto_intent);
+    assert(dongle_routing_request(0,routing_state.revision,77)==DONGLE_ACCEPTED && !reconnect_auto_intent);
+    assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_ACCEPTED && playback_released);
+    assert(routing_state.nonce==77 && routing_state.action==1); // Saving Manual cannot erase the later release receipt.
+
+    for(unsigned bad=0;bad<3;++bad) {
+        reconnect_policy_fixture();stored_automatic=true;playback_reconnect_policy_load();
+        if(bad==0)saved_address[1]=1;else if(bad==1)bonded=false;else pair_slot=3;
+        now=1000;playback_reconnect_poll(now);assert(!connects && !connection_requested);
+    }
+    reconnect_policy_fixture();stored_automatic=true;playback_reconnect_policy_load();
+    now=1000;playback_reconnect_poll(now);assert(connects==1);
+    a2dp_connect_pending=connection_requested=false;now=2999;playback_reconnect_poll(now);assert(connects==1);
+    now=3000;playback_reconnect_poll(now);assert(connects==2); // Automatic retains bounded backoff.
+    a2dp_connect_pending=false;mic_requested=true;now+=reconnect_delay;
+    playback_reconnect_poll(now);assert(connects==2); // Existing automatic intent cannot bypass mic/call safety.
+    mic_requested=false;usb_mic_wanted=true;audio_owned=false;now+=reconnect_delay;
+    playback_reconnect_poll(now);assert(connects==2); // USB can request capture before AACP owns audio.
+
+    bool *busy[]={&is_usb_streaming,&phone_opened,&phone_active,&call_active,&call_opened,&usb_mic_wanted,&mic_requested,
+        &mic_active,&profile_pending,&profile_reconnect,&a2dp_connect_pending,&playback_release_pending,
+        &mic_prepare_open,&mic_recovery_pending,&phone_output_recovery,&suspend_recovery_pending,
+        &media_tracker.streaming,&playback_game.waiting_tx,&playback_game.waiting_report,&playback_game.restore_failed};
+    for(unsigned i=0;i<sizeof(busy)/sizeof(*busy);++i) {
+        reconnect_policy_fixture();*busy[i]=true;
+        assert(dongle_reconnect_policy(true,true,&automatic)==DONGLE_BUSY && !policy_writes);
+        assert(dongle_reconnect_policy(false,false,&automatic)==DONGLE_ACCEPTED && !automatic);
+    }
+    for(unsigned phase=PLAYBACK_SUSPENDING;phase<=PLAYBACK_STARTING;phase+=2) {
+        reconnect_policy_fixture();playback_idle_phase=phase;
+        assert(dongle_reconnect_policy(true,true,&automatic)==DONGLE_BUSY && !policy_writes);
+    }
+    reconnect_policy_fixture();policy_storage_ready=false;
+    assert(dongle_reconnect_policy(true,true,&automatic)==DONGLE_UNSUPPORTED && !policy_writes && !reconnect_automatic);
+    reconnect_policy_fixture();stored_automatic=true;playback_reconnect_policy_load();
+    now=1000;playback_reconnect_poll(now);a2dp_connect_pending=false;policy_write_ok=false;
+    assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_TRANSPORT && !reconnect_automatic && !connection_requested);
+    unsigned reads=policy_reads;
+    assert(dongle_reconnect_policy(false,false,&automatic)==DONGLE_UNSUPPORTED && policy_reads==reads);
+    now+=60000;playback_reconnect_poll(now);assert(connects==1); // Query cannot reactivate uncertain stored Auto.
+    policy_write_ok=true;
+    assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_ACCEPTED && !automatic);
+    assert(dongle_reconnect_policy(false,false,NULL)==DONGLE_MALFORMED);
+    reconnect_policy_fixture();
+}
+
 int main(int argc,char **argv) {
     if(argc==2 && !strcmp(argv[1],"pair_selection_race")) {selected_pair_waits_for_the_old_signaling_release();return 0;}
     if(argc==2 && !strcmp(argv[1],"pair_retirement")) {pairing_cannot_reconnect_an_unsaved_ram_peer();return 0;}
@@ -887,5 +990,6 @@ int main(int argc,char **argv) {
     idle_inputs_and_preferences_do_not_reclaim_the_buds();
     handover_release_preserves_pairing_and_requires_a_current_intent();
     handover_restores_game_mode_only_on_its_original_owner();
+    reconnect_policy_is_verified_and_respects_manual_release();
     puts("playback lifecycle: passive boot, bounded explicit reconnect, unchanged incoming/profile recovery and Pair cancellation passed");
 }

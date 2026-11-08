@@ -94,6 +94,85 @@ class Clock:
         self.now += delay
 
 
+class ConnectionDongle(Dongle):
+    def __init__(self):
+        super().__init__()
+        self.status[12:18] = bytes.fromhex('010203040506')
+        struct.pack_into('<H', self.status, 42, 1 | 4 | 16 | 512)
+        self.route = bytearray(32)
+        self.route[:2] = b'\x01\x20'
+        struct.pack_into('<I', self.route, 4, 10)
+        self.route[12:18] = self.status[12:18]
+        self.basic_result = 1
+        self.basic_receipt = True
+        self.basic_generation_change = False
+        self.basic_writes = []
+        self.routing_writes = []
+        self.routing_generation_change = False
+        self.routing_reads = 0
+        self.complete_after = 2
+        self.supersede = None
+        self.policy = 0
+        self.policy_writes = []
+        self.policy_reply = None
+        self.fail_policy_reply = False
+
+    def set(self, data):
+        if data[0] == 2:
+            self.wire_writes.append(bytes(data))
+            self.basic_writes.append(bytes(data))
+            if self.basic_receipt:
+                self.status[36:40] = data[18:22]
+                self.status[40:42] = bytes((self.basic_result, data[7]))
+            if self.basic_generation_change:
+                struct.pack_into('<I', self.status, 8, 43)
+                self.status[12:18] = bytes(6)
+            return
+        if data[7] != 6 or self.payload[0] not in (20, 21, 23):
+            return super().set(data)
+        self.wire_writes.append(bytes(data))
+        self.report = bytearray(data)
+        feature = self.payload[0]
+        if self.reject:
+            self.report[21] = 4
+            self.report[20] = 1
+            self.report[22] = self.reject
+            return
+        if feature == 20:
+            if self.routing_writes:
+                self.routing_reads += 1
+                if self.complete_after is not None and self.routing_reads >= self.complete_after:
+                    self.route[2] = 0x63 if self.route[18] == 2 else 8
+                if self.supersede:
+                    self.supersede(self.route)
+            self.response = bytes(self.route)
+        elif feature == 21:
+            self.routing_writes.append(self.payload)
+            assert len(self.payload) == 10 and self.payload[1] in (0, 1)
+            assert self.payload[2:6] == self.route[4:8]
+            revision = (struct.unpack_from('<I', self.route, 4)[0] + 1) & 0xffffffff or 1
+            struct.pack_into('<I', self.route, 4, revision)
+            self.route[18] = self.payload[1] + 1
+            self.route[28:32] = self.payload[6:10]
+            self.route[2] = 4 if self.payload[1] else 16
+            self.response = bytes(self.route)
+            if self.routing_generation_change:
+                struct.pack_into('<I', self.status, 8, 43)
+        else:
+            assert len(self.payload) in (1, 2)
+            if len(self.payload) == 2:
+                self.policy_writes.append(self.payload[1])
+                self.policy = self.payload[1]
+                if self.fail_policy_reply:
+                    raise OSError('reply lost after flash write')
+            self.response = self.policy_reply if self.policy_reply is not None else bytes((1, self.policy))
+        self.report[7] = 7
+        self.report[21] = 3
+        struct.pack_into('<HHB', self.report, 16, len(self.response), 0, len(self.response))
+        self.report[22:] = bytes(42)
+        self.report[22:22 + len(self.response)] = self.response
+
+
 class CliTests(unittest.TestCase):
     def test_apple_encodings_and_percent_bounds(self):
         for name, word, value in [
@@ -121,9 +200,10 @@ class CliTests(unittest.TestCase):
 
     def test_help_never_opens_hardware(self):
         with patch.object(airpods, 'Hid') as hid, contextlib.redirect_stdout(io.StringIO()) as output:
-            for args in (['help'], ['help', 'set'], ['help', 'mode'], ['help', 'hold-modes']):
+            for args in (['help'], ['help', 'set'], ['help', 'mode'], ['help', 'hold-modes'],
+                         ['help', 'pair'], ['help', 'connect'], ['help', 'disconnect'], ['help', 'reconnect-policy']):
                 self.assertEqual(airpods.main(args), 0)
-            for args in (['--help'], ['set', '--help']):
+            for args in (['--help'], ['set', '--help'], ['pair', '--help'], ['reconnect-policy', '--help']):
                 with self.assertRaises(SystemExit) as result:
                     airpods.main(args)
                 self.assertEqual(result.exception.code, 0)
@@ -133,7 +213,8 @@ class CliTests(unittest.TestCase):
 
     def test_invalid_arguments_never_open_hardware(self):
         with patch.object(airpods, 'Hid') as hid, contextlib.redirect_stderr(io.StringIO()):
-            for args in (['set', 'mode', 'loud'], ['set', 'case-volume', '101'], ['help', 'unknown']):
+            for args in (['set', 'mode', 'loud'], ['set', 'case-volume', '101'], ['help', 'unknown'],
+                         ['pair', 'speaker'], ['pair', 'phone', '--replace'], ['reconnect-policy', 'sometimes']):
                 with self.assertRaises(SystemExit) as result:
                     airpods.main(args)
                 self.assertEqual(result.exception.code, 2)
@@ -278,6 +359,286 @@ class CliTests(unittest.TestCase):
             self.assertEqual(airpods.main(['get', 'case-volume']), 1)
         self.assertIn('unknown', output.getvalue())
         self.assertTrue(device.closed)
+
+    def test_pair_existing_bond_requires_explicit_replacement(self):
+        device = ConnectionDongle()
+        with self.assertRaisesRegex(RuntimeError, 'Use connect'):
+            airpods.SettingsClient(device).pair('airpods')
+        self.assertFalse(device.wire_writes)
+        result = airpods.SettingsClient(device).pair('airpods', replace=True)
+        self.assertIn('started; not yet paired', result)
+        self.assertEqual(len(device.basic_writes), 1)
+        self.assertEqual(device.basic_writes[0][7], 2)
+
+    def test_pair_new_airpods_and_phone_window_are_distinct(self):
+        for target, opcode, text in [('airpods', 2, 'not yet paired'), ('phone', 4, '120 seconds')]:
+            for empty_peer in (bytes(6), b'\xff' * 6):
+                device = ConnectionDongle()
+                device.status[12:18] = empty_peer
+                self.assertIn(text, airpods.SettingsClient(device).pair(target))
+                self.assertEqual([request[7] for request in device.basic_writes], [opcode])
+                self.assertEqual(device.basic_writes[0][12:18], empty_peer)
+                self.assertFalse(device.routing_writes)
+
+    def test_basic_command_uses_fresh_target_and_sequence_across_cli_sessions(self):
+        device = ConnectionDongle()
+        struct.pack_into('<I', device.status, 36, 98)
+        client = airpods.SettingsClient(device)
+        struct.pack_into('<I', device.status, 8, 44)
+        client.pair('phone')
+        airpods.SettingsClient(device).pair('phone')
+        for request, sequence in zip(device.basic_writes, (99, 100)):
+            self.assertEqual(request[:7], b'\x02APDG\x01\x40')
+            self.assertEqual(request[8:18], device.status[8:18])
+            self.assertEqual(struct.unpack_from('<I', request, 18)[0], sequence)
+            self.assertFalse(any(request[22:]))
+        struct.pack_into('<I', device.status, 36, 0xffffffff)
+        airpods.SettingsClient(device).pair('phone')
+        self.assertEqual(struct.unpack_from('<I', device.basic_writes[-1], 18)[0], 1)
+
+    def test_basic_pair_receipt_survives_its_own_session_and_selected_peer_change(self):
+        device = ConnectionDongle()
+        device.basic_generation_change = True
+        self.assertIn('pairing started', airpods.SettingsClient(device).pair('airpods', replace=True))
+        self.assertEqual(len(device.basic_writes), 1)
+
+    def test_basic_rejection_codes_are_not_typed_rpc_codes(self):
+        for result, code in [(2, 2), (3, 3), (5, 4), (6, 1)]:
+            device = ConnectionDongle()
+            device.basic_result = result
+            with self.assertRaises(airpods.RequestRejected) as error:
+                airpods.SettingsClient(device).pair('phone')
+            self.assertEqual(error.exception.code, code)
+            self.assertEqual(len(device.basic_writes), 1)
+        device = ConnectionDongle()
+        device.basic_result = 4
+        with self.assertRaises(airpods.Unsupported):
+            airpods.SettingsClient(device).pair('phone')
+
+    def test_pair_preflight_blocks_active_audio_and_post_submit_failure_is_uncertain(self):
+        for flag in (4, 8, 16, 64):
+            device = ConnectionDongle()
+            device.status[7] |= flag
+            with self.assertRaisesRegex(RuntimeError, 'no changes sent'):
+                airpods.SettingsClient(device).pair('airpods', replace=True)
+            self.assertFalse(device.wire_writes)
+        device = ConnectionDongle()
+        device.basic_result = 2
+        with self.assertRaisesRegex(airpods.Unconfirmed, 'failed after changing state'):
+            airpods.SettingsClient(device).pair('airpods', replace=True)
+        self.assertEqual(len(device.basic_writes), 1)
+
+    def test_missing_basic_receipt_times_out_without_retry(self):
+        device = ConnectionDongle()
+        device.basic_receipt = False
+        clock = Clock()
+        with patch.object(airpods.time, 'monotonic', side_effect=lambda: clock.now), \
+             patch.object(airpods.time, 'sleep', side_effect=clock.sleep):
+            with self.assertRaisesRegex(airpods.Unconfirmed, 'receipt was lost or timed out'):
+                airpods.SettingsClient(device).pair('phone')
+        self.assertGreaterEqual(clock.now, 4)
+        self.assertEqual(len(device.basic_writes), 1)
+
+    def test_legacy_connect_uses_existing_command_but_disconnect_has_no_destructive_fallback(self):
+        device = ConnectionDongle()
+        struct.pack_into('<H', device.status, 42, 1 | 4 | 16)
+        self.assertIn('not yet confirmed', airpods.SettingsClient(device).connection(True))
+        self.assertEqual([request[7] for request in device.basic_writes], [1])
+        with self.assertRaisesRegex(airpods.Unsupported, 'Disconnect requires newer firmware'):
+            airpods.SettingsClient(device).connection(False)
+        self.assertEqual([request[7] for request in device.basic_writes], [1])
+
+    def test_no_saved_peer_blocks_connect_without_starting_pairing(self):
+        for capabilities in (1 | 16, 1 | 16 | 512):
+            device = ConnectionDongle()
+            struct.pack_into('<H', device.status, 42, capabilities)
+            device.status[12:18] = device.route[12:18] = bytes(6)
+            with self.assertRaisesRegex(RuntimeError, 'pair airpods first'):
+                airpods.SettingsClient(device).connection(True)
+            self.assertFalse(device.basic_writes)
+            self.assertFalse(device.routing_writes)
+
+    def test_routing_waits_for_exact_receipt_and_completed_state(self):
+        for connect, action in ((True, 2), (False, 1)):
+            device = ConnectionDongle()
+            device.complete_after = 3
+            with patch.object(airpods.secrets, 'randbits', return_value=1234):
+                result = airpods.SettingsClient(device).connection(connect)
+            self.assertIn('ownership confirmed' if connect else 'automatic reconnect held off', result)
+            self.assertEqual(device.routing_writes, [bytes((21, int(connect))) + struct.pack('<II', 10, 1234)])
+            self.assertEqual(device.routing_reads, 3)
+            self.assertEqual(device.route[18], action)
+            self.assertFalse(device.basic_writes)
+
+    def test_disconnect_sets_hold_when_already_disconnected(self):
+        device = ConnectionDongle()
+        self.assertEqual(device.status[7] & 1, 1)
+        device.status[7] = 0
+        self.assertEqual(device.route[2], 0)
+        airpods.SettingsClient(device).connection(False)
+        self.assertEqual(len(device.routing_writes), 1)
+        self.assertEqual(device.route[2], 8)
+        self.assertIn('already disconnected', airpods.SettingsClient(device).connection(False))
+        self.assertEqual(len(device.routing_writes), 1)
+
+    def test_routing_avoids_noop_and_nonce_collisions_and_handles_revision_wrap(self):
+        device = ConnectionDongle()
+        device.route[2] = 0x63
+        self.assertIn('already connected', airpods.SettingsClient(device).connection(True))
+        self.assertFalse(device.routing_writes)
+        device.route[2] = 0
+        struct.pack_into('<I', device.route, 4, 0xffffffff)
+        struct.pack_into('<I', device.route, 28, 1)
+        with patch.object(airpods.secrets, 'randbits', return_value=0):
+            airpods.SettingsClient(device).connection(True)
+        self.assertEqual(struct.unpack_from('<II', device.routing_writes[0], 2), (0xffffffff, 2))
+        self.assertEqual(struct.unpack_from('<I', device.route, 4)[0], 1)
+
+    def test_routing_recovers_matching_receipt_after_its_own_generation_change_without_retry(self):
+        device = ConnectionDongle()
+        device.routing_generation_change = True
+        self.assertIn('ownership confirmed', airpods.SettingsClient(device).connection(True))
+        self.assertEqual(len(device.routing_writes), 1)
+        self.assertEqual(struct.unpack_from('<I', device.status, 8)[0], 43)
+
+    def test_routing_does_not_accept_other_peer_revision_action_or_nonce(self):
+        for offset in (12, 4, 18, 28):
+            device = ConnectionDongle()
+            device.supersede = lambda reply, offset=offset: reply.__setitem__(offset, 1 if offset == 18 else reply[offset] ^ 1)
+            with self.assertRaisesRegex(airpods.Unconfirmed, 'receipt is missing or was replaced'):
+                airpods.SettingsClient(device).connection(True)
+            self.assertEqual(len(device.routing_writes), 1)
+            self.assertFalse(device.basic_writes)
+
+    def test_routing_rejection_is_not_retried_or_fallen_back(self):
+        device = ConnectionDongle()
+        actual = airpods.typed_request
+
+        def reject_change(device, payload, generation=None):
+            if payload[0] == 21:
+                raise airpods.RequestRejected(2)
+            return actual(device, payload, generation)
+
+        with patch.object(airpods, 'typed_request', side_effect=reject_change):
+            with self.assertRaises(airpods.RequestRejected):
+                airpods.SettingsClient(device).connection(True)
+        self.assertFalse(device.routing_writes)
+        self.assertFalse(device.basic_writes)
+
+    def test_accepted_routing_does_not_claim_final_state_on_timeout(self):
+        device = ConnectionDongle()
+        device.complete_after = None
+        clock = Clock()
+        with patch.object(airpods.time, 'monotonic', side_effect=lambda: clock.now), \
+             patch.object(airpods.time, 'sleep', side_effect=clock.sleep):
+            with self.assertRaisesRegex(airpods.Unconfirmed, 'accepted, but its final state was not confirmed'):
+                airpods.SettingsClient(device).connection(True)
+        self.assertEqual(len(device.routing_writes), 1)
+
+    def test_reconnect_policy_query_and_verified_save(self):
+        device = ConnectionDongle()
+        client = airpods.SettingsClient(device)
+        self.assertEqual(client.reconnect_policy(None), 'Reconnect policy: manual')
+        self.assertFalse(device.policy_writes)
+        self.assertIn('saved and verified', client.reconnect_policy('auto'))
+        self.assertEqual(device.policy_writes, [1])
+        self.assertIn('no change needed; no write sent', client.reconnect_policy('auto'))
+        self.assertEqual(device.policy_writes, [1])
+        self.assertFalse(device.routing_writes)
+        self.assertFalse(device.basic_writes)
+
+    def test_reconnect_policy_set_rejection_is_not_retried(self):
+        device = ConnectionDongle()
+        actual = airpods.typed_request
+        calls = []
+
+        def reject_write(device, payload, generation=None):
+            calls.append(bytes(payload))
+            if len(payload) == 2:
+                raise airpods.RequestRejected(2)
+            return actual(device, payload, generation)
+
+        with patch.object(airpods, 'typed_request', side_effect=reject_write):
+            with self.assertRaises(airpods.RequestRejected):
+                airpods.SettingsClient(device).reconnect_policy('auto')
+        self.assertEqual(calls, [b'\x17', b'\x17\x01'])
+        self.assertFalse(device.policy_writes)
+
+    def test_older_firmware_policy_rejected_without_changes(self):
+        device = ConnectionDongle()
+        device.reject = 7
+        with self.assertRaisesRegex(airpods.Unsupported, 'firmware may need updating or its saved configuration is unreadable'):
+            airpods.SettingsClient(device).reconnect_policy('auto')
+        self.assertFalse(device.policy_writes)
+        self.assertFalse(device.routing_writes)
+
+    def test_uncertain_policy_write_is_not_retried(self):
+        device = ConnectionDongle()
+        device.fail_policy_reply = True
+        with self.assertRaisesRegex(airpods.Unconfirmed, 'Query reconnect-policy before retrying'):
+            airpods.SettingsClient(device).reconnect_policy('auto')
+        self.assertEqual(device.policy, 1)
+        self.assertEqual(device.policy_writes, [1])
+
+    def test_policy_write_requires_matching_readback(self):
+        class WrongReadback(ConnectionDongle):
+            def set(self, data):
+                super().set(data)
+                if data[7] == 6 and self.payload == b'\x17\x01':
+                    self.report[23] = 0
+
+        device = WrongReadback()
+        with self.assertRaisesRegex(airpods.Unconfirmed, 'did not match'):
+            airpods.SettingsClient(device).reconnect_policy('auto')
+        self.assertEqual(device.policy_writes, [1])
+
+    def test_policy_read_rejects_malformed_responses(self):
+        for reply in (b'', b'\x01', b'\x02\0', b'\x01\x02', b'\x01\0\0'):
+            device = ConnectionDongle()
+            device.policy_reply = reply
+            with self.assertRaisesRegex(RuntimeError, 'Malformed reconnect-policy'):
+                airpods.SettingsClient(device).reconnect_policy(None)
+            self.assertFalse(device.policy_writes)
+
+    def test_new_commands_select_serial_and_always_close_handle(self):
+        for args in (['pair', 'phone'], ['connect'], ['disconnect'], ['reconnect-policy'], ['reconnect-policy', 'auto']):
+            device = ConnectionDongle()
+            with patch.object(airpods, 'Hid', return_value=device) as hid, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(airpods.main(['--serial', 'PHONE'] + args), 0)
+                hid.assert_called_once_with('PHONE')
+            self.assertTrue(device.closed)
+        device = ConnectionDongle()
+        device.routing_generation_change = True
+        device.supersede = lambda reply: reply.__setitem__(12, 99)
+        with patch.object(airpods, 'Hid', return_value=device) as hid, \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(airpods.main(['--serial', 'PC', 'connect']), 3)
+            hid.assert_called_once_with('PC')
+        self.assertTrue(device.closed)
+        self.assertEqual(len(device.routing_writes), 1)
+
+    def test_lost_device_after_routing_write_never_reopens_a_different_board(self):
+        class LostDongle(ConnectionDongle):
+            def get(self, report):
+                if self.routing_writes:
+                    raise OSError('selected board unplugged')
+                return super().get(report)
+
+        device = LostDongle()
+        with patch.object(airpods, 'Hid', return_value=device) as hid, \
+             contextlib.redirect_stderr(io.StringIO()) as output:
+            self.assertEqual(airpods.main(['--serial', 'PC', 'connect']), 3)
+            hid.assert_called_once_with('PC')
+        self.assertIn('selected board unplugged', output.getvalue())
+        self.assertTrue(device.closed)
+        self.assertEqual(len(device.routing_writes), 1)
+
+    def test_status_does_not_query_policy_or_open_transaction_channel(self):
+        device = ConnectionDongle()
+        with patch.object(airpods, 'Hid', return_value=device), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(airpods.main(['status']), 0)
+        self.assertFalse(device.wire_writes)
 
 
 if __name__ == '__main__':

@@ -104,6 +104,7 @@ def playback_lifecycle_sources(directory):
     (directory / "playback_bitrate.inc").write_text("\n".join(bitrate_functions))
     defaults = []
     for declaration in ["static playback_game_t playback_game", "static bool a2dp_accept_incoming",
+                        "static bool reconnect_policy_supported",
                         "static bool playback_released", "static uint8_t release_peer",
                         "static bool playback_release_pending", "static uint32_t release_revision",
                         "static uint16_t release_cid"]:
@@ -133,6 +134,7 @@ def playback_lifecycle_sources(directory):
                       "void dongle_playback_connect_requested(void)",
                       "static void playback_release_close(void)",
                       "uint16_t dongle_routing_snapshot(", "uint8_t dongle_routing_request(",
+                      "static void playback_reconnect_policy_load(", "uint8_t dongle_reconnect_policy(",
                       "uint8_t dongle_playback_configure(",
                       "void dongle_playback_mic_request_changed(",
                       "bool dongle_playback_mic_ready(", "bool dongle_playback_mic_recover(",

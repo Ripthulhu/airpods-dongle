@@ -14,6 +14,14 @@ static bool flush_comparison_active,flush_comparison_ready=true;
 uint32_t btstack_run_loop_get_time_ms(void) {return 12345;}
 static unsigned radio_reads,adaptive_reads;
 static unsigned routing_reads,routing_writes;
+static unsigned policy_queries,policy_changes;
+static bool automatic_reconnect;
+uint8_t dongle_reconnect_policy(bool set,bool automatic,bool *current) {
+    if(set)++policy_changes;else ++policy_queries;
+    if(result!=DONGLE_ACCEPTED)return result;
+    if(set)automatic_reconnect=automatic;
+    *current=automatic_reconnect;return DONGLE_ACCEPTED;
+}
 uint16_t dongle_routing_snapshot(uint8_t *out,uint16_t capacity) {
     ++routing_reads;if(capacity<32)return 0;
     memset(out,0,32);out[0]=1;out[1]=32;return 32;
@@ -218,5 +226,22 @@ int main(void) {
     uint8_t route_busy[]={21,1,17,0,0,0,0xe7,3,0,0};result=DONGLE_BUSY;
     assert(dongle_features_request(1,route_busy,10,out,64,&n)==2 && !n && routing_writes==2);
     assert(routing_reads==3);
+    uint8_t reserved[]={22};
+    assert(dongle_features_request(0,reserved,1,out,64,&n)==7 && !policy_queries);
+    uint8_t policy[3]={23,1,0};result=DONGLE_ACCEPTED;
+    assert(dongle_features_request(0,policy,3,out,64,&n)==1 && !policy_changes);
+    assert(dongle_features_request(0,policy,2,out,1,&n)==1 && !policy_changes);
+    policy[1]=2;assert(dongle_features_request(0,policy,2,out,64,&n)==1 && !policy_changes);
+    policy[1]=1;
+    assert(dongle_features_request(0,policy,1,out,64,&n)==0 && n==2 && out[0]==1 && !out[1]);
+    assert(dongle_features_request(1,policy,2,policy,2,&n)==0 && n==2 && policy[0]==1 && policy[1]==1);
+    policy[0]=23;policy[1]=0;
+    assert(dongle_features_request(0,policy,2,out,64,&n)==0 && n==2 && !out[1]);
+    assert(policy_changes==2 && policy_queries==1);
+    const uint8_t policy_failures[]={DONGLE_BUSY,DONGLE_UNSUPPORTED,DONGLE_TRANSPORT};
+    const uint8_t policy_errors[]={2,7,6};
+    for(unsigned i=0;i<sizeof(policy_failures);++i) {
+        result=policy_failures[i];assert(dongle_features_request(0,policy,2,out,64,&n)==policy_errors[i] && !n);
+    }
     puts("typed features: validation, exact integer values, aliased buffers, bounded responses and result mapping passed");
 }

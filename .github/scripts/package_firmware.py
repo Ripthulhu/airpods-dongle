@@ -264,8 +264,13 @@ def self_test():
                 archive.write(ROOT / name, "airpods-cli/" + name)
         with zipfile.ZipFile(root / "cli.zip") as archive:
             archive.extractall(root / "extracted")
-        help_text = subprocess.check_output([sys.executable, str(root / "extracted/airpods-cli/tools/airpods.py"), "help"], text=True)
+        cli = str(root / "extracted/airpods-cli/tools/airpods.py")
+        help_text = subprocess.check_output([sys.executable, cli, "help"], text=True)
         require("settings" in help_text, "Packaged CLI help failed")
+        for command in ("pair", "connect", "disconnect", "reconnect-policy"):
+            require(command in help_text, f"Packaged CLI is missing {command}")
+            command_help = subprocess.check_output([sys.executable, cli, "help", command], text=True)
+            require(f" {command}" in command_help, f"Packaged CLI help failed for {command}")
     print("Firmware packaging checks passed")
 
 

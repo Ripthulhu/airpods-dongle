@@ -34,6 +34,7 @@ static uint8_t error(uint8_t result) {
         case DONGLE_STALE:return 3;
         case DONGLE_DISCONNECTED:return 4;
         case DONGLE_UNSUPPORTED:return 7;
+        case DONGLE_TRANSPORT:return 6;
         default:return 1;
     }
 }
@@ -115,6 +116,13 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
             result=dongle_routing_request(p[1],dongle_u32(p+2),dongle_u32(p+6));
             if(result!=DONGLE_ACCEPTED)return error(result);
             *length=dongle_routing_snapshot(out,capacity);return *length?0:7;
+        case 23: {
+            if ((size!=1 && size!=2) || capacity<2 || (size==2 && p[1]>1)) return 1;
+            bool automatic=false;
+            result=dongle_reconnect_policy(size==2,size==2 && p[1]!=0,&automatic);
+            if (result!=DONGLE_ACCEPTED) return error(result);
+            out[0]=1;out[1]=automatic?1:0;*length=2;return 0;
+        }
         default:return 7;
     }
 }

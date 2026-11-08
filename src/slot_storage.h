@@ -15,5 +15,8 @@ void read_slot1_mac(uint8_t mac[MAC_LEN]);
 bool write_slot1_mac(const uint8_t mac[MAC_LEN]);
 void read_slot2_mac(uint8_t mac[MAC_LEN]);
 bool write_slot2_mac(const uint8_t mac[MAC_LEN]);
+// A missing reconnect preference means Manual; unknown storage is never overwritten.
+bool read_reconnect_policy(bool *automatic);
+bool write_reconnect_policy(bool automatic);
 
 #endif

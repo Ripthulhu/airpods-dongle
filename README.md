@@ -75,16 +75,25 @@ The Python CLI uses the existing USB HID protocol on Windows, Linux and Android:
 ```sh
 python tools/airpods.py help
 python tools/airpods.py status
+python tools/airpods.py connect
+python tools/airpods.py disconnect
+python tools/airpods.py pair phone
+python tools/airpods.py reconnect-policy manual
 python tools/airpods.py get mode
 python tools/airpods.py set mode transparency
 ```
+
+Use `pair` for new AirPods, or `connect` for an existing bond. Replacing saved
+AirPods requires `pair airpods --replace`. Reconnect is manual by default;
+`reconnect-policy auto` explicitly allows reclaiming AirPods from another host.
+See [CLI help and connection behavior](docs/CLI.md) for confirmation and firmware requirements.
 
 The serial port is a diagnostic console. See [runtime USB bootloader entry](docs/USB-CONTROL.md#usb-bootloader-entry)
 for updating through the console instead of the physical button.
 
 ## Status and limits
 
-Current source version: **0.1.62**. The [Game Mode transition](docs/GAME-TRANSITION.md)
+Current source version: **0.1.63**. The [Game Mode transition](docs/GAME-TRANSITION.md)
 and [Android/dongle protocol alignment](docs/ANDROID-PROTOCOL-PARITY.md) describe
 its implementation and validation boundaries.
 

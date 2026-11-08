@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Control AirPods through the dongle's existing USB HID interface (Python 3.10+)."""
 import argparse
+import secrets
 import struct
 import sys
 import time
@@ -100,6 +101,13 @@ def snapshot(data):
     return result
 
 
+def routing(data):
+    if (len(data) != 32 or data[:2] != b'\x01\x20' or data[19] != 0 or
+            not struct.unpack_from('<I', data, 4)[0] or data[18] not in (0, 1, 2)):
+        raise RuntimeError('Malformed routing snapshot')
+    return data
+
+
 class Unconfirmed(RuntimeError):
     pass
 
@@ -147,15 +155,152 @@ class SettingsClient:
             raise Unconfirmed(f'{name}: change not confirmed: {error}. It may have applied; read it again before retrying.') from error
         raise Unconfirmed(f'{name}: sent, but no fresh matching device report. It may have applied; use get {name} before retrying.')
 
+    def basic(self, opcode, replace=False):
+        before = self.device.get(2)
+        capability = 4 if opcode == 4 else 1
+        if not struct.unpack_from('<H', before, 42)[0] & capability:
+            raise Unsupported('Firmware does not support this connection command')
+        if opcode == 2 and any(before[12:18]) and before[12:18] != b'\xff' * 6 and not replace:
+            raise RuntimeError('AirPods are already saved. Use connect, or pair airpods --replace to replace their bond.')
+        if opcode in (2, 4) and before[7] & (4 | 8 | 16 | 64):
+            raise RuntimeError('Pause playback, stop microphone use and disconnect the phone relay before pairing; no changes sent')
+        if opcode == 1 and (not any(before[12:18]) or before[12:18] == b'\xff' * 6):
+            raise RuntimeError('No saved AirPods; use pair airpods first')
+        sequence = (struct.unpack_from('<I', before, 36)[0] + 1) & 0xffffffff or 1
+        request = bytearray(64)
+        request[:7] = before[:7]
+        request[7] = opcode
+        request[8:18] = before[8:18]
+        struct.pack_into('<I', request, 18, sequence)
+        try:
+            self.device.set(request)
+            until = time.monotonic() + 4
+            while time.monotonic() < until:
+                current = self.device.get(2)
+                received = struct.unpack_from('<I', current, 36)[0]
+                if received == sequence and current[41] == opcode:
+                    result = current[40]
+                    if result == 1:
+                        return
+                    if result == 4:
+                        raise Unsupported('Firmware rejected this connection command as unsupported')
+                    if opcode == 2 and result == 2:
+                        raise Unconfirmed('AirPods pairing setup was busy or failed after changing state. Inspect status before retrying.')
+                    if result in (2, 3, 5, 6):
+                        raise RequestRejected({2: 2, 3: 3, 5: 4, 6: 1}[result])
+                    break
+                if current[8:18] != before[8:18] or received != struct.unpack_from('<I', before, 36)[0]:
+                    break
+                time.sleep(.01)
+        except (Unsupported, RequestRejected, Unconfirmed):
+            raise
+        except (OSError, RuntimeError) as error:
+            raise Unconfirmed(f'Connection request not confirmed: {error}. It may have applied; inspect status before retrying.') from error
+        raise Unconfirmed('Connection request sent, but its receipt was lost or timed out. Inspect status before retrying.')
+
+    def pair(self, target, replace=False):
+        self.basic(2 if target == 'airpods' else 4, replace)
+        if target == 'phone':
+            return 'Phone pairing window opened for 120 seconds. Pair AirPods Dongle in the phone Bluetooth settings.'
+        return 'AirPods pairing started; not yet paired. Leave both buds in the open case, flashing white.'
+
+    def connection(self, connect):
+        status = self.device.get(2)
+        if not struct.unpack_from('<H', status, 42)[0] & 512:
+            if not connect:
+                raise Unsupported('Disconnect requires newer firmware with routing support; no changes sent')
+            self.basic(1)
+            return 'AirPods connection requested; not yet confirmed. Use status to check the connection.'
+        before = routing(typed_request(self.device, b'\x14'))
+        peer = bytes(before[12:18])
+        if not any(peer) or peer == b'\xff' * 6 or peer != status[12:18]:
+            raise RuntimeError('No matching saved AirPods; use pair airpods first')
+        complete = (lambda flags: flags & 0x7f == 0x63) if connect else (lambda flags: flags & 0x7e == 8)
+        if complete(before[2]):
+            return 'AirPods already connected and audio ownership confirmed.' if connect else 'AirPods already disconnected; automatic reconnect is held off.'
+        revision = (struct.unpack_from('<I', before, 4)[0] + 1) & 0xffffffff or 1
+        nonce = secrets.randbits(32) or 1
+        if nonce == struct.unpack_from('<I', before, 28)[0]:
+            nonce = (nonce + 1) & 0xffffffff or 1
+        action = 2 if connect else 1
+        # A release/acquire can change the session during its reply. Recover only its exact receipt, never resend it.
+        payload = bytes((21, int(connect))) + before[4:8] + struct.pack('<I', nonce)
+        try:
+            current = routing(typed_request(self.device, payload))
+        except Unsupported:
+            raise
+        except RequestRejected as error:
+            if error.code in (1, 2, 3, 4):
+                raise
+            current = None
+        except (OSError, RuntimeError):
+            current = None
+        until = time.monotonic() + 12
+        try:
+            while time.monotonic() < until:
+                if current is None:
+                    current = routing(typed_request(self.device, b'\x14'))
+                if (current[12:18] != peer or struct.unpack_from('<I', current, 4)[0] != revision or
+                        current[18] != action or struct.unpack_from('<I', current, 28)[0] != nonce):
+                    raise RuntimeError('Matching routing receipt is missing or was replaced')
+                if complete(current[2]):
+                    return 'AirPods connected; audio ownership confirmed.' if connect else 'AirPods disconnected; automatic reconnect held off until Connect, a button press or reboot.'
+                current = None
+                time.sleep(.1)
+        except (OSError, RuntimeError) as error:
+            raise Unconfirmed(f'Connection change not confirmed: {error}. It may have applied; inspect status before retrying.') from error
+        raise Unconfirmed('Connection request accepted, but its final state was not confirmed. Inspect status before retrying.')
+
+    def reconnect_policy(self, mode):
+        def decode_policy(reply):
+            if len(reply) != 2 or reply[0] != 1 or reply[1] not in (0, 1):
+                raise RuntimeError('Malformed reconnect-policy response')
+            return ('manual', 'auto')[reply[1]]
+
+        if not struct.unpack_from('<H', self.device.get(2), 42)[0] & 16:
+            raise Unsupported('Reconnect policy requires newer firmware; no changes sent')
+        try:
+            current = decode_policy(typed_request(self.device, b'\x17'))
+        except Unsupported as error:
+            raise Unsupported('Reconnect policy unavailable: firmware may need updating or its saved configuration is unreadable; no changes sent') from error
+        if mode is None:
+            return f'Reconnect policy: {current}'
+        if mode == current:
+            return f'Reconnect policy: {current} (no change needed; no write sent)'
+        try:
+            confirmed = decode_policy(typed_request(self.device, bytes((23, int(mode == 'auto')))))
+            if confirmed != mode:
+                raise RuntimeError('Reconnect policy did not match the requested value')
+        except Unsupported:
+            raise
+        except RequestRejected as error:
+            if error.code in (1, 2, 3, 4):
+                raise
+            raise Unconfirmed(f'Reconnect policy not confirmed: {error}. Query reconnect-policy before retrying.') from error
+        except (OSError, RuntimeError) as error:
+            raise Unconfirmed(f'Reconnect policy not confirmed: {error}. Query reconnect-policy before retrying.') from error
+        return f'Reconnect policy: {confirmed} (saved and verified)'
+
 
 def parser():
-    result = argparse.ArgumentParser(description=__doc__, epilog='Close NTPods or other HID control clients before using settings commands.')
+    result = argparse.ArgumentParser(description=__doc__, epilog='Close NTPods or other HID control clients before using control commands.')
     result.add_argument('--serial', help='select one Pico by its USB serial; required when multiple dongles are attached')
     commands = result.add_subparsers(dest='command', required=True)
     help_command = commands.add_parser('help', help='show commands or help for a setting')
     help_command.add_argument('topic', nargs='?', help='command or setting name')
     commands.add_parser('status', help='show connection, codec and batteries without changing settings')
     commands.add_parser('settings', help='list readable setting values and their report ages')
+    pair = commands.add_parser('pair', help='start AirPods pairing or open phone pairing for 120 seconds',
+                               description='Pair new AirPods (default), or open the phone pairing window. Pause playback and microphone use first. Use connect for an existing AirPods bond.')
+    pair.add_argument('target', nargs='?', default='airpods', choices=('airpods', 'phone'))
+    pair.add_argument('--replace', action='store_true', help='AirPods only: erase the saved AirPods bond before pairing its replacement')
+    commands.add_parser('connect', help='explicitly reconnect to the saved AirPods and request audio ownership',
+                        description='Reconnect using the saved AirPods bond, without pairing again. This explicit request can reclaim audio from another host. New firmware confirms audio ownership; older firmware confirms only that the request was accepted.')
+    commands.add_parser('disconnect', help='release AirPods and hold automatic reconnect off until Connect, a button press or reboot',
+                        description='Release the AirPods without erasing pairing. Automatic reconnect stays held off until Connect, a button press or reboot, including when the saved policy is Auto. Requires firmware with routing support.')
+    policy = commands.add_parser('reconnect-policy', help='read or save manual/automatic reconnect behavior (new firmware)',
+                                 description='Read the reconnect policy, or change it while playback, microphone use and connection transitions are idle. Manual is the default: use Connect or one button press. Auto explicitly allows reclaiming AirPods from another host on subsequent eligible attempts. A Disconnect hold overrides Auto until Connect, a button press or reboot. Older firmware rejects policy commands without changes.')
+    policy.add_argument('mode', nargs='?', choices=('manual', 'auto'), help='omit to read; auto may interrupt another host')
     get = commands.add_parser('get', help='read one reported setting')
     get.add_argument('setting', choices=SETTINGS)
     set_command = commands.add_parser('set', help='change one setting and wait for device confirmation')
@@ -178,10 +323,12 @@ def main(argv=None):
             print('\nSettings:')
             for name in SETTINGS:
                 print(f'  {name}: {value_help(name)}')
-            print('\nExamples:\n  airpods.py get mode\n  airpods.py set mode transparency\n  airpods.py set ear-detection on')
+            print('\nExamples:\n  airpods.py connect\n  airpods.py pair airpods\n  airpods.py pair phone\n  airpods.py disconnect\n  airpods.py reconnect-policy manual\n  airpods.py get mode\n  airpods.py set mode transparency\n  airpods.py set ear-detection on')
         else:
             cli.error('unknown help topic: ' + args.topic)
         return 0
+    if args.command == 'pair' and args.target == 'phone' and args.replace:
+        cli.error('--replace applies only to pair airpods')
     if args.command == 'set':
         try:
             value = encode(args.setting, args.value)
@@ -200,6 +347,12 @@ def main(argv=None):
                 print(f'Battery {label}: ' + (f'{raw}%' if raw <= 100 else 'unknown'))
         elif args.command == 'set':
             print(client.set(args.setting, value))
+        elif args.command == 'pair':
+            print(client.pair(args.target, args.replace))
+        elif args.command in ('connect', 'disconnect'):
+            print(client.connection(args.command == 'connect'))
+        elif args.command == 'reconnect-policy':
+            print(client.reconnect_policy(args.mode))
         else:
             values = client.read()
             for name in ([args.setting] if args.command == 'get' else SETTINGS):

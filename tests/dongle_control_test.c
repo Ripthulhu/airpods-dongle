@@ -7,6 +7,7 @@ static bd_addr_t test_address = {1,2,3,4,5,6};
 static uint32_t test_session = 1;
 static uint64_t now = 20;
 static bool capture, playback, phone, ready = true;
+static bool capture_requested,capture_active;
 static bool pairing_ok = true;
 static bool pairing_busy;
 static bool settings_busy;
@@ -51,7 +52,8 @@ bool phone_sink_connected(void) { return phone; }
 bool get_usb_streaming(void) { return playback; }
 bool get_a2dp_connected_flag(void) { return ready; }
 bool check_is_streaming(void) { return playback; }
-bool aacp_mic_active(void) { return capture; }
+bool aacp_mic_requested(void) { return capture || capture_requested; }
+bool aacp_mic_active(void) { return capture || capture_active; }
 uint8_t dongle_output_codec(void) { return 3; }
 static void request(uint8_t *r, uint8_t op, uint32_t seq) {
     dongle_header(r); r[7] = op; dongle_put32(r + 8, controls[0].generation);
@@ -93,7 +95,19 @@ int main(void) {
     request(r, 1, 1); dongle_control_set(r + 1, 63); test_session++;
     dongle_control_poll(); assert(controls[0].last_result == DONGLE_STALE && reconnects == 1);
     request(r, 2, 2); playback = true; send(r); assert(controls[0].last_result == DONGLE_BUSY && !pairs);
-    playback = false; request(r, 2, 3); send(r); assert(pairs == 1);
+    playback = false;
+    bd_addr_t original_pair;memcpy(original_pair,test_address,6);uint32_t original_session=test_session;
+    for(unsigned state=0;state<2;++state) {
+        request(r,2,3+state);dongle_control_set(r+1,63);
+        if(state)capture_active=true;else capture_requested=true;
+        dongle_control_poll();
+        assert(controls[0].last_result==DONGLE_BUSY && !pairs &&
+            !memcmp(test_address,original_pair,6) && test_session==original_session);
+        capture_active=capture_requested=false;
+    }
+    // A fresh control epoch keeps the following existing receipt sequence independent.
+    dongle_control_available(false);dongle_control_poll();dongle_control_available(true);dongle_control_poll();
+    request(r, 2, 3); send(r); assert(pairs == 1);
     dongle_control_poll(); assert(controls[0].last_sequence == 3 && controls[0].last_result == DONGLE_ACCEPTED);
     request(r, 3, 4); r[22] = 2; send(r); assert(controls[0].last_result == DONGLE_UNSUPPORTED);
     readback.anc = 3; request(r, 3, 5); r[22] = 2; send(r);

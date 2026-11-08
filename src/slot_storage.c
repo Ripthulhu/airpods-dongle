@@ -6,6 +6,7 @@
 #include "slot_storage.h"
 
 #define SLOT_TAG 0x4150534cu // APSL; distinct from BTstack's bond tags.
+#define RECONNECT_TAG 0x41505243u // APRC; independent of pairing records.
 #define LEGACY_PAGE (PICO_FLASH_SIZE_BYTES - 2u * FLASH_SECTOR_SIZE - FLASH_PAGE_SIZE)
 
 typedef struct {
@@ -74,3 +75,34 @@ void read_slot1_mac(uint8_t mac[MAC_LEN]) { read_mac(0, mac); }
 void read_slot2_mac(uint8_t mac[MAC_LEN]) { read_mac(1, mac); }
 bool write_slot1_mac(const uint8_t mac[MAC_LEN]) { return write_field(offsetof(slot_record_t, mac[0]), mac, MAC_LEN); }
 bool write_slot2_mac(const uint8_t mac[MAC_LEN]) { return write_field(offsetof(slot_record_t, mac[1]), mac, MAC_LEN); }
+
+bool read_reconnect_policy(bool *automatic) {
+    const btstack_tlv_t *tlv;
+    void *context;
+    if (!automatic) return false;
+    *automatic = false;
+    btstack_tlv_get_instance(&tlv, &context);
+    if (!tlv) return false;
+    int length = tlv->get_tag(context, RECONNECT_TAG, NULL, 0);
+    if (!length) return true;
+    uint8_t record[2];
+    if (length != sizeof(record) ||
+        tlv->get_tag(context, RECONNECT_TAG, record, sizeof(record)) != sizeof(record) ||
+        record[0] != 1 || record[1] > 1) return false;
+    *automatic = record[1] != 0;
+    return true;
+}
+
+bool write_reconnect_policy(bool automatic) {
+    bool current;
+    // Validate first so a newer format survives a firmware downgrade.
+    if (!read_reconnect_policy(&current)) return false;
+    if (current == automatic) return true;
+    const btstack_tlv_t *tlv;
+    void *context;
+    btstack_tlv_get_instance(&tlv, &context);
+    if (!tlv) return false;
+    uint8_t record[2] = {1, automatic ? 1 : 0};
+    if (tlv->store_tag(context, RECONNECT_TAG, record, sizeof(record)) != 0) return false;
+    return read_reconnect_policy(&current) && current == automatic;
+}

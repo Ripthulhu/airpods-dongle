@@ -72,7 +72,7 @@ bool dongle_att_request(const uint8_t *p, uint16_t n) {
     return true;
 }
 void dongle_att_poll(void) {
-    if (att_cid && !same_peer()) { fail(); return; }
+    if ((att_cid || result == DONGLE_ATT_DONE) && !same_peer()) { fail(); return; }
     if (pending && (uint32_t)(btstack_run_loop_get_time_ms() - started) >= ATT_TIMEOUT_MS) fail();
 }
 dongle_att_result_t dongle_att_take(uint8_t *out, uint16_t capacity, uint16_t *length) {
@@ -159,7 +159,9 @@ static void packet_handler(uint8_t type, uint16_t channel, uint8_t *p, uint16_t 
         case L2CAP_EVENT_CHANNEL_CLOSED:
             if (n >= 4 && att_cid && l2cap_event_channel_closed_get_local_cid(p) == att_cid) {
                 att_cid = 0;
-                fail();
+                opened = sent = false;
+                // A valid reply may precede the peer's idle close before the main loop takes it.
+                if (result != DONGLE_ATT_DONE) fail();
             }
             break;
         default: break;

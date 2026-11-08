@@ -383,6 +383,7 @@ static uint8_t is_cmd_triggered_localy = 0;
 static bool a2dp_is_connected_flag = false;
 static bool a2dp_connect_pending;
 static bool a2dp_accept_incoming = true;
+static bool reconnect_policy_supported, reconnect_automatic, reconnect_auto_intent;
 static bool playback_released;
 static uint8_t release_peer[6];
 static bool playback_release_pending;
@@ -3502,6 +3503,7 @@ static int setup_aaceld_configuration(){
 
 
 bool avdtp_disconnect_and_scan(void){
+    reconnect_auto_intent=false;
     aacp_routing_override();
     playback_released=playback_release_pending=false;
     avrcp_reconnect_reset();
@@ -3556,6 +3558,7 @@ void a2dp_source_reconnect(void) {
 }
 
 void dongle_playback_connect_requested(void) {
+    reconnect_auto_intent=false;
     playback_released=playback_release_pending=false;
     a2dp_accept_incoming=true;
 }
@@ -3608,6 +3611,7 @@ uint8_t dongle_routing_request(uint8_t action, uint32_t expected, uint32_t nonce
         avdtp_source_establish_stream();
         return DONGLE_ACCEPTED;
     }
+    reconnect_auto_intent=false;
     aacp_routing_override();
     aacp_routing_receipt(nonce,1);
     memcpy(release_peer,peer,6);playback_released=true;a2dp_accept_incoming=false;
@@ -3619,6 +3623,40 @@ uint8_t dongle_routing_request(uint8_t action, uint32_t expected, uint32_t nonce
         playback_adjust_cancel_stream(&media_tracker,btstack_run_loop_get_time_ms(),playback_adjust_interval(&playback_adjust));
         playback_game.phase=GAME_RESTORING;
     } else playback_release_close();
+    return DONGLE_ACCEPTED;
+}
+
+static void playback_reconnect_policy_load(void) {
+    reconnect_policy_supported=read_reconnect_policy(&reconnect_automatic);
+    if (!reconnect_policy_supported) reconnect_automatic=false;
+}
+
+uint8_t dongle_reconnect_policy(bool set, bool automatic, bool *current) {
+    if (!current) return DONGLE_MALFORMED;
+    *current=false;
+    if (set) {
+        if (is_usb_streaming || phone_opened || phone_active || media_tracker.streaming ||
+            usb_mic_requested() || aacp_mic_requested() || aacp_mic_active() || call_active || call_opened ||
+            profile_pending || profile_reconnect || a2dp_connect_pending || playback_release_pending ||
+            mic_prepare_open || mic_recovery_pending || phone_output_recovery || suspend_recovery_pending ||
+            playback_game.waiting_tx || playback_game.waiting_report || playback_game.restore_failed ||
+            playback_adjust_busy(&playback_adjust) || playback_idle_phase==PLAYBACK_SUSPENDING ||
+            playback_idle_phase==PLAYBACK_STARTING) return DONGLE_BUSY;
+        bool stored;
+        bool readable=read_reconnect_policy(&stored);
+        if (!readable || !write_reconnect_policy(automatic)) {
+            // Persistence may have partly succeeded: do not claim the old mode is still stored.
+            reconnect_policy_supported=reconnect_automatic=false;
+            if (reconnect_auto_intent) {aacp_routing_override();reconnect_auto_intent=false;}
+            return readable?DONGLE_TRANSPORT:DONGLE_UNSUPPORTED;
+        }
+        reconnect_policy_supported=true;reconnect_automatic=automatic;
+        if (!automatic && reconnect_auto_intent) {
+            aacp_routing_override();reconnect_auto_intent=false;
+        }
+    }
+    if (!reconnect_policy_supported) return DONGLE_UNSUPPORTED;
+    *current=reconnect_automatic;
     return DONGLE_ACCEPTED;
 }
 
@@ -3798,7 +3836,7 @@ static void playback_reconnect_poll(uint32_t now) {
     const uint8_t *peer = (const uint8_t *)get_device_addr();
     if (a2dp_is_connected_flag) reconnect_delay = 1000;
     if (a2dp_is_connected_flag || a2dp_connect_pending || !a2dp_accept_incoming ||
-        !aacp_takeover_pending(peer) ||
+        playback_released || (!reconnect_automatic && !aacp_takeover_pending(peer)) ||
         profile_pending || profile_reconnect || !peer || !peer_address_valid(peer)) {
         reconnect_since = now;
         return;
@@ -3806,6 +3844,23 @@ static void playback_reconnect_poll(uint32_t now) {
     if ((uint32_t)(now - reconnect_since) < reconnect_delay) return;
     reconnect_since = now;
     if (reconnect_delay < 8000) reconnect_delay *= 2;
+    if ((reconnect_auto_intent || !aacp_takeover_pending(peer)) &&
+        (usb_mic_requested() || aacp_mic_requested() || aacp_mic_active() || call_active || call_opened ||
+            mic_prepare_open || mic_recovery_pending || phone_output_recovery || suspend_recovery_pending ||
+            playback_game.waiting_tx || playback_game.waiting_report || playback_game.restore_failed ||
+            playback_adjust_busy(&playback_adjust) || playback_idle_phase==PLAYBACK_SUSPENDING ||
+            playback_idle_phase==PLAYBACK_STARTING)) return;
+    if (!aacp_takeover_pending(peer)) {
+        uint8_t saved[6], slot=read_uint8_last_flash();
+        if (slot==1) read_slot1_mac(saved);
+        else if (slot==2) read_slot2_mac(saved);
+        else return;
+        link_key_t key;
+        link_key_type_t type;
+        if (memcmp(saved,peer,6) || !gap_get_link_key_for_bd_addr(peer,key,&type) ||
+            !aacp_takeover_request(peer)) return;
+        reconnect_auto_intent=true;
+    }
     avdtp_source_establish_stream();
 }
 void dongle_playback_poll(void) {
@@ -4318,6 +4373,8 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 }
 
 int btstack_main(int argc, const char * argv[]){
+
+    playback_reconnect_policy_load();
 
 #if AIRPODS_EXPERIMENTAL_RADIO0076
     radio0076_register_gate();

@@ -3,8 +3,9 @@
 The [version-1 USB reports](USB-CONTROL.md) provide phone
 controls, device settings, output profiles, Game Mode, performance readings and
 nearby finding. The implementation and host tests are complete; Pico/AirPods
-hardware verification is pending. Explicit routing operations preserve the
-passive connection policy; polling never requests ownership.
+hardware verification is pending. The default reconnect policy is Manual;
+ordinary polling never requests ownership unless Automatic was explicitly saved
+with feature 23.
 
 All integer fields are little-endian. Layout lengths below are exact.
 
@@ -58,6 +59,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 19: radio and adaptive bitrate | none | read-only, cached 128-byte version-1 snapshot; USB or phone |
 | 20: routing status | none | 32-byte version-1 snapshot; capability 512 |
 | 21: authorized handover | action u8 (0 release, 1 acquire), expected intent revision u32, nonzero request nonce u32 | routing snapshot; capability 512 |
+| 23: reconnect policy | query: none; set: mode u8 (0 Manual, 1 Automatic) | version u8=1, effective mode u8 |
 
 ## Explicit routing handover
 
@@ -76,8 +78,9 @@ advances that revision and records the request nonce and action. Repeating the
 old revision or reusing the current receipt's nonce is stale; hosts must not
 retry the operation. Physical button, basic Connect and Pair choices advance the
 revision and clear the automatic receipt, including coalesced takeover presses.
-Source playback and routing policy remain host responsibilities: audio packets,
-proximity and notification sounds do not authorize acquisition.
+Source playback and routing policy remain host responsibilities by default:
+audio packets, proximity and notification sounds do not authorize acquisition.
+Feature 23 provides a separate, explicit opt-in to autonomous saved-peer retries.
 
 | Snapshot offset | Field |
 | --- | --- |
@@ -103,6 +106,48 @@ fresh feature 20 reads tied to the same USB session, selected pair, new intent
 revision and exact echoed nonce/action. A missing receipt never authorizes a
 retry or source reconnection. Settings workflow leases block routing writes,
 including writes from their owner; read-only routing status remains available.
+
+## Reconnect preference
+
+Firmware 0.1.63 adds feature 23 with exact payloads `[23]` to query and `[23, mode]` to save, with
+`mode=0` for Manual or `mode=1` for Automatic. Both return exactly `[1, mode]`
+on success. No report-2 capability bit or existing report layout changes.
+Older firmware returns unsupported (RPC error 7) for feature 23. Feature 22
+remains reserved for the existing USB output-continuity contract.
+
+Manual is the default, including after upgrades with no saved preference. A
+button press, basic Connect or feature-21 acquisition still grants the existing
+bounded takeover intent; a saved AirPods pair may also initiate an incoming
+connection. Automatic authorizes outgoing retries only to the selected saved
+address with a valid bond, using the existing 1/2/4/8-second backoff. It never
+starts discovery. **Automatic may interrupt another host using that pair**;
+Manual is recommended when the AirPods are shared between devices.
+
+A successful policy write takes effect on subsequent eligible retries, which
+may happen immediately. Explicit release suppresses incoming connections and automatic retries
+until Connect, a button request or reboot. Changing the preference cannot clear
+that hold. Saving Manual cancels an outstanding automatic takeover intent but
+preserves an explicit user request. An already-started connection may finish;
+new policy writes return busy during physical connection or audio transitions.
+
+The preference occupies the separate `APRC` TLV tag (`0x41505243`): exactly two
+bytes, version 1 and mode 0/1. Pair-slot `APSL` and bond formats are unchanged.
+Missing `APRC` means Manual and does not require a flash write. Wrong lengths,
+unknown versions, invalid modes or unavailable storage fail closed to Manual
+and return unsupported without overwriting the record. Writes are acknowledged
+only after exact schema and value readback; unchanged preferences avoid writes.
+The verified runtime preference is loaded once at startup, with no repeated
+preference reads in the audio polling loop.
+
+Policy writes return busy (RPC error 2) during playback, microphone/call use,
+codec/media recovery, connection or Game Mode transitions, and while any settings
+workflow lease exists, including the caller's own lease. Read-only queries remain
+available during playback and leases. Malformed requests return error 1.
+If a store or post-write verification fails, RPC error 6 means the change may
+have persisted: **do not retry automatically**. Runtime retries fail closed to
+Manual, and subsequent queries return unsupported rather than claiming the old
+value or reactivating uncertain stored Automatic. A later explicit verified set
+or restart can reload a valid record; future unknown formats remain protected.
 
 The explicit [host volume authority contract](HOST-VOLUME.md) coordinates a host
 that actually delegates its mixer volume to the AirPods. It suppresses standalone

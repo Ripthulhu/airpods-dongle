@@ -74,7 +74,8 @@ static void execute(control_client_t *c, const uint8_t *p) {
         else if (!aacp_takeover_request(selected)) c->last_result = DONGLE_BUSY;
         else a2dp_source_reconnect();
     } else if (p[7] == 2) {
-        if (usb_mic_requested() || phone_sink_connected() || get_usb_streaming()) c->last_result = DONGLE_BUSY;
+        if (usb_mic_requested() || aacp_mic_requested() || aacp_mic_active() ||
+            phone_sink_connected() || get_usb_streaming()) c->last_result = DONGLE_BUSY;
         else if (!avdtp_disconnect_and_scan()) c->last_result = DONGLE_BUSY;
     } else if (p[7] == 3) {
         if (!aacp_control_ready()) c->last_result = DONGLE_DISCONNECTED;

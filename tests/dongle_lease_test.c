@@ -51,6 +51,11 @@ int main(void){
     const uint8_t handover[]={21,0,1,0,0,0,17,0,0,0};
     transact(1,7,handover,sizeof(handover));assert(clients[1].failure==BUSY && lease_owner==0);
     transact(0,7,handover,sizeof(handover));assert(clients[0].failure==BUSY && lease_owner==0);
+    const uint8_t policy_set[]={23,1},policy_get[]={23};
+    for(unsigned client=0;client<2;++client) {
+        transact(client,7,policy_set,sizeof(policy_set));assert(clients[client].failure==BUSY && lease_owner==0);
+        transact(client,7,policy_get,sizeof(policy_get));assert(clients[client].phase==COMPLETE && lease_owner==0);
+    }
     raw(0);complete();raw(0);complete();assert(att_sent==3);
     lease(1,2,tokens[0]);assert(clients[1].failure==STALE && lease_owner==0);
     lease(0,2,tokens[0]);assert(clients[0].phase==COMPLETE && lease_owner<0);

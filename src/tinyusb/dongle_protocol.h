@@ -8,7 +8,7 @@
 #define DONGLE_REPORT_ID 2
 #define DONGLE_REPORT_SIZE 64
 enum { DONGLE_ACCEPTED = 1, DONGLE_BUSY, DONGLE_STALE,
-       DONGLE_UNSUPPORTED, DONGLE_DISCONNECTED, DONGLE_MALFORMED };
+       DONGLE_UNSUPPORTED, DONGLE_DISCONNECTED, DONGLE_MALFORMED, DONGLE_TRANSPORT };
 static inline uint32_t dongle_u32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }

@@ -63,6 +63,7 @@ uint16_t dongle_playback_status(uint8_t *out, uint16_t capacity);
 void dongle_playback_connect_requested(void);
 uint16_t dongle_routing_snapshot(uint8_t *out, uint16_t capacity);
 uint8_t dongle_routing_request(uint8_t action, uint32_t expected, uint32_t nonce);
+uint8_t dongle_reconnect_policy(bool set, bool automatic, bool *current);
 uint16_t dongle_playback_diagnostics(uint8_t *out, uint16_t capacity);
 uint16_t dongle_playback_adaptive_snapshot(uint8_t *out, uint16_t capacity);
 // Main thread under the Bluetooth lock; cumulative diagnostics for an explicit w request.
