@@ -35,6 +35,11 @@ uses its built-in USB drivers. NTPods' default app-only installation provides
 optional dongle controls; playback and stem controls also work without the app.
 LibrePods can control the dongle from Android.
 
+With firmware 0.1.65, Conversation Awareness music lowering and USB Automatic
+Ear Detection also run in the dongle. Windows/Linux need no companion app or
+extra driver for those actions. Enable their existing AirPods settings through
+the [CLI](docs/CLI.md); see [behavior and host/player limits](docs/releases/0.1.65.md).
+
 For Bluetooth relay, pause audio and hold BOOTSEL for at least three seconds,
 then release it. Pair **AirPods Dongle** in the phone's Bluetooth settings within
 two minutes. Keep the Pico powered by USB or an external supply.
@@ -93,7 +98,8 @@ for updating through the console instead of the physical button.
 
 ## Status and limits
 
-Current source version: **0.1.63**. The [Game Mode transition](docs/GAME-TRANSITION.md)
+Current source version: **0.1.65**. See the [release notes](docs/releases/0.1.65.md).
+The [Game Mode transition](docs/GAME-TRANSITION.md)
 and [Android/dongle protocol alignment](docs/ANDROID-PROTOCOL-PARITY.md) describe
 its implementation and validation boundaries.
 
@@ -114,6 +120,9 @@ previous measurements and acceptance records.
 are available in GitHub Actions. Successful `main` builds publish the latest
 unified firmware release; its tag and `COMMIT.txt` identify the exact source.
 `BUILD.json` records the build options and artifact hashes.
+When changing the firmware version, add `docs/releases/<version>.md` with the
+user-visible changes, usage and verification limits. Publication refuses missing
+or blank version notes before making changes on GitHub.
 
 Local builds need Python 3, Git, CMake 3.17+, Ninja, a complete Arm GNU embedded
 C/C++ toolchain with newlib, and `qemu-system-arm`. Use a separate SDK checkout:

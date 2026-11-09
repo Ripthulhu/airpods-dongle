@@ -7,6 +7,8 @@ static uint16_t next_cid, last_disconnected;
 static unsigned connects, disconnects, sends, starts, stops, decoded, resets;
 static unsigned modern_init_sends,legacy_init_sends,capability_sends;
 static unsigned setting_sends;
+static unsigned accessory_events;
+void dongle_playback_accessory_event(const uint8_t *p,uint16_t n) {(void)p;(void)n;++accessory_events;}
 static unsigned buffer_send_callbacks;
 static uint8_t create_result, send_result;
 static uint16_t remote_mtu = 512;
@@ -1009,6 +1011,14 @@ static void test_default_and_cached_snapshots_keep_legacy_ids(void) {
     aacp_disconnect();
     assert(!aacp_settings_snapshot(legacy,sizeof(legacy)) && !aacp_settings_snapshot_extended(full,sizeof(full)));
 }
+static void test_accessory_choices_before_metadata(void) {
+    fixture();ready();assert(!aacp_settings_model_known());
+    unsigned before=accessory_events;
+    setting_report(0x0a,1);assert(accessory_events==before+1);
+    setting_report(0x28,2);assert(accessory_events==before+2);
+    model_report_for("A3063","9A348");assert(aacp_settings_model_known());
+    model_report_for("A0000","9A348");assert(!aacp_settings_model_known());
+}
 static void test_typed_setting_owner_lifecycle(void) {
     fixture();ready();
     assert(aacp_setting_take()==0);
@@ -1479,6 +1489,7 @@ int main(void) {
     test_queued_eq_cannot_overwrite_a_replaced_or_invalidated_baseline();
     test_typed_settings_and_confirmation();
     test_default_and_cached_snapshots_keep_legacy_ids();
+    test_accessory_choices_before_metadata();
     test_typed_setting_owner_lifecycle();
     test_hold_cycle_wire_and_assignments();
     test_host_writes_recheck_owner_and_microphone();

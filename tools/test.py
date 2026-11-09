@@ -61,6 +61,9 @@ def usb_descriptor_sources(directory):
 
 def playback_lifecycle_sources(directory):
     source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
+    start=source.index("// Driverless accessory behavior")
+    end=source.index("static void audio_slot_push_data(",start)
+    (directory / "playback_accessory.inc").write_text(source[start:end])
     start = source.index("static struct {\n    uint32_t aac_calls")
     end = source.index("\nstatic void playback_work_cancel_wait", start)
     (directory / "playback_work_metrics.inc").write_text(source[start:end])
@@ -353,6 +356,9 @@ def main():
         "runtime_watch": ["tests/runtime_watch_test.c"],
         "main_button_lock": ["tests/main_button_lock_test.c"],
         "playback_inspect": ["tests/playback_inspect_test.c"],
+        "playback_duck": ["tests/playback_duck_test.c", "-lm"],
+        "accessory_automation": ["tests/accessory_automation_test.c"],
+        "playback_accessory": ["tests/playback_accessory_test.c", "-lm"],
         "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],

@@ -14,6 +14,7 @@ typedef struct {
     uint32_t generation;
     uint32_t intent_epoch, deadline;
     uint16_t usage;
+    bool automatic;
 } media_event_t;
 
 static media_event_t queue[MEDIA_QUEUE_LENGTH];
@@ -22,15 +23,19 @@ static _Atomic uint32_t read;
 static _Atomic uint32_t host_state;
 static _Atomic uint32_t volume_epoch;
 static _Atomic uint32_t pause_epoch;
+static _Atomic uint32_t automatic_epoch;
 static _Atomic uint32_t volume_sent;
+static _Atomic uint32_t pause_sent;
+static _Atomic uint32_t play_sent;
 static bool release_pending;
 static uint16_t last_usage;
 // One HID IN transfer at a time; these fields belong to the USB task/callbacks.
 // RP2350 queues completions before reset/setup; tud_task drains them before
 // usb_media_task can submit a report in the next configuration.
-static bool volume_pending;
-static uint16_t volume_usage;
-static uint32_t volume_generation, volume_transfer_epoch;
+static bool receipt_pending;
+static uint16_t receipt_usage;
+static bool receipt_automatic;
+static uint32_t receipt_generation, receipt_epoch;
 
 bool usb_media_enqueue(enum usb_media_command command) {
     uint16_t usage;
@@ -38,6 +43,8 @@ bool usb_media_enqueue(enum usb_media_command command) {
         case USB_MEDIA_PLAY: case USB_MEDIA_PAUSE: usage = 0x00cd; break;
         // shortcut: Android may map Pause to BREAK; universal auto-pause needs host support, never a toggle fallback.
         case USB_MEDIA_PAUSE_ONLY: usage = 0x00b1; break;
+        case USB_MEDIA_AUTO_PAUSE: usage = 0x00b1; break;
+        case USB_MEDIA_AUTO_PLAY: usage = 0x00b0; break;
         case USB_MEDIA_NEXT: usage = 0x00b5; break;
         case USB_MEDIA_PREVIOUS: usage = 0x00b6; break;
         case USB_MEDIA_STOP: usage = 0x00b7; break;
@@ -50,9 +57,10 @@ bool usb_media_enqueue(enum usb_media_command command) {
     uint32_t w = atomic_load_explicit(&written, memory_order_relaxed);
     uint32_t r = atomic_load_explicit(&read, memory_order_acquire);
     if (w - r >= MEDIA_QUEUE_LENGTH) return false;
+    bool automatic=command==USB_MEDIA_AUTO_PAUSE || command==USB_MEDIA_AUTO_PLAY;
     queue[w % MEDIA_QUEUE_LENGTH] = (media_event_t){
-        .generation=state, .usage=usage,
-        .intent_epoch=atomic_load_explicit(command==USB_MEDIA_PAUSE_ONLY ? &pause_epoch : &volume_epoch,
+        .generation=state, .usage=usage, .automatic=automatic,
+        .intent_epoch=atomic_load_explicit(automatic ? &automatic_epoch : command==USB_MEDIA_PAUSE_ONLY ? &pause_epoch : &volume_epoch,
                                          memory_order_acquire),
         .deadline=time_us_32()+5000000u};
     atomic_store_explicit(&written, w + 1u, memory_order_release);
@@ -67,12 +75,24 @@ uint32_t usb_media_volume_sent(void) {
     return atomic_load_explicit(&volume_sent, memory_order_acquire);
 }
 
+uint32_t usb_media_pause_sent(void) {
+    return atomic_load_explicit(&pause_sent, memory_order_acquire);
+}
+
+uint32_t usb_media_play_sent(void) {
+    return atomic_load_explicit(&play_sent, memory_order_acquire);
+}
+
 void usb_media_cancel_volume(void) {
     atomic_fetch_add_explicit(&volume_epoch, 1u, memory_order_acq_rel);
 }
 
 void usb_media_cancel_pause(void) {
     atomic_fetch_add_explicit(&pause_epoch, 1u, memory_order_acq_rel);
+}
+
+void usb_media_cancel_automatic(void) {
+    atomic_fetch_add_explicit(&automatic_epoch, 1u, memory_order_acq_rel);
 }
 
 void usb_media_set_available(bool available) {
@@ -82,7 +102,7 @@ void usb_media_set_available(bool available) {
     uint32_t next = ((old + 2u) & ~1u) | (uint32_t)available;
     atomic_store_explicit(&host_state, next, memory_order_release);
     usb_media_cancel_volume();
-    volume_pending = false;
+    receipt_pending = false;
     atomic_store_explicit(&read, atomic_load_explicit(&written, memory_order_acquire),
                           memory_order_release);
     last_usage = 0;
@@ -90,14 +110,15 @@ void usb_media_set_available(bool available) {
     release_pending = true;
 }
 
-static bool send_usage(uint16_t usage) {
+static bool send_usage(uint16_t usage, uint32_t generation, uint32_t epoch, bool automatic) {
     const uint8_t report[] = {(uint8_t)usage, (uint8_t)(usage >> 8)};
-    volume_pending = usage == 0x00e9 || usage == 0x00ea;
-    volume_usage = usage;
-    volume_generation = usb_media_generation();
-    volume_transfer_epoch = atomic_load_explicit(&volume_epoch, memory_order_acquire);
+    receipt_pending = usage == 0x00e9 || usage == 0x00ea || automatic;
+    receipt_usage = usage;
+    receipt_automatic = automatic;
+    receipt_generation = generation;
+    receipt_epoch = epoch;
     if (!tud_hid_report(1, report, sizeof(report))) {
-        volume_pending = false;
+        receipt_pending = false;
         return false;
     }
     last_usage = usage;
@@ -107,18 +128,20 @@ static bool send_usage(uint16_t usage) {
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t length) {
     // TinyUSB includes the report ID in its completed endpoint buffer.
     if (instance != 0 || report == NULL || length != 3 || report[0] != 1 ||
-        !volume_pending || (uint16_t)(report[1] | (uint16_t)report[2] << 8) != volume_usage) return;
-    volume_pending = false;
-    if (volume_generation == usb_media_generation() &&
-        volume_transfer_epoch == atomic_load_explicit(&volume_epoch, memory_order_acquire))
-        atomic_fetch_add_explicit(&volume_sent, 1u, memory_order_release);
+        !receipt_pending || (uint16_t)(report[1] | (uint16_t)report[2] << 8) != receipt_usage) return;
+    receipt_pending = false;
+    if (receipt_generation == usb_media_generation() &&
+        receipt_epoch == atomic_load_explicit(receipt_automatic ? &automatic_epoch : &volume_epoch,
+                                               memory_order_acquire))
+        atomic_fetch_add_explicit(receipt_usage == 0x00b0 ? &play_sent : receipt_usage == 0x00b1 ? &pause_sent : &volume_sent,
+                                  1u, memory_order_release);
 }
 
 void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t type,
                               uint8_t const *report, uint16_t length) {
     (void)report;
     (void)length;
-    if (instance == 0 && type == HID_REPORT_TYPE_INPUT) volume_pending = false;
+    if (instance == 0 && type == HID_REPORT_TYPE_INPUT) receipt_pending = false;
     // An accepted press still gets a release before any later queued key.
 }
 
@@ -126,7 +149,7 @@ void usb_media_task(void) {
     uint32_t state = atomic_load_explicit(&host_state, memory_order_acquire);
     if (!(state & 1u)) return;
     if (release_pending) {
-        if (tud_hid_ready() && send_usage(0)) release_pending = false;
+        if (tud_hid_ready() && send_usage(0, state, 0, false)) release_pending = false;
         return;
     }
     // Stale events can be published by a Bluetooth callback interrupted by reset.
@@ -136,15 +159,15 @@ void usb_media_task(void) {
         if (r == w) return;
         media_event_t event = queue[r % MEDIA_QUEUE_LENGTH];
         bool volume = event.usage==0x00e9 || event.usage==0x00ea;
-        bool automatic_pause = event.usage==0x00b1;
-        if (event.generation != state || ((volume || automatic_pause) &&
-            (event.intent_epoch != atomic_load_explicit(automatic_pause ? &pause_epoch : &volume_epoch,
+        bool takeover_pause = event.usage==0x00b1 && !event.automatic;
+        if (event.generation != state || ((volume || event.automatic || takeover_pause) &&
+            (event.intent_epoch != atomic_load_explicit(event.automatic ? &automatic_epoch : takeover_pause ? &pause_epoch : &volume_epoch,
                                                        memory_order_acquire) ||
              (int32_t)(time_us_32()-event.deadline)>=0))) {
             atomic_store_explicit(&read, r + 1u, memory_order_release);
             continue;
         }
-        if (tud_hid_ready() && send_usage(event.usage)) {
+        if (tud_hid_ready() && send_usage(event.usage, event.generation, event.intent_epoch, event.automatic)) {
             release_pending = true;
             atomic_store_explicit(&read, r + 1u, memory_order_release);
         }

@@ -10,6 +10,7 @@ static playback_adjust_t playback_adjust;
 static playback_usb_verification_t usb_game_verification;
 static void playback_usb_verify_cancel(void) {memset(&usb_game_verification,0,sizeof(usb_game_verification));}
 static bool playback_usb_verify_poll(uint32_t time) {(void)time;return false;}
+static void playback_accessory_poll(void) {}
 static void playback_usb_verify_sent(void) {}
 #include "../src/tinyusb/dongle_protocol.h"
 

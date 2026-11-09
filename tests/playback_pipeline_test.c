@@ -687,7 +687,7 @@ static double waveform_power(unsigned first,unsigned count,unsigned channel,doub
     return real*real+imaginary*imaginary;
 }
 
-static void waveform_check_pitch(unsigned first,unsigned end) {
+static void waveform_check_pitch_level(unsigned first,unsigned end,double gain) {
     assert(end>first+12000);
     first+=960;end-=960;
     for(unsigned channel=0;channel<2;++channel) {
@@ -723,8 +723,11 @@ static void waveform_check_pitch(unsigned first,unsigned end) {
             measured=peak_hz;
         }
         assert(fabs(measured/hz-1)<=0.01);
-        assert(squares/(end-first)>0.025 && squares/(end-first)<0.065);
+        assert(squares/(end-first)>0.025*gain*gain && squares/(end-first)<0.065*gain*gain);
     }
+}
+static void waveform_check_pitch(unsigned first,unsigned end) {
+    waveform_check_pitch_level(first,end,1);
 }
 
 static void waveform_check_joins(unsigned first,unsigned end) {
@@ -743,6 +746,55 @@ static void waveform_check_joins(unsigned first,unsigned end) {
         assert(fabs(waveform_output[i][0]+waveform_output[i][1])<=0x1p-23);
     assert(!playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
     assert(!playback_trace.stats[TRACE_RECOVERIES] && !sink_underruns);
+}
+
+static double waveform_rms(unsigned first,unsigned end,unsigned channel) {
+    double squares=0;
+    assert(end>first);
+    for(unsigned i=first;i<end;++i) {
+        double sample=waveform_output[i][channel];squares+=sample*sample;
+    }
+    return sqrt(squares/(end-first));
+}
+
+static void conversation_duck_reaches_actual_encoder_and_tempo_output(void) {
+    waveform_start(100,100,true,true);
+    double baseline[2];
+    for(unsigned channel=0;channel<2;++channel)
+        baseline[channel]=waveform_rms(waveform_frames-4800,waveform_frames,channel);
+    unsigned first=waveform_frames,until=now+250;
+    accessory_duck_enabled=true;
+    while(now<until)step();
+    assert(encoder_duck.gain==PLAYBACK_DUCK_ATTENUATED && !encoder_duck.remaining);
+    for(unsigned channel=0;channel<2;++channel) {
+        double ratio=waveform_rms(waveform_frames-4800,waveform_frames,channel)/baseline[channel];
+        assert(ratio>0.249 && ratio<0.251);
+    }
+
+    // Exercise the real post-tempo encoder input, not only the standalone gain helper.
+    unsigned tempo_first=waveform_frames,tempo_jobs=waveform_tempo_jobs;
+    sink_frames=150*48;sink_started=true;
+    playback_adjust_request(&playback_adjust,1500,60);playback_game.target=60;
+    unsigned deadline=now+2500;
+    do step();while(playback_adjust_busy(&playback_adjust) && now<deadline);
+    assert(!playback_adjust_busy(&playback_adjust) && !playback_adjust.failed);
+    assert(waveform_tempo_jobs>tempo_jobs);
+    for(unsigned i=tempo_first;i<waveform_frames;++i)for(unsigned channel=0;channel<2;++channel)
+        assert(fabs(waveform_output[i][channel])<=0.0751);
+    waveform_check_pitch_level(tempo_first,waveform_frames,0.25);
+
+    accessory_duck_enabled=false;until=now+650;
+    unsigned restored_first=waveform_frames;
+    while(now<until)step();
+    assert(encoder_duck.gain==PLAYBACK_DUCK_UNITY && !encoder_duck.remaining);
+    for(unsigned channel=0;channel<2;++channel) {
+        double ratio=waveform_rms(waveform_frames-4800,waveform_frames,channel)/baseline[channel];
+        assert(ratio>0.999 && ratio<1.001);
+    }
+    waveform_check_pitch_level(restored_first,waveform_frames,1);
+    waveform_check_joins(first,waveform_frames);
+    waveform_fixture=false;
+    puts("Conversation Awareness encoder pipeline: quarter gain, post-tempo attenuation, pitch, stereo, smooth restoration and zero losses passed");
 }
 
 static void game_transition_waveforms(void) {
@@ -961,6 +1013,7 @@ static void game_transition_insufficient_throughput(void) {
 }
 
 int main(void) {
+    conversation_duck_reaches_actual_encoder_and_tempo_output();
     game_transition_waveforms();
     game_transition_cancel_and_reverse();
     game_transition_retains_float_precision();

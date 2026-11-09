@@ -64,8 +64,19 @@ remain authoritative; listing a command does not mean every model supports it.
 The CLI opts into the extended catalog for `settings` and the new EN 352/Gain
 Swipe commands. Older apps keep receiving their original catalog; older firmware
 can still answer the CLI's existing commands through its legacy read form.
-`ear-detection` sets the AirPods preference; host-side automatic pause/resume
-still requires the companion app's media integration.
+Firmware 0.1.65 also handles USB ear-removal Pause and reinsertion Play itself
+using standard Consumer media controls, without a companion app or extra driver
+on Windows/Linux. It resumes only after its own Pause was delivered and the
+stream became idle; connecting the AirPods cannot start playback. The host/player
+must support dedicated Play/Pause commands, and generic USB cannot identify every
+manual media action, so resumption is best effort.
+
+`conversation-awareness on` enables speech detection and the dongle's smooth
+music attenuation/restoration on USB and relay input. It does not change host or
+AirPods volume settings. Known dongle call/microphone paths suspend automatic
+behavior. Generic USB does not identify a host call using the host's own
+microphone; its audio can receive the same processing as music.
+See the [0.1.65 notes](releases/0.1.65.md) for validation limits.
 
 ## Pairing and connections
 

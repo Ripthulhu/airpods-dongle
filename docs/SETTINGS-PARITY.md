@@ -10,6 +10,19 @@ installed NTPods versions that reject unfamiliar IDs. The CLI opts into EN 352
 and Gain Swipe readback through feature-2 `[2,1]`; no Windows app update is needed
 to keep its existing settings working.
 
+Firmware 0.1.65 adds the music behavior behind two existing settings: Conversation
+Awareness speech events drive smooth, temporary PCM attenuation on USB and relay
+music; Automatic Ear Detection drives USB Consumer Pause/Play on wear transitions.
+Neither needs a companion app or custom Windows/Linux driver. These actions
+respect current settings and ownership, never change host/hardware volume, and
+stop during known dongle call/microphone paths. Conversation Awareness uses a
+uniform quarter-amplitude reduction for active speech stages, rather than
+Android's configurable stage behavior. Dedicated Play/Pause support depends on
+the host/player; generic USB cannot track every manual media action or identify
+a host call using the host's own microphone. Physical Windows/Linux and listening
+checks remain outstanding; see the
+[release notes](releases/0.1.65.md).
+
 | Setting | Previously missing | Path and validation |
 | --- | --- | --- |
 | EN 352 Protection | Firmware catalog and CLI | AACP `09/37`, 1 on/2 off; known Pro 3 only; received valid scalar baseline |

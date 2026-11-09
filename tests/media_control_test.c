@@ -17,6 +17,7 @@ void dongle_control_set(const uint8_t *buffer, uint16_t size) { (void)buffer; (v
 
 static bool ready = true;
 static bool reject_report;
+static bool cancel_during_report;
 static uint16_t reports[128];
 static unsigned count;
 static unsigned ready_queries;
@@ -39,6 +40,7 @@ bool tud_hid_report(uint8_t report_id, const void *report, uint16_t length) {
     transfer_report[2] = bytes[1];
     transfer_pending = true;
     ready = false;
+    if (cancel_during_report) usb_media_cancel_automatic();
     return true;
 }
 uint16_t tud_hid_get_report_cb(uint8_t, uint8_t, hid_report_type_t, uint8_t *, uint16_t);
@@ -59,6 +61,7 @@ static void fresh_host(void) {
     usb_media_set_available(true);
     assert(usb_media_generation() & 1u);
     reject_report = false;
+    cancel_during_report = false;
     transfer_pending = false;
     count = 0;
     tick();
@@ -223,6 +226,79 @@ static void test_automatic_pause_is_not_a_toggle(void) {
     usb_media_set_available(false);
 }
 
+static void test_automatic_media_completion(void) {
+    const enum usb_media_command commands[]={USB_MEDIA_AUTO_PAUSE,USB_MEDIA_AUTO_PLAY};
+    const uint16_t usages[]={0xb1,0xb0};
+    for(unsigned i=0;i<2;++i) {
+        fresh_host();test_time_us=100;
+        uint32_t paused=usb_media_pause_sent(),played=usb_media_play_sent(),volume=usb_media_volume_sent();
+        assert(usb_media_enqueue(commands[i]));
+        reject_report=true;tick();
+        assert(!count && usb_media_pause_sent()==paused && usb_media_play_sent()==played);
+        reject_report=false;tick();
+        assert(count==1 && reports[0]==usages[i]);
+        assert(usb_media_pause_sent()==paused && usb_media_play_sent()==played);
+        uint8_t saved[3];memcpy(saved,transfer_report,sizeof(saved));
+        uint8_t other[]={1,(uint8_t)usages[1-i],0};
+        tud_hid_report_complete_cb(0,other,3);
+        assert(usb_media_pause_sent()==paused && usb_media_play_sent()==played);
+        complete_transfer(true);
+        assert(usb_media_pause_sent()==paused+(i==0) && usb_media_play_sent()==played+(i==1));
+        tud_hid_report_complete_cb(0,saved,3);
+        assert(usb_media_pause_sent()==paused+(i==0) && usb_media_play_sent()==played+(i==1));
+        usb_media_task();assert(count==2 && reports[1]==0);tick();
+        assert(usb_media_volume_sent()==volume);
+
+        // Failed, cancelled or reset transfers cannot authorize automatic resume.
+        fresh_host();paused=usb_media_pause_sent();played=usb_media_play_sent();
+        assert(usb_media_enqueue(commands[i]));tick();complete_transfer(false);usb_media_task();
+        assert(usb_media_pause_sent()==paused && usb_media_play_sent()==played && reports[1]==0);tick();
+        assert(usb_media_enqueue(commands[i]));tick();usb_media_cancel_automatic();complete_transfer(true);usb_media_task();
+        assert(usb_media_pause_sent()==paused && usb_media_play_sent()==played && reports[3]==0);tick();
+        assert(usb_media_enqueue(commands[i]));tick();memcpy(saved,transfer_report,sizeof(saved));
+        usb_media_set_available(false);usb_media_set_available(true);
+        tud_hid_report_complete_cb(0,saved,3);
+        assert(usb_media_pause_sent()==paused && usb_media_play_sent()==played);
+        transfer_pending=false;tick();complete_transfer(true);
+        assert(usb_media_enqueue(commands[i]));tick();complete_transfer(true);usb_media_task();tick();
+        assert(usb_media_pause_sent()==paused+(i==0) && usb_media_play_sent()==played+(i==1));
+
+        // Cancellation racing report submission keeps the queued epoch, not its replacement.
+        fresh_host();paused=usb_media_pause_sent();played=usb_media_play_sent();
+        assert(usb_media_enqueue(commands[i]));cancel_during_report=true;tick();cancel_during_report=false;
+        complete_transfer(true);usb_media_task();tick();
+        assert(usb_media_pause_sent()==paused && usb_media_play_sent()==played);
+
+        fresh_host();test_time_us=UINT32_MAX-100u;
+        paused=usb_media_pause_sent();played=usb_media_play_sent();
+        assert(usb_media_enqueue(commands[i]));test_time_us+=5000000u;tick();
+        assert(!count && usb_media_pause_sent()==paused && usb_media_play_sent()==played);
+    }
+
+    // Cancelling automatic intent preserves stem toggles, track changes and gain keys.
+    fresh_host();uint32_t paused=usb_media_pause_sent(),played=usb_media_play_sent(),volume=usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_AUTO_PAUSE));assert(usb_media_enqueue(USB_MEDIA_AUTO_PLAY));
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_DOWN));assert(usb_media_enqueue(USB_MEDIA_NEXT));
+    assert(usb_media_enqueue(USB_MEDIA_PLAY));usb_media_cancel_automatic();
+    for(unsigned i=0;i<8;++i)tick();
+    assert(count==8 && reports[0]==0xb1 && reports[2]==0xea && reports[4]==0xb5 && reports[6]==0xcd);
+    assert(usb_media_pause_sent()==paused && usb_media_play_sent()==played && usb_media_volume_sent()==volume+1);
+
+    // Takeover has its original independent epoch and never credits a wear Pause.
+    fresh_host();paused=usb_media_pause_sent();played=usb_media_play_sent();
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));tick();tick();
+    assert(count==2 && reports[0]==0xb1 && usb_media_pause_sent()==paused && usb_media_play_sent()==played);
+    assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));
+    assert(usb_media_enqueue(USB_MEDIA_AUTO_PAUSE));usb_media_cancel_pause();tick();
+    assert(count==3 && reports[2]==0xb1);
+    usb_media_cancel_pause();complete_transfer(true);usb_media_task();tick();
+    assert(count==4 && reports[3]==0 && usb_media_pause_sent()==paused+1);
+    assert(usb_media_enqueue(USB_MEDIA_AUTO_PLAY));usb_media_cancel_pause();tick();tick();
+    assert(count==6 && reports[4]==0xb0 && usb_media_play_sent()==played+1);
+    usb_media_set_available(false);
+}
+
 int main(void) {
     assert(!usb_media_enqueue(USB_MEDIA_PLAY));
     usb_media_set_available(true);
@@ -289,5 +365,6 @@ int main(void) {
     test_volume_queue();
     test_volume_completion();
     test_automatic_pause_is_not_a_toggle();
-    puts("media controls: bounded queue, ordered releases, completed volume receipts/epochs/expiry, suspend/reset and retry passed");
+    test_automatic_media_completion();
+    puts("media controls: bounded queue, ordered releases, volume and absolute Play/Pause completion receipts/epochs/expiry, suspend/reset and retry passed");
 }

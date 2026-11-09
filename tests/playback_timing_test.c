@@ -14,6 +14,7 @@
 #include "../src/btstack/playback_inspect.h"
 #include "../src/btstack/playback_pcm.h"
 #include "../src/btstack/playback_tempo.h"
+#include "../src/btstack/playback_duck.h"
 static playback_inspect_t playback_inspect;
 static playback_pcm_t playback_pcm;
 static union { playback_resample_t resample; playback_tempo_work_t tempo; } encoder_work;
@@ -48,6 +49,13 @@ static struct { unsigned inputChannels; } aacinf = {2};
 static struct { bool rate_mode; } playback_options;
 static bool bt_locked = true, encode_in_progress;
 static uint32_t control_session = 1, usb_playback_revision = 1;
+static struct {uint32_t epoch;} playback_accessory;
+static playback_duck_t sbc_duck = {.gain=PLAYBACK_DUCK_UNITY, .target=PLAYBACK_DUCK_UNITY};
+static bool accessory_duck_enabled;
+static bool playback_accessory_duck(void) {return accessory_duck_enabled;}
+#ifdef PLAYBACK_PIPELINE
+static void playback_accessory_signal(const void *p,uint16_t n,bool f) {(void)p;(void)n;(void)f;}
+#endif
 static uint32_t aacp_control_session(void) {return control_session;}
 static void (*encode_hook)(void);
 static void (*pcm_read_hook)(void), (*pcm_lock_hook)(void);
@@ -337,6 +345,9 @@ static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigne
     memset(&encoder_job, 0, sizeof(encoder_job));
     atomic_init(&encoder_job.epoch, 1);
     atomic_init(&encoder_job.state, ENCODE_IDLE);
+    accessory_duck_enabled=false;playback_accessory.epoch=1;
+    playback_duck_reset(&encoder_duck);encoder_duck_epoch=0;
+    playback_duck_reset(&sbc_duck);
     handleAAC = (void *)1; bt_locked = true; encode_in_progress = false; encode_hook = NULL;
     encoder_closes = encoder_resets = configuration_callbacks = 0;
     encoder_errors = 0;allow_encoder_failure = encode_zero = false;

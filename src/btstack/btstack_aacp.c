@@ -559,6 +559,7 @@ bool aacp_control_address(bd_addr_t address) {
     return true;
 }
 const dongle_readback_t *aacp_control_readback(void) { return &control_readback; }
+bool aacp_settings_model_known(void) {return settings.profile && settings.firmware_major;}
 bool aacp_model_known(void) { return settings.profile && settings.firmware_major; }
 bool aacp_model_game_supported(void) {
     return settings.profile && settings.profile->silent_allow_off && settings.firmware_major>=8;
@@ -957,7 +958,10 @@ static void aacp_handle_can_send_now(void) {
     // Pro 3 can leave Allow Off unreported; a sent choice is not a device report.
     if (p.data==setting_tx && setting_tx[6]==0x34 && settings.profile && settings.profile->silent_allow_off)
         settings.allow_off_requested=dongle_u32(setting_tx+7)==1;
-    if (p.data==setting_tx) { setting_pending=false; setting_result=1; }
+    if (p.data==setting_tx) {
+        setting_pending=false; setting_result=1;
+        dongle_playback_accessory_event(setting_tx,sizeof(setting_tx));
+    }
     if (p.data==receive_buffer_tx) {
         receive_buffer_last=(uint16_t)dongle_u32(p.data+7);
         if (++receive_buffer_serial==0) ++receive_buffer_serial;
@@ -1204,6 +1208,8 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
             }
             research_cache(packet, size);
             dongle_readback_packet(&control_readback, packet, size, dongle_uptime_ms());
+            if((settings.profile && settings.firmware_major) || (size==11 && packet[4]==9))
+                dongle_playback_accessory_event(packet,size);
             if (aacp_capabilities_valid(packet,size) || aacp_legacy_control_valid(packet,size) ||
                 (packet[4]==0x1d && !packet[5] && settings.profile && settings.firmware_major))
                 aacp_got_control = true;

@@ -7,10 +7,52 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 from test_codec_probe import ROOT, PHONE_RESULT, SYMBOLS, TABLE_SYMBOLS, USB_RESULT, probe
 
 PICOTOOL = os.environ.get("PICOTOOL") or shutil.which("picotool")
+sys.path.insert(0, str(ROOT / ".github/scripts"))
+import publish_firmware_release as release
+
+
+class ReleaseNotesTests(unittest.TestCase):
+    def test_missing_or_blank_notes_reject_publication_before_github_access(self):
+        commit = "a" * 40
+        environment = dict(GITHUB_REPOSITORY=release.REPOSITORY, RELEASE_COMMIT=commit,
+                           RELEASE_TAG="v0.1.65-aaaaaaaaaaaa", FIRMWARE_VERSION="0.1.65")
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, environment), \
+                patch.object(release, "ROOT", Path(temporary)), \
+                patch.object(release, "gh_git_commit", return_value=commit), \
+                patch.object(release, "validate_package", return_value={}), \
+                patch.object(release, "gh") as github_write, patch.object(release, "api") as github_read, \
+                patch.object(release, "release_by_tag") as release_read:
+            notes = Path(temporary) / "docs/releases/0.1.65.md"
+            notes.parent.mkdir(parents=True)
+            for contents in (None, "", "  \n\t"):
+                with self.subTest(contents=contents):
+                    if contents is not None:
+                        notes.write_text(contents)
+                    with self.assertRaisesRegex(ValueError, "Release notes"):
+                        release.publish(Path(temporary))
+                    github_write.assert_not_called()
+                    github_read.assert_not_called()
+                    release_read.assert_not_called()
+
+    def test_version_specific_notes_include_exact_source_and_integrity_marker(self):
+        commit = "b" * 40
+        with tempfile.TemporaryDirectory() as temporary, patch.object(release, "ROOT", Path(temporary)):
+            notes = Path(temporary) / "docs/releases/0.1.65.md"
+            notes.parent.mkdir(parents=True)
+            notes.write_text("## Changes\n\nMusic now lowers during speech.\n", encoding="utf-8")
+            result = release.release_notes("0.1.65", commit)
+            self.assertTrue(result.startswith("## Changes\n\nMusic now lowers during speech.\n"))
+            self.assertIn(f"https://github.com/{release.REPOSITORY}/commit/{commit}", result)
+            self.assertIn(f"<!-- airpods-dongle-ci:{commit} -->", result)
+            self.assertIn("not a hardware listening or latency qualification", result)
+
+    def test_safe_publication_and_resume_keep_version_specific_notes(self):
+        release.self_test()
 
 
 class PicotoolContractTests(unittest.TestCase):

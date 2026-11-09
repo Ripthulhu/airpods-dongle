@@ -84,6 +84,7 @@ void aacp_mic_recovery_failed(void);
 uint32_t aacp_control_session(void);
 bool aacp_control_ready(void);
 const dongle_readback_t *aacp_control_readback(void);
+bool aacp_settings_model_known(void);
 bool aacp_control_anc(uint8_t mode);
 bool aacp_control_address(bd_addr_t address);
 

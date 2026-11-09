@@ -25,6 +25,8 @@ static struct {unsigned song_length_ms,song_position_ms,status;} play_info;
 static bool is_usb_streaming=true,phone_controls,mic;
 static bool audio_owned=true;
 static bool aacp_audio_owned(void) {return audio_owned;}
+static unsigned manual_operations;
+static void playback_accessory_manual(void) {++manual_operations;}
 static unsigned usb_events,phone_events;
 static uint32_t volume_operations_up,volume_operations_down;
 static unsigned target_requests;
@@ -55,6 +57,7 @@ int main(void) {
     uint8_t event[9]={HCI_EVENT_AVRCP_META,17,AVRCP_SUBEVENT_OPERATION,7,0,AVRCP_OPERATION_ID_PAUSE,1,0,0};
     avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8);
     assert(usb_events==1 && last==USB_MEDIA_PAUSE);
+    assert(manual_operations==1);
     event[6]=0; avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8); assert(usb_events==1);
     event[6]=1; event[5]=AVRCP_OPERATION_ID_PLAY; event[1]=6;
     avrcp_target_packet_handler(HCI_EVENT_PACKET,0,event,8); assert(usb_events==2 && last==USB_MEDIA_PLAY);

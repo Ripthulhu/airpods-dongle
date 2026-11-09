@@ -12,6 +12,7 @@ from urllib.parse import quote
 from package_firmware import validate_package
 
 REPOSITORY = "Ripthulhu/airpods-dongle"
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def require(condition, message):
@@ -66,6 +67,21 @@ def release_by_tag(tag):
     return api(url.removeprefix("https://api.github.com/"))
 
 
+def release_notes(version, commit):
+    path = ROOT / "docs" / "releases" / f"{version}.md"
+    require(path.is_file(), f"Release notes are required: docs/releases/{version}.md")
+    changes = path.read_text(encoding="utf-8").strip()
+    require(changes, f"Release notes must not be blank: docs/releases/{version}.md")
+    return (changes + "\n\n---\n\n"
+            "One **airpods_dongle.uf2** for both PC and phone Pico 2 W dongles. "
+            "Release build with the .0076 radio, PCM32/float32/S16 USB input, and Bluetooth calls off.\n\n"
+            "CI passed the codec, memory, transport and regression gates; "
+            "this is not a hardware listening or latency qualification. "
+            "Matching tracked source, dependency revisions, notices, CLI and SHA256SUMS are attached.\n\n"
+            f"Source: https://github.com/{REPOSITORY}/commit/{commit}\n\n"
+            f"<!-- airpods-dongle-ci:{commit} -->\n")
+
+
 def publish(directory):
     require(os.environ["GITHUB_REPOSITORY"] == REPOSITORY, "Publishing is restricted to the firmware repository")
     commit, tag, version = (os.environ[name] for name in ("RELEASE_COMMIT", "RELEASE_TAG", "FIRMWARE_VERSION"))
@@ -74,6 +90,7 @@ def publish(directory):
     require(tag == f"v{version}-{commit[:12]}", "Release tag does not identify this exact version and source")
     require(gh_git_commit() == commit, "Publishing checkout does not match the build")
     assets = validate_package(directory, commit, version)
+    notes_body = release_notes(version, commit)
     prefix = f"repos/{REPOSITORY}"
     marker = f"<!-- airpods-dongle-ci:{commit} -->"
 
@@ -90,14 +107,7 @@ def publish(directory):
     if release is None:
         with tempfile.TemporaryDirectory() as temporary:
             notes = Path(temporary) / "release-notes.md"
-            notes.write_text(
-                f"## AirPods Dongle {version}\n\n"
-                "Preview: one **airpods_dongle.uf2** for both PC and phone Pico 2 W dongles. "
-                "Release build with the .0076 radio, PCM32/float32/S16 USB input, and Bluetooth calls off.\n\n"
-                "CI passed the existing codec, memory, transport and regression gates; "
-                "this is not a hardware listening or latency qualification. "
-                "Matching tracked source, dependency revisions, notices, CLI and SHA256SUMS are attached.\n\n"
-                f"Source: https://github.com/{REPOSITORY}/commit/{commit}\n\n{marker}\n", encoding="utf-8")
+            notes.write_text(notes_body, encoding="utf-8")
             gh("release", "create", tag, "--repo", REPOSITORY, "--target", commit, "--draft",
                "--title", f"AirPods Dongle {version} (preview)", "--notes-file", str(notes))
         release = release_by_tag(tag)
@@ -168,9 +178,23 @@ def self_test():
     with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, env), patch(__name__+".gh_git_commit", return_value=commit), \
          patch(__name__+".validate_package", return_value=expected), patch(__name__+".gh", side_effect=fake_gh), \
          patch(__name__+".api", side_effect=fake_api), patch(__name__+".release_by_tag", side_effect=lambda _:state["release"]), \
+         patch(__name__+".ROOT", Path(temp)), \
          patch("builtins.print"):
+        notes = Path(temp) / "docs/releases/0.1.62.md"
+        notes.parent.mkdir(parents=True)
+        for contents in (None, " \n\t"):
+            if contents is not None:
+                notes.write_text(contents)
+            try:
+                publish(Path(temp))
+            except ValueError:
+                assert not writes
+            else:
+                raise AssertionError("Missing or blank release notes accepted")
+        notes.write_text("## Changes\n\nFixed example reconnect behavior.\n")
         publish(Path(temp))
         assert [a[1] for a in writes] == ["create","upload","edit"] and "--latest=true" in writes[-1]
+        assert "Fixed example reconnect behavior." in state["release"]["body"] and marker in state["release"]["body"]
         writes.clear()
         publish(Path(temp))
         assert [a[1] for a in writes] == ["edit"]

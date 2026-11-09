@@ -57,6 +57,8 @@
 #define PLAYBACK_PCM_Q31_TYPE INT_PCM
 #include "playback_pcm.h"
 #include "playback_tempo.h"
+#include "playback_duck.h"
+#include "accessory_automation.h"
 #include "../runtime_watch.h"
 #include "playback_inspect.h"
 #include "playback_eld.h"
@@ -176,12 +178,15 @@ static struct {
     atomic_uint epoch, state;
     HANDLE_AACENCODER handle;
     uint32_t epoch_at_prepare, session, usb_revision, unit_started, encode_us;
-    uint32_t cancelled, deferred_epoch, deferred_session;
-    uint16_t samples, offset, capacity, reset_cid;
+    uint32_t cancelled, deferred_epoch, deferred_session, accessory_epoch;
+    uint16_t samples, offset, capacity, reset_cid, sample_rate;
+    bool duck;
     int error, bytes, consumed;
     uint8_t codec, input, deferred_size, deferred_event[40], deferred_peer[6];
     bool close_pending, reset_pending, tempo;
 } encoder_job = {.epoch = 1};
+static playback_duck_t encoder_duck = {.gain=PLAYBACK_DUCK_UNITY, .target=PLAYBACK_DUCK_UNITY};
+static uint32_t encoder_duck_epoch;
 static playback_tempo_state_t encoder_tempo_state;
 static playback_tempo_job_t encoder_tempo_job;
 static uint32_t encoder_tempo_epoch, encoder_tempo_generation;
@@ -1348,9 +1353,102 @@ static void audio_slot_queue_configure_with_count(uint16_t samples_per_slot, uin
     critical_section_exit(&playback_pcm_lock);
 }
 
+// Driverless accessory behavior is scoped to this audio owner, never a remembered device choice.
+static struct {
+    accessory_automation_t state;
+    uint32_t session, host, epoch;
+    uint16_t cid;
+    uint8_t input;
+    bool admitted;
+} playback_accessory;
+static atomic_uint usb_signal_stamp;
+static playback_duck_t sbc_duck = {.gain=PLAYBACK_DUCK_UNITY, .target=PLAYBACK_DUCK_UNITY};
+
+static void playback_accessory_update(bool dispatch) {
+    uint32_t session=aacp_control_session(), host=usb_media_generation();
+    uint8_t input=is_usb_streaming ? 1 : phone_active ? 2 : usb_host_active() ? 1 : 0;
+    bool allowed=input && (input!=1 || (host&1u)) && a2dp_is_connected_flag && aacp_control_ready() &&
+        aacp_settings_model_known() && aacp_audio_owned() &&
+        !call_active && !call_opened && !usb_mic_requested() && !aacp_mic_requested() && !aacp_mic_active() &&
+        !mic_prepare_open && !mic_recovery_pending && !profile_pending && !playback_released;
+    bool changed=playback_accessory.session!=session || playback_accessory.host!=host ||
+        playback_accessory.cid!=media_tracker.avdtp_cid || playback_accessory.input!=input;
+    if(changed || playback_accessory.admitted!=allowed) {
+        bool same_session=playback_accessory.session==session;
+        bool ear=playback_accessory.state.ear_enabled, ca=playback_accessory.state.ca_enabled;
+        accessory_automation_reset(&playback_accessory.state);
+        if(same_session) {
+            playback_accessory.state.ear_enabled=ear;playback_accessory.state.ca_enabled=ca;
+        }
+        playback_accessory.session=session;playback_accessory.host=host;
+        playback_accessory.cid=media_tracker.avdtp_cid;playback_accessory.input=input;
+        playback_accessory.admitted=allowed;
+        if(changed) {
+            if(++playback_accessory.epoch==0)++playback_accessory.epoch;
+            playback_duck_reset(&sbc_duck);
+        }
+        atomic_store_explicit(&usb_signal_stamp,0,memory_order_release);
+        usb_media_cancel_automatic();
+    }
+    uint32_t now=btstack_run_loop_get_time_ms();
+    if(!allowed || !dispatch)return;
+    uint32_t stamp=atomic_load_explicit(&usb_signal_stamp,memory_order_acquire);
+    uint32_t age=now-(stamp-1u);
+    uint32_t receipt=usb_media_pause_sent();
+    uint8_t action=accessory_automation_poll(&playback_accessory.state,now,
+        input==1 && stamp && age<1000u,input==1 && stamp && age<150u,receipt);
+    if(action&ACCESSORY_AUTOMATION_CANCEL)usb_media_cancel_automatic();
+    if(input!=1)return;
+    if(action&ACCESSORY_AUTOMATION_PAUSE)
+        accessory_automation_sent(&playback_accessory.state,ACCESSORY_AUTOMATION_PAUSE,
+            usb_media_enqueue(USB_MEDIA_AUTO_PAUSE),receipt,now);
+    else if(action&ACCESSORY_AUTOMATION_PLAY)
+        accessory_automation_sent(&playback_accessory.state,ACCESSORY_AUTOMATION_PLAY,
+            usb_media_enqueue(USB_MEDIA_AUTO_PLAY),receipt,now);
+}
+
+static void playback_accessory_poll(void) {playback_accessory_update(true);}
+
+void dongle_playback_accessory_event(const uint8_t *packet,uint16_t size) {
+    if(!packet || size<6)return;
+    playback_accessory_update(false);
+    if(playback_accessory.admitted || (size==11 && packet[4]==9))
+        accessory_automation_packet(&playback_accessory.state,packet,size,btstack_run_loop_get_time_ms());
+    playback_accessory_poll();
+}
+
+static void playback_accessory_manual(void) {
+    accessory_automation_cancel_media(&playback_accessory.state);
+    usb_media_cancel_automatic();
+}
+
+static bool playback_accessory_duck(void) {
+    return playback_accessory.admitted && accessory_automation_duck(&playback_accessory.state,
+        btstack_run_loop_get_time_ms());
+}
+
+static void playback_accessory_signal(const void *src,uint16_t frames,bool floating) {
+    for(unsigned i=0;i<2u*frames;++i) {
+        bool nonzero;
+        if(floating) {
+            float sample;memcpy(&sample,(const uint8_t *)src+i*sizeof(float),sizeof(sample));
+            nonzero=isfinite(sample) && sample!=0;
+        } else {
+            int16_t sample;memcpy(&sample,(const uint8_t *)src+i*sizeof(sample),sizeof(sample));
+            nonzero=sample!=0;
+        }
+        if(nonzero) {
+            uint32_t stamp=btstack_run_loop_get_time_ms()+1u;
+            atomic_store_explicit(&usb_signal_stamp,stamp ? stamp : 1u,memory_order_release);
+            break;
+        }
+    }
+}
+
 static void audio_slot_push_data(const void *src, uint16_t stereo_pair_count, bool floating) {
     critical_section_enter_blocking(&playback_pcm_lock);
     if (!phone_active && !call_active && src && stereo_pair_count) {
+        playback_accessory_signal(src,stereo_pair_count,floating);
         usb_ingress_frames+=stereo_pair_count;
         if(inspect_enabled)playback_inspect_samples(&playback_inspect,src,2u*stereo_pair_count,floating,true,time_us_32());
         if(floating) {
@@ -1535,6 +1633,8 @@ static int fill_sbc_audio_buffer(a2dp_media_sending_context_t * context){
            (context->max_media_payload_size - context->codec_storage_count - 1) >= btstack_sbc_encoder_sbc_buffer_length()){
 
         audio_pcm_read((uint16_t)num_audio_samples_per_sbc_buffer);
+        playback_duck_s16(&sbc_duck,encoder_pcm.s16,num_audio_samples_per_sbc_buffer,
+            (uint32_t)a2dp_sample_rate(),playback_accessory_duck());
         uint32_t started=time_us_32();
         if(!context->codec_storage_count)packet_oldest_us=started;
         btstack_sbc_encoder_process_data(encoder_pcm.s16);
@@ -1731,6 +1831,9 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
     encoder_job.usb_revision = usb_playback_revision;
     encoder_job.epoch_at_prepare = atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed);
     encoder_job.input = (is_usb_streaming ? 1u : 0u) | (phone_active ? 2u : 0u) | (call_active ? 4u : 0u);
+    encoder_job.accessory_epoch=playback_accessory.epoch;
+    encoder_job.duck=playback_accessory_duck();
+    encoder_job.sample_rate=(uint16_t)a2dp_sample_rate();
     critical_section_exit(&playback_pcm_lock);
     runtime_watch_set(WATCH_PCM);
     audio_pcm_read((uint16_t)frames);
@@ -1782,6 +1885,13 @@ void dongle_playback_encode_run(void) {
     encoder_job.encode_us = 0;
     if (encoder_job.epoch_at_prepare == atomic_load_explicit(&encoder_job.epoch, memory_order_relaxed) &&
         playback_encoder_tempo_run()) {
+        if(encoder_duck_epoch!=encoder_job.accessory_epoch) {
+            playback_duck_reset(&encoder_duck);encoder_duck_epoch=encoder_job.accessory_epoch;
+        }
+        if(encoder_job.codec==4)playback_duck_q31(&encoder_duck,encoder_pcm.q31,
+            encoder_job.samples/2u,encoder_job.sample_rate,encoder_job.duck);
+        else playback_duck_s16(&encoder_duck,encoder_pcm.s16,
+            encoder_job.samples/2u,encoder_job.sample_rate,encoder_job.duck);
         void *input_data = encoder_job.codec==4?(void *)encoder_pcm.q31:(void *)encoder_pcm.s16;
         void *output_data = media_tracker.codec_storage + encoder_job.offset;
         int input_id = IN_AUDIO_DATA, output_id = OUT_BITSTREAM_DATA;
@@ -3864,6 +3974,7 @@ static void playback_reconnect_poll(uint32_t now) {
     avdtp_source_establish_stream();
 }
 void dongle_playback_poll(void) {
+    playback_accessory_poll();
     const uint8_t *peer=(const uint8_t *)get_device_addr();
     uint32_t now=btstack_run_loop_get_time_ms();
     if (playback_release_pending && (!playback_released || !peer || memcmp(peer,release_peer,6) ||
@@ -4319,6 +4430,9 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
                 break;
             }
             if (!aacp_audio_owned()) break;
+            if(operation_id==AVRCP_OPERATION_ID_PLAY || operation_id==AVRCP_OPERATION_ID_PAUSE ||
+               operation_id==AVRCP_OPERATION_ID_STOP || operation_id==AVRCP_OPERATION_ID_FORWARD ||
+               operation_id==AVRCP_OPERATION_ID_BACKWARD)playback_accessory_manual();
             if (operation_id==AVRCP_OPERATION_ID_VOLUME_UP) ++volume_operations_up;
             if (operation_id==AVRCP_OPERATION_ID_VOLUME_DOWN) ++volume_operations_down;
             if (!is_usb_streaming && !usb_mic_requested() && phone_call_media_control((uint8_t)operation_id)) break;
