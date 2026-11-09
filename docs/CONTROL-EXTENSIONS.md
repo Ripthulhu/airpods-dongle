@@ -195,13 +195,30 @@ stem actions (`16`), press speed and hold duration (`17`, `18`), the hold-mode m
 tone/swipe/call controls (`1C`, `1F`, `23`–`25`), Personalized Volume (`26`),
 Conversation Awareness (`28`), adaptive strength (`2E`), case sounds/volume
 (`31`, `40`), Allow Off (`34`), Pause When Asleep (`35`), and the reviewed
-`20`, `36`, `3B` settings. Availability follows the reported model, firmware and
+`20`, `36`, `3B` settings. Firmware 0.1.64 appends Gain Swipe (`2F`) for known Pro 2/3
+and EN 352 Protection (`37`) for known Pro 3, both 1 on/2 off and requiring a valid
+current report before writing. Existing catalog indices and model masks retain
+their meaning. `38` remains rejected: its value format has not been verified.
+Availability follows the reported model, firmware and
 control readback; this is not a promise that every model supports every control.
 Ear detection reverses the ordinary toggle encoding: `0A` uses 2 on/1 off;
 ordinary toggles use 1 on/2 off. Microphone preference is 0 automatic, 1 right,
 2 left. Press/hold/swipe durations use 0–2; values are not shifted to match
 older UI indexes. Left/right actions are sent together, preserving the other
 side. Existing hearing/diagnostic RPCs and their restoration guards are unchanged.
+
+Firmware 0.1.64 also adds raw cached report slot 7 for EQ. Its payload is the
+same age/revision envelope as slots 1–5, followed by exactly 13 bytes:
+`04 00 04 00 63 00 05 00 01 STATE LOW MID HIGH`. State is 1 off/2 on;
+each band is 0–100. Slot 6 remains the scalar snapshot. Unknown/malformed EQ
+reports never authorize a write. A raw opcode-63 write requires known model
+metadata and a valid current EQ report; its baseline revision is captured at
+queue admission and checked again at the radio send. Replacing or invalidating
+that report retires the queued edit. Hosts preserve untouched fields and require
+a newer exact device report, separately from local send completion.
+
+The [CLI](CLI.md) exposes these settings and the existing leased hearing/ATT paths.
+[Settings parity](SETTINGS-PARITY.md) records their layouts and remaining exclusions.
 
 The native hold-cycle setting `1A` is a shared selection mask: Off `01`, ANC `02`,
 Transparency `04`, Adaptive `08`. Any supported combination of at least two modes

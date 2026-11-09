@@ -155,14 +155,15 @@ static aacp_pkt_t aacp_tx_queue[AACP_TX_QUEUE_LEN];
 static uint8_t aacp_tx_head, aacp_tx_count;
 static uint8_t research_tx[512];
 static uint32_t research_since;
+static uint32_t research_eq_revision;
 static bool research_pending;
 static int research_result;
-static uint8_t model_report[384], hearing_report[11], assist_report[11], pme_report[140], ear_report[32];
+static uint8_t model_report[384], hearing_report[11], assist_report[11], pme_report[140], ear_report[32], eq_report[13];
 typedef struct { uint8_t *packet; uint16_t capacity, length; uint32_t updated, revision; } cached_report_t;
 static cached_report_t reports[] = {
     {model_report, sizeof(model_report), 0, 0, 0}, {hearing_report, sizeof(hearing_report), 0, 0, 0},
     {assist_report, sizeof(assist_report), 0, 0, 0}, {pme_report, sizeof(pme_report), 0, 0, 0},
-    {ear_report, sizeof(ear_report), 0, 0, 0}
+    {ear_report, sizeof(ear_report), 0, 0, 0}, {eq_report, sizeof(eq_report), 0, 0, 0}
 };
 static dongle_readback_t control_readback;
 static dongle_settings_t settings;
@@ -670,10 +671,17 @@ void aacp_research_cancel(void) {
     aacp_tx_count = (uint8_t)kept;
     research_pending = false;
     research_result = 0;
+    research_eq_revision = 0;
+}
+static bool eq_report_valid(const uint8_t *p, uint16_t n) {
+    static const uint8_t prefix[]={4,0,4,0,0x63,0,5,0,1};
+    return p && n==13 && !memcmp(p,prefix,sizeof(prefix)) && (p[9]==1 || p[9]==2) &&
+        p[10]<=100 && p[11]<=100 && p[12]<=100;
 }
 static bool research_valid(const uint8_t *p, uint16_t n) {
     static const uint8_t header[] = {4,0,4,0};
     if (!p || n < 6 || n > sizeof(research_tx) || memcmp(p, header, sizeof(header)) || p[5]) return false;
+    if (p[4]==0x63) return eq_report_valid(p,n) && settings.profile && reports[5].length==sizeof(eq_report);
     if (p[4] == 9 && n == 11 && p[9] == 0 && p[10] == 0) {
         if (p[6] == 0x2c) return p[7] <= 2 && (p[8] == 1 || p[8] == 2);
         if (p[6] == 0x33) return (p[7] == 1 || p[7] == 2) && p[8] == 0;
@@ -695,6 +703,7 @@ bool aacp_research_send(const uint8_t *packet, uint16_t length) {
     if (!aacp_control_ready() || research_pending || research_result || !research_valid(packet, length) ||
         aacp_tx_count >= AACP_TX_QUEUE_LEN - 2 || length > l2cap_get_remote_mtu_for_local_cid(aacp_cid)) return false;
     memcpy(research_tx, packet, length);
+    research_eq_revision = packet[4]==0x63 ? reports[5].revision : 0;
     research_since = btstack_run_loop_get_time_ms();
     research_pending = true;
     if (aacp_tx_enqueue(research_tx, length)) return true;
@@ -708,6 +717,7 @@ int aacp_research_take(void) {
 }
 uint16_t aacp_research_cached(uint8_t slot, uint8_t *out, uint16_t capacity) {
     if (slot==6) return aacp_settings_snapshot(out,capacity);
+    if (slot==7) slot=6; // Slot 6 remains the scalar settings snapshot.
     if (!aacp_control_ready() || slot < 1 || slot > sizeof(reports) / sizeof(reports[0]) || !out) return 0;
     cached_report_t *report = &reports[slot - 1];
     if (!report->length || capacity < report->length + 8u) return 0;
@@ -725,11 +735,12 @@ static void research_cache(const uint8_t *p, uint16_t n) {
         if (n == 10 && p[6] == 2 && p[7] == 0 && p[8] == 1) return;
         slot = 3;
     } else if (p[4] == 6) slot = 4;
+    else if (p[4] == 0x63) slot = 5;
     if (slot < 0) return;
     cached_report_t *report = &reports[slot];
     if (++report->revision == 0) ++report->revision;
     report->length = 0;
-    if (n > report->capacity) return;
+    if (n > report->capacity || (slot==5 && !eq_report_valid(p,n))) return;
     memcpy(report->packet, p, n);
     report->length = n;
     report->updated = btstack_run_loop_get_time_ms();
@@ -892,6 +903,8 @@ static void aacp_handle_can_send_now(void) {
     }
     if ((p.data==setting_tx || p.data==research_tx) &&
         (!dongle_rpc_transport_current() || aacp_mic_requested() || aacp_mic_active() ||
+         (p.data==research_tx && research_tx[4]==0x63 &&
+          (research_eq_revision!=reports[5].revision || !research_valid(p.data,p.len))) ||
          (uint32_t)(now-(p.data==setting_tx ? setting_since : research_since))>=3000u)) {
         if (p.data==setting_tx) {
             aacp_setting_cancel();

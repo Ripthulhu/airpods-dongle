@@ -10,7 +10,8 @@
 // Value validation and model masks mirror NTPods device_settings/device-models.
 static const uint8_t setting_ids[] = {
     0x01,0x0a,0x0d,0x16,0x17,0x18,0x1a,0x1b,0x1c,0x1f,0x20,0x23,
-    0x24,0x25,0x26,0x28,0x2e,0x31,0x34,0x35,0x36,0x3b,0x40
+    0x24,0x25,0x26,0x28,0x2e,0x31,0x34,0x35,0x36,0x3b,0x40,
+    0x37,0x2f // Append controls to preserve the existing model-mask bit positions.
 };
 #define DONGLE_SETTING_COUNT (sizeof(setting_ids) / sizeof(setting_ids[0]))
 typedef struct {
@@ -27,9 +28,9 @@ static const setting_profile_t setting_profiles[] = {
     {{3531,3532,3533},    0x0029d6ff,true,true,false,false},
     {{3439,3440,3441},    0x006bfeff,true,true,false,false},
     {{2084,2083,0},       0x002016ff,true,false,false,false},
-    {{2931,2699,2698},    0x007ffeff,true,true,true,false},
-    {{3047,3048,3049},    0x007ffeff,true,true,true,false},
-    {{3063,3064,3065},    0x007ffeff,true,true,true,true},
+    {{2931,2699,2698},    0x017ffeff,true,true,true,false},
+    {{3047,3048,3049},    0x017ffeff,true,true,true,false},
+    {{3063,3064,3065},    0x01fffeff,true,true,true,true},
     {{2096,3184,0},       0x00201746,true,false,false,false},
     {{3454,0,0},          0x0029d746,true,true,false,false},
     {{3157,0,0},          0x00000006,true,false,false,false},
@@ -49,7 +50,7 @@ static inline int setting_index(uint8_t id) {
 static inline bool setting_value_valid(uint8_t id, uint32_t value) {
     switch(id) {
         case 0x0a: case 0x1b: case 0x20: case 0x25: case 0x26: case 0x28:
-        case 0x31: case 0x34: case 0x35: case 0x36: case 0x3b: case 0x1c:
+        case 0x2f: case 0x31: case 0x34: case 0x35: case 0x36: case 0x37: case 0x3b: case 0x1c:
             return value==1 || value==2;
         case 0x01: case 0x17: case 0x18: case 0x23: return value<=2;
         case 0x0d: return value>=1 && value<=4;

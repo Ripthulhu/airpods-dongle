@@ -864,6 +864,77 @@ static void model_report_for(const char *model, const char *firmware) {
     }
     audio(packet,aacp_cid,n);
 }
+static void test_eq_cache_and_guarded_writes(void) {
+    fixture(); ready();
+    uint8_t report[]={4,0,4,0,0x63,0,5,0,1,1,25,50,75}, output[512], desired[13];
+    assert(!aacp_research_cached(7,output,sizeof(output)));
+    assert(!aacp_research_send(report,sizeof(report)));
+    audio(report,aacp_cid+1,sizeof(report));
+    assert(!aacp_research_cached(7,output,sizeof(output)));
+    audio(report,aacp_cid,sizeof(report));
+    now=123;
+    assert(aacp_research_cached(7,output,sizeof(output))==21 && dongle_u32(output)==123 &&
+        dongle_u32(output+4)==1 && !memcmp(output+8,report,sizeof(report)));
+    assert(!aacp_research_cached(7,output,20) && !aacp_research_cached(7,NULL,sizeof(output)));
+    assert(!aacp_research_cached(8,output,sizeof(output)));
+    assert(!aacp_research_send(report,sizeof(report))); // Unknown model: report is readable, never writable.
+    model_report_for("A3063","9A348");
+    memcpy(desired,report,sizeof(desired)); desired[9]=2; desired[10]=80;
+    for (unsigned i=0;i<9;++i) {
+        uint8_t bad[13]; memcpy(bad,desired,sizeof(bad)); ++bad[i];
+        assert(!aacp_research_send(bad,sizeof(bad)));
+    }
+    for (unsigned i=9;i<13;++i) {
+        uint8_t bad[13]; memcpy(bad,desired,sizeof(bad)); bad[i]=i==9 ? 3 : 101;
+        assert(!aacp_research_send(bad,sizeof(bad)));
+    }
+    uint8_t oversized[14]; memcpy(oversized,desired,sizeof(desired)); oversized[13]=0;
+    assert(!aacp_research_send(desired,12) && !aacp_research_send(oversized,sizeof(oversized)));
+    assert(aacp_research_send(desired,sizeof(desired)));
+    assert(research_tx[9]==2 && research_tx[10]==80 && research_tx[11]==50 && research_tx[12]==75);
+    drain(); assert(aacp_research_take()==1);
+    assert(aacp_research_cached(7,output,sizeof(output))==21 && dongle_u32(output+4)==1 &&
+        !memcmp(output+8,report,sizeof(report))); // Local send does not manufacture confirmation.
+    audio(desired,aacp_cid,sizeof(desired));
+    assert(aacp_research_cached(7,output,sizeof(output))==21 && dongle_u32(output+4)==2 &&
+        !memcmp(output+8,desired,sizeof(desired)));
+    assert(aacp_research_cached(6,output,sizeof(output))==15 && output[2]==0x0d);
+    for (unsigned i=5;i<13;++i) {
+        audio(report,aacp_cid,sizeof(report));
+        uint8_t bad[13]; memcpy(bad,report,sizeof(bad)); bad[i]=i>=10 ? 101 : i==9 ? 0 : 255;
+        uint32_t revision=reports[5].revision;
+        audio(bad,aacp_cid,sizeof(bad));
+        assert(reports[5].revision==revision+1 && !aacp_research_cached(7,output,sizeof(output)));
+        assert(!aacp_research_send(desired,sizeof(desired)));
+    }
+    audio(report,aacp_cid,sizeof(report));
+    audio(report,aacp_cid,12);
+    assert(!aacp_research_cached(7,output,sizeof(output)));
+    audio(report,aacp_cid,sizeof(report));
+    audio(oversized,aacp_cid,sizeof(oversized));
+    assert(!aacp_research_cached(7,output,sizeof(output)));
+    reports[5].revision=UINT32_MAX; audio(report,aacp_cid,sizeof(report));
+    assert(aacp_research_cached(7,output,sizeof(output))==21 && dongle_u32(output+4)==1);
+    aacp_disconnect();
+    assert(!reports[5].length && !reports[5].revision && !aacp_research_cached(7,output,sizeof(output)));
+    assert(!aacp_research_send(desired,sizeof(desired)));
+}
+static void test_queued_eq_cannot_overwrite_a_replaced_or_invalidated_baseline(void) {
+    for (unsigned replacement=0;replacement<4;++replacement) {
+        fixture(); ready(); model_report_for("A3063","9A348");
+        uint8_t report[]={4,0,4,0,0x63,0,5,0,1,1,25,50,75}, desired[13];
+        audio(report,aacp_cid,sizeof(report));
+        memcpy(desired,report,sizeof(desired)); desired[10]=80;
+        assert(aacp_research_send(desired,sizeof(desired)));
+        if (replacement==0) { report[12]=90; audio(report,aacp_cid,sizeof(report)); }
+        if (replacement==1) audio(report,aacp_cid,sizeof(report)); // Identical reports still carry a fresh receipt.
+        if (replacement==2) { report[9]=0; audio(report,aacp_cid,sizeof(report)); }
+        if (replacement==3) model_report_for("A0000","9A348");
+        unsigned before=sends;
+        event(L2CAP_EVENT_CAN_SEND_NOW,aacp_cid);
+        assert(sends==before && !aacp_tx_count && aacp_research_take()==2);
+    }
+}
 static void test_typed_settings_and_confirmation(void) {
     fixture();
     assert(aacp_setting_write(0x28,1)==DONGLE_DISCONNECTED);
@@ -1392,6 +1463,8 @@ int main(void) {
     test_host_controls_preserve_mic_capacity_and_readback();
     test_research_lifecycle_and_cache();
     test_research_allowed_packets();
+    test_eq_cache_and_guarded_writes();
+    test_queued_eq_cannot_overwrite_a_replaced_or_invalidated_baseline();
     test_typed_settings_and_confirmation();
     test_typed_setting_owner_lifecycle();
     test_hold_cycle_wire_and_assignments();

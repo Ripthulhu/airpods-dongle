@@ -5,6 +5,7 @@
 static uint32_t clock_ms=1, connection=10;
 static unsigned att_sent, aacp_sent, cancellations;
 static unsigned critical_sections, att_polls;
+static uint8_t last_cache_slot;
 static int att_result, aacp_result, setting_result;
 static bool microphone;
 uint32_t save_and_disable_interrupts(void) {++critical_sections;return 0;}
@@ -28,7 +29,8 @@ void aacp_research_cancel(void) {aacp_result=0;}
 int aacp_setting_take(void) {int value=setting_result;setting_result=0;return value;}
 void aacp_setting_cancel(void) {setting_result=0;}
 uint16_t aacp_research_cached(uint8_t slot,uint8_t *out,uint16_t cap) {
-    assert(slot==4 && cap>=144);for(unsigned i=0;i<144;i++)out[i]=(uint8_t)i;return 144;
+    assert((slot==4 || slot==7) && cap>=144);last_cache_slot=slot;
+    unsigned size=slot==7 ? 21 : 144;for(unsigned i=0;i<size;i++)out[i]=(uint8_t)i;return (uint16_t)size;
 }
 static void send_packet(uint8_t op,uint32_t seq,uint16_t size,uint16_t offset,const uint8_t *data,uint8_t n) {
     // These fragmentation tests enter a workflow directly; lease tests use full wire requests.
@@ -130,6 +132,10 @@ int main(void) {
     send_packet(1,3,3,0,buffer,3);send_packet(6,3,0,0,NULL,0);
     att_result=2;dongle_rpc_poll();
     assert(clients[0].published[21]==FAILED && clients[0].published[22]==TRANSPORT);
+    slot=7;send_packet(3,4,1,0,&slot,1);send_packet(6,4,0,0,NULL,0);
+    assert(last_cache_slot==7 && clients[0].phase==COMPLETE && clients[0].total==21 && clients[0].payload[20]==20);
+    slot=8;send_packet(3,5,1,0,&slot,1);send_packet(6,5,0,0,NULL,0);
+    assert(last_cache_slot==7 && clients[0].phase==FAILED && clients[0].failure==UNSUPPORTED);
     puts("dongle RPC: dirty publication, live transport/deadlines, fragments, pages, replay, cancellation and generation fencing passed");
     return 0;
 }

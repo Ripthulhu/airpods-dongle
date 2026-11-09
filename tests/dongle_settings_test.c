@@ -26,7 +26,7 @@ static void test_values(void) {
         {0x17,2,3},{0x18,2,3},{0x1a,6,16},{0x1b,1,3},{0x1c,2,3},
         {0x1f,0x5064,0x5065},{0x20,1,3},{0x23,0,3},{0x24,0x0300,3},
         {0x25,1,3},{0x26,2,0},{0x28,1,0x0101},{0x2e,100,101},
-        {0x31,1,0},{0x34,2,3},{0x35,1,3},{0x36,1,3},{0x3b,1,3},{0x40,100,101},
+        {0x31,1,0},{0x34,2,3},{0x35,1,3},{0x36,1,3},{0x3b,1,3},{0x40,100,101},{0x37,1,0},{0x2f,2,3},
     };
     for (unsigned i=0;i<sizeof(cases)/sizeof(*cases);++i) {
         assert(setting_value_valid(cases[i].id,cases[i].good));
@@ -34,6 +34,96 @@ static void test_values(void) {
         assert(!setting_value_valid(cases[i].id,UINT32_MAX));
     }
     assert(!setting_value_valid(3,1) && !setting_value_valid(0x1a,1));
+}
+static void test_ppe_support_and_reports(void) {
+    const uint8_t old_ids[]={0x01,0x0a,0x0d,0x16,0x17,0x18,0x1a,0x1b,0x1c,0x1f,0x20,0x23,
+        0x24,0x25,0x26,0x28,0x2e,0x31,0x34,0x35,0x36,0x3b,0x40};
+    assert(DONGLE_SETTING_COUNT==sizeof(old_ids)+2);
+    for (unsigned i=0;i<sizeof(old_ids);++i) assert(setting_index(old_ids[i])==(int)i);
+    assert(setting_index(0x37)==(int)sizeof(old_ids));
+    assert(setting_index(0x2f)==(int)sizeof(old_ids)+1);
+    assert(!setting_explicit_choice(0x37));
+    assert(setting_index(0x38)<0 && !setting_value_valid(0x38,1));
+    const char *models[]={"A3063","A3064","A3065"};
+    for (unsigned i=0;i<sizeof(models)/sizeof(*models);++i) {
+        dongle_settings_t s; settings_reset(&s);
+        identify(&s,models[i],"9A348","");
+        assert(s.profile && !settings_supported(&s,0x37,1) && !settings_supported(&s,0x37,2));
+        reported(&s,0x37,2,10);
+        assert(settings_supported(&s,0x37,1) && settings_supported(&s,0x37,2));
+        assert(setting_report_is(&s,0x37,2)); // Asking to write On must not invent an On report.
+        uint8_t out[15];
+        assert(settings_snapshot(&s,15,out,sizeof(out))==15 && out[1]==1 && out[2]==0x37);
+        assert(dongle_u32(out+3)==5 && dongle_u32(out+7)==1 && dongle_u32(out+11)==2);
+        reported(&s,0x37,1,16);
+        assert(setting_report_is(&s,0x37,1) && !setting_report_is(&s,0x37,2));
+        assert(!settings_supported(&s,0x37,0) && !settings_supported(&s,0x37,3));
+        assert(!settings_supported(&s,0x38,1));
+        reported(&s,0x38,1,17);
+        assert(setting_report_is(&s,0x37,1));
+        const uint32_t invalid[]={0,3,0x0101,UINT32_MAX};
+        for (unsigned j=0;j<sizeof(invalid)/sizeof(*invalid);++j) {
+            reported(&s,0x37,2,18);
+            reported(&s,0x37,invalid[j],19);
+            assert(!settings_supported(&s,0x37,1) && !settings_supported(&s,0x37,2));
+            assert(settings_snapshot(&s,20,out,sizeof(out))==2 && out[1]==0);
+        }
+        reported(&s,0x37,2,21);
+        const uint8_t short_report[]={4,0,4,0,9,0,0x37,1,0,0};
+        settings_packet(&s,short_report,sizeof(short_report),22);
+        assert(!settings_supported(&s,0x37,1));
+        settings_reset(&s);
+        identify(&s,models[i],"9A348","");
+        assert(!settings_supported(&s,0x37,1));
+    }
+    for (unsigned i=0;i<sizeof(setting_profiles)/sizeof(*setting_profiles);++i) {
+        const setting_profile_t *profile=&setting_profiles[i];
+        if (profile->models[0]==3063) continue;
+        for (unsigned j=0;j<3 && profile->models[j];++j) {
+            char model[8]; snprintf(model,sizeof(model),"A%04u",profile->models[j]);
+            dongle_settings_t s; settings_reset(&s); identify(&s,model,"9A348","");
+            reported(&s,0x37,1,0);
+            assert(s.profile && !settings_supported(&s,0x37,1) && !settings_supported(&s,0x37,2));
+        }
+    }
+    dongle_settings_t unknown; settings_reset(&unknown);
+    reported(&unknown,0x37,1,0);
+    assert(!settings_supported(&unknown,0x37,1) && !settings_supported(&unknown,0x37,2));
+    identify(&unknown,"A0000","9A348","");
+    assert(!unknown.profile && !settings_supported(&unknown,0x37,1));
+}
+static void test_hearing_gain_swipe(void) {
+    const char *models[]={"A2931","A2699","A2698","A3047","A3048","A3049","A3063","A3064","A3065"};
+    assert(!setting_explicit_choice(0x2f));
+    for (unsigned i=0;i<sizeof(models)/sizeof(*models);++i) {
+        dongle_settings_t s; settings_reset(&s); identify(&s,models[i],"9A348","");
+        assert(!settings_supported(&s,0x2f,1) && !settings_supported(&s,0x2f,2));
+        reported(&s,0x25,2,0); // Ordinary volume swipe is a different control.
+        assert(!settings_supported(&s,0x2f,1));
+        reported(&s,0x2f,2,1);
+        assert(settings_supported(&s,0x2f,1) && settings_supported(&s,0x2f,2));
+        assert(setting_report_is(&s,0x2f,2) && setting_report_is(&s,0x25,2));
+        reported(&s,0x2f,1,2);
+        assert(setting_report_is(&s,0x2f,1) && setting_report_is(&s,0x25,2));
+        const uint32_t invalid[]={0,3,0x0101,UINT32_MAX};
+        for (unsigned j=0;j<sizeof(invalid)/sizeof(*invalid);++j) {
+            reported(&s,0x2f,2,3);
+            reported(&s,0x2f,invalid[j],4);
+            assert(!settings_supported(&s,0x2f,1) && !settings_supported(&s,0x2f,2));
+        }
+        settings_reset(&s); identify(&s,models[i],"9A348","");
+        assert(!settings_supported(&s,0x2f,1));
+    }
+    for (unsigned i=0;i<sizeof(setting_profiles)/sizeof(*setting_profiles);++i) {
+        const setting_profile_t *profile=&setting_profiles[i];
+        if (profile->models[0]==2931 || profile->models[0]==3047 || profile->models[0]==3063) continue;
+        dongle_settings_t s; settings_reset(&s);
+        char model[8]; snprintf(model,sizeof(model),"A%04u",profile->models[0]);
+        identify(&s,model,"9A348",""); reported(&s,0x2f,1,0);
+        assert(!settings_supported(&s,0x2f,1) && !settings_supported(&s,0x2f,2));
+    }
+    dongle_settings_t unknown; settings_reset(&unknown); reported(&unknown,0x2f,1,0);
+    assert(!settings_supported(&unknown,0x2f,1));
 }
 static void test_model_and_firmware(void) {
     dongle_settings_t s; settings_reset(&s);
@@ -140,7 +230,8 @@ static void test_report_replacement_and_snapshot(void) {
     settings_reset(&s); assert(settings_snapshot(&s,8,out,sizeof(out))==2 && !out[1]);
 }
 int main(void) {
-    test_values(); test_model_and_firmware(); test_all_hold_cycle_combinations();
+    test_values(); test_ppe_support_and_reports(); test_hearing_gain_swipe();
+    test_model_and_firmware(); test_all_hold_cycle_combinations();
     test_metadata_bounds(); test_report_replacement_and_snapshot();
     puts("dongle settings: bounded catalog, firmware gates, malformed replacement and non-optimistic snapshots passed");
 }

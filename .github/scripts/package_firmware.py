@@ -128,7 +128,7 @@ def package(root, build, sdk):
     (output / "THIRD-PARTY-NOTICES.txt").write_text(notices(root, sdk), encoding="utf-8")
     with (output / "source.tar.gz").open("wb") as archive:
         subprocess.run(["git", "-C", str(root), "archive", "--format=tar.gz", "--prefix=airpods-dongle/", commit], stdout=archive, check=True)
-    cli_files = ("tools/airpods.py", "tools/audio_diagnostics.py", "docs/CLI.md", "LICENSE", "LICENSE.Apache-2.0")
+    cli_files = ("tools/airpods.py", "tools/audio_diagnostics.py", "tools/airpods_att.py", "tools/airpods_hearing.py", "docs/CLI.md", "LICENSE", "LICENSE.Apache-2.0")
     with zipfile.ZipFile(output / "airpods-cli.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in cli_files:
             archive.writestr(zipfile.ZipInfo("airpods-cli/" + name), (root / name).read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
@@ -260,13 +260,15 @@ def self_test():
         with tarfile.open(fileobj=io.BytesIO(archived)) as archive:
             assert set(archive.getnames()) == {"tracked.c", ".gitignore"}
         with zipfile.ZipFile(root / "cli.zip", "w") as archive:
-            for name in ("tools/airpods.py", "tools/audio_diagnostics.py"):
+            for name in ("tools/airpods.py", "tools/audio_diagnostics.py", "tools/airpods_att.py", "tools/airpods_hearing.py"):
                 archive.write(ROOT / name, "airpods-cli/" + name)
         with zipfile.ZipFile(root / "cli.zip") as archive:
             archive.extractall(root / "extracted")
         cli = str(root / "extracted/airpods-cli/tools/airpods.py")
         help_text = subprocess.check_output([sys.executable, cli, "help"], text=True)
         require("settings" in help_text, "Packaged CLI help failed")
+        for setting in ("en352-protection", "gain-swipe", "loud-sound-reduction", "game-mode", "eq-low", "hearing-aid", "accommodations-preset", "transparency-tone"):
+            require(setting in help_text, f"Packaged CLI is missing {setting}")
         for command in ("pair", "connect", "disconnect", "reconnect-policy"):
             require(command in help_text, f"Packaged CLI is missing {command}")
             command_help = subprocess.check_output([sys.executable, cli, "help", command], text=True)

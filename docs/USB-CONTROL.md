@@ -223,6 +223,8 @@ bounded malformed packets reach the host parser and clear its known state.
 Microphone and sensor payloads are never copied into these reports.
 Slot 6 returns the versioned settings snapshot defined in
 [control extensions](CONTROL-EXTENSIONS.md), rather than a raw packet.
+From firmware 0.1.64, slot 7 returns the validated EQ report with the same
+age/revision envelope; an absent or malformed EQ stays unknown.
 Ear detection uses fresh slot-5 reports and player ownership in the host app;
 the firmware never sends a global resume command for ear reinsertion.
 

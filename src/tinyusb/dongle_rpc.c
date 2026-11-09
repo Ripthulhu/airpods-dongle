@@ -146,7 +146,7 @@ static void handle(unsigned client,const uint8_t *p,uint32_t now) {
         }else if(c->operation==2){
             transport_owner=(int)client;
             if(!aacp_research_send(c->payload,c->total))fail(client,TRANSPORT);
-        }else if(c->operation==3 && c->total==1 && c->payload[0]>=1 && c->payload[0]<=6){
+        }else if(c->operation==3 && c->total==1 && c->payload[0]>=1 && c->payload[0]<=7){
             c->total=aacp_research_cached(c->payload[0],c->payload,sizeof(c->payload));
             c->phase=COMPLETE; c->page=0;
         }else if(c->operation==7){

@@ -264,6 +264,13 @@ def typed_request(device, payload, generation=None):
     """One bounded report-3 typed request; never retries uncertain writes."""
     if not 1 <= len(payload) <= 42:
         raise ValueError('Typed requests must fit one 1..42 byte HID fragment')
+    return rpc_request(device, payload, generation)
+
+
+def rpc_request(device, payload, generation=None, operation=7):
+    """One settings RPC, including fragmented ATT/AACP; commit exactly once."""
+    if operation not in (1, 2, 3, 7) or not 1 <= len(payload) <= 512:
+        raise ValueError('Invalid settings RPC operation or payload length')
     current = struct.unpack_from('<I', device.get(2), 8)[0]
     if generation is not None and generation != current:
         raise RuntimeError('Pico session changed; reconnect before issuing another command')
@@ -301,8 +308,10 @@ def typed_request(device, payload, generation=None):
             time.sleep(.005)
         raise TimeoutError('Pico diagnostic read timed out')
 
-    send(7, len(payload), payload=payload)
-    wait(1, len(payload))
+    for offset in range(0, len(payload), 42):
+        fragment = payload[offset:offset + 42]
+        send(operation, len(payload), offset, fragment)
+        wait(1, offset + len(fragment))
     send(6)
     page = wait(3, 0)
     total = struct.unpack_from('<H', page, 16)[0]

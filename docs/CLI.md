@@ -26,6 +26,9 @@ python tools/airpods.py get mode
 python tools/airpods.py set mode transparency
 python tools/airpods.py set ear-detection on
 python tools/airpods.py set microphone auto
+python tools/airpods.py set en352-protection on
+python tools/airpods.py get loud-sound-reduction
+python tools/airpods.py set game-mode on
 ```
 
 With multiple dongles attached, put `--serial YOUR_PICO_USB_SERIAL` before the
@@ -50,11 +53,11 @@ open because they use a different interface.
 | `connect` | Explicitly connect to the saved AirPods and request audio ownership |
 | `disconnect` | Release the AirPods and hold automatic reconnect off, keeping pairing |
 | `reconnect-policy [manual\|auto]` | Read the reconnect policy, or save a new policy while audio and connection transitions are idle |
-| `settings` | All named device settings, with report age or an explicit unknown value |
-| `get SETTING` | One reported value and its age |
+| `settings` | Cached scalar settings, with report age or an explicit unknown value |
+| `get SETTING` | One scalar report, or a guarded live hearing/EQ read |
 | `set SETTING VALUE` | Validate, send once and wait for a fresh matching device report |
 
-`get` and `settings` read the device-reported cache; they do not force a new Apple
+Scalar `get` and `settings` read the device-reported cache; they do not force a new Apple
 notification or guess a value. Unknown can mean unreported or unsupported. A
 device report's age is shown in milliseconds. Model/firmware checks in the dongle
 remain authoritative; listing a command does not mean every model supports it.
@@ -139,6 +142,17 @@ not query policy or use the shared transaction channel.
 | `microphone` | `auto`, `left`, `right` |
 | `ear-detection`, `one-bud-anc`, `conversation-awareness`, `personalized-volume` | `on`, `off` |
 | `allow-off`, `pause-when-asleep`, `case-sounds`, `optimized-charging`, `volume-swipe` | `on`, `off` |
+| `en352-protection` | `on`, `off`; known AirPods Pro 3, firmware 0.1.64+ |
+| `gain-swipe` | `on`, `off`; known AirPods Pro 2/3, firmware 0.1.64+ |
+| `smart-routing`, `allow-auto-connect` | `on`, `off`; AirPods settings, separate from the dongle's reconnect policy |
+| `loud-sound-reduction` | `on`, `off`; dynamically discovered ATT setting on known Pro 2/3 |
+| `game-mode` | `on`, `off`; waits for controller/device confirmation, or explicitly reports waiting for playback |
+| `eq`, `eq-low`, `eq-mid`, `eq-high` | `on`/`off` for `eq`; integer `0`..`100` for each band; firmware 0.1.64+ and a valid current device EQ report |
+| `hearing-aid`, `media-assist` | `on`, `off`; enrolled, writable saved fitting required for On |
+| `headphone-accommodations` | `on`, `off`; sets Phone and Media together, preserving tuning curves |
+| `accommodations-phone`, `accommodations-media` | `on`, `off`; changes only the chosen processing target |
+| `accommodations-preset` | `balanced-slight`, `balanced-moderate`, `balanced-strong`, `vocal-slight`, `vocal-moderate`, `vocal-strong`, `brightness-slight`, `brightness-moderate`, `brightness-strong`, `audiogram` |
+| `custom-transparency` | `on`, `off`; preserves the full received tuning record |
 | `press-speed`, `hold-duration` | `default`, `slower`, `slowest` |
 | `swipe-duration` | `default`, `longer`, `longest` |
 | `call-controls` | `default`, `swapped` |
@@ -156,7 +170,45 @@ python tools/airpods.py set tone-volume 75
 The hold-mode selection is shared by both ears, not an ordered cycle. The CLI
 does not silently enable `allow-off` to satisfy another command. `hold-actions`
 explicitly sets both sides together. Tone/case volume refers to notification
-sounds, not music volume. No raw ATT packets or hearing-profile edits are exposed.
+sounds, not music volume. No raw ATT packets or hearing-threshold edits are exposed.
+
+### Hearing adjustments
+
+`help SETTING` lists every accepted range. Both `hearing-` and `transparency-`
+prefixes offer `amplification`, `balance`, `tone`, `noise-reduction`, `own-voice`
+and `conversation-boost`. Tone is `-1`..`1`; noise reduction and own voice are
+`0`..`1`; Conversation Boost is `on`/`off`. Hearing amplification is `-1.5`..`1.5`,
+Custom Transparency amplification is `-1`..`2`, and balance is `-3`..`3`.
+A combination that would put either hearing channel outside its valid range is
+rejected before writing. Own Voice requires its field in the received record.
+These are the captured protocol units, not decibels or playback volume.
+
+```powershell
+python tools/airpods.py help hearing-amplification
+python tools/airpods.py get hearing-aid
+python tools/airpods.py set custom-transparency off
+python tools/airpods.py set accommodations-preset audiogram
+python tools/airpods.py set headphone-accommodations on
+python tools/airpods.py set eq-mid 55
+```
+
+Hearing, accommodations and Custom Transparency edits require a current known
+Pro 2/3 model and complete received mode records. Their existing mutual-exclusion
+rules remain in force. Enable commands never manufacture enrollment or a fitting.
+Audiogram uses only a validated writable profile already saved on the AirPods;
+stock presets use the same nine anonymous captured blocks as LibrePods.
+Preset selection updates the coupled Custom Transparency curves while preserving
+its amplification and other adjustments. Fitting edits preserve the remaining
+100-byte payload, including the hearing thresholds; no threshold editor or raw
+packet command is exposed.
+
+Each complex action holds the existing settings-workflow lease from baseline to
+readback. Characteristics are discovered by UUID afresh, with their advertised
+write form, and discarded afterward. No ATT handle, mode baseline or lease is
+reused after a target/session change. A delayed readback can be read again within
+the bounded action; a setting write is never repeated. A partial or uncertain
+change exits with code 3 and does not silently restore or overwrite another host's
+newer settings. Reading settings never connects, starts audio or runs a hearing test.
 
 ## Confirmation and exit codes
 

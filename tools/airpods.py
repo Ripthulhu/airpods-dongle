@@ -7,6 +7,9 @@ import sys
 import time
 
 from audio_diagnostics import Hid, RequestRejected, Unsupported, typed_request
+from airpods_att import AttSettings, Unconfirmed as AttUnconfirmed
+from airpods_hearing import HearingSettings, PARAMETERS
+import airpods_hearing
 
 
 MODES = {'off': 1, 'anc': 2, 'transparency': 3, 'adaptive': 4}
@@ -20,6 +23,10 @@ SETTINGS = {
     'one-bud-anc': (0x1b, TOGGLE),
     'conversation-awareness': (0x28, TOGGLE),
     'personalized-volume': (0x26, TOGGLE),
+    'en352-protection': (0x37, TOGGLE),
+    'gain-swipe': (0x2f, TOGGLE),
+    'smart-routing': (0x20, TOGGLE),
+    'allow-auto-connect': (0x36, TOGGLE),
     'allow-off': (0x34, TOGGLE),
     'pause-when-asleep': (0x35, TOGGLE),
     'case-sounds': (0x31, TOGGLE),
@@ -36,10 +43,14 @@ SETTINGS = {
     'hold-modes': (0x1a, 'modes'),
     'hold-actions': (0x16, 'actions'),
 }
+EXTRA_SETTINGS = {'loud-sound-reduction': TOGGLE, 'game-mode': TOGGLE}
+SETTING_NAMES = tuple(SETTINGS) + tuple(EXTRA_SETTINGS) + tuple(PARAMETERS)
 
 
 def value_help(name):
-    kind = SETTINGS[name][1]
+    if name in PARAMETERS:
+        return airpods_hearing.value_help(name)
+    kind = EXTRA_SETTINGS[name] if name in EXTRA_SETTINGS else SETTINGS[name][1]
     if isinstance(kind, dict):
         return ', '.join(kind)
     if kind == 'percent':
@@ -50,6 +61,12 @@ def value_help(name):
 
 
 def encode(name, value):
+    if name in PARAMETERS:
+        return airpods_hearing.encode(name, value)
+    if name in EXTRA_SETTINGS:
+        if value not in EXTRA_SETTINGS[name]:
+            raise ValueError(value_help(name))
+        return value == 'on'
     control, kind = SETTINGS[name]
     if isinstance(kind, dict):
         if value not in kind:
@@ -122,6 +139,49 @@ class SettingsClient:
         if not struct.unpack_from('<H', self.status, 42)[0] & 16:
             raise RuntimeError('Firmware does not advertise typed settings support')
         return snapshot(typed_request(self.device, b'\x02', self.generation))
+
+    def game(self, enabled=None):
+        def read(data):
+            if (len(data) != 20 or data[0] != 1 or data[12] not in (0, 1) or
+                    data[13] > 6 or data[14] > 2 or data[15] & ~15):
+                raise RuntimeError('Malformed audio profile status')
+            return data
+        current = read(typed_request(self.device, b'\x09', self.generation))
+        if enabled is None:
+            label = ('off', 'waiting for playback', 'unconfirmed', 'on', 'failed', 'unsupported', 'turning off')[current[13]]
+            return f'game-mode: {label} (requested {"on" if current[12] else "off"})'
+        if not self.status[7] & 2 or self.status[7] & 16 or current[15] & 4:
+            raise RuntimeError('Settings must be ready and microphone use stopped')
+        if enabled and not current[15] & 8:
+            raise Unsupported('Game Mode is unavailable on this connection')
+        if current[12] == enabled and current[13] == (3 if enabled else 0):
+            return f'game-mode: {"on" if enabled else "off"} (already confirmed; no write sent)'
+        attempted = False
+        try:
+            attempted = True
+            current = read(typed_request(self.device, bytes((4, enabled)), self.generation))
+            until = time.monotonic() + 8
+            while True:
+                if current[12] != enabled:
+                    raise RuntimeError('Game Mode choice was superseded')
+                if current[13] == (3 if enabled else 0):
+                    return f'game-mode: {"on" if enabled else "off"} (confirmed)'
+                if enabled and current[13] == 1 and not current[15] & 2:
+                    return 'game-mode: on requested; waiting for playback (not yet active)'
+                if current[13] in (4, 5) or time.monotonic() >= until:
+                    raise RuntimeError('Game Mode did not confirm')
+                time.sleep(.1)
+                current = read(typed_request(self.device, b'\x09', self.generation))
+        except RequestRejected as error:
+            if error.code in (1, 2, 4):
+                raise
+            raise Unconfirmed(f'Game Mode not confirmed: {error}. Read get game-mode before retrying.') from error
+        except Unsupported:
+            raise
+        except (OSError, RuntimeError) as error:
+            if attempted:
+                raise Unconfirmed(f'Game Mode not confirmed: {error}. Read get game-mode before retrying.') from error
+            raise
 
     def set(self, name, value):
         control = SETTINGS[name][0]
@@ -289,7 +349,7 @@ def parser():
     help_command = commands.add_parser('help', help='show commands or help for a setting')
     help_command.add_argument('topic', nargs='?', help='command or setting name')
     commands.add_parser('status', help='show connection, codec and batteries without changing settings')
-    commands.add_parser('settings', help='list readable setting values and their report ages')
+    commands.add_parser('settings', help='list cached scalar setting values and their report ages')
     pair = commands.add_parser('pair', help='start AirPods pairing or open phone pairing for 120 seconds',
                                description='Pair new AirPods (default), or open the phone pairing window. Pause playback and microphone use first. Use connect for an existing AirPods bond.')
     pair.add_argument('target', nargs='?', default='airpods', choices=('airpods', 'phone'))
@@ -302,9 +362,9 @@ def parser():
                                  description='Read the reconnect policy, or change it while playback, microphone use and connection transitions are idle. Manual is the default: use Connect or one button press. Auto explicitly allows reclaiming AirPods from another host on subsequent eligible attempts. A Disconnect hold overrides Auto until Connect, a button press or reboot. Older firmware rejects policy commands without changes.')
     policy.add_argument('mode', nargs='?', choices=('manual', 'auto'), help='omit to read; auto may interrupt another host')
     get = commands.add_parser('get', help='read one reported setting')
-    get.add_argument('setting', choices=SETTINGS)
+    get.add_argument('setting', choices=SETTING_NAMES)
     set_command = commands.add_parser('set', help='change one setting and wait for device confirmation')
-    set_command.add_argument('setting', choices=SETTINGS)
+    set_command.add_argument('setting', choices=SETTING_NAMES)
     set_command.add_argument('value', help='named value; use help SETTING to see accepted values')
     return result, commands.choices
 
@@ -313,7 +373,7 @@ def main(argv=None):
     cli, commands = parser()
     args = cli.parse_args(argv)
     if args.command == 'help':
-        if args.topic in SETTINGS:
+        if args.topic in SETTING_NAMES:
             print(f'{args.topic}: {value_help(args.topic)}')
             print(f'Get: airpods.py get {args.topic}\nSet: airpods.py set {args.topic} VALUE')
         elif args.topic in commands:
@@ -321,7 +381,7 @@ def main(argv=None):
         elif args.topic is None:
             cli.print_help()
             print('\nSettings:')
-            for name in SETTINGS:
+            for name in SETTING_NAMES:
                 print(f'  {name}: {value_help(name)}')
             print('\nExamples:\n  airpods.py connect\n  airpods.py pair airpods\n  airpods.py pair phone\n  airpods.py disconnect\n  airpods.py reconnect-policy manual\n  airpods.py get mode\n  airpods.py set mode transparency\n  airpods.py set ear-detection on')
         else:
@@ -345,6 +405,24 @@ def main(argv=None):
             print('Codec: ' + {0: 'unknown', 1: 'SBC', 2: 'AAC', 3: 'AAC-ELD'}.get(data[23], 'unknown'))
             for label, raw in zip(('left', 'right', 'case'), data[19:22]):
                 print(f'Battery {label}: ' + (f'{raw}%' if raw <= 100 else 'unknown'))
+        elif args.command in ('get', 'set') and args.setting == 'loud-sound-reduction':
+            att = AttSettings(device, client.generation)
+            if args.command == 'get':
+                print('loud-sound-reduction: ' + ('on' if att.get_loud_sound_reduction() else 'off'))
+            else:
+                changed = att.set_loud_sound_reduction(value)
+                print(f'loud-sound-reduction: {args.value} (' + ('confirmed by AirPods)' if changed else 'already read; no write sent)'))
+        elif args.command in ('get', 'set') and args.setting == 'game-mode':
+            print(client.game(value if args.command == 'set' else None))
+        elif args.command in ('get', 'set') and args.setting in PARAMETERS:
+            hearing = HearingSettings(device, client.generation)
+            if args.command == 'get':
+                result = hearing.get(args.setting)
+                rendered = ('on' if result else 'off') if type(result) is bool else str(result)
+                print(f'{args.setting}: {rendered}')
+            else:
+                changed = hearing.set(args.setting, value)
+                print(f'{args.setting}: {args.value} (' + ('confirmed by AirPods)' if changed else 'already read; no write sent)'))
         elif args.command == 'set':
             print(client.set(args.setting, value))
         elif args.command == 'pair':
@@ -364,7 +442,7 @@ def main(argv=None):
                 else:
                     print(f'{name}: {decode(name, record[2])} (report age {record[0]} ms)')
         return 0
-    except Unconfirmed as error:
+    except (Unconfirmed, AttUnconfirmed) as error:
         print(str(error), file=sys.stderr)
         return 3
     except (OSError, RuntimeError) as error:

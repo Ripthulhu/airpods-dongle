@@ -94,6 +94,66 @@ class Clock:
         self.now += delay
 
 
+class NewSettingsTest(unittest.TestCase):
+    def test_scalar_gaps_have_exact_wire_values_and_help(self):
+        for name, control in (('en352-protection', 0x37), ('gain-swipe', 0x2f),
+                              ('smart-routing', 0x20), ('allow-auto-connect', 0x36)):
+            self.assertEqual(airpods.SETTINGS[name][0], control)
+            self.assertEqual(airpods.encode(name, 'on'), 1)
+            self.assertEqual(airpods.encode(name, 'off'), 2)
+            with patch.object(airpods, 'Hid') as hid, contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(airpods.main(['help', name]), 0)
+                self.assertIn('on, off', output.getvalue())
+                hid.assert_not_called()
+
+    def test_complex_values_validate_before_opening_hardware(self):
+        with patch.object(airpods, 'Hid') as hid, contextlib.redirect_stderr(io.StringIO()):
+            for name, value in (('loud-sound-reduction', 'maybe'), ('eq-low', '2.5'),
+                                ('hearing-amplification', 'nan'), ('transparency-tone', 'inf'),
+                                ('accommodations-preset', 'fake-audiogram')):
+                with self.assertRaises(SystemExit) as error:
+                    airpods.main(['set', name, value])
+                self.assertEqual(error.exception.code, 2)
+            hid.assert_not_called()
+
+    def test_complex_confirmation_and_uncertainty_exit_codes(self):
+        for name, cls, method in (('loud-sound-reduction', airpods.AttSettings, 'set_loud_sound_reduction'),
+                                  ('hearing-aid', airpods.HearingSettings, 'set')):
+            for outcome, code in ((True, 0), (airpods.AttUnconfirmed('read again'), 3)):
+                device = Dongle()
+                with patch.object(airpods, 'Hid', return_value=device), patch.object(cls, '__init__', return_value=None), \
+                     patch.object(cls, method, side_effect=outcome if isinstance(outcome, Exception) else None,
+                                  return_value=outcome), contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(airpods.main(['set', name, 'on']), code)
+                self.assertTrue(device.closed)
+
+    def test_game_mode_confirms_or_reports_waiting_without_replaying(self):
+        device = Dongle()
+        baseline = bytearray(20)
+        baseline[0] = 1
+        baseline[15] = 8 | 2
+        active = bytearray(baseline)
+        active[12:14] = bytes((1, 3))
+        with patch.object(airpods, 'typed_request', side_effect=(baseline, active)) as request:
+            self.assertIn('on (confirmed)', airpods.SettingsClient(device).game(True))
+            self.assertEqual(request.call_args_list[-1].args[1], b'\x04\x01')
+        pending = bytearray(active)
+        pending[13], pending[15] = 1, 8
+        with patch.object(airpods, 'typed_request', side_effect=(baseline, pending)) as request:
+            self.assertIn('waiting for playback (not yet active)', airpods.SettingsClient(device).game(True))
+            self.assertEqual(request.call_count, 2)
+
+    def test_game_mode_known_rejection_differs_from_uncertain_confirmation(self):
+        baseline = bytearray(20)
+        baseline[0], baseline[15] = 1, 8 | 2
+        for error, expected in ((airpods.RequestRejected(2), airpods.RequestRejected),
+                                (OSError('lost'), airpods.Unconfirmed)):
+            with patch.object(airpods, 'typed_request', side_effect=(baseline, error)):
+                with self.assertRaises(expected):
+                    airpods.SettingsClient(Dongle()).game(True)
+
+
 class ConnectionDongle(Dongle):
     def __init__(self):
         super().__init__()
