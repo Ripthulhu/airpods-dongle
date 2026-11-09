@@ -76,7 +76,8 @@ music attenuation/restoration on USB and relay input. It does not change host or
 AirPods volume settings. Known dongle call/microphone paths suspend automatic
 behavior. Generic USB does not identify a host call using the host's own
 microphone; its audio can receive the same processing as music.
-See the [0.1.65 notes](releases/0.1.65.md) for validation limits.
+See the [current release notes](releases/0.1.66.md) for validation limits and
+the fix for initial wear reports arriving before connection setup finishes.
 
 ## Pairing and connections
 

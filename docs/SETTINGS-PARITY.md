@@ -19,9 +19,11 @@ stop during known dongle call/microphone paths. Conversation Awareness uses a
 uniform quarter-amplitude reduction for active speech stages, rather than
 Android's configurable stage behavior. Dedicated Play/Pause support depends on
 the host/player; generic USB cannot track every manual media action or identify
-a host call using the host's own microphone. Physical Windows/Linux and listening
-checks remain outstanding; see the
-[release notes](releases/0.1.65.md).
+a host call using the host's own microphone. Windows listening checks confirmed
+Conversation Awareness and ear pause/resume with NTPods closed. Physical Linux
+testing remains outstanding. Firmware 0.1.66 also seeds initial wear state from
+the current session's cache when that report precedes metadata or audio ownership;
+seeding never performs a media action. See the [release notes](releases/0.1.66.md).
 
 | Setting | Previously missing | Path and validation |
 | --- | --- | --- |

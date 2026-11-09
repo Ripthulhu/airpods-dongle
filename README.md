@@ -98,7 +98,7 @@ for updating through the console instead of the physical button.
 
 ## Status and limits
 
-Current source version: **0.1.65**. See the [release notes](docs/releases/0.1.65.md).
+Current source version: **0.1.66**. See the [release notes](docs/releases/0.1.66.md).
 The [Game Mode transition](docs/GAME-TRANSITION.md)
 and [Android/dongle protocol alignment](docs/ANDROID-PROTOCOL-PARITY.md) describe
 its implementation and validation boundaries.

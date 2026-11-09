@@ -1391,6 +1391,13 @@ static void playback_accessory_update(bool dispatch) {
         usb_media_cancel_automatic();
     }
     uint32_t now=btstack_run_loop_get_time_ms();
+    if(allowed && !playback_accessory.state.have_presence) {
+        // Wear can arrive before metadata or audio ownership; seed only this session's baseline.
+        uint8_t cached[40];
+        uint16_t length=aacp_research_cached(5,cached,sizeof(cached));
+        if(length>=16 && cached[12]==6)
+            accessory_automation_packet(&playback_accessory.state,cached+8,length-8,now);
+    }
     if(!allowed || !dispatch)return;
     uint32_t stamp=atomic_load_explicit(&usb_signal_stamp,memory_order_acquire);
     uint32_t age=now-(stamp-1u);

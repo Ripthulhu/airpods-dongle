@@ -14,6 +14,9 @@ static bool call_active, call_opened, mic, mic_prepare_open, mic_recovery_pendin
 static bool profile_pending, playback_released, queue_ok;
 static struct {uint16_t avdtp_cid;} media_tracker;
 static unsigned pauses, plays, cancellations;
+static uint8_t cached_wear[40];
+static uint16_t cached_length;
+static uint32_t cached_session;
 static uint32_t aacp_control_session(void) {return session;}
 uint32_t usb_media_generation(void) {return host;}
 static bool usb_host_active(void) {return (host&1u)!=0;}
@@ -24,6 +27,11 @@ static bool usb_mic_requested(void) {return mic;}
 static bool aacp_mic_requested(void) {return mic;}
 static bool aacp_mic_active(void) {return mic;}
 static uint32_t btstack_run_loop_get_time_ms(void) {return now;}
+static uint16_t aacp_research_cached(uint8_t slot,uint8_t *out,uint16_t capacity) {
+    assert(slot==5);
+    if(!ready || cached_session!=session || capacity<cached_length)return 0;
+    memcpy(out,cached_wear,cached_length);return cached_length;
+}
 uint32_t usb_media_pause_sent(void) {return pause_receipt;}
 void usb_media_cancel_automatic(void) {++cancellations;}
 bool usb_media_enqueue(enum usb_media_command command) {
@@ -36,6 +44,10 @@ bool usb_media_enqueue(enum usb_media_command command) {
 
 static void ear(uint8_t a,uint8_t b) {
     const uint8_t packet[]={4,0,4,0,6,0,a,b};
+    memset(cached_wear,0,sizeof(cached_wear));
+    cached_wear[0]=0x60;cached_wear[1]=0xea;cached_wear[4]=1; // A 60-second-old unchanged report is still current.
+    memcpy(cached_wear+8,packet,sizeof(packet));
+    cached_length=8+sizeof(packet);cached_session=session;
     dongle_playback_accessory_event(packet,sizeof(packet));
 }
 static void stage(uint8_t n) {
@@ -55,6 +67,7 @@ static void fixture(void) {
     is_usb_streaming=a2dp_is_connected_flag=ready=owned=queue_ok=model_known=true;
     phone_active=call_active=call_opened=mic=mic_prepare_open=mic_recovery_pending=false;
     profile_pending=playback_released=false;media_tracker.avdtp_cid=7;
+    cached_length=0;cached_session=0;
     pauses=plays=cancellations=0;playback_accessory_poll();
 }
 static void paused(void) {
@@ -73,6 +86,34 @@ static void test_wear_and_signal(void) {
     playback_accessory_signal(bad,1,true);ear(0,1);assert(!pauses);
     fixture();ear(0,0);float quiet[]={0x1p-25f,-0x1p-25f};
     playback_accessory_signal(quiet,1,true);ear(0,1);assert(pauses==1);
+}
+static void test_cached_startup_presence(void) {
+    fixture();ready=model_known=false;playback_accessory_poll();
+    ear(0,0);assert(!playback_accessory.state.have_presence && !pauses && !plays);
+    ready=true;playback_accessory_poll();
+    assert(!playback_accessory.state.have_presence && !pauses && !plays);
+    model_known=true;playback_accessory_poll();
+    assert(playback_accessory.state.have_presence && playback_accessory.state.presence==ACCESSORY_EARS_FULL);
+    assert(!pauses && !plays && !playback_accessory_duck());
+    signal();ear(0,1);assert(pauses==1 && !plays);
+    ++pause_receipt;now+=200;playback_accessory_poll();
+    assert(playback_accessory.state.phase==ACCESSORY_AUTO_PAUSED);
+    ++session;playback_accessory_poll();
+    assert(!playback_accessory.state.have_presence && !plays);
+    ear(0,0);assert(playback_accessory.state.have_presence && pauses==1 && !plays);
+
+    for(unsigned invalid=0;invalid<5;++invalid) {
+        fixture();model_known=false;playback_accessory_poll();ear(0,0);
+        if(invalid==0)cached_length=15;
+        if(invalid==1)cached_wear[8]=0;
+        if(invalid==2)cached_wear[14]=4;
+        if(invalid==3)cached_wear[13]=1;
+        if(invalid==4) {
+            cached_length=18;cached_wear[12]=0x4b;cached_wear[17]=1;
+        }
+        model_known=true;playback_accessory_poll();signal();playback_accessory_poll();
+        assert(!playback_accessory.state.have_presence && !pauses && !plays && !playback_accessory_duck());
+    }
 }
 static void test_owner_and_manual_fences(void) {
     for(unsigned reason=0;reason<10;++reason) {
@@ -115,6 +156,6 @@ static void test_conversation_scope(void) {
     dongle_playback_accessory_event(NULL,11);
 }
 int main(void) {
-    test_wear_and_signal();test_owner_and_manual_fences();test_conversation_scope();
+    test_wear_and_signal();test_cached_startup_presence();test_owner_and_manual_fences();test_conversation_scope();
     puts("driverless accessory bridge: actual event/poll wiring, scope, signal, manual controls and relay duck passed");
 }
