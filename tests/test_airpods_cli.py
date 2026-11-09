@@ -54,10 +54,12 @@ class Dongle:
         assert op in (4, 6)
         if op == 6:
             assert not any(data[16:])
-            if self.payload == b'\x02':
-                self.response = bytes((1, len(self.values))) + b''.join(
+            if self.payload in (b'\x02', b'\x02\x01'):
+                values = {control: value for control, value in self.values.items()
+                          if self.payload == b'\x02\x01' or control not in (0x37, 0x2f)}
+                self.response = bytes((1, len(values))) + b''.join(
                     bytes((control,)) + struct.pack('<III', *value)
-                    for control, value in self.values.items())
+                    for control, value in values.items())
             else:
                 assert len(self.payload) == 6 and self.payload[0] == 1
                 if self.reject:
@@ -95,6 +97,28 @@ class Clock:
 
 
 class NewSettingsTest(unittest.TestCase):
+    def test_extended_scalar_reads_are_explicit_and_confirm_new_fields(self):
+        device = Dongle()
+        device.values[0x37] = (0, 12, 2)
+        client = airpods.SettingsClient(device)
+        self.assertNotIn(0x37, client.read())
+        self.assertEqual(client.read(True)[0x37][2], 2)
+        self.assertIn('confirmed by AirPods', client.set('en352-protection', 1))
+        self.assertEqual(device.setting_writes, [(0x37, 1)])
+        self.assertEqual(device.requests[-3:], [b'\x02\x01', b'\x01\x37\x01\0\0\0', b'\x02\x01'])
+
+    def test_older_firmware_extended_read_falls_back_without_write_retry(self):
+        for error in (airpods.Unsupported('old'), airpods.RequestRejected(1)):
+            device = Dongle()
+            with patch.object(airpods, 'typed_request', side_effect=(error, b'\x01\0')) as request:
+                self.assertEqual(airpods.SettingsClient(device).read(True), {})
+                self.assertEqual([call.args[1] for call in request.call_args_list], [b'\x02\x01', b'\x02'])
+            self.assertFalse(device.wire_writes)
+        with patch.object(airpods, 'typed_request', side_effect=airpods.RequestRejected(2)) as request:
+            with self.assertRaises(airpods.RequestRejected):
+                airpods.SettingsClient(Dongle()).read(True)
+            self.assertEqual(request.call_count, 1)
+
     def test_scalar_gaps_have_exact_wire_values_and_help(self):
         for name, control in (('en352-protection', 0x37), ('gain-swipe', 0x2f),
                               ('smart-routing', 0x20), ('allow-auto-connect', 0x36)):

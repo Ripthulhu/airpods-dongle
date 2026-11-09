@@ -94,6 +94,7 @@ int aacp_setting_take(void); // 0 pending/idle, 1 sent locally, 2 failed
 void aacp_setting_cancel(void); // Remove only its unsent queue entry and clear receipt.
 // Version 1, count, then {id:u8, age_ms:u32, revision:u32, value:u32} records.
 uint16_t aacp_settings_snapshot(uint8_t *out, uint16_t capacity);
+uint16_t aacp_settings_snapshot_extended(uint8_t *out, uint16_t capacity);
 bool aacp_model_game_supported(void);
 bool aacp_model_known(void);
 // Only the stream-owned 60/150 ms policy is allowed; not a general buffer knob.

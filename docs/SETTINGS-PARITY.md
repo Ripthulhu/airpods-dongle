@@ -5,6 +5,11 @@ Firmware 0.1.64 keeps the existing HID protocol, radio .0076, audio formats,
 volume synchronization and connection policy. All commands are documented by
 `python tools/airpods.py help`; these changes do not add Android UI controls.
 
+Existing feature-2 and cached-slot-6 snapshots keep their original 23 IDs for
+installed NTPods versions that reject unfamiliar IDs. The CLI opts into EN 352
+and Gain Swipe readback through feature-2 `[2,1]`; no Windows app update is needed
+to keep its existing settings working.
+
 | Setting | Previously missing | Path and validation |
 | --- | --- | --- |
 | EN 352 Protection | Firmware catalog and CLI | AACP `09/37`, 1 on/2 off; known Pro 3 only; received valid scalar baseline |

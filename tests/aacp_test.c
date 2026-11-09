@@ -997,6 +997,18 @@ static void test_typed_settings_and_confirmation(void) {
     assert(aacp_setting_take()==2 && aacp_setting_take()==0);
     assert(!aacp_tx_count && !aacp_settings_snapshot(out,sizeof(out)) && !settings.profile);
 }
+static void test_default_and_cached_snapshots_keep_legacy_ids(void) {
+    fixture(); ready(); model_report_for("A3063","9A348");
+    setting_report(0x28,2); setting_report(0x37,1); setting_report(0x2f,2);
+    uint8_t legacy[64], cached[64], full[64];
+    assert(aacp_settings_snapshot(legacy,sizeof(legacy))==28 && legacy[1]==2 && legacy[2]==0x0d && legacy[15]==0x28);
+    assert(aacp_research_cached(6,cached,sizeof(cached))==28 && !memcmp(legacy,cached,28));
+    assert(aacp_settings_snapshot_extended(full,sizeof(full))==54 && full[1]==4 && full[28]==0x37 && full[41]==0x2f);
+    assert(!memcmp(legacy+2,full+2,26));
+    assert(!aacp_settings_snapshot_extended(full,53));
+    aacp_disconnect();
+    assert(!aacp_settings_snapshot(legacy,sizeof(legacy)) && !aacp_settings_snapshot_extended(full,sizeof(full)));
+}
 static void test_typed_setting_owner_lifecycle(void) {
     fixture();ready();
     assert(aacp_setting_take()==0);
@@ -1466,6 +1478,7 @@ int main(void) {
     test_eq_cache_and_guarded_writes();
     test_queued_eq_cannot_overwrite_a_replaced_or_invalidated_baseline();
     test_typed_settings_and_confirmation();
+    test_default_and_cached_snapshots_keep_legacy_ids();
     test_typed_setting_owner_lifecycle();
     test_hold_cycle_wire_and_assignments();
     test_host_writes_recheck_owner_and_microphone();

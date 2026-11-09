@@ -41,7 +41,7 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | Subcommand | Request after the subcommand byte | Successful response |
 | --- | --- | --- |
 | 1: device setting | control ID u8, value u32 little-endian | empty after local transmission; device readback is separate |
-| 2: settings snapshot | none | cached setting records below |
+| 2: settings snapshot | none (legacy), or selector u8=1 (extended) | cached setting records below |
 | 3: audio profile | output codec u8 (0 auto, 1 SBC, 2 AAC, 3 ELD), rate mode u8 (0 CBR, 1 VBR), bitrate u32 in bits/s | profile status below |
 | 4: Game Mode | enabled u8 (0/1) | 20-byte profile status; device confirmation is separate |
 | 5: performance | none | versioned diagnostic snapshot |
@@ -180,7 +180,7 @@ per-handle ACK/epoch command engine; a failed or missing ACK remains visible.
 It is volatile and has no product UI or persistent setting. The report-3 layout
 and capability 16 remain unchanged; older firmware returns unsupported.
 
-Cached report slot 6 also returns the settings snapshot. Format: version u8=1,
+Cached report slot 6 also returns the legacy settings snapshot. Format: version u8=1,
 count u8, then count records of control ID u8, age milliseconds u32, report
 revision u32, value u32. Only device reports create records. Requested values
 must remain separate until a fresh matching device report is received. Unknown
@@ -216,6 +216,16 @@ metadata and a valid current EQ report; its baseline revision is captured at
 queue admission and checked again at the radio send. Replacing or invalidating
 that report retires the queued edit. Hosts preserve untouched fields and require
 a newer exact device report, separately from local send completion.
+
+The default feature-2 request `[2]` and cached slot 6 retain the original
+23-control catalog. EN 352 (`37`) and Gain Swipe (`2F`) are returned only by
+the explicit extended feature-2 request `[2,1]`. Other lengths/selectors are
+malformed. This keeps already-installed clients that reject unfamiliar IDs
+working without an app upgrade. The CLI requests the extended form for those
+fields and `settings`, falling back to legacy reads only when older firmware
+explicitly rejects the read form as malformed or unsupported. A busy or
+uncertain transaction is never retried. Write validation is identical for both
+catalogs; only the snapshot's fields differ.
 
 The [CLI](CLI.md) exposes these settings and the existing leased hearing/ATT paths.
 [Settings parity](SETTINGS-PARITY.md) records their layouts and remaining exclusions.

@@ -53,7 +53,7 @@ static void test_ppe_support_and_reports(void) {
         assert(settings_supported(&s,0x37,1) && settings_supported(&s,0x37,2));
         assert(setting_report_is(&s,0x37,2)); // Asking to write On must not invent an On report.
         uint8_t out[15];
-        assert(settings_snapshot(&s,15,out,sizeof(out))==15 && out[1]==1 && out[2]==0x37);
+        assert(settings_snapshot(&s,15,out,sizeof(out),true)==15 && out[1]==1 && out[2]==0x37);
         assert(dongle_u32(out+3)==5 && dongle_u32(out+7)==1 && dongle_u32(out+11)==2);
         reported(&s,0x37,1,16);
         assert(setting_report_is(&s,0x37,1) && !setting_report_is(&s,0x37,2));
@@ -66,7 +66,7 @@ static void test_ppe_support_and_reports(void) {
             reported(&s,0x37,2,18);
             reported(&s,0x37,invalid[j],19);
             assert(!settings_supported(&s,0x37,1) && !settings_supported(&s,0x37,2));
-            assert(settings_snapshot(&s,20,out,sizeof(out))==2 && out[1]==0);
+            assert(settings_snapshot(&s,20,out,sizeof(out),true)==2 && out[1]==0);
         }
         reported(&s,0x37,2,21);
         const uint8_t short_report[]={4,0,4,0,9,0,0x37,1,0,0};
@@ -206,15 +206,15 @@ static void test_metadata_bounds(void) {
 }
 static void test_report_replacement_and_snapshot(void) {
     dongle_settings_t s; settings_reset(&s); uint8_t out[512];
-    assert(settings_snapshot(&s,0,out,sizeof(out))==2 && out[0]==1 && out[1]==0);
+    assert(settings_snapshot(&s,0,out,sizeof(out),false)==2 && out[0]==1 && out[1]==0);
     reported(&s,0x28,2,UINT32_MAX-3);
-    assert(settings_snapshot(&s,4,out,sizeof(out))==15 && out[1]==1 && out[2]==0x28);
+    assert(settings_snapshot(&s,4,out,sizeof(out),false)==15 && out[1]==1 && out[2]==0x28);
     assert(dongle_u32(out+3)==8 && dongle_u32(out+7)==1 && dongle_u32(out+11)==2);
     reported(&s,0x28,2,4);
-    assert(settings_snapshot(&s,4,out,sizeof(out))==15 && dongle_u32(out+7)==2);
+    assert(settings_snapshot(&s,4,out,sizeof(out),false)==15 && dongle_u32(out+7)==2);
     uint8_t bad[]={4,0,4,0,9,0,0x28,1,1,0,0};
     settings_packet(&s,bad,sizeof(bad),5);
-    assert(settings_snapshot(&s,5,out,sizeof(out))==2 && out[1]==0);
+    assert(settings_snapshot(&s,5,out,sizeof(out),false)==2 && out[1]==0);
     int index=setting_index(0x28); assert(s.reports[index].revision==3 && !s.reports[index].known);
     s.reports[index].revision=UINT32_MAX; reported(&s,0x28,1,6);
     assert(s.reports[index].revision==1);
@@ -225,13 +225,36 @@ static void test_report_replacement_and_snapshot(void) {
     reported(&s,0x16,0xff000501,8);
     assert(setting_report_is(&s,0x16,0x0501));
     memset(out,0xa5,sizeof(out));
-    assert(!settings_snapshot(&s,8,out,14) && out[0]==0xa5);
-    assert(!settings_snapshot(&s,8,NULL,512));
-    settings_reset(&s); assert(settings_snapshot(&s,8,out,sizeof(out))==2 && !out[1]);
+    assert(!settings_snapshot(&s,8,out,14,false) && out[0]==0xa5);
+    assert(!settings_snapshot(&s,8,NULL,512,false));
+    settings_reset(&s); assert(settings_snapshot(&s,8,out,sizeof(out),false)==2 && !out[1]);
+}
+static void test_extended_snapshot_requires_explicit_opt_in(void) {
+    dongle_settings_t s; settings_reset(&s); uint8_t legacy[64], full[64];
+    assert(DONGLE_LEGACY_SETTING_COUNT==23 && DONGLE_SETTING_COUNT==25);
+    for (unsigned extended=0;extended<2;++extended) {
+        assert(settings_snapshot(&s,0,full,2,extended)==2 && full[0]==1 && !full[1]);
+        assert(!settings_snapshot(&s,0,NULL,sizeof(full),extended));
+        memset(full,0xa5,sizeof(full));
+        assert(!settings_snapshot(&s,0,full,1,extended) && full[0]==0xa5);
+    }
+    reported(&s,0x37,1,5); reported(&s,0x2f,2,6);
+    assert(settings_snapshot(&s,10,legacy,2,false)==2 && !legacy[1]);
+    memset(full,0xa5,sizeof(full));
+    assert(!settings_snapshot(&s,10,full,27,true) && full[0]==0xa5);
+    assert(settings_snapshot(&s,10,full,28,true)==28 && full[1]==2 && full[2]==0x37 && full[15]==0x2f);
+    reported(&s,0x28,2,7); reported(&s,0x0d,3,8);
+    assert(settings_snapshot(&s,10,legacy,28,false)==28 && legacy[1]==2 && legacy[2]==0x0d && legacy[15]==0x28);
+    assert(settings_snapshot(&s,10,full,54,true)==54 && full[1]==4 && full[28]==0x37 && full[41]==0x2f);
+    assert(!memcmp(legacy+2,full+2,26));
+    for (unsigned i=0;i<legacy[1];++i) assert(setting_index(legacy[2+13*i])<(int)DONGLE_LEGACY_SETTING_COUNT);
+    memset(full,0xa5,sizeof(full));
+    assert(!settings_snapshot(&s,10,full,53,true) && full[0]==0xa5);
 }
 int main(void) {
     test_values(); test_ppe_support_and_reports(); test_hearing_gain_swipe();
     test_model_and_firmware(); test_all_hold_cycle_combinations();
     test_metadata_bounds(); test_report_replacement_and_snapshot();
+    test_extended_snapshot_requires_explicit_opt_in();
     puts("dongle settings: bounded catalog, firmware gates, malformed replacement and non-optimistic snapshots passed");
 }

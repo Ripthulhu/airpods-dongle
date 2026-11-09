@@ -61,6 +61,11 @@ Scalar `get` and `settings` read the device-reported cache; they do not force a 
 notification or guess a value. Unknown can mean unreported or unsupported. A
 device report's age is shown in milliseconds. Model/firmware checks in the dongle
 remain authoritative; listing a command does not mean every model supports it.
+The CLI opts into the extended catalog for `settings` and the new EN 352/Gain
+Swipe commands. Older apps keep receiving their original catalog; older firmware
+can still answer the CLI's existing commands through its legacy read form.
+`ear-detection` sets the AirPods preference; host-side automatic pause/resume
+still requires the companion app's media integration.
 
 ## Pairing and connections
 

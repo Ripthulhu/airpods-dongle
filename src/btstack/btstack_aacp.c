@@ -648,7 +648,11 @@ int aacp_setting_take(void) {
 }
 uint16_t aacp_settings_snapshot(uint8_t *out, uint16_t capacity) {
     if (!aacp_control_ready()) return 0;
-    return settings_snapshot(&settings,btstack_run_loop_get_time_ms(),out,capacity);
+    return settings_snapshot(&settings,btstack_run_loop_get_time_ms(),out,capacity,false);
+}
+uint16_t aacp_settings_snapshot_extended(uint8_t *out, uint16_t capacity) {
+    if (!aacp_control_ready()) return 0;
+    return settings_snapshot(&settings,btstack_run_loop_get_time_ms(),out,capacity,true);
 }
 bool aacp_control_anc(uint8_t mode) {
     if (!aacp_control_ready() || !control_readback.anc || (mode != 2 && mode != 3)) return false;

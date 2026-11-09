@@ -14,6 +14,7 @@ static const uint8_t setting_ids[] = {
     0x37,0x2f // Append controls to preserve the existing model-mask bit positions.
 };
 #define DONGLE_SETTING_COUNT (sizeof(setting_ids) / sizeof(setting_ids[0]))
+#define DONGLE_LEGACY_SETTING_COUNT 23u
 typedef struct {
     uint16_t models[3];
     uint32_t controls;
@@ -181,13 +182,14 @@ static inline bool settings_supported(const dongle_settings_t *s, uint8_t id, ui
         (id==0x34 && s->profile && s->profile->silent_allow_off);
 }
 static inline uint16_t settings_snapshot(const dongle_settings_t *s, uint32_t now,
-                                         uint8_t *out, uint16_t capacity) {
+                                         uint8_t *out, uint16_t capacity, bool extended) {
+    unsigned limit=extended ? DONGLE_SETTING_COUNT : DONGLE_LEGACY_SETTING_COUNT;
     unsigned count=0;
-    for (unsigned i=0;i<DONGLE_SETTING_COUNT;++i) if (s->reports[i].known) ++count;
+    for (unsigned i=0;i<limit;++i) if (s->reports[i].known) ++count;
     if (!out || capacity<2+count*13) return 0;
     out[0]=1; out[1]=(uint8_t)count;
     unsigned offset=2;
-    for (unsigned i=0;i<DONGLE_SETTING_COUNT;++i) {
+    for (unsigned i=0;i<limit;++i) {
         const setting_report_t *r=&s->reports[i];
         if (!r->known) continue;
         out[offset]=setting_ids[i];

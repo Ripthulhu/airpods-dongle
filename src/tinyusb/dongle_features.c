@@ -49,8 +49,9 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
             if(size!=6)return 1;
             return error(aacp_setting_write(p[1],dongle_u32(p+2)));
         case 2:
-            if(size!=1)return 1;
-            *length=aacp_settings_snapshot(out,capacity);return *length?0:7;
+            if(size!=1 && (size!=2 || p[1]!=1))return 1;
+            *length=size==2 ? aacp_settings_snapshot_extended(out,capacity) : aacp_settings_snapshot(out,capacity);
+            return *length?0:7;
         case 3:
             if(size!=7 || capacity<20)return 1;
             result=dongle_playback_configure(p[1],p[2],dongle_u32(p+3));

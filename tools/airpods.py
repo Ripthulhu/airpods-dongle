@@ -135,9 +135,17 @@ class SettingsClient:
         self.status = device.get(2)
         self.generation = struct.unpack_from('<I', self.status, 8)[0]
 
-    def read(self):
+    def read(self, extended=False):
         if not struct.unpack_from('<H', self.status, 42)[0] & 16:
             raise RuntimeError('Firmware does not advertise typed settings support')
+        if extended:
+            try:
+                return snapshot(typed_request(self.device, b'\x02\x01', self.generation))
+            except Unsupported:
+                pass
+            except RequestRejected as error:
+                if error.code != 1:
+                    raise
         return snapshot(typed_request(self.device, b'\x02', self.generation))
 
     def game(self, enabled=None):
@@ -189,7 +197,8 @@ class SettingsClient:
             raise RuntimeError('AirPods settings connection is not ready')
         if self.status[7] & 16:
             raise RuntimeError('Stop microphone use before changing AirPods settings')
-        before = self.read().get(control)
+        extended = control in (0x37, 0x2f)
+        before = self.read(extended).get(control)
         if before and before[2] == value:
             return f'{name}: {decode(name, value)} (already reported, {before[0]} ms old; no write sent)'
         try:
@@ -207,7 +216,7 @@ class SettingsClient:
         try:
             until = time.monotonic() + 5
             while time.monotonic() < until:
-                current = self.read().get(control)
+                current = self.read(extended).get(control)
                 if current and (before is None or current[1] != before[1]) and current[2] == value:
                     return f'{name}: {decode(name, value)} (confirmed by AirPods)'
                 time.sleep(.1)
@@ -432,7 +441,7 @@ def main(argv=None):
         elif args.command == 'reconnect-policy':
             print(client.reconnect_policy(args.mode))
         else:
-            values = client.read()
+            values = client.read(args.command == 'settings' or SETTINGS[args.setting][0] in (0x37, 0x2f))
             for name in ([args.setting] if args.command == 'get' else SETTINGS):
                 record = values.get(SETTINGS[name][0])
                 if record is None:

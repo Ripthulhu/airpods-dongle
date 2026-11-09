@@ -4,6 +4,7 @@
 #include "../src/tinyusb/dongle_features.c"
 
 static unsigned setting_writes, profile_writes, game_writes, starts, stops, polls;
+static unsigned legacy_snapshots,extended_snapshots;
 static uint8_t result=DONGLE_ACCEPTED;
 static uint8_t expected_setting_id=0x28;
 static bool diagnostic_scan_paused;
@@ -77,8 +78,14 @@ uint8_t aacp_setting_write(uint8_t id,uint32_t value) {
     assert(id==expected_setting_id && value==expected_setting_value);setting_writes++;return result;
 }
 uint16_t aacp_settings_snapshot(uint8_t *out,uint16_t cap) {
+    ++legacy_snapshots;
     if(cap<2)return 0;
     out[0]=1;out[1]=0;return 2;
+}
+uint16_t aacp_settings_snapshot_extended(uint8_t *out,uint16_t cap) {
+    ++extended_snapshots;
+    if(cap<15)return 0;
+    memset(out,0,15);out[0]=1;out[1]=1;out[2]=0x37;return 15;
 }
 uint8_t dongle_playback_configure(uint8_t codec,uint8_t mode,uint32_t bitrate) {
     assert(codec==3 && mode==1 && bitrate==174000);profile_writes++;return result;
@@ -136,6 +143,19 @@ int main(void) {
     p[0]=7;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==24 && starts==1);
     p[0]=8;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==0 && stops==1);
     p[0]=2;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==2 && out[0]==1);
+    assert(legacy_snapshots==1 && !extended_snapshots);
+    const uint8_t extended[]={2,1};
+    assert(dongle_features_request(1,extended,2,out,64,&n)==0 && n==15 && out[1]==1 && out[2]==0x37);
+    assert(legacy_snapshots==1 && extended_snapshots==1);
+    assert(dongle_features_request(1,extended,2,out,14,&n)==7 && !n);
+    assert(dongle_features_request(1,p,1,out,1,&n)==7 && !n);
+    unsigned old_legacy=legacy_snapshots,old_extended=extended_snapshots;
+    const uint8_t bad_selectors[][3]={{2,0,0},{2,2,0},{2,255,0},{2,1,0}};
+    for(unsigned i=0;i<sizeof(bad_selectors)/sizeof(*bad_selectors);++i)
+        assert(dongle_features_request(1,bad_selectors[i],i==3 ? 3 : 2,out,64,&n)==1 && !n);
+    assert(legacy_snapshots==old_legacy && extended_snapshots==old_extended);
+    memcpy(p,extended,sizeof(extended));
+    assert(dongle_features_request(1,p,2,p,64,&n)==0 && n==15 && p[0]==1 && p[1]==1 && p[2]==0x37);
     p[0]=5;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==64);
     p[0]=9;assert(dongle_features_request(1,p,1,out,64,&n)==0 && n==20);
     uint8_t trace[512];p[0]=11;
