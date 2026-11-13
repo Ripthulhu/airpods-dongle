@@ -320,6 +320,16 @@ class SettingsClient:
             raise Unconfirmed(f'Connection change not confirmed: {error}. It may have applied; inspect status before retrying.') from error
         raise Unconfirmed('Connection request accepted, but its final state was not confirmed. Inspect status before retrying.')
 
+    def firmware(self):
+        try:
+            reply = typed_request(self.device, b'\x18')
+        except Unsupported as error:
+            raise Unsupported('Firmware version not reported: this firmware is older than the version report') from error
+        if len(reply) != 6 or reply[0] != 1 or reply[5] > 1:
+            raise RuntimeError('Malformed firmware version response')
+        version = f'{reply[1]}.{reply[2]}.{struct.unpack_from("<H", reply, 3)[0]}'
+        return f'Firmware: {version}' + (' (experimental radio0076)' if reply[5] else '')
+
     def reconnect_policy(self, mode):
         def decode_policy(reply):
             if len(reply) != 2 or reply[0] != 1 or reply[1] not in (0, 1):
@@ -367,6 +377,8 @@ def parser():
                         description='Reconnect using the saved AirPods bond, without pairing again. This explicit request can reclaim audio from another host. New firmware confirms audio ownership; older firmware confirms only that the request was accepted.')
     commands.add_parser('disconnect', help='release AirPods and hold automatic reconnect off until Connect, a button press or reboot',
                         description='Release the AirPods without erasing pairing. Automatic reconnect stays held off until Connect, a button press or reboot, including when the saved policy is Auto. Requires firmware with routing support.')
+    commands.add_parser('firmware', help='show the running firmware version (new firmware)',
+                        description='Read the version of the firmware the dongle is running. Read-only; older firmware rejects it without changes.')
     policy = commands.add_parser('reconnect-policy', help='read or save manual/automatic reconnect behavior (new firmware)',
                                  description='Read the reconnect policy, or change it while playback, microphone use and connection transitions are idle. Manual is the default: use Connect or one button press. Auto explicitly allows reclaiming AirPods from another host on subsequent eligible attempts. A Disconnect hold overrides Auto until Connect, a button press or reboot. Older firmware rejects policy commands without changes.')
     policy.add_argument('mode', nargs='?', choices=('manual', 'auto'), help='omit to read; auto may interrupt another host')
@@ -440,6 +452,8 @@ def main(argv=None):
             print(client.connection(args.command == 'connect'))
         elif args.command == 'reconnect-policy':
             print(client.reconnect_policy(args.mode))
+        elif args.command == 'firmware':
+            print(client.firmware())
         else:
             values = client.read(args.command == 'settings' or SETTINGS[args.setting][0] in (0x37, 0x2f))
             for name in ([args.setting] if args.command == 'get' else SETTINGS):

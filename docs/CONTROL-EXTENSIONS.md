@@ -60,6 +60,12 @@ request, staged and committed exactly like ATT/AACP requests. Its first byte is:
 | 20: routing status | none | 32-byte version-1 snapshot; capability 512 |
 | 21: authorized handover | action u8 (0 release, 1 acquire), expected intent revision u32, nonzero request nonce u32 | routing snapshot; capability 512 |
 | 23: reconnect policy | query: none; set: mode u8 (0 Manual, 1 Automatic) | version u8=1, effective mode u8 |
+| 24: firmware version | none | version u8=1, major u8, minor u8, patch u16 little-endian, variant u8 (0 standard, 1 experimental radio0076) |
+
+Feature 24 reports the running firmware's project version, so a host can tell whether a
+newer release exists without entering BOOTSEL. It is read-only, allowed for every client
+and at any time, and needs no capability bit: older firmware rejects it as unsupported
+(error 7) without changes.
 
 ## Explicit routing handover
 

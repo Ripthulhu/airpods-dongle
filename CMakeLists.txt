@@ -130,6 +130,9 @@ target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_eld_cbr_band
 target_link_options(airpods_dongle PRIVATE "-Wl,--undefined=airpods_lhdc_fingerprint"
     "-Wl,--undefined=airpods_phone_worker_storage_bytes")
 target_compile_definitions(airpods_dongle PRIVATE
+    AIRPODS_DONGLE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    AIRPODS_DONGLE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    AIRPODS_DONGLE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
     AACELD_CBR_BANDWIDTH=${AACELD_CBR_BANDWIDTH}
     AIRPODS_USB_FLOAT=$<BOOL:${AIRPODS_USB_FLOAT}>
     AIRPODS_ENABLE_BLUETOOTH_CALLS=$<BOOL:${AIRPODS_ENABLE_BLUETOOTH_CALLS}>
