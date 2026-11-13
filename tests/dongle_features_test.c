@@ -263,5 +263,11 @@ int main(void) {
     for(unsigned i=0;i<sizeof(policy_failures);++i) {
         result=policy_failures[i];assert(dongle_features_request(0,policy,2,out,64,&n)==policy_errors[i] && !n);
     }
+    uint8_t info[8]={24,9};
+    assert(dongle_features_request(0,info,2,out,64,&n)==1 && !n);
+    assert(dongle_features_request(0,info,1,out,5,&n)==1 && !n);
+    assert(dongle_features_request(1,info,1,info,8,&n)==0 && n==6 && info[0]==1 &&
+        info[1]==AIRPODS_DONGLE_VERSION_MAJOR && info[2]==AIRPODS_DONGLE_VERSION_MINOR &&
+        (info[3]|info[4]<<8)==AIRPODS_DONGLE_VERSION_PATCH && info[5]==0);
     puts("typed features: validation, exact integer values, aliased buffers, bounded responses and result mapping passed");
 }

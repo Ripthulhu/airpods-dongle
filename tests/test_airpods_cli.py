@@ -200,6 +200,7 @@ class ConnectionDongle(Dongle):
         self.policy_writes = []
         self.policy_reply = None
         self.fail_policy_reply = False
+        self.firmware_reply = bytes((1, 0, 1, 67, 0, 1))
 
     def set(self, data):
         if data[0] == 2:
@@ -212,7 +213,7 @@ class ConnectionDongle(Dongle):
                 struct.pack_into('<I', self.status, 8, 43)
                 self.status[12:18] = bytes(6)
             return
-        if data[7] != 6 or self.payload[0] not in (20, 21, 23):
+        if data[7] != 6 or self.payload[0] not in (20, 21, 23, 24):
             return super().set(data)
         self.wire_writes.append(bytes(data))
         self.report = bytearray(data)
@@ -242,6 +243,9 @@ class ConnectionDongle(Dongle):
             self.response = bytes(self.route)
             if self.routing_generation_change:
                 struct.pack_into('<I', self.status, 8, 43)
+        elif feature == 24:
+            assert self.payload == b'\x18'
+            self.response = self.firmware_reply
         else:
             assert len(self.payload) in (1, 2)
             if len(self.payload) == 2:
@@ -618,6 +622,19 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(airpods.Unconfirmed, 'accepted, but its final state was not confirmed'):
                 airpods.SettingsClient(device).connection(True)
         self.assertEqual(len(device.routing_writes), 1)
+
+    def test_firmware_version_is_read_only(self):
+        device = ConnectionDongle()
+        self.assertEqual(airpods.SettingsClient(device).firmware(), 'Firmware: 0.1.67 (experimental radio0076)')
+        device.firmware_reply = bytes((1, 1, 2, 3, 1, 0))
+        self.assertEqual(airpods.SettingsClient(device).firmware(), 'Firmware: 1.2.259')
+        self.assertFalse(device.policy_writes or device.routing_writes or device.basic_writes)
+        device.firmware_reply = bytes((2, 0, 1, 67, 0, 0))
+        with self.assertRaisesRegex(RuntimeError, 'Malformed'):
+            airpods.SettingsClient(device).firmware()
+        device.reject = 7
+        with self.assertRaisesRegex(airpods.Unsupported, 'older than the version report'):
+            airpods.SettingsClient(device).firmware()
 
     def test_reconnect_policy_query_and_verified_save(self):
         device = ConnectionDongle()

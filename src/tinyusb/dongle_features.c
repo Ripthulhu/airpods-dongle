@@ -27,6 +27,31 @@ static uint16_t radio_snapshot(uint8_t *out,uint16_t capacity) {
     return dongle_playback_adaptive_snapshot(out+64,64)==64?128:0;
 }
 
+// Feature 24 reports the running firmware's version, so hosts can tell whether an update
+// exists. Host test builds have no project version and report 0.0.0.
+#ifndef AIRPODS_DONGLE_VERSION_MAJOR
+#define AIRPODS_DONGLE_VERSION_MAJOR 0
+#endif
+#ifndef AIRPODS_DONGLE_VERSION_MINOR
+#define AIRPODS_DONGLE_VERSION_MINOR 0
+#endif
+#ifndef AIRPODS_DONGLE_VERSION_PATCH
+#define AIRPODS_DONGLE_VERSION_PATCH 0
+#endif
+#ifdef AIRPODS_EXPERIMENTAL_RADIO0076
+#define AIRPODS_DONGLE_VARIANT 1u
+#else
+#define AIRPODS_DONGLE_VARIANT 0u
+#endif
+
+static uint16_t firmware_info(uint8_t *out,uint16_t capacity) {
+    if(capacity<6)return 0;
+    out[0]=1;out[1]=AIRPODS_DONGLE_VERSION_MAJOR;out[2]=AIRPODS_DONGLE_VERSION_MINOR;
+    out[3]=(uint8_t)AIRPODS_DONGLE_VERSION_PATCH;out[4]=(uint8_t)(AIRPODS_DONGLE_VERSION_PATCH>>8);
+    out[5]=AIRPODS_DONGLE_VARIANT;
+    return 6;
+}
+
 static uint8_t error(uint8_t result) {
     switch(result){
         case DONGLE_ACCEPTED:return 0;
@@ -124,6 +149,9 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
             if (result!=DONGLE_ACCEPTED) return error(result);
             out[0]=1;out[1]=automatic?1:0;*length=2;return 0;
         }
+        case 24:
+            if(size!=1)return 1;
+            *length=firmware_info(out,capacity);return *length?0:1;
         default:return 7;
     }
 }
