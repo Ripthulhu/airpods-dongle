@@ -81,7 +81,7 @@ static void live_transition(uint16_t report, uint16_t target) {
             assert(playback_pcm_read_adjusted(&pcm,output,480,s.interval));
             for(unsigned i=64;i<480;++i) {assert(output[i*2]==1200);assert(output[i*2+1]==-1200);}
             due-=480; packet_frames+=480;
-            if(packet_frames==1440) {playback_adjust_sent(&s,packet_frames,ms);packet_frames=0;}
+            if(packet_frames==1440) {playback_adjust_sent(&s,packet_frames,ms,true);packet_frames=0;}
         }
     }
     assert(!s.running && !s.failed && ms<2000);
@@ -99,6 +99,11 @@ int main(void) {
     playback_adjust_request(&s,5610,60); assert(!s.pending && s.failed);
     playback_adjust_request(&s,5600,60); assert(s.pending && !s.failed);
     playback_adjust_request(&s,1500,60); assert(s.goal_frames==80*48 && s.interval==11);
+    playback_adjust_start(&s,0);
+    playback_adjust_sent(&s,480,100,false);assert(s.running);
+    playback_adjust_sent(&s,480,100,false);assert(s.running);
+    playback_adjust_sent(&s,480,120,true);assert(!s.running && !s.failed);
+    playback_adjust_request(&s,1500,60);
     playback_adjust_start(&s,UINT32_MAX-500);
     playback_adjust_poll(&s,9498); assert(s.running);
     playback_adjust_poll(&s,9499); assert(!s.running && s.failed);

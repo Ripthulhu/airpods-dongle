@@ -115,7 +115,7 @@ static void claimed_start_proves_buffer_only_after_media(void) {
         if(game) {
             assert(playback_adjust.pending);
             playback_adjust_start(&playback_adjust,now);now+=1000;
-            playback_adjust_sent(&playback_adjust,43200,now);
+            playback_adjust_sent(&playback_adjust,43200,now,true);
             production_game_poll();
             assert(playback_game.phase==GAME_CONFIRMED);
         } else assert(playback_game.phase==GAME_OFF && !playback_game.changed);
@@ -158,7 +158,7 @@ static void post_prime_verification_uses_fresh_send_and_report(void) {
     // The separate timing suite drives the real packet worker. Here finish the
     // production adjustment accounting so the token reaches confirmed, not canceled.
     playback_adjust_start(&playback_adjust,now);now+=1000;
-    playback_adjust_sent(&playback_adjust,43200,now);
+    playback_adjust_sent(&playback_adjust,43200,now,true);
     assert(!playback_adjust_busy(&playback_adjust));
     production_game_poll();production_game_poll();
     set_usb_streaming(false);production_game_poll();set_usb_streaming(true);production_game_poll();

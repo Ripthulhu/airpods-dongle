@@ -7,6 +7,7 @@
 static void ready_job(void) {
     initialize(4,480,324,10,986);
     is_usb_streaming=true;allow_recovery=true;
+    phone_opened=true; // Keep partial-packet lifecycle coverage on the grouped path.
     media_tracker.avdtp_cid=42;media_tracker.local_seid=5;
     media_tracker.samples_ready=960;
     playback_game.changed=true;playback_game.target=60;

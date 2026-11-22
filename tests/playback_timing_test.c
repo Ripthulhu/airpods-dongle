@@ -395,6 +395,23 @@ static void timing(unsigned codec, unsigned samples, unsigned bytes, unsigned in
     assert(consumed - before <= (samples * 4 > 1920 ? samples * 4 : 1920));
     assert(playback_metrics.recoveries == 0);
 }
+static void usb_eld_sends_each_completed_unit(void) {
+    initialize(4,480,324,10,986);
+    is_usb_streaming=true;
+    btstack_timer_source_t timer={.context=&media_tracker};
+    for (unsigned unit=0;unit<60;++unit) {
+        playback_game.changed=unit>=20 && unit<40;
+        playback_game.target=playback_game.changed ? 60 : 150;
+        now+=10;
+        avdtp_audio_timeout_handler(&timer);
+        playback_prepare_packet(&media_tracker,now);
+        assert(send_requested && media_tracker.codec_num_frames==1);
+        send_requested=false;
+        a2dp_demo_send_media_packet();
+        assert(eld_packets==unit+1 && media_tracker.rtp_timestamp==(unit+1)*480);
+    }
+    is_usb_streaming=false;
+}
 static void phone_packet_groups(void) {
     // A nominal 320-byte CBR AU can need one extra byte from FDK's reservoir alignment.
     initialize(4,480,324,10,324);media_tracker.samples_ready=480;
@@ -504,6 +521,7 @@ static void signed_source_credit(void) {
 }
 int main(void) {
     signed_source_credit();
+    usb_eld_sends_each_completed_unit();
     phone_packet_groups();
     rate_boundaries_preserve_source_time();
     fixed_deadlines();

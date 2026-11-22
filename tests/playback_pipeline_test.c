@@ -34,8 +34,6 @@ static unsigned waveform_frames;
 static unsigned waveform_tempo_cost,waveform_tempo_jobs;
 static unsigned waveform_tempo_hundredths,waveform_encoder_hundredths;
 static unsigned waveform_tempo_remainder,waveform_encoder_remainder;
-static unsigned waveform_previous_tempo_ms,waveform_previous_tempo_interval;
-static uint32_t waveform_previous_tempo_generation;
 static unsigned stale_tempo_kind,stale_tempo_hooks;
 static uint32_t stale_tempo_read,stale_tempo_used;
 static int16_t encoder_sample_s16(unsigned index) {
@@ -146,13 +144,6 @@ static void pipeline_encode(AACENC_BufDesc *input,AACENC_InArgs *args) {
         unsigned frames=args->numInSamples/2;
         assert(input->bufElSizes[0]==4 && !bt_locked && !pcm_locked);
         if(encoder_job.tempo) {
-            unsigned interval=encoder_tempo_job.interval;
-            if(interval!=10 && interval==waveform_previous_tempo_interval &&
-               tempo_generation==waveform_previous_tempo_generation)
-                assert((uint32_t)(now-waveform_previous_tempo_ms)>=interval);
-            waveform_previous_tempo_ms=now;
-            waveform_previous_tempo_interval=interval;
-            waveform_previous_tempo_generation=tempo_generation;
             ++waveform_tempo_jobs;
             advance(waveform_tempo_cost+waveform_fractional_ms(waveform_tempo_hundredths,&waveform_tempo_remainder));
         }
@@ -211,8 +202,6 @@ static void fixture(int ppm) {
     waveform_tempo_cost=waveform_tempo_jobs=0;
     waveform_tempo_hundredths=waveform_encoder_hundredths=0;
     waveform_tempo_remainder=waveform_encoder_remainder=0;
-    waveform_previous_tempo_ms=waveform_previous_tempo_interval=0;
-    waveform_previous_tempo_generation=0;
     initialize(4,480,324,10,986);
     is_usb_streaming=true;phone_active=phone_buffer_started=false;
     playback_game.changed=true;playback_game.target=60;
@@ -282,8 +271,8 @@ static void startup_keeps_one_filter_phase(void) {
             for(unsigned i=0;i<960;++i)assert(encoder_sample_s16(i)==0);
         }
         assert(!playback_pcm.priming && playback_pcm.used==1440);
-        // Normal 150 ms mode sends three AUs together: priming finishes inside
-        // a packet, and two real AUs precede its on-wire priming receipt.
+        assert(memcmp(&before,&usb_clock,sizeof(before))==0);
+        playback_media_sent(); // The last primer AU now gets its own send receipt.
         for(unsigned block=0;block<3;++block) {
             audio_pcm_read(480);
             for(unsigned i=0;i<480;++i) {
@@ -292,8 +281,6 @@ static void startup_keeps_one_filter_phase(void) {
                     (int16_t)((position-PLAYBACK_FILTER_DELAY+1u)*8u);
                 assert(encoder_sample_s16(2*i)==expected && encoder_sample_s16(2*i+1)==-expected);
             }
-            if(block<2)assert(memcmp(&before,&usb_clock,sizeof(before))==0);
-            if(block==1)playback_pcm_sent(&playback_pcm);
         }
         assert(!playback_metrics.pcm_underflows);
     }
@@ -1056,6 +1043,44 @@ static void game_transition_measured_pressure(void) {
     waveform_fixture=false;
 }
 
+static void game_transition_keeps_unit_deadlines(void) {
+    for (unsigned interval=9;interval<=11;interval+=2) {
+        waveform_start(100,100,true,true);
+        dongle_playback_encode_complete();
+        if (send_requested) { send_requested=false; a2dp_demo_send_media_packet(); }
+        encode_cost=0;
+        for (unsigned i=0;i<45;++i) ingress(48);
+        uint32_t start=UINT32_MAX-5u;
+        playback_adjust_request(&playback_adjust,interval==9?600:1500,interval==9?150:60);
+        playback_adjust_start(&playback_adjust,start);
+        // Begin late by 1 ms, then make the original next deadline. Beyond
+        // the catch-up window, the slow clock cancels and the fast clock rebases.
+        unsigned stall=2*interval+PLAYBACK_ADJUST_CATCH_UP_UNITS*(interval>10?interval:10);
+        const uint32_t attempts[]={1,interval-1,interval,stall,stall};
+        unsigned sent=eld_packets;
+        for (unsigned i=0;i<sizeof(attempts)/sizeof(*attempts);++i) {
+            now=start+attempts[i];
+            media_tracker.time_audio_data_sent=now;
+            media_tracker.samples_ready=480;
+            if (interval==11 && i==4) break;
+            bool due=i==0 || i==2 || (i==3 && interval==9);
+            assert(fill_aac_audio_buffer(&media_tracker)==(due?480:0));
+            if (due) {
+                assert(encoder_job.tempo);
+                complete_test_encode();
+                assert(send_requested && media_tracker.codec_num_frames==1);
+                send_requested=false;
+                a2dp_demo_send_media_packet();
+                assert(eld_packets==++sent);
+            }
+        }
+        assert(playback_adjust.running==(interval==9) && playback_adjust.failed==(interval==11));
+        assert(!playback_encoder_busy());
+        assert(!playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
+    }
+    waveform_fixture=false;
+}
+
 static void game_transition_ingress_debt(void) {
     static const struct { int32_t arrived; uint16_t consumed; } cases[]={
         {449,448},{1057,528},{1,384},{-17,384},{450,450}
@@ -1117,6 +1142,7 @@ int main(void) {
     game_transition_cpu_budget();
     game_transition_stale_snapshot();
     game_transition_prepare_services_usb_and_fences_source();
+    game_transition_keeps_unit_deadlines();
     game_transition_ingress_debt();
     game_transition_measured_pressure();
     game_transition_insufficient_throughput();

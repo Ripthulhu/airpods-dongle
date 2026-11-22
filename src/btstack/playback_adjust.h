@@ -4,11 +4,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define PLAYBACK_ADJUST_CATCH_UP_UNITS 4u
+
 typedef struct {
     bool pending, running, failed;
     uint8_t interval;
     uint16_t target;
-    uint32_t goal_frames, started, sent_frames;
+    uint32_t goal_frames, started, sent_frames, next_unit_ms;
 } playback_adjust_t;
 
 static inline bool playback_adjust_busy(const playback_adjust_t *s) {
@@ -38,6 +40,7 @@ static inline void playback_adjust_start(playback_adjust_t *s, uint32_t now) {
     if (!s->pending) return;
     s->pending = false; s->running = true;
     s->started = now; s->sent_frames = 0;
+    s->next_unit_ms = now;
 }
 static inline void playback_adjust_poll(playback_adjust_t *s, uint32_t now) {
     if (s->running && (uint32_t)(now - s->started) >= 10000) {
@@ -45,7 +48,7 @@ static inline void playback_adjust_poll(playback_adjust_t *s, uint32_t now) {
     }
 }
 static inline void playback_adjust_sent(playback_adjust_t *s, uint32_t frames,
-                                         uint32_t now) {
+                                         uint32_t now, bool caught_up) {
     if (!s->running) return;
     playback_adjust_poll(s, now);
     if (!s->running) return;
@@ -53,6 +56,7 @@ static inline void playback_adjust_sent(playback_adjust_t *s, uint32_t frames,
     int32_t drift = (int32_t)((uint32_t)(now - s->started) * 48u) -
                     (int32_t)s->sent_frames;
     if (s->interval == 9) drift = -drift;
+    else if (!caught_up) return; // Only slowing down can mistake a stall for progress.
     if (drift >= (int32_t)s->goal_frames) s->running = false;
 }
 // A common denominator preserves fractional frame debt when the interval changes.

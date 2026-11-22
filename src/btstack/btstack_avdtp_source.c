@@ -175,7 +175,6 @@ static playback_tempo_job_t encoder_tempo_job;
 static uint32_t encoder_tempo_epoch, encoder_tempo_generation;
 static uint32_t tempo_read, tempo_fraction, tempo_generation;
 static uint32_t usb_ingress_frames, encoder_tempo_ingress, tempo_ingress_after;
-static uint32_t encoder_tempo_prepared_ms, tempo_prepared_ms;
 _Static_assert(sizeof(encoder_job) <= 128, "AAC job must not consume another audio buffer");
 static bool playback_encoder_busy(void) {
     return atomic_load_explicit(&encoder_job.state, memory_order_acquire) != ENCODE_IDLE;
@@ -402,7 +401,9 @@ static void a2dp_demo_send_media_packet(void) {
     bool adjusting = playback_adjust.running;
     uint8_t old_interval=playback_adjust_interval(&playback_adjust);
     uint32_t now = btstack_run_loop_get_time_ms();
-    playback_adjust_sent(&playback_adjust, samples, now);
+    // One unit can be due while the last encode finishes. A larger gap is not deliberate drift.
+    bool caught_up = (int32_t)(now - playback_adjust.next_unit_ms) < old_interval;
+    playback_adjust_sent(&playback_adjust, samples, now, caught_up);
     if (adjusting && !playback_adjust.running) {
         printf("[GAME] clock done: target=%u elapsed_ms=%lu sent_frames=%lu failed=%u\n",
             playback_adjust.target, (unsigned long)(now-playback_adjust.started),
@@ -976,7 +977,6 @@ static void audio_pcm_read(uint16_t frames) {
     if(encoder_tempo_epoch!=encoder_job.epoch_at_prepare ||
        encoder_tempo_generation!=playback_pcm.generation) encoder_tempo_state.active=false;
     if (playback_adjust.running || encoder_tempo_state.active) {
-        uint32_t prepared_ms=btstack_run_loop_get_time_ms();
         uint8_t interval=playback_adjust_interval(&playback_adjust);
         uint16_t consumed=(uint16_t)(48u*interval);
         uint32_t origin=encoder_tempo_state.active?encoder_tempo_ingress:usb_ingress_frames-consumed;
@@ -992,7 +992,6 @@ static void audio_pcm_read(uint16_t frames) {
             playback_tempo_prepare_checkpointed(&encoder_work.tempo,&encoder_tempo_job,&encoder_tempo_state,
                 interval,consumed,playback_pcm.fraction,playback_pcm.valid_past,playback_pcm.used,
                 playback_tempo_source,&playback_pcm,playback_tempo_checkpoint)) {
-            tempo_prepared_ms=prepared_ms;
             // Retain odd-frame and clamped source debt instead of resetting to the latest arrival.
             tempo_ingress_after=origin+consumed;
             encoder_job.tempo=true;
@@ -1289,11 +1288,22 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
         playback_continuity_reset(&phone_continuity);
         return 0;
     }
-    // Source credit is not permission to exceed the requested receiver clock.
-    if(playback_adjust.running && encoder_tempo_state.active &&
-       encoder_tempo_epoch==atomic_load_explicit(&encoder_job.epoch,memory_order_relaxed) &&
-       encoder_tempo_generation==playback_pcm.generation &&
-       (uint32_t)(btstack_run_loop_get_time_ms()-encoder_tempo_prepared_ms)<playback_adjust.interval) return 0;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (playback_adjust.running) {
+        int32_t late = (int32_t)(now - playback_adjust.next_unit_ms);
+        if (late < 0) return 0;
+        uint8_t interval = playback_adjust.interval;
+        unsigned budget = PLAYBACK_ADJUST_CATCH_UP_UNITS * (interval > 10 ? interval : 10);
+        if ((uint32_t)late >= budget) {
+            if (interval == 11) {
+                playback_adjust_cancel_stream(context,now,interval);
+                playback_adjust.failed = true;
+                return 0;
+            }
+            // The fast clock still has to earn its lead from actual sends.
+            playback_adjust.next_unit_ms = now;
+        }
+    }
     (void)playback_encoder_packet_current();
     if (cur_codec == 4 && !playback_bitrate_apply(context)) return playback_encoder_failed(context);
     if(playback_adjust.running)playback_clock_accrue(context,btstack_run_loop_get_time_ms());
@@ -1345,6 +1355,8 @@ static int fill_aac_audio_buffer(a2dp_media_sending_context_t *context) {
         playback_clock_accrue(context,btstack_run_loop_get_time_ms());
         playback_clock_debit(context,encoder_tempo_job.consumed,encoder_tempo_job.interval);
     } else context->samples_ready -= frames;
+    // Keep phase for bounded catch-up. The worker still prepares one unit at a time.
+    if (playback_adjust.running) playback_adjust.next_unit_ms += playback_adjust.interval;
     if (!context->codec_storage_count) packet_oldest_us = encoder_job.unit_started;
     atomic_store_explicit(&encoder_job.state, ENCODE_PREPARED, memory_order_release);
     critical_section_exit(&playback_pcm_lock);
@@ -1467,8 +1479,9 @@ static bool playback_encoder_packet_current(void) {
 static bool playback_aac_packet_submit(a2dp_media_sending_context_t *context, uint32_t now) {
     if (playback_encoder_busy() || context->codec_ready_to_send || !context->codec_storage_count) return false;
     if (!playback_encoder_packet_current()) return false;
-    unsigned limit = (phone_opened || call_opened) ? 2u :
-        playback_game.changed && playback_game.target == 60 ? 2u : 3u;
+    unsigned limit = playback_game.changed && playback_game.target == 60 ? 2u : 3u;
+    if (phone_opened || call_opened) limit = 2;
+    else if (is_usb_streaming) limit = 1;
     bool full = cur_codec == 2 || (cur_codec == 4 &&
         (context->codec_num_frames >= limit ||
          context->max_media_payload_size - context->codec_storage_count <
@@ -1507,7 +1520,6 @@ void dongle_playback_encode_complete(void) {
             encoder_tempo_epoch=encoder_job.epoch_at_prepare;
             encoder_tempo_generation=playback_pcm.generation;
             encoder_tempo_ingress=tempo_ingress_after;
-            encoder_tempo_prepared_ms=tempo_prepared_ms;
         } else if(encoder_job.tempo) encoder_tempo_state.active=false;
         playback_work_pending = true;
     } else playback_encoder_discard(true);

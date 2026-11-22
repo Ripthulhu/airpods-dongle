@@ -40,9 +40,18 @@ fraction, PCM generation, retained history and required future input. Rendering
 then runs unlocked. Only a current, successful encoder job commits the next
 overlap state. A reset or overwritten/trimmed/zero-padded timeline invalidates
 history. Source-time credit retains fractional and negative balances across
-clock changes. An independent 9/11 ms minimum preparation cadence prevents
-inherited credit from sending faster than the requested receiver clock.
+clock changes. From 0.1.70, a preparation deadline advances by 9/11 ms from the
+scheduled time. Brief lateness can be recovered one unit at a time within four
+intervals (at least 40 ms). A longer gap cancels a slow adjustment. A fast
+adjustment resumes from a fresh deadline and still has to earn its lead from
+actual submissions. A slow adjustment cannot finish on a send that is at least
+one interval behind its next preparation deadline.
 Cancellation and reversal retain the finite, actual-sent-frame drift target.
+
+Direct USB AAC-ELD sends one 480-sample access unit per RTP packet in both modes,
+matching LibrePods' native encoder. The phone relay and call routes keep their
+grouped packets. More frequent USB-path sends need live controller and weak-signal
+checks, including packet gaps and completed packets.
 
 The final unit blends the carried waveform back to the exact normal fractional
 FIR timeline. A splice is not mathematically transparent for all signals: a
@@ -51,6 +60,31 @@ bend. Do not describe synthetic pitch checks as listening acceptance.
 
 Delay corrections above 500 ms are rejected before changing the sample clock,
 matching Android's admission bound. The existing ten-second safeguard remains.
+
+## USB clock feedback feasibility
+
+The current USB speaker advertises an adaptive OUT endpoint with a fixed 48 kHz
+format. Its 1 ms PCM32 packet is capped at 392 bytes, or 49 stereo frames. An
+asynchronous OUT endpoint with explicit feedback could request variable packet
+sizes. One 480-frame unit every 11 ms needs an average of 43.64 frames/ms. One
+every 9 ms needs 53.33 frames/ms and a maximum of at least 54 frames (432 bytes
+for stereo PCM32). Feedback alone cannot exceed the current descriptor limit.
+
+Windows supports explicit feedback on an asynchronous OUT alternate setting.
+The Android common kernel uses the feedback rate to size playback packets and
+caps them at the negotiated endpoint maximum. These capabilities do not establish
+how either host's mixer behaves during a brief 9–11% rate offset. A host that
+queues unchanged PCM can absorb the rate mismatch upstream, moving the latency.
+If a host resamples the source instead, pitch and timing need to be measured.
+[Windows USB Audio driver](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/usb-2-0-audio-drivers),
+[Android common USB audio driver](https://android.googlesource.com/kernel/common/+/refs/heads/android13-5.15/sound/usb/endpoint.c),
+[TinyUSB feedback reference](https://docs.tinyusb.org/en/latest/reference/class/audio.html).
+
+An isolated feedback build can first validate enumeration, PCM32, clock drift,
+volume, and the microphone on each host at nominal rate. Then it can measure
+actual samples/ms, host and device queue depth, pitch and end-to-end latency
+through temporary rates and restoration. Keep the existing USB clock and
+time-stretch path until that comparison demonstrates a benefit.
 
 ## Validation
 

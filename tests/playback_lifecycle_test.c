@@ -530,7 +530,7 @@ static void game_receipts_follow_actual_send(void) {
     assert(playback_adjust.pending && playback_adjust.interval==11);
     assert(playback_game.phase==GAME_PENDING);
     playback_adjust_start(&playback_adjust,now);
-    now+=990; playback_adjust_sent(&playback_adjust,43200,now);
+    now+=990; playback_adjust_sent(&playback_adjust,43200,now,true);
     dongle_playback_poll();
     assert(!playback_adjust_busy(&playback_adjust) && playback_game.phase==GAME_CONFIRMED);
     assert(media_tracker.streaming);
