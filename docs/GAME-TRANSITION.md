@@ -70,6 +70,12 @@ sizes. One 480-frame unit every 11 ms needs an average of 43.64 frames/ms. One
 every 9 ms needs 53.33 frames/ms and a maximum of at least 54 frames (432 bytes
 for stereo PCM32). Feedback alone cannot exceed the current descriptor limit.
 
+USB Audio 2.0 Type I allows only a one-frame deviation from nominal at a fixed
+sample rate. The pinned TinyUSB feedback helpers follow that rule and limit 48 kHz
+full-speed playback to 47–49 frames/ms. A wider endpoint and raw feedback can be
+used for a lab experiment, but those Game Mode rates are outside the fixed-rate
+packet rules. See section 2.3.1.1 of the [USB Audio 2.0 data formats specification](https://www.usb.org/document-library/audio-devices-rev-20-and-adopters-agreement).
+
 Windows supports explicit feedback on an asynchronous OUT alternate setting.
 The Android common kernel uses the feedback rate to size playback packets and
 caps them at the negotiated endpoint maximum. These capabilities do not establish
@@ -80,11 +86,10 @@ If a host resamples the source instead, pitch and timing need to be measured.
 [Android common USB audio driver](https://android.googlesource.com/kernel/common/+/refs/heads/android13-5.15/sound/usb/endpoint.c),
 [TinyUSB feedback reference](https://docs.tinyusb.org/en/latest/reference/class/audio.html).
 
-An isolated feedback build can first validate enumeration, PCM32, clock drift,
-volume, and the microphone on each host at nominal rate. Then it can measure
-actual samples/ms, host and device queue depth, pitch and end-to-end latency
-through temporary rates and restoration. Keep the existing USB clock and
-time-stretch path until that comparison demonstrates a benefit.
+An isolated feedback build can validate enumeration, PCM32, volume and the
+microphone on each host, then measure actual samples/ms, host and device queue
+depth, pitch and end-to-end latency during small clock corrections. Keep the
+current USB clock and time-stretch path for the Game Mode transition.
 
 ## Validation
 
