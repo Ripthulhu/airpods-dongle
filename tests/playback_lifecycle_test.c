@@ -39,7 +39,7 @@ static uint8_t cur_active_device[6];
 static uint8_t cur_codec, cur_capability;
 static uint32_t now, profile_since, game_session, delay_revision, actual_bitrate;
 static uint32_t reconnect_since, reconnect_delay = 1000;
-static uint16_t reported_delay;
+static uint16_t reported_delay, aaceld_frame_sequence;
 enum { PLAYBACK_RUNNING, PLAYBACK_SUSPENDING, PLAYBACK_SUSPENDED, PLAYBACK_STARTING, PLAYBACK_CLAIMING };
 static unsigned playback_idle_phase;
 static bool mic_prepare_open, mic_recovery_pending, mic_recovery_started;
@@ -53,7 +53,7 @@ typedef struct {
     uint16_t avdtp_cid, avrcp_cid, local_seid, remote_seid;
     bool streaming;
     uint8_t codec_ready_to_send;
-    uint32_t time_audio_data_sent, samples_ready, acc_num_missed_samples;
+    uint32_t time_audio_data_sent, samples_ready, acc_num_missed_samples, rtp_timestamp;
     uint64_t sample_debt;
     btstack_timer_source_t audio_timer;
 } a2dp_media_sending_context_t;
@@ -338,9 +338,13 @@ static void media_open_failure_retires_only_the_current_output(void) {
         assert(!memcmp(connected_address,address,6));
         // A late failure from the retired CID cannot tear down its replacement.
         a2dp_is_connected_flag=true;a2dp_connect_pending=false;finish_scan_avdtp_codec=true;
+        media_tracker.rtp_timestamp=1920;
+        aaceld_frame_sequence=5;
         media_established(70,address,0x67,14);assert(disconnects==1 && finish_scan_avdtp_codec);
+        assert(media_tracker.rtp_timestamp==1920 && aaceld_frame_sequence==5);
         media_established(media_tracker.avdtp_cid,address,0,14);
         assert(disconnects==1 && avrcp_schedules==1 && !media_tracker.streaming);
+        assert(media_tracker.rtp_timestamp==0 && aaceld_frame_sequence==1);
         assert(playback_idle_phase==(audio_owned?PLAYBACK_SUSPENDED:PLAYBACK_RUNNING));
         assert(audio_owned==(active_input!=0)); // Recovery never claims a standby route or sends Play.
     }

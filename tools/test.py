@@ -74,6 +74,9 @@ def playback_lifecycle_sources(directory):
     end = source.index("\nstatic void playback_encoder_close(void);", start)
     (directory / "playback_encoder_state.inc").write_text(source[start:end])
     start = source.index("static bool aaceld_encoder_init(void) {")
+    encoder_reset = source[start:source.index("\n}", start)]
+    if re.search(r"\b(rtp_timestamp|aaceld_frame_sequence)\b", encoder_reset):
+        raise ValueError("Encoder reset must preserve the media channel timeline")
     start = source.index("{", start) + 1
     end = source.index("\n    if (handleAAC != NULL)", start)
     (directory / "playback_encoder_reset_guard.inc").write_text(

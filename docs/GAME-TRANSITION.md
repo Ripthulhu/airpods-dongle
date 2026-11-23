@@ -53,6 +53,15 @@ matching LibrePods' native encoder. The phone relay and call routes keep their
 grouped packets. More frequent USB-path sends need live controller and weak-signal
 checks, including packet gaps and completed packets.
 
+Both 0.1.69 and the first 0.1.70 preview reset the RTP timestamp and AAC-ELD
+access-unit sequence when reopening the encoder. Bluetooth media recovery can
+suspend and resume on the same channel, where BTstack keeps the RTP sequence
+number. The November 23 preview trace showed the RTP timestamp jump backward
+across such a recovery while the connection stayed up. LibrePods preserves both
+media counters on a feeding reset. The dongle now initializes them when a new
+media channel opens and keeps them through encoder recovery. AirPods playback
+after a live recovery still needs verification.
+
 The final unit blends the carried waveform back to the exact normal fractional
 FIR timeline. A splice is not mathematically transparent for all signals: a
 short bass-envelope change can remain, although it avoids the former 10% pitch

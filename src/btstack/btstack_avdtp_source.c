@@ -1175,8 +1175,6 @@ static bool aaceld_encoder_init(void) {
         aacEncoder_GetParam(handleAAC,AACENC_PEAK_BITRATE)!=(playback_bitrate.current ? playback_bitrate.current : aaceld_bitrate) ||
         aacEncoder_GetParam(handleAAC,AACENC_BITRATEMODE)!=(playback_options.rate_mode ?
             ((playback_bitrate.current ? playback_bitrate.current : aaceld_bitrate)<192000 ? 4u : 5u) : 0u)) goto fail;
-    aaceld_frame_sequence = 1;
-    media_tracker.rtp_timestamp = 0;
     ++playback_inspect.stats[11];
     playback_inspect.stats[10]=0;
     return true;
@@ -2175,6 +2173,9 @@ static void media_connection_established(uint8_t *packet, uint16_t size) {
     avdtp_cid = avdtp_subevent_streaming_connection_established_get_avdtp_cid(packet);
     media_tracker.local_seid = avdtp_subevent_streaming_connection_established_get_local_seid(packet);
     media_tracker.remote_seid = avdtp_subevent_streaming_connection_established_get_remote_seid(packet);
+    // Encoder recovery reuses this media channel. Start the wire timeline only on a new channel.
+    media_tracker.rtp_timestamp = 0;
+    aaceld_frame_sequence = 1;
     a2dp_is_connected_flag = true;
 
     printf("Streaming connection established, avdtp_cid 0x%02x\n", avdtp_cid);
@@ -2370,8 +2371,6 @@ static void vendor_codec_configuration_received(uint8_t *packet, uint16_t size) 
         printf("AAC-ELD acc_num_simples=%d\n", acc_num_simples);
 
         audio_slot_queue_configure_with_count(acc_num_simples, AUDIO_SLOT_COUNT_ELD);
-
-        aaceld_frame_sequence = 1;
 
         cur_codec = 4;  // new codec ID for AAC-ELD
         actual_bitrate=aaceld_bitrate; profile_pending=false;
