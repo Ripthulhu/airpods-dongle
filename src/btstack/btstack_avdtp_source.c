@@ -1645,6 +1645,12 @@ static void playback_audio_work(uint32_t now) {
     uint32_t limit=4u*acc_num_simples;
     if(limit<PLAYBACK_USB_DEBT_LIMIT)limit=PLAYBACK_USB_DEBT_LIMIT;
     limit=limit*10u/playback_adjust_interval(&playback_adjust);
+    // The USB FIFO already retains one extra ELD unit. Let a progressing stream encode it.
+    if (context->samples_ready>limit && is_usb_streaming && !external && cur_codec==4 &&
+        playback_pcm.primed_on_wire && !playback_adjust_busy(&playback_adjust) &&
+        playback_pcm.used>=context->samples_ready && media_last_sent_us &&
+        time_us_32()-media_last_sent_us<60000u)
+        limit+=PLAYBACK_ELD_FRAME_SAMPLES;
     if(external && playback_pcm.dropped_pending) {
         // Credit physical losses only against overdue work that would otherwise
         // be trimmed again below. Cancelling healthy or future deadlines keeps
@@ -1662,6 +1668,8 @@ static void playback_audio_work(uint32_t now) {
     }
     if(is_usb_streaming && !external &&
        (usb_recovery_drops || context->samples_ready>limit || playback_transport_stale)) {
+        playback_trace_usb_recovery(&playback_trace,usb_recovery_drops!=0,
+                                    context->samples_ready>limit,playback_transport_stale);
         uint32_t trimmed=playback_pcm_limit(&playback_pcm,PLAYBACK_USB_MIN_FRAMES);
         uint32_t skipped=usb_recovery_drops+trimmed;
         playback_metrics.pcm_drops+=trimmed;

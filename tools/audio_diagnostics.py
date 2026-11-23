@@ -246,6 +246,13 @@ def decode_trace(data):
         raise RuntimeError('Unsupported audio trace layout')
     result = dict(zip(('time_us_wrapped', 'event_serial', 'pcm_used', 'sample_debt',
                        'game_phase', 'rtp_timestamp', 'reserved'), struct.unpack_from('<7I', data, 4)))
+    result['usb_timeline_recovery'] = None
+    if data[28] & 0x80:
+        reasons = ('usb_pcm_drop', 'deadline_debt', 'stale_send')
+        result['usb_timeline_recovery'] = {
+            'last_reasons': [reason for bit, reason in enumerate(reasons) if data[28] & (1 << bit)],
+            'counts_mod_256': dict(zip(reasons, data[29:32])),
+        }
     result['stats'] = dict(zip(TRACE_STATS, struct.unpack_from('<24I', data, 32)))
     result['events'] = []
     for i in range(data[2]):

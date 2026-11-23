@@ -447,6 +447,45 @@ static void usb_bursts_at_steady_queue_limit(void) {
         assert(!usb_recovery_drops && !playback_metrics.recoveries && !playback_trace.stats[TRACE_DEBT_DROP]);
     }
 }
+static void usb_retained_debt_can_catch_up(void) {
+    fixture(0);encode_cost=6;filter_cost=1;allow_recovery=true;
+    while(now<1100)step();
+    blocked_until=now+25;
+    while(!send_requested && now<blocked_until)step();
+    assert(send_requested);
+    // Replay the measured mean debt per restart, with the corresponding PCM still buffered.
+    for(unsigned fill=playback_pcm.used;fill<4080;fill+=48)ingress(48);
+    assert(playback_pcm.used>=4080);
+    media_tracker.samples_ready=2971;
+    media_tracker.time_audio_data_sent=now;
+    check_sequence=false;
+    playback_audio_work(now);
+    assert(media_tracker.streaming && media_tracker.samples_ready==2971);
+    blocked_until=now;
+    unsigned sent=emitted,end=now+450;
+    while(now<end)step();
+    assert(emitted-sent>=450u*48u && playback_pcm.used<PLAYBACK_USB_ACTIVE_LIMIT);
+    assert(media_tracker.samples_ready<2u*PLAYBACK_ELD_FRAME_SAMPLES);
+    assert(!sink_underruns && !playback_metrics.pcm_drops && !playback_metrics.pcm_underflows);
+    assert(!playback_trace.stats[TRACE_DEBT_DROP] && !playback_metrics.recoveries);
+    assert(!playback_trace.last_usb_recovery);
+}
+static void usb_debt_recovery_is_bounded(void) {
+    const struct { unsigned debt, retained, last_send_age_us; } cases[]={
+        {3361,4080,10000}, {2971,1920,10000}, {2971,4080,60000}
+    };
+    for(unsigned i=0;i<sizeof(cases)/sizeof(*cases);++i) {
+        fixture(0);allow_recovery=true;now=100;
+        for(unsigned fill=playback_pcm.used;fill<cases[i].retained;fill+=48)ingress(48);
+        assert(playback_pcm.used==cases[i].retained);
+        media_last_sent_us=time_us_32()-cases[i].last_send_age_us;
+        media_tracker.samples_ready=cases[i].debt;
+        playback_audio_work(now);
+        assert(!media_tracker.streaming && suspend_recovery_pending && playback_metrics.recoveries==1);
+        assert(playback_trace.stats[TRACE_DEBT_DROP]==cases[i].debt);
+        assert(playback_trace.last_usb_recovery==2 && playback_trace.usb_debt_recoveries==1);
+    }
+}
 static void usb_burst_beyond_headroom(void) {
     for(unsigned floating=0;floating<2;++floating) {
         fixture(0);
@@ -463,6 +502,7 @@ static void usb_burst_beyond_headroom(void) {
         allow_recovery=true;
         playback_audio_work(now);
         assert(suspend_recovery_pending && !media_tracker.streaming && playback_metrics.recoveries==1);
+        assert(playback_trace.last_usb_recovery==1 && playback_trace.usb_drop_recoveries==1);
     }
 }
 static void excessive_stall(void) {
@@ -495,6 +535,7 @@ static void stale_receiver_window(void) {
     assert(playback_transport_stale);
     allow_recovery=true;playback_audio_work(now);
     assert(suspend_recovery_pending && !media_tracker.streaming && playback_metrics.recoveries==1);
+    assert(playback_trace.last_usb_recovery==4 && playback_trace.usb_stale_recoveries==1);
 }
 static void jitter_and_live_changes(void) {
     fixture(100);usb_jitter=variable_cost=true;
@@ -1131,6 +1172,8 @@ int main(void) {
     seven_packets_in_a_sixty_ms_receiver_window();
     timer_interrupts_respect_bluetooth_lock();
     usb_bursts_at_steady_queue_limit();
+    usb_retained_debt_can_catch_up();
+    usb_debt_recovery_is_bounded();
     usb_burst_beyond_headroom();
     call_prefill_uses_call_clock();
     startup_keeps_one_filter_phase();

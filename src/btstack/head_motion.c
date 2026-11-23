@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <stddef.h>
 #include <string.h>
+#include "pico/time.h"
 
 #include "head_motion.h"
 #include "../tinyusb/motion_usb.h"
@@ -23,6 +24,7 @@ static uint64_t announcement, last_timestamp;
 static uint16_t tx_sequence;
 static uint8_t role[4], service, probes, applied_rate;
 static bool receive_enabled, timed_out, retried;
+static realtime_metric_t rx_work;
 static enum { STOPPED, START_FIFO_SET, RUNNING, STOP_REQUESTED, STOP_INTERVAL_SET } stream;
 
 static uint32_t le32(const uint8_t *p) {
@@ -257,6 +259,7 @@ static void payload(bytes_t b, uint32_t now) {
 
 bool head_motion_receive(const uint8_t *p, uint16_t n, uint32_t now) {
     if (!receive_enabled || !n) return false;
+    uint32_t started = time_us_32();
     if (used && (uint32_t)(now - fragment_ms) > 100u) used = 0;
     if (n >= sizeof(prefix) && !memcmp(p, prefix, sizeof(prefix))) used = 0;
     else if (n >= 6 && !memcmp(p, prefix, 4) && memcmp(p, prefix, n < sizeof(prefix) ? n : sizeof(prefix)))
@@ -291,7 +294,14 @@ bool head_motion_receive(const uint8_t *p, uint16_t n, uint32_t now) {
         consumed = true;
     }
     fragment_ms = now;
+    // Wall time through parsing and mailbox publication includes any IRQ preemption.
+    // Controller reception and the later USB transfer are outside this interval.
+    if (consumed) realtime_metric_record(&rx_work, started, time_us_32(), UINT32_MAX);
     return consumed;
+}
+
+realtime_metric_t head_motion_receive_work(void) {
+    return rx_work;
 }
 
 static bool request(uint8_t report, uint32_t value, bool (*send)(uint8_t *, uint16_t)) {

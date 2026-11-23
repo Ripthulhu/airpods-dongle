@@ -7,20 +7,31 @@
 #include "head_motion_announcement.inc"
 
 static uint32_t now, writes, reports;
+static uint32_t readiness_checks, absolute_time_reads, parser_clock, publish_during_send;
 static bool hid_ready, hid_accepts, tx_ready;
 static uint8_t sent[32], output[USB_MOTION_SIZE];
 static uint16_t sent_size;
 
 uint32_t save_and_disable_interrupts(void) { return 0; }
 void restore_interrupts(uint32_t previous) { assert(previous == 0); }
-uint64_t get_absolute_time(void) { return (uint64_t)now * 1000; }
+uint32_t time_us_32(void) { return ++parser_clock; }
+uint64_t get_absolute_time(void) { ++absolute_time_reads; return (uint64_t)now * 1000; }
 uint32_t to_ms_since_boot(uint64_t time) { return time / 1000; }
-bool tud_hid_n_ready(uint8_t instance) { assert(instance == USB_MOTION_INSTANCE); return hid_ready; }
+bool tud_hid_n_ready(uint8_t instance) {
+    assert(instance == USB_MOTION_INSTANCE);
+    ++readiness_checks;
+    return hid_ready;
+}
 bool tud_hid_n_report(uint8_t instance, uint8_t id, const void *report, uint16_t length) {
     assert(instance == USB_MOTION_INSTANCE && id == USB_MOTION_INPUT_ID && length == sizeof(output));
     if (!hid_accepts) return false;
     memcpy(output, report, length);
     ++reports;
+    if (publish_during_send) {
+        uint8_t next[USB_MOTION_SIZE] = {2};
+        usb_motion_publish(publish_during_send, now, next);
+        publish_during_send = 0;
+    }
     return true;
 }
 
@@ -87,11 +98,44 @@ static size_t make_report(uint8_t *frame, uint8_t log, uint8_t service, uint8_t 
     return 12 + frame[10];
 }
 
+static void test_mailbox_idle_and_publish_during_send(void) {
+    usb_motion_set_rate(100);
+    uint8_t rate;
+    uint32_t owner = usb_motion_lease(&rate);
+    assert(owner && rate == 100);
+    uint32_t reads = absolute_time_reads;
+    for (unsigned tick = 0; tick < 2000; ++tick) usb_motion_task();
+    assert(readiness_checks == 0 && absolute_time_reads == reads);
+
+    uint8_t first[USB_MOTION_SIZE] = {1};
+    usb_motion_publish(owner, now, first);
+    hid_ready = hid_accepts = true;
+    publish_during_send = owner;
+    usb_motion_task();
+    assert(readiness_checks == 1 && reports == 1 && output[0] == 1);
+    usb_motion_task();
+    assert(readiness_checks == 2 && reports == 2 && output[0] == 2);
+    usb_motion_task();
+    assert(readiness_checks == 2);
+
+    // An idle lease expires on the next observation even when no USB poll needs it.
+    now += 3000;
+    usb_motion_task();
+    assert(readiness_checks == 2 && !usb_motion_lease(&rate));
+}
+
 int main(void) {
+    test_mailbox_idle_and_publish_during_send();
     for (size_t split = 0; split <= sizeof(motion_announcement); ++split) setup(split);
     uint8_t frame[160];
     size_t length = make_report(frame, 5, 14, 1);
-    head_motion_receive(frame, length, now);
+    realtime_metric_t work = head_motion_receive_work();
+    const uint8_t unrelated[] = {4, 0, 4, 0, 7, 0};
+    assert(!head_motion_receive(unrelated, sizeof(unrelated), now));
+    assert(head_motion_receive_work().count == work.count);
+    assert(head_motion_receive(frame, length, now));
+    realtime_metric_t after = head_motion_receive_work();
+    assert(after.count == work.count + 1 && after.total_us == work.total_us + 1 && after.max_us == 1);
     usb_motion_task();
     assert(reports == 0);
     length = make_report(frame, 5, 16, 1);

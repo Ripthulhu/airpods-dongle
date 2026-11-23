@@ -9,7 +9,7 @@
 // The USB task and BTstack both run on core 0. Keep this mailbox newest-only.
 static uint32_t serial, lease, renewed, arrived, revision;
 static uint8_t requested_rate;
-static bool pending;
+static volatile bool pending;
 static uint8_t latest[USB_MOTION_SIZE];
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
@@ -81,7 +81,8 @@ void usb_motion_publish(uint32_t owner, uint32_t now, const uint8_t report[USB_M
 }
 
 void usb_motion_task(void) {
-    if (!tud_hid_n_ready(USB_MOTION_INSTANCE)) return;
+    // An IRQ can publish after the empty check. The next USB tick picks it up.
+    if (!pending || !tud_hid_n_ready(USB_MOTION_INSTANCE)) return;
     uint8_t report[USB_MOTION_SIZE];
     uint32_t irq = save_and_disable_interrupts();
     uint32_t now = now_ms();

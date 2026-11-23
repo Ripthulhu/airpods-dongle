@@ -185,6 +185,7 @@ class AudioDiagnosticsTests(unittest.TestCase):
         struct.pack_into('<4I', data, 144, 71300, 10, 70, 7)
         struct.pack_into('<4I', data, 160, 72000, 255, 3, 4)
         decoded = diagnostics.decode_trace(data)
+        self.assertIsNone(decoded['usb_timeline_recovery'])  # Older firmware left bytes 28..31 zero.
         self.assertEqual(decoded['stats']['usb_alternate_setting'], 2)
         self.assertEqual(decoded['events'][0]['kind'], 'controller_flush')
         self.assertEqual(decoded['events'][1], dict(time_us_wrapped=71300,
@@ -196,6 +197,19 @@ class AudioDiagnosticsTests(unittest.TestCase):
         data[2] = 25
         with self.assertRaises(RuntimeError):
             diagnostics.decode_trace(data)
+
+    def test_usb_recovery_extension(self):
+        data = bytearray(512)
+        data[:2] = bytes((1, 16))
+        data[28] = 0x80
+        empty = diagnostics.decode_trace(data)['usb_timeline_recovery']
+        self.assertEqual(empty['last_reasons'], [])
+        self.assertFalse(any(empty['counts_mod_256'].values()))
+        data[28:32] = bytes((0x85, 255, 2, 0))
+        self.assertEqual(diagnostics.decode_trace(data)['usb_timeline_recovery'], {
+            'last_reasons': ['usb_pcm_drop', 'stale_send'],
+            'counts_mod_256': {'usb_pcm_drop': 255, 'deadline_debt': 2, 'stale_send': 0},
+        })
 
     def test_profiling_restores_game_mode_after_capture_failure(self):
         original = dict(game_requested=True, audio_flags=10,

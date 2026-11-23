@@ -8,6 +8,9 @@
 #include "btstack/btstack_hci.h"
 #include "btstack/btstack_ble_scan.h"
 #include "btstack/btstack_aacp.h"
+#if AIRPODS_HEAD_TRACKING
+#include "btstack/head_motion.h"
+#endif
 #include "btstack/aacp_mic_dec.h"
 #include "btstack/mic_decoder_lifecycle.h"
 #include "btstack/phone_sink.h"
@@ -78,6 +81,12 @@ static void realtime_work_print(void) {
            (unsigned long)usb.total_us, (unsigned long)bluetooth.total_us,
            (unsigned long)lock.total_us, (unsigned long)lock.max_us,
            (unsigned long)bluetooth.count);
+#if AIRPODS_HEAD_TRACKING
+    // Emit the short motion summary before the detailed report fills the CDC ring.
+    realtime_metric_t motion = head_motion_receive_work();
+    printf("[MOTION_WORK] rx_calls=%lu rx_us=%lu rx_max_us=%lu\n",
+           (unsigned long)motion.count, (unsigned long)motion.total_us, (unsigned long)motion.max_us);
+#endif
     dongle_playback_work_report();
 }
 

@@ -266,7 +266,9 @@ storage and uses normal 42-byte paging; command 10 remains the settings lease.
 | Offset | Contents |
 | --- | --- |
 | 0, 1, 2, 3 | Version 1, event size 16, event count 0..24, reserved 0 |
-| 4..28 | Seven u32: snapshot microseconds, event serial, PCM used, sample debt, Game phase, RTP timestamp, reserved |
+| 4..27 | Six u32: snapshot microseconds, event serial, PCM used, sample debt, Game phase, RTP timestamp |
+| 28 | Bit 7 indicates USB recovery diagnostics are available. Bits 0, 1 and 2 record the conditions at the last hard USB timeline recovery: actual USB PCM loss, deadline debt above the active hard limit, and stale send, respectively. Multiple bits can be set. |
+| 29..31 | One counter per condition in the same order, each modulo 256 since boot. These counts survive event history rollover. Older firmware returns zero for bytes 28..31. |
 | 32..127 | Twenty-four u32 statistics below |
 | 128..511 | Up to 24 chronological events: u32 microseconds, kind, argument A, argument B |
 
