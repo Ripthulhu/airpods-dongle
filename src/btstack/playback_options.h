@@ -141,8 +141,12 @@ static inline uint16_t playback_game_step(playback_game_t *s, bool available,
         report_revision!=s->report_revision && delay && delay!=UINT16_MAX) {
         s->waiting_report=false;
         s->low_latency_confirmed=s->target==60;
-        if (s->target==150) { s->changed=false; s->phase=s->failed ? GAME_FAILED : s->requested ? GAME_PENDING : GAME_OFF; }
-        else s->phase=GAME_CONFIRMED;
+        if (s->target==150) {
+            s->changed=false;
+            // Keep an enable failure visible only while the user still wants Game Mode.
+            if (!s->requested) s->failed=false;
+            s->phase=s->failed ? GAME_FAILED : s->requested ? GAME_PENDING : GAME_OFF;
+        } else s->phase=GAME_CONFIRMED;
     }
     if ((s->waiting_tx || s->waiting_report) && (uint32_t)(now-s->sent_since)>=2000) {
         s->waiting_tx=s->waiting_report=false; s->failed=true;

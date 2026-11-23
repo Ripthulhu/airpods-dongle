@@ -184,6 +184,11 @@ static void test_game_faults_wrap_and_session_loss(void) {
     for (unsigned i=0;i<1000;++i) assert(!playback_game_step(&s,true,true,true,2200+i,3,1500));
     playback_game_request(&s,false);
     assert(playback_game_step(&s,true,true,false,4000,3,1500)==150);
+    playback_game_queued(&s,150,4000,2);
+    playback_game_observe_send(&s,4001,3,150,3);
+    assert(!playback_game_step(&s,true,true,true,4002,4,0) && s.waiting_report);
+    assert(!playback_game_step(&s,true,true,true,4003,5,1100));
+    assert(s.phase==GAME_OFF && !s.changed && !s.failed && !s.restore_failed);
     s=(playback_game_t){0}; playback_game_request(&s,true);
     playback_game_queued(&s,60,0,1); playback_game_observe_send(&s,1,2,60,0);
     assert(playback_game_step(&s,true,true,true,2001,1,600)==150 && s.failed);

@@ -172,4 +172,19 @@ Hardware music, both transitions, rapid toggle, pause/resume, volume and weak
 signal checks are required before calling the preview accepted. Exact source,
 test, binary, benchmark and deployment receipts belong with the release.
 
+On November 23, the 0.1.70 recovery preview stayed silent with the same
+Bluetooth owner and advancing RTP timestamps. In 13.985 s, Windows supplied
+671,136 PCM frames and the controller reported 1,398 packet completions, with
+no recorded PCM losses or controller flushes. Controller completions cannot show
+whether the AirPods rendered the audio. Pausing and resuming restored sound
+without replacing the connection.
+
+During silence, the last delay report was zero. The Off request could not
+confirm normal buffering. A later Off retry during audible playback transmitted
+150 ms and received a fresh 110 ms report, initiating a 9 ms clock adjustment.
+The firmware kept the earlier failure latched even after a fresh Off report.
+The explicit Off path now clears the old failure on fresh confirmation. A failure
+in the current clock adjustment can still surface. This addresses status and
+restoration bookkeeping. The cause of the silent AirPods stream remains open.
+
 Algorithm background: [Verhelst and Roelands, WSOLA (1993)](https://sps.ewi.tudelft.nl/Education/courses/ee4c03/assignments/audio_lpc/roelands93icassp.pdf).
