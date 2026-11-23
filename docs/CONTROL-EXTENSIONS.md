@@ -184,8 +184,8 @@ Status/Packet Type Changed admission remain; an unknown or failed baseline is
 not reported as confirmed. Toggling Game Mode does not issue another packet-type
 command. Existing restoration debt keeps the same owner/epoch, command-credit,
 timeout, late-reply and disconnect fences. Receiver buffer targets stay at 60 ms
-for Game Mode and 150 ms for normal mode, with the existing finite clock and
-pitch-preserving USB transition. Codec and volume policies are unchanged.
+for Game Mode and 150 ms for normal mode. Direct USB playback briefly changes
+speed while adjusting the receiver buffer. See [USB Game Mode transitions](GAME-TRANSITION.md).
 
 The override expires after 120 seconds, including across timer wrap. Repeated
 enable requests and playback polling do not renew it. Disable, selected-peer or
@@ -552,6 +552,9 @@ as signed byte (`7F` unknown); trend (0 unknown,
 1 stronger, 2 steady, 3 weaker). u32 fields at 4, 8, 12 and 16 are last-heard
 age (`FFFFFFFF` unknown), matched report count, BLE pause flags and finder
 session ID. Signed i32 at 20 is smoothed RSSI in Q8 (`80000000` unknown).
+Pause flags at offset 12 are a bitmask. Bits 0 through 4 indicate microphone
+use, device inquiry, USB suspension, a diagnostic pause and Game Mode
+playback respectively. Multiple reasons can be present at the same time.
 An old reading means over 90 seconds without a verified report, not proof the
 device is absent. No metres, direction or anonymous Apple-device fallback.
 
@@ -650,3 +653,31 @@ packet boundary. That ordered codec reset does not clear PCM or increment the
 buffer-reset field. The wire layout is unchanged.
 The snapshot neither resets counters nor changes playback. The collector's
 `--phone` option requests it without enabling audio-payload inspection or logging.
+
+## A2DP source priority (USB typed feature 25)
+
+Send `[25]` to read the scheduling state for Game Mode. The .0076 firmware
+manages priority itself and reports the result asynchronously. Versions 1
+and 2 were manual trial builds. Version 3 provides read-only status and
+rejects their old enable and disable requests. Version 1 has eight
+bytes. Versions 2 and 3 have nine. [Game Mode behavior](GAME-TRANSITION.md#game-mode-and-a2dp-scheduling-priority)
+
+| Byte | Meaning |
+| --- | --- |
+| 0 | Layout version |
+| 1 | Flags for high priority requested (1), pending (2), high priority confirmed (4), failure (8), timeout (16), and a binding for the current or last scheduler command on this connection (32 in version 3, trial armed in version 2). The binding can remain after ordinary priority is confirmed. |
+| 2 | Result status. See byte 7 for its source |
+| 3 | Last command's priority, 0 or 1, or 255 before an attempt |
+| 4–5 | Bound classic Bluetooth connection handle, little-endian, or 65535 when unbound |
+| 6 | Latest successfully acknowledged priority, or 255 when unknown |
+| 7 | Result source. 0 before a result, 1 for Command Complete, 2 for a Command Status error, 3 for a local submission failure, 4 for a timeout |
+| 8 | Transition reason. 0 initial/reset, 1 eligible for automatic priority, 2 Game Mode off, 3 AVDTP Start, 4 accepted Suspend, 5 media closure, 6 scope loss, 7 ACL loss, 9 command failure, 10 reply timeout, 11 USB disconnect. In version 2, 1 and 2 were explicit arm/off and 8 meant trial expiry. |
+
+To count a high or normal command as acknowledged on a live link, require
+byte 7 equal to 1, status 0, the expected value in bytes 3 and 6, and no
+pending, failure or timeout flag. A status read on an untouched link carries
+no command receipt.
+
+In version 3, Start and Suspend refer to Bluetooth media-stream transitions.
+A host can keep the stream open while rendering silence. Priority can be
+requested again when eligible playback resumes. There is no trial timer.

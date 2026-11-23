@@ -78,6 +78,7 @@ jobs:
             -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" \
             -DCMAKE_BUILD_TYPE=Release \
             -DAIRPODS_USB_FLOAT=ON \
+            -DAIRPODS_HEAD_TRACKING=ON \
             -DAIRPODS_EXPERIMENTAL_RADIO0076=ON
       - name: Build and validate firmware
         run: cmake --build build --parallel 2

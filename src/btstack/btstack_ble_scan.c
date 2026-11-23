@@ -52,6 +52,17 @@ void ble_scan_set_paused(uint32_t reason, bool paused) {
     else scan_state.stats.pause_reasons &= ~reason;
     scan_update();
 }
+void ble_scan_set_runtime_pauses(bool usb_suspended, bool mic, bool game_playback) {
+    if (!scan_initialized) return;
+    // Replace these reasons together so a handoff between them never restarts scanning.
+    uint32_t reasons = scan_state.stats.pause_reasons &
+        ~(BLE_SCAN_PAUSE_USB_SUSPEND | BLE_SCAN_PAUSE_MIC | BLE_SCAN_PAUSE_GAME_PLAYBACK);
+    if (usb_suspended) reasons |= BLE_SCAN_PAUSE_USB_SUSPEND;
+    if (mic) reasons |= BLE_SCAN_PAUSE_MIC;
+    if (game_playback) reasons |= BLE_SCAN_PAUSE_GAME_PLAYBACK;
+    scan_state.stats.pause_reasons = reasons;
+    scan_update();
+}
 void ble_scan_diagnostic_pause(bool paused) {
     if(!scan_initialized)return;
     diagnostic_started=btstack_run_loop_get_time_ms();

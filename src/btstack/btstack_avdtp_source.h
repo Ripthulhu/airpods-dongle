@@ -59,6 +59,10 @@ uint8_t dongle_output_codec(void);
 uint8_t dongle_playback_configure(uint8_t codec, uint8_t rate_mode, uint32_t bitrate);
 uint8_t dongle_playback_game_mode(bool enabled);
 uint8_t dongle_playback_game_toggle(void);
+bool dongle_playback_defer_scan(void);
+// Returns eligibility and separately reports the current local media CID, even before Game Mode starts.
+bool dongle_playback_priority_scope(uint16_t *media_cid);
+bool dongle_playback_game_timing(void);
 uint16_t dongle_playback_status(uint8_t *out, uint16_t capacity);
 void dongle_playback_connect_requested(void);
 uint16_t dongle_routing_snapshot(uint8_t *out, uint16_t capacity);
@@ -73,6 +77,7 @@ uint16_t dongle_playback_inspect(uint8_t *out, uint16_t capacity);
 void dongle_playback_inspect_enable(bool enabled);
 void dongle_playback_usb_packet(uint32_t us, uint16_t frames, uint8_t format, uint8_t error);
 void dongle_playback_usb_format(uint8_t format);
+void dongle_playback_airpods_credits(uint32_t gap_ms, uint16_t packets);
 void dongle_playback_controller_event(const uint8_t *packet, uint16_t size);
 void dongle_playback_poll(void);
 // Current AACP reports and accepted scalar sends, under the Bluetooth lock.

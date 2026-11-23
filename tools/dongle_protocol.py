@@ -140,6 +140,7 @@ FEATURES = {
     'reserved_output_continuity': 22,
     'reconnect_policy': 23,
     'read_firmware_version': 24,
+    'diagnostic_a2dp_priority': 25,
 }
 SETTINGS_LEASE_ACTIONS = {'acquire': 0, 'renew': 1, 'release': 2}
 RECONNECT_POLICIES = {'manual': 0, 'automatic': 1}

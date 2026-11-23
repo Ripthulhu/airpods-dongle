@@ -101,6 +101,182 @@ static const uint16_t radio_opcodes[5]={HCI_OPCODE_HCI_READ_RSSI,HCI_OPCODE_HCI_
     HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL,HCI_OPCODE_HCI_READ_TRANSMIT_POWER_LEVEL,0x1406};
 static const hci_cmd_t radio_read_afh_map={0x1406,"H"};
 
+// Infineon Write_A2DP_Connection: classic ACL handle, priority, raw HCI direction (0=source).
+static const hci_cmd_t write_a2dp_connection = {0xfd1a, "H11"};
+// Keep the stream lifetime independent of Game Mode so enabling it mid-track needs no new Start.
+static uint16_t priority_stream_cid, priority_stream_handle;
+static uint32_t priority_stream_session;
+static bool priority_unsupported, priority_declined;
+static struct {
+    bd_addr_t address;
+    uint32_t sent_at, session;
+    uint16_t handle, media_cid;
+    uint8_t sent, confirmed, status, result, reason, restore_attempts;
+    bool requested, pending, failed;
+} priority;
+
+static void priority_forget(enum priority_reason reason) {
+    // A completion has no handle. An old command must finish before a new link can use this opcode.
+    bool pending = priority.pending;
+    uint32_t sent_at = priority.sent_at;
+    memset(&priority, 0, sizeof(priority));
+    priority.handle = HCI_CON_HANDLE_INVALID;
+    priority.sent = priority.confirmed = priority.status = UINT8_MAX;
+    priority.pending = pending;
+    priority.sent_at = sent_at;
+    priority.reason = reason;
+}
+
+void bt_hci_priority_snapshot(uint8_t out[9]) {
+    out[0] = 3;
+    out[1] = priority.requested | (priority.pending << 1) | ((priority.confirmed == 1) << 2) |
+             (priority.failed << 3) | ((priority.result == 4) << 4) | ((priority.handle != HCI_CON_HANDLE_INVALID) << 5);
+    out[2] = priority.status;
+    out[3] = priority.sent;
+    out[4] = (uint8_t)priority.handle;
+    out[5] = (uint8_t)(priority.handle >> 8);
+    out[6] = priority.confirmed;
+    out[7] = priority.result;
+    out[8] = priority.reason;
+}
+
+static void priority_result(uint8_t status, uint8_t source) {
+    priority.pending = false;
+    if (source != 3 && status == 1) priority_unsupported = true; // Unknown HCI command, controller-wide.
+    if (priority.handle == HCI_CON_HANDLE_INVALID) {
+        priority_forget(PRIORITY_ACL_LOST); // Release only the opcode fence for a retired link.
+        return;
+    }
+    priority.result = source;
+    priority.status = status;
+    priority.failed = status != 0;
+    if (status) {
+        if (priority.sent && priority.handle == priority_stream_handle && priority.media_cid == priority_stream_cid &&
+            priority.session == priority_stream_session) priority_declined = true;
+        priority.requested = false;
+        priority.reason = PRIORITY_COMMAND_ERROR;
+    }
+    else {
+        priority.confirmed = priority.sent;
+        priority.restore_attempts = 0;
+    }
+}
+
+static void priority_reconcile(enum priority_reason enable_reason) {
+    if ((!priority_stream_cid || priority_unsupported || priority_declined) &&
+        !priority.pending && priority.confirmed != 1 && !priority.requested) return;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (priority.pending && now - priority.sent_at >= 2000u) {
+        if (priority.handle != HCI_CON_HANDLE_INVALID && priority.handle == priority_stream_handle &&
+            priority.media_cid == priority_stream_cid && priority.session == priority_stream_session)
+            priority_declined = true;
+        priority.requested = false;
+        priority.failed = true;
+        priority.result = 4;
+        priority.reason = PRIORITY_TIMEOUT;
+    }
+    if (priority.handle != HCI_CON_HANDLE_INVALID) {
+        hci_connection_t *original = hci_connection_for_handle(priority.handle);
+        if (!original || original->state != OPEN || original->address_type != BD_ADDR_TYPE_ACL ||
+            memcmp(original->address, priority.address, 6)) {
+            if (priority_stream_handle == priority.handle) priority_stream_cid = 0;
+            priority_forget(PRIORITY_ACL_LOST);
+        }
+    }
+    uint16_t cid = 0;
+    bool eligible = priority_stream_cid && !priority_unsupported && !priority_declined && selected_bonded &&
+        dongle_playback_priority_scope(&cid) && cid == priority_stream_cid;
+    hci_connection_t *acl = eligible ? hci_connection_for_handle(priority_stream_handle) : NULL;
+    uint32_t session = acl ? aacp_control_session() : 0;
+    if (session && !priority_stream_session) priority_stream_session = session;
+    bool wanted = acl && session && session == priority_stream_session && acl->state == OPEN && acl->address_type == BD_ADDR_TYPE_ACL &&
+        !memcmp(acl->address, device_addr, 6) && gap_security_level(acl->con_handle) >= LEVEL_2;
+    if (priority.requested && (!wanted || priority.handle != acl->con_handle ||
+        priority.media_cid != cid || priority.session != session)) {
+        priority.requested = false;
+        priority.reason = PRIORITY_SCOPE_LOST;
+    }
+    // An old link's write or restoration must finish before acquiring the new scope.
+    bool same_scope_high = wanted && priority.confirmed == 1 && priority.failed && !priority.sent &&
+        priority.handle == acl->con_handle && priority.session == session && priority.media_cid == cid;
+    if (wanted && !priority.requested && !priority.pending && (priority.confirmed != 1 || same_scope_high)) {
+        if (priority.handle != acl->con_handle || memcmp(priority.address, device_addr, 6)) {
+            priority_forget(PRIORITY_ARM);
+            priority.handle = acl->con_handle;
+            memcpy(priority.address, acl->address, 6);
+        }
+        priority.requested = true;
+        priority.failed = false;
+        priority.restore_attempts = 0;
+        priority.media_cid = cid;
+        priority.session = session;
+        priority.reason = enable_reason;
+    }
+    if (priority.pending || priority_unsupported || priority.requested == (priority.confirmed == 1) ||
+        !hci_can_send_command_packet_now()) return;
+    if (!priority.requested && priority.failed &&
+        (priority.restore_attempts >= 3 || now - priority.sent_at < 500u)) return;
+    priority.pending = true;
+    priority.failed = false;
+    priority.sent = priority.requested;
+    if (!priority.sent) ++priority.restore_attempts;
+    priority.sent_at = now;
+    priority.status = UINT8_MAX;
+    priority.result = 0;
+    uint8_t status = hci_send_cmd(&write_a2dp_connection, priority.handle, priority.sent, 0);
+    if (status && priority.pending) priority_result(status, 3);
+}
+
+static void priority_poll(void) { priority_reconcile(PRIORITY_ARM); }
+
+void bt_hci_priority_transition(enum priority_reason reason) {
+    if (reason == PRIORITY_START) {
+        uint16_t cid = 0;
+        (void)dongle_playback_priority_scope(&cid);
+        hci_connection_t *acl = cid && peer_address_valid(device_addr) ?
+            hci_connection_for_bd_addr_and_type(device_addr, BD_ADDR_TYPE_ACL) : NULL;
+        if (!acl || acl->state != OPEN || acl->address_type != BD_ADDR_TYPE_ACL || memcmp(acl->address, device_addr, 6)) return;
+        uint32_t session = aacp_control_session();
+        if (cid != priority_stream_cid || acl->con_handle != priority_stream_handle || session != priority_stream_session) {
+            priority_declined = false;
+            // A new stream can retry failed cleanup on an ACL that survived media closure.
+            if (priority.failed && !priority.pending && !priority.sent) priority.restore_attempts = 0;
+        }
+        priority_stream_cid = cid;
+        priority_stream_handle = acl->con_handle;
+        priority_stream_session = session;
+    } else if (reason == PRIORITY_ARM || reason == PRIORITY_OFF) {
+        priority_declined = false;
+    } else {
+        priority_stream_cid = 0;
+    }
+    if (reason != PRIORITY_ARM && reason != PRIORITY_START && priority.requested) {
+        priority.reason = reason;
+        priority.requested = false;
+    }
+    // Submit before AVDTP Start if credit permits. Audio never waits for this hint.
+    priority_reconcile(reason == PRIORITY_START ? PRIORITY_START : PRIORITY_ARM);
+}
+
+static void priority_event(const uint8_t *p, uint16_t size) {
+    if (p[0] == BTSTACK_EVENT_STATE && size >= 3 && p[2] != HCI_STATE_WORKING) {
+        priority_stream_cid = 0;
+        priority_unsupported = priority_declined = false;
+        priority.pending = false;
+        priority_forget(PRIORITY_RESET);
+    } else if (p[0] == HCI_EVENT_DISCONNECTION_COMPLETE && size == 6 && !p[2]) {
+        uint16_t handle = (uint16_t)p[3] | (uint16_t)p[4] << 8;
+        if (priority_stream_handle == handle) priority_stream_cid = 0;
+        if (priority.handle == handle) priority_forget(PRIORITY_ACL_LOST);
+    } else if (priority.pending && size == 6) {
+        if (p[0] == HCI_EVENT_COMMAND_COMPLETE && ((uint16_t)p[3] | (uint16_t)p[4] << 8) == write_a2dp_connection.opcode)
+            priority_result(p[5], 1);
+        else if (p[0] == HCI_EVENT_COMMAND_STATUS && p[2] &&
+                 ((uint16_t)p[4] | (uint16_t)p[5] << 8) == write_a2dp_connection.opcode)
+            priority_result(p[2], 2);
+    }
+}
+
 typedef struct {
     uint8_t version;
     uint8_t address[6];
@@ -112,6 +288,11 @@ static bool airpods_address(const uint8_t address[6]) {
         (memcmp(address, device_addr, 6) == 0 ||
          memcmp(address, device_addr_list[0], 6) == 0 ||
          memcmp(address, device_addr_list[1], 6) == 0);
+}
+static bool airpods_key_saved(bd_addr_t address) {
+    link_key_t key;
+    link_key_type_t type;
+    return gap_get_link_key_for_bd_addr(address, key, &type);
 }
 
 static void media_flush_forget(void) {
@@ -560,11 +741,13 @@ static void credit_event(const uint8_t *p, uint16_t size) {
             credit_roles[role].totals.events = credit_add(credit_roles[role].totals.events, 1);
             credit_roles[role].totals.packets = credit_add(credit_roles[role].totals.packets, completed);
             if (!completed) continue;
+            uint32_t gap = 0;
             if (active && credit_roles[role].armed && credit_roles[role].handle == handle) {
-                uint32_t gap = now - credit_roles[role].last_ms;
+                gap = now - credit_roles[role].last_ms;
                 if (gap > credit_roles[role].totals.max_active_gap_ms)
                     credit_roles[role].totals.max_active_gap_ms = gap;
             }
+            if (role == 0) dongle_playback_airpods_credits(gap, completed);
             credit_roles[role].handle = handle;
             credit_roles[role].last_ms = now;
             credit_roles[role].armed = active;
@@ -651,6 +834,7 @@ static void phone_pairing_stop(void) {
 void bt_hci_phone_poll(void) {
     media_packet_poll();
     media_flush_poll();
+    priority_poll();
     radio_poll();
     if (!phone_pairing_audio_busy()) credit_roles[0].armed = credit_roles[1].armed = false;
     if (phone_pairing && !bt_hci_phone_pairing_active()) phone_pairing_stop();
@@ -829,6 +1013,7 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     credit_event(packet, size);
     media_flush_event(packet, size);
     media_packet_event(packet, size);
+    priority_event(packet, size);
     radio_event(packet,size);
     dongle_playback_controller_event(packet,size);
     uint8_t status;
@@ -873,6 +1058,15 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
             ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
             set_led_mode_off();
             printf("Pairing inquiry rejected: 0x%02x\n", hci_event_command_status_get_status(packet));
+            break;
+        case HCI_EVENT_LINK_KEY_NOTIFICATION:
+            if (size != 25) break;
+            hci_event_link_key_request_get_bd_addr(packet, address);
+            if (!peer_address_valid(device_addr) || memcmp(address, device_addr, 6)) break;
+            // BTstack has already attempted to persist the key when it forwards this event.
+            selected_bonded = airpods_key_saved(address);
+            for (unsigned i = 0; i < 2; ++i)
+                if (!memcmp(address, device_addr_list[i], 6)) device_addr_bonded[i] = selected_bonded;
             break;
         case HCI_EVENT_PIN_CODE_REQUEST:
             if (size < 8) return;
@@ -919,15 +1113,17 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 gap_inquiry_stop();
                 ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
 
-                uint8_t currect_slot = read_uint8_last_flash();
-                bool saved = (currect_slot == 1 && write_slot1_mac(address)) ||
-                             (currect_slot == 2 && write_slot2_mac(address));
+                uint8_t slot = read_uint8_last_flash();
+                bool saved = (slot == 1 && write_slot1_mac(address)) ||
+                             (slot == 2 && write_slot2_mac(address));
                 if (!saved) {
                     set_led_mode_off();
                     printf("Pairing address could not be saved\n");
                     break;
                 }
                 memcpy(device_addr, address, 6);
+                memcpy(device_addr_list[slot - 1], address, 6);
+                selected_bonded = device_addr_bonded[slot - 1] = airpods_key_saved(address);
                 snprintf(device_addr_string, sizeof(device_addr_string), "%s", bd_addr_to_str(address));
                 printf("Bluetooth speaker detected, trying to connect to %s...\n", bd_addr_to_str(device_addr));
                 if (aacp_takeover_request(device_addr)) avdtp_source_establish_stream();
@@ -953,11 +1149,9 @@ void get_link_keys(void){
     read_slot1_mac(device_addr_list[0]);
     read_slot2_mac(device_addr_list[1]);
     memset(device_addr_bonded, 0, sizeof(device_addr_bonded));
-    link_key_t link_key;
-    link_key_type_t type;
     for (unsigned i = 0; i < 2; ++i) {
         if (peer_address_valid(device_addr_list[i])) {
-            device_addr_bonded[i] = gap_get_link_key_for_bd_addr(device_addr_list[i], link_key, &type);
+            device_addr_bonded[i] = airpods_key_saved(device_addr_list[i]);
         }
     }
     // Slot identity is authoritative; key iteration order cannot identify a peer.
@@ -989,6 +1183,10 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 static btstack_packet_callback_registration_t hci_state_callback_registration;
 
 void bt_hci_init(void){
+    priority_stream_cid = 0;
+    priority_unsupported = priority_declined = false;
+    priority.pending = false;
+    priority_forget(PRIORITY_RESET);
     media_flush_forget();
     media_flush_pending.active = false;
     media_flush_links[0].handle = media_flush_links[1].handle = HCI_CON_HANDLE_INVALID;

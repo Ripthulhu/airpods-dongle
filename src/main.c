@@ -610,9 +610,8 @@ int main() {
             phone_sink_yield();
         runtime_watch_set(WATCH_PHONE);
         if (!decoder.releasing) phone_sink_poll();
-        ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND,
-                            !usb_host_active() && !phone_sink_connected() && !dongle_finder_active());
-        ble_scan_set_paused(BLE_SCAN_PAUSE_MIC, aacp_mic_requested() || aacp_mic_active());
+        ble_scan_set_runtime_pauses(!usb_host_active() && !phone_sink_connected() && !dongle_finder_active(),
+                                    aacp_mic_requested() || aacp_mic_active(), dongle_playback_defer_scan());
         // Keep decoder allocation in thread context and serialize malloc with
         // Bluetooth encoder callbacks. The USB service timer remains active.
         mic_decoder_prepare_t prepared = mic_decoder_lifecycle_prepare(&decoder,

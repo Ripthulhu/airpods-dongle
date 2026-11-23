@@ -60,22 +60,14 @@ typedef struct {
     uint32_t dropped_pending;
     uint32_t priming;
     uint32_t fraction;
-    uint32_t valid_past, generation;
     float history[PLAYBACK_FILTER_TAPS*2];
     bool primed_on_wire;
 } playback_pcm_t;
-
-// Zero-initialize before first reset; generation fences unlocked input snapshots.
-static inline void playback_pcm_discontinuity(playback_pcm_t *pcm) {
-    pcm->valid_past=0;
-    if(++pcm->generation==0)++pcm->generation;
-}
 
 static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
                                       bool prime) {
     if (capacity == 0 || capacity > PLAYBACK_PCM_FRAMES ||
         (prime && capacity < PLAYBACK_PRIMING_FRAMES)) return false;
-    playback_pcm_discontinuity(pcm);
     pcm->read = pcm->used = pcm->dropped_pending = 0;
     pcm->fraction = 0;
     memset(pcm->history,0,sizeof(pcm->history));
@@ -88,7 +80,6 @@ static inline bool playback_pcm_reset(playback_pcm_t *pcm, uint32_t capacity,
 // Changing input discards its PCM, without restarting the AirPods' warm stream.
 static inline void playback_pcm_clear(playback_pcm_t *pcm, uint32_t capacity) {
     if (capacity == 0 || capacity > PLAYBACK_PCM_FRAMES) return;
-    playback_pcm_discontinuity(pcm);
     pcm->read = pcm->used = pcm->dropped_pending = 0;
     pcm->fraction = 0;
     memset(pcm->history,0,sizeof(pcm->history));
@@ -109,7 +100,6 @@ static inline void playback_pcm_push_data(playback_pcm_t *pcm, const void *data,
     if (pcm->capacity == 0 || src == NULL) return;
     if (frames > pcm->capacity - pcm->used) {
         uint32_t dropped = frames - (pcm->capacity - pcm->used);
-        playback_pcm_discontinuity(pcm);
         // Track overwritten frames so overdue work is not trimmed twice.
         // This accounting must never cancel healthy or future output deadlines.
         pcm->dropped_pending = dropped > UINT32_MAX - pcm->dropped_pending ?
@@ -144,9 +134,6 @@ static inline void playback_pcm_push_data(playback_pcm_t *pcm, const void *data,
         }
     }
     pcm->used += frames;
-    // New input overwrites old consumed samples before it overwrites unread PCM.
-    uint32_t retained=pcm->capacity-pcm->used;
-    if(pcm->valid_past>retained)pcm->valid_past=retained;
 }
 static inline void playback_pcm_push(playback_pcm_t *pcm,const int16_t *src,uint32_t frames) {
     playback_pcm_push_data(pcm,src,frames,false);
@@ -159,7 +146,6 @@ static inline void playback_pcm_push_float(playback_pcm_t *pcm,const float *src,
 static inline uint32_t playback_pcm_limit(playback_pcm_t *pcm, uint32_t frames) {
     if (pcm->used <= frames) return 0;
     uint32_t drop = pcm->used - frames;
-    playback_pcm_discontinuity(pcm);
     pcm->read += drop;
     if (pcm->read >= pcm->capacity) pcm->read -= pcm->capacity;
     pcm->used = frames;
@@ -185,8 +171,6 @@ static inline bool playback_pcm_consume(playback_pcm_t *pcm,uint32_t frames) {
     pcm->read+=frames;
     if(pcm->read>=pcm->capacity)pcm->read-=pcm->capacity;
     pcm->used-=frames;
-    pcm->valid_past+=frames;
-    if(pcm->valid_past>pcm->capacity-pcm->used)pcm->valid_past=pcm->capacity-pcm->used;
     return true;
 }
 
@@ -210,7 +194,6 @@ static inline uint32_t playback_pcm_read_format(playback_pcm_t *pcm, void *dst,
     uint32_t filled = prefix + copied;
     if (filled < frames) {
         memset((uint8_t *)dst + filled * 2 * element, 0, (size_t)(frames - filled) * 2 * element);
-        playback_pcm_discontinuity(pcm);
     }
     return copied;
 }
@@ -257,46 +240,64 @@ static inline bool playback_pcm_prepare_resample_fill(playback_pcm_t *pcm,playba
     pcm->read+=copied;
     if(pcm->read>=pcm->capacity)pcm->read-=pcm->capacity;
     pcm->used-=copied;pcm->fraction=end%denominator;
-    pcm->valid_past+=copied;
-    if(pcm->valid_past>pcm->capacity-pcm->used)pcm->valid_past=pcm->capacity-pcm->used;
-    if(needed>available)playback_pcm_discontinuity(pcm);
     return true;
 }
 static inline bool playback_pcm_prepare_resample(playback_pcm_t *pcm,playback_resample_t *work,
                                                  uint32_t frames,uint32_t rate) {
     return playback_pcm_prepare_resample_fill(pcm,work,frames,rate,NULL);
 }
-static inline void playback_pcm_render_format(const playback_resample_t *work,void *dst,bool wide) {
+// These output positions have the same fractional source phase and FIR coefficients.
+static inline void playback_pcm_render_phase(const playback_resample_t *work,void *dst,bool wide,
+        unsigned frame,unsigned output_step,unsigned input_step,unsigned filter) {
     const uint32_t denominator=655360u;
-    // At unity rate the fractional phase and its filter are constant for the block.
-    if(work->rate==denominator) {
-        if(!work->fraction) {
-            for(uint32_t frame=0;frame<work->frames;++frame) {
-                uint32_t index=PLAYBACK_FILTER_TAPS+frame-PLAYBACK_FILTER_DELAY;
-                playback_pcm_store(dst,2*frame,work->samples[2*index],wide);
-                playback_pcm_store(dst,2*frame+1,work->samples[2*index+1],wide);
-            }
-        } else {
-            uint32_t phase=work->fraction*PLAYBACK_FILTER_PHASES;
-            unsigned bin=phase/denominator;
-            float blend=(float)(phase%denominator)/(float)denominator;
-            float coefficients[PLAYBACK_FILTER_TAPS];
-            for(unsigned tap=0;tap<PLAYBACK_FILTER_TAPS;++tap)
-                coefficients[tap]=playback_filter[0][bin][tap]+blend*
-                    (playback_filter[0][bin+1][tap]-playback_filter[0][bin][tap]);
-            for(uint32_t frame=0;frame<work->frames;++frame) {
-                uint32_t center=PLAYBACK_FILTER_TAPS+frame;
-                float left=0,right=0;
-                for(unsigned tap=0;tap<PLAYBACK_FILTER_TAPS;++tap) {
-                    left+=coefficients[tap]*work->samples[2*(center-tap)];
-                    right+=coefficients[tap]*work->samples[2*(center-tap)+1];
-                }
-                playback_pcm_store(dst,2*frame,left,wide);playback_pcm_store(dst,2*frame+1,right,wide);
-            }
+    uint32_t position=work->fraction+frame*work->rate;
+    unsigned center=PLAYBACK_FILTER_TAPS+position/denominator;
+    uint32_t phase=(position%denominator)*PLAYBACK_FILTER_PHASES;
+    if(!filter && !phase) {
+        for(;frame<work->frames;frame+=output_step,center+=input_step) {
+            unsigned index=2u*(center-PLAYBACK_FILTER_DELAY);
+            playback_pcm_store(dst,2*frame,work->samples[index],wide);
+            playback_pcm_store(dst,2*frame+1,work->samples[index+1],wide);
         }
         return;
     }
+    unsigned bin=phase/denominator;
+    float blend=(float)(phase%denominator)/(float)denominator;
+    float coefficients[PLAYBACK_FILTER_TAPS];
+    for(unsigned tap=0;tap<PLAYBACK_FILTER_TAPS;++tap)
+        coefficients[tap]=playback_filter[filter][bin][tap]+blend*
+            (playback_filter[filter][bin+1][tap]-playback_filter[filter][bin][tap]);
+    for(;frame<work->frames;frame+=output_step,center+=input_step) {
+        float left=0,right=0;
+        for(unsigned tap=0;tap<PLAYBACK_FILTER_TAPS;++tap) {
+            left+=coefficients[tap]*work->samples[2*(center-tap)];
+            right+=coefficients[tap]*work->samples[2*(center-tap)+1];
+        }
+        playback_pcm_store(dst,2*frame,left,wide);
+        playback_pcm_store(dst,2*frame+1,right,wide);
+    }
+}
+static inline void playback_pcm_render_format(const playback_resample_t *work,void *dst,bool wide) {
+    const uint32_t denominator=655360u;
+    if(work->rate==denominator) {
+        playback_pcm_render_phase(work,dst,wide,0,1,1,0);
+        return;
+    }
     unsigned filter=work->rate>denominator+denominator/20u?1:0;
+    if(work->frames==480 && !(work->rate%4096u)) {
+        // Game Mode consumes multiples of three source frames per 480 output frames.
+        unsigned numerator=work->rate/4096u;
+        unsigned divisor=160,remainder=numerator;
+        while(remainder) {
+            unsigned next=divisor%remainder;
+            divisor=remainder;
+            remainder=next;
+        }
+        unsigned period=160u/divisor;
+        for(unsigned first=0;first<period;++first)
+            playback_pcm_render_phase(work,dst,wide,first,period,numerator/divisor,filter);
+        return;
+    }
     for(uint32_t frame=0;frame<work->frames;++frame) {
         uint32_t position=work->fraction+frame*work->rate;
         uint32_t phase=(position%denominator)*PLAYBACK_FILTER_PHASES;

@@ -21,7 +21,11 @@
 #include "debug_cdc.h"
 
 // Diagnostic history is expendable; reserve scarce SRAM for live duplex audio.
+#if AIRPODS_HEAD_TRACKING
+#define DBG_BUF_SIZE 512u                  // Make room for RTBuddy without reducing the codec heap.
+#else
 #define DBG_BUF_SIZE 2048u                 // must be a power of two
+#endif
 #define DBG_BUF_MASK (DBG_BUF_SIZE - 1u)
 
 #if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE

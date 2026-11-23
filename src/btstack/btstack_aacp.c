@@ -33,6 +33,10 @@
 #include "phone_call.h"
 #include "peer_address.h"
 #include "aacp_routing.h"
+#if AIRPODS_HEAD_TRACKING
+#include "head_motion.h"
+#include "../tinyusb/motion_usb.h"
+#endif
 
 static atomic_bool audio_authority;
 
@@ -199,6 +203,9 @@ static const uint8_t control_anc[] = {AACP_HEADER_BYTES,AACP_OPCODE_CONTROL_COMM
 static const uint8_t control_transparency[] = {AACP_HEADER_BYTES,AACP_OPCODE_CONTROL_COMMAND,0,
     DONGLE_SETTING_LISTENING_MODE,DONGLE_LISTENING_MODE_TRANSPARENCY,0,0,0};
 static void control_reset(void) {
+#if AIRPODS_HEAD_TRACKING
+    head_motion_reset();
+#endif
     ++control_session;
     dongle_readback_clear(&control_readback);
     settings_reset(&settings);
@@ -416,6 +423,9 @@ void aacp_receive_buffer_cancel(void) {
 static void routing_authority(bool allowed) {
     bool previous = atomic_exchange_explicit(&audio_authority, allowed, memory_order_acq_rel);
     if (previous != allowed) dongle_playback_ownership_changed(allowed);
+#if AIRPODS_HEAD_TRACKING
+    if (previous && !allowed) usb_motion_invalidate();
+#endif
 }
 
 bool aacp_takeover_request(const uint8_t peer[6]) {
@@ -1036,6 +1046,15 @@ static void aacp_handle_can_send_now(void) {
     aacp_try_mic_start();
 }
 
+#if AIRPODS_HEAD_TRACKING
+static bool head_motion_send(uint8_t *packet, uint16_t size) {
+    return aacp_connected && aacp_cid && !aacp_tx_count &&
+           size <= l2cap_get_remote_mtu_for_local_cid(aacp_cid) &&
+           l2cap_can_send_packet_now(aacp_cid) &&
+           l2cap_send(aacp_cid, packet, size) == ERROR_CODE_SUCCESS;
+}
+#endif
+
 void aacp_poll(void) {
     // USB IRQs can revoke capture while the main loop still holds cached intent.
     if (aacp_mic_want && !aacp_mic_requested()) aacp_mic_stop();
@@ -1112,6 +1131,13 @@ void aacp_poll(void) {
         }
     }
     aacp_try_mic_start();
+#if AIRPODS_HEAD_TRACKING
+    bool motion_allowed = aacp_control_ready() && aacp_audio_owned() &&
+        settings.profile && settings.profile->models[0] == DONGLE_CASE_BATTERY_PROFILE_MODEL &&
+        settings.firmware_major >= 8 && !aacp_mic_requested() && !aacp_mic_active();
+    head_motion_poll(now, motion_allowed ? (dongle_playback_game_timing() ? 30 : 100) : 0,
+                     head_motion_send);
+#endif
 }
 
 static bool aacp_has_header(const uint8_t *sdu, uint16_t size) {
@@ -1235,6 +1261,12 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
             aacp_try_mic_start();
             return;
         }
+#if AIRPODS_HEAD_TRACKING
+        if (aacp_audio_owned() && !aacp_mic_requested() && !aacp_mic_active() &&
+            head_motion_receive(packet, size, btstack_run_loop_get_time_ms())) return;
+        if (size == 10 && aacp_has_header(packet, size) && packet[4] == 8 && !packet[5])
+            head_motion_role(packet + 6);
+#endif
         if (!aacp_has_header(packet,size)) return;
         // All microphone messages, including malformed ones, stay out of control readiness.
         if (little_endian_read_16(packet, 4) == 0x58) {

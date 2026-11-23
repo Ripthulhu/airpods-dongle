@@ -240,7 +240,33 @@ static void cancellation_and_missing_receipts_are_bounded(void) {
     now+=2000;production_game_poll();assert(playback_game.failed && requests_60==2);
     now+=2000;production_game_poll();now+=5000;production_game_poll();assert(requests_60==2 && requests_150<=1);
 }
+static void failed_off_retries_once_on_fresh_owned_usb_playback(void) {
+    reset_test();set_usb_streaming(true);playback_media_sent();
+    production_game_poll();assert(requests_150==1);
+    fresh_report(780);assert(playback_adjust.pending && playback_game.phase==GAME_RESTORING);
+    playback_adjust_cancel(&playback_adjust);playback_adjust.failed=true;
+    production_game_poll();assert(playback_game.phase==GAME_FAILED);
+    for(unsigned i=0;i<20;++i){now+=10;playback_media_sent();production_game_poll();}
+    assert(requests_150==1 && playback_game.phase==GAME_FAILED);
+
+    set_usb_streaming(false);set_usb_streaming(true);
+    production_game_poll();assert(requests_150==1); // A host Start alone cannot issue a retry.
+    audio_owned=false;playback_media_sent();production_game_poll();
+    assert(requests_150==1 && playback_game.phase==GAME_FAILED);
+    audio_owned=true;defer_send=true;playback_media_sent();production_game_poll();
+    assert(requests_150==2 && playback_game.waiting_tx);
+    fresh_report(1500);assert(playback_game.waiting_tx);
+    actual_send();production_game_poll();
+    fresh_report(0);assert(playback_game.waiting_report);
+    fresh_report(1100);assert(playback_adjust.pending && playback_game.phase==GAME_RESTORING);
+    playback_adjust_start(&playback_adjust,now);now+=400;
+    playback_adjust_sent(&playback_adjust,21200,now,true);production_game_poll();
+    assert(!playback_adjust_busy(&playback_adjust) && playback_game.phase==GAME_OFF);
+    for(unsigned i=0;i<20;++i){now+=10;playback_media_sent();production_game_poll();}
+    assert(requests_150==2 && !requests_60);
+}
 int main(void) {
+    failed_off_retries_once_on_fresh_owned_usb_playback();
     claimed_start_proves_buffer_only_after_media();
     claiming_defers_old_restoration_without_faking_receipt();
     post_prime_verification_uses_fresh_send_and_report();

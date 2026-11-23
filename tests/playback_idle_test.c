@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <assert.h>
+#include "../src/btstack/a2dp_priority.h"
+static unsigned priority_starts,priority_suspends,priority_closes,priority_at_local_start,priority_at_peer_accept,peer_accepts;
+void bt_hci_priority_transition(enum priority_reason reason) {
+    if(reason==PRIORITY_START)++priority_starts;
+    if(reason==PRIORITY_SUSPEND)++priority_suspends;
+    if(reason==PRIORITY_CLOSE)++priority_closes;
+}
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include "../src/btstack/playback_pcm.h"
@@ -23,6 +31,11 @@ static playback_adjust_t playback_adjust;
 #define SUSPEND_RECOVERY_TIMEOUT_MS 3000u
 #define AVDTP_SI_START 1
 #define AVDTP_SI_SUSPEND 2
+#define AVDTP_SI_ACCEPT_START 3
+#define AVDTP_SI_OPEN 4
+#define AVDTP_SI_SET_CONFIGURATION 5
+#define AVDTP_SI_ABORT 6
+#define AVDTP_SI_CLOSE 7
 enum { PLAYBACK_RUNNING, PLAYBACK_SUSPENDING, PLAYBACK_SUSPENDED, PLAYBACK_STARTING, PLAYBACK_CLAIMING };
 static uint8_t playback_idle_phase, cur_codec = 4;
 static struct {
@@ -34,6 +47,7 @@ static struct {
 static bool playback_idle_counting, phone_opened, phone_active, phone_buffer_started;
 static bool playback_peer_suspended;
 static uint32_t usb_playback_revision, playback_peer_suspend_revision;
+static atomic_uint usb_signal_stamp;
 static bool call_active, call_opened, call_capture;
 static bool phone_output_recovery;
 static uint16_t phone_output_recovery_cid;
@@ -155,7 +169,17 @@ static int btstack_sbc_encoder_sbc_buffer_length(void) {return sbc_frame_bytes;}
 static void aacp_disconnect(void) { }
 static unsigned a2dp_source_disconnect(unsigned cid) { assert(cid == 10); ++closes; return 0; }
 static unsigned avdtp_source_suspend(unsigned cid, unsigned seid) { assert(cid == 10 && seid == 5); ++suspends; return suspend_error; }
-static unsigned avdtp_source_start_stream(unsigned cid, unsigned seid) { assert(cid == 10 && seid == 5); ++starts; return start_error; }
+static unsigned avdtp_source_start_stream(unsigned cid, unsigned seid) {
+    assert(cid==10 && seid==5);
+    priority_at_local_start=priority_starts;
+    ++starts;
+    return start_error;
+}
+static void avdtp_start_stream_accept(unsigned cid,unsigned seid) {
+    assert(cid==10 && seid==5);
+    priority_at_peer_accept=priority_starts;
+    ++peer_accepts;
+}
 static bool aaceld_encoder_init(void) { ++resets; return encoder_ready; }
 static bool usb_mic_requested(void) { return mic_requested; }
 static void usb_media_cancel_volume(void) {}
@@ -204,19 +228,23 @@ static void fixture(void) {
     game_eligible=false; playback_game=(playback_game_t){0};
 }
 static void suspend_idle(void) {
+    unsigned before=priority_suspends;
     playback_idle_poll(now);
     now += 999; playback_idle_poll(now); assert(!suspends);
     ++now; playback_idle_poll(now); assert(suspends == 1);
     assert(is_streaming && media_tracker.streaming && playback_idle_phase == PLAYBACK_SUSPENDING);
     assert(get_a2dp_connected_flag()); // USB availability survives ordinary idle suspension.
     accept(AVDTP_SI_SUSPEND, 6); assert(media_tracker.streaming);
+    assert(priority_suspends==before);
     accept(AVDTP_SI_SUSPEND, 5);
+    assert(priority_suspends==before+1);
     assert(!is_streaming && !media_tracker.streaming && !media_tracker.audio_timer.active);
     assert(playback_idle_phase == PLAYBACK_SUSPENDED);
     assert(get_a2dp_connected_flag());
 }
 static void usb_onset_survives_restart(void) {
     fixture(); suspend_idle();
+    unsigned before=priority_starts;
     for(unsigned i=0;i<PLAYBACK_FILTER_TAPS*2;++i)playback_pcm.history[i]=0.5f;
     int16_t onset[960], output[960];
     for (unsigned i = 0; i < 960; ++i) onset[i] = (int16_t)(i + 1);
@@ -224,6 +252,7 @@ static void usb_onset_survives_restart(void) {
     playback_idle_poll(++now);
     assert(starts == 1 && resets == 1 && !media_tracker.streaming);
     assert(playback_idle_phase == PLAYBACK_STARTING);
+    assert(priority_starts==before+1 && priority_at_local_start==before+1);
     assert(get_a2dp_connected_flag());
     accept(AVDTP_SI_START, 6); assert(!media_tracker.streaming);
     accept(AVDTP_SI_START, 5);
@@ -238,6 +267,27 @@ static void usb_onset_survives_restart(void) {
     assert(playback_pcm_read(&playback_pcm, output, 480) == 480);
     assert(memcmp(onset, output, sizeof(onset)) == 0);
 }
+static void close_and_abort_only_stop_their_own_stream(void) {
+    const unsigned signals[] = {AVDTP_SI_CLOSE, AVDTP_SI_ABORT};
+    for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i) {
+        fixture();
+        unsigned before = priority_closes;
+        accept(signals[i], 6);
+        assert(media_tracker.streaming && media_tracker.audio_timer.active && priority_closes == before);
+        accept(signals[i], 5);
+        assert(!media_tracker.streaming && !media_tracker.audio_timer.active && priority_closes == before + 1);
+    }
+}
+
+static void peer_start_sets_priority_before_acceptance(void) {
+    fixture();
+    unsigned before=priority_starts,accepted=peer_accepts;
+    accept(AVDTP_SI_ACCEPT_START,6);
+    assert(peer_accepts==accepted && priority_starts==before);
+    accept(AVDTP_SI_ACCEPT_START,5);
+    assert(peer_accepts==accepted+1 && priority_at_peer_accept==before+1);
+}
+
 static void fresh_usb_start_reclaims_peer_suspend(void) {
     fixture();set_usb_streaming(true);
     accept(AVDTP_SI_SUSPEND,5);
@@ -710,6 +760,13 @@ static void claim_ownership_loss_suspends_without_pcm(void) {
 }
 
 int main(void) {
+    fixture();
+    atomic_store(&usb_signal_stamp, 100);
+    set_usb_streaming(true);
+    assert(atomic_load(&usb_signal_stamp)==0); // Reopening the endpoint must wait for fresh PCM.
+    atomic_store(&usb_signal_stamp, 200);
+    set_usb_streaming(true);
+    assert(atomic_load(&usb_signal_stamp)==200);
     explicit_claim_waits_for_real_owner();
     explicit_claim_admission_does_not_spend_denied_intent();
     explicit_claim_keeps_original_deadline_and_attempt();
@@ -723,6 +780,8 @@ int main(void) {
     phone_output_recovers_without_losing_input();
     usb_onset_survives_restart();
     fresh_usb_start_reclaims_peer_suspend();
+    peer_start_sets_priority_before_acceptance();
+    close_and_abort_only_stop_their_own_stream();
     ownership_loss_is_passive_until_explicit_claim();
     fixture(); suspend_recovery_pending=recovery_reset_encoder=true; is_usb_streaming=true;
     mic_recovery_pending=mic_recovery_started=true; mic_recovery_cid=10; mic_recovery_revision=4;

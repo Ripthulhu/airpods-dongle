@@ -7,7 +7,7 @@ static unsigned att_sent, aacp_sent, cancellations;
 static unsigned critical_sections, att_polls;
 static uint8_t last_cache_slot;
 static int att_result, aacp_result, setting_result;
-static bool microphone;
+static bool microphone, check_unpublished;
 uint32_t save_and_disable_interrupts(void) {++critical_sections;return 0;}
 void restore_interrupts(uint32_t value) {(void)value;}
 uint32_t btstack_run_loop_get_time_ms(void) {return clock_ms;}
@@ -18,7 +18,14 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t n,uint8
 bool usb_mic_requested(void) {return microphone;}
 bool aacp_mic_active(void) {return false;}
 bool dongle_att_request(const uint8_t *p,uint16_t n) {assert(p && n);att_sent++;att_result=0;return true;}
-void dongle_att_poll(void) {++att_polls;}
+void dongle_att_poll(void) {
+    ++att_polls;
+    if (check_unpublished) {
+        uint8_t data[64];
+        check_unpublished = false;
+        assert(!dongle_rpc_client_get(DONGLE_CLIENT_USB, data));
+    }
+}
 void dongle_att_cancel(void) {cancellations++;att_result=0;}
 dongle_att_result_t dongle_att_take(uint8_t *out,uint16_t cap,uint16_t *n) {
     (void)cap;if(att_result==1){out[0]=0x0b;out[1]=7;*n=2;}return att_result;
@@ -136,6 +143,13 @@ int main(void) {
     assert(last_cache_slot==7 && clients[0].phase==COMPLETE && clients[0].total==21 && clients[0].payload[20]==20);
     slot=8;send_packet(3,5,1,0,&slot,1);send_packet(6,5,0,0,NULL,0);
     assert(last_cache_slot==7 && clients[0].phase==FAILED && clients[0].failure==UNSUPPORTED);
+    ++connection;
+    assert(!dongle_rpc_client_get(DONGLE_CLIENT_USB, buffer));
+    dongle_rpc_available(false);
+    dongle_rpc_available(true);
+    check_unpublished = true;
+    dongle_rpc_poll();
+    assert(dongle_rpc_client_get(DONGLE_CLIENT_USB, buffer) && buffer[21] == IDLE);
     puts("dongle RPC: dirty publication, live transport/deadlines, fragments, pages, replay, cancellation and generation fencing passed");
     return 0;
 }

@@ -93,6 +93,18 @@ class UsbAudioDescriptorTests(unittest.TestCase):
         self.assertNotIn('1:2', check.validate(configuration(False), False))
         self.assertNotIn('1:3', check.validate(configuration(False), False))
 
+    def test_motion_interface_requires_its_own_endpoint(self):
+        data = configuration()
+        data.extend(check.MOTION_INTERFACE)
+        struct.pack_into('<H', data, 2, len(data))
+        data[4] = 7
+        self.assertIn('1:3', check.validate(data, motion_enabled=True))
+        with self.assertRaises(ValueError):
+            check.validate(data)
+        data[-5] = 0x85
+        with self.assertRaises(ValueError):
+            check.validate(data, motion_enabled=True)
+
     def test_pcm32_requires_integer_format_and_complete_stereo_slots(self):
         for offset, replacement in ((6, 4), (20, 2), (21, 24)):
             data = configuration()

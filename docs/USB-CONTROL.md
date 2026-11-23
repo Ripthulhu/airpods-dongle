@@ -12,6 +12,51 @@ The [AirPods CLI](CLI.md) exposes named `status`, `settings`, `get`, `set` and
 `help` commands over this same interface. It shares the host HID transport with
 the diagnostic tools and confirms setting writes through fresh device reports.
 
+## Head tracking preview
+
+Build with `-DAIRPODS_HEAD_TRACKING=ON` for AirPods Pro 3 motion over USB HID.
+On the audio personality (`CAFE:4015`, USB device revision `0x0101`), find the
+HID collection with usage page `0xFF31` and usage `0x03`. Match its USB serial
+to the dongle selected for playback. The existing HID control collection and
+stereo UAC2 formats keep their existing IDs. The control-only personality
+does not expose motion.
+
+- Feature report `[0x02, 100]` requests a 10 ms interval. Use `[0x02, 50]`
+  for 20 ms or `[0x02, 30]` for approximately 33.3 ms. Renew once per second
+  and send `[0x02, 0]` to stop. Game Mode caps this stream at 30 Hz while its
+  low-latency mode is requested and until normal buffering is restored.
+  GET returns the requested rate. Measure the delivered rate from the AirPods'
+  sample timestamps. A new USB rate request discards pending motion from the
+  old request. The Game Mode cap updates the existing stream in place.
+  The dongle restarts the stream once if valid reports stop for three seconds.
+  USB suspend or detach revokes the request. The dongle waits for its AirPods
+  audio ownership, a known bud role and the advertised Pro 3 motion service.
+  Microphone use suspends motion.
+- Read input report ID `0x01`, 51 bytes including the ID. Offsets below begin
+  immediately after the ID. Integers are little-endian and vectors are in the
+  bud's raw axis order.
+
+| Payload offset | Size | Field |
+| --- | ---: | --- |
+| 0 | 1 | Protocol version `1` |
+| 1 | 1 | Flags, bit 0 marks that the device counter is present |
+| 2 | 4 | AACP bud role bytes, first byte `1` left primary or `2` right primary |
+| 6 | 4 | Source generation, unsigned |
+| 10 | 4 | Dongle arrival time in milliseconds since boot, wrapping unsigned |
+| 14 | 8 | AirPods timestamp in nanoseconds, unsigned |
+| 22 | 4 | AirPods sample counter when present, otherwise zero |
+| 26 | 6 | Three signed 16-bit attitude values in Q15 |
+| 32 | 6 | Three signed 16-bit raw gyro values |
+| 38 | 6 | Three signed 16-bit raw user-acceleration values |
+| 44 | 6 | Three signed 16-bit raw gravity values |
+
+Treat a generation change as a discontinuity. Use the AirPods timestamp to
+track sample spacing and a host monotonic clock to detect when reports stop.
+The dongle queues only the newest sample and discards it after 100 ms.
+The Windows renderer owns pose calibration, recentering and HRTF processing.
+The Windows virtual endpoint will accept multichannel audio and render it to
+the dongle's existing stereo endpoint.
+
 ## Stem volume
 
 From 0.1.48, native AirPods gain is retained. A fresh, transaction-matched AVRCP

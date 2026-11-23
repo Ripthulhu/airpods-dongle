@@ -87,8 +87,30 @@ static void live_transition(uint16_t report, uint16_t target) {
     assert(!s.running && !s.failed && ms<2000);
     assert(playback_adjust_interval(&s)==10 && pcm.used<PLAYBACK_USB_MIN_FRAMES);
 }
+static void losing_restore_preserves_playback(void) {
+    playback_adjust_t s={0};
+    playback_adjust_request(&s,640,150);
+    uint32_t start=UINT32_MAX-100u;
+    playback_adjust_start(&s,start);
+    // The PC trace delivered 933 ten-ms units in 10,003 ms during a 64 -> 150 ms restore.
+    for (unsigned unit=1;unit<=933 && s.running;++unit) {
+        uint32_t elapsed=unit*10003u/933u;
+        playback_adjust_sent(&s,480,start+elapsed,true);
+    }
+    assert(s.failed && !s.running && s.sent_frames < 480u*60u);
+    // A brief queueing delay followed by catch-up can still complete normally.
+    playback_adjust_request(&s,640,150);
+    playback_adjust_start(&s,start);
+    for (unsigned unit=1;unit<=150 && s.running;++unit) {
+        uint32_t elapsed=unit*9u;
+        if(unit>=5 && elapsed<85) elapsed=85;
+        playback_adjust_sent(&s,480,start+elapsed,true);
+    }
+    assert(!s.failed && !s.running);
+}
 int main(void) {
     padded_window_boundaries();
+    losing_restore_preserves_playback();
     interpolation();
     live_transition(1590,60); live_transition(900,150);
     playback_adjust_t s={0};

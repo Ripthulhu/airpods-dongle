@@ -6,13 +6,23 @@
 #include <string.h>
 #include "../src/btstack/accessory_automation.h"
 #include "../src/btstack/playback_duck.h"
+#include "../src/btstack/playback_options.h"
 #include "../src/tinyusb/media_control.h"
 
 static uint32_t now, session, host, pause_receipt;
-static bool is_usb_streaming, phone_active, a2dp_is_connected_flag, ready, owned, model_known;
+static bool is_usb_streaming, phone_opened, phone_active, a2dp_is_connected_flag, ready, owned, model_known;
 static bool call_active, call_opened, mic, mic_prepare_open, mic_recovery_pending;
-static bool profile_pending, playback_released, queue_ok;
-static struct {uint16_t avdtp_cid;} media_tracker;
+static bool profile_pending, playback_released, playback_peer_suspended, queue_ok;
+static struct {uint16_t avdtp_cid;bool streaming;} media_tracker;
+static struct test_endpoint {uint16_t l2cap_media_cid;} endpoint;
+static struct {struct test_endpoint *local_stream_endpoint;} sc;
+static playback_game_t playback_game;
+static uint8_t cur_codec;
+static uint32_t usb_playback_revision;
+static bool game_eligible;
+static uint8_t cur_active_device[6], selected_device[6];
+static const uint8_t *get_device_addr(void) {return selected_device;}
+static bool playback_game_eligible(void) {return game_eligible;}
 static unsigned pauses, plays, cancellations;
 static uint8_t cached_wear[40];
 static uint16_t cached_length;
@@ -65,7 +75,7 @@ static void fixture(void) {
     memset(&playback_accessory,0,sizeof(playback_accessory));
     session=1;host=3;now=100;pause_receipt=0;
     is_usb_streaming=a2dp_is_connected_flag=ready=owned=queue_ok=model_known=true;
-    phone_active=call_active=call_opened=mic=mic_prepare_open=mic_recovery_pending=false;
+    phone_opened=phone_active=call_active=call_opened=mic=mic_prepare_open=mic_recovery_pending=false;
     profile_pending=playback_released=false;media_tracker.avdtp_cid=7;
     cached_length=0;cached_session=0;
     pauses=plays=cancellations=0;playback_accessory_poll();
@@ -155,7 +165,111 @@ static void test_conversation_scope(void) {
     fixture();stage(1);host+=2;playback_accessory_poll();assert(!playback_accessory_duck());
     dongle_playback_accessory_event(NULL,11);
 }
+
+static void test_priority_scope(void) {
+    fixture();
+    cur_codec=4;
+    game_eligible=playback_game.requested=true;
+    sc.local_stream_endpoint=&endpoint;
+    endpoint.l2cap_media_cid=0x40;
+    selected_device[0]=1;
+    memcpy(cur_active_device,get_device_addr(),sizeof(cur_active_device));
+    uint16_t cid=0;
+#if AIRPODS_EXPERIMENTAL_RADIO0076
+    assert(dongle_playback_priority_scope(&cid) && cid==0x40);
+    bool *busy[]={&phone_opened,&phone_active,&call_active,&call_opened,&mic,&mic_prepare_open,
+                  &mic_recovery_pending,&profile_pending,&playback_released};
+    for(unsigned i=0;i<sizeof(busy)/sizeof(*busy);++i) {
+        *busy[i]=true;
+        assert(!dongle_playback_priority_scope(&cid));
+        *busy[i]=false;
+    }
+    bool *required[]={&playback_game.requested,&a2dp_is_connected_flag,&owned,&ready,&game_eligible};
+    for(unsigned i=0;i<sizeof(required)/sizeof(*required);++i) {
+        *required[i]=false;
+        assert(!dongle_playback_priority_scope(&cid));
+        *required[i]=true;
+    }
+    ++cur_active_device[0];assert(!dongle_playback_priority_scope(&cid));--cur_active_device[0];
+    sc.local_stream_endpoint=NULL;assert(!dongle_playback_priority_scope(&cid));sc.local_stream_endpoint=&endpoint;
+    endpoint.l2cap_media_cid=0;assert(!dongle_playback_priority_scope(&cid));endpoint.l2cap_media_cid=0x40;
+    host&=~1u;assert(!dongle_playback_priority_scope(&cid));host|=1u;
+    cur_codec=2;assert(!dongle_playback_priority_scope(&cid));cur_codec=4;
+    assert(dongle_playback_priority_scope(&cid) && cid==0x40);
+#else
+    assert(!dongle_playback_priority_scope(&cid));
+#endif
+}
+
+static void test_scan_follows_real_usb_playback(void) {
+    fixture();
+    cur_codec=4;
+    game_eligible=true;
+    media_tracker.streaming=true;
+    playback_game.requested=true;
+    const float silence[]={0.0f,-0.0f};
+    const float quiet[]={0x1p-25f,0.0f};
+    playback_accessory_signal(silence,1,true);
+    assert(!dongle_playback_defer_scan()); // Open USB endpoint playing zeros.
+    now=UINT32_MAX;
+    playback_accessory_signal(quiet,1,true);
+    assert(dongle_playback_defer_scan()); // Timestamp zero is reserved for no samples yet.
+    now+=998u;
+    playback_accessory_signal(silence,1,true);
+    assert(dongle_playback_defer_scan()); // Short musical rest, including across millisecond wrap.
+    playback_game.requested=false;
+    signal();
+    assert(dongle_playback_defer_scan()); // Switching off mid-track must not restart the scanner.
+    now+=1001u;
+    playback_accessory_signal(silence,1,true);
+    assert(!dongle_playback_defer_scan());
+    signal();
+    assert(!dongle_playback_defer_scan()); // Normal-only playback after that pause.
+    playback_game.requested=true;
+    assert(dongle_playback_defer_scan());
+    is_usb_streaming=false;
+    assert(!dongle_playback_defer_scan()); // Explicit endpoint close takes effect immediately.
+}
+
+static void test_scan_relay_and_route_loss(void) {
+    fixture();
+    cur_codec=4;
+    game_eligible=true;
+    media_tracker.streaming=playback_game.requested=true;
+    is_usb_streaming=false;
+    assert(!dongle_playback_defer_scan());
+    phone_active=true;
+    assert(dongle_playback_defer_scan()); // Relay is independent of USB audio.
+    phone_active=false;
+    assert(!dongle_playback_defer_scan());
+    is_usb_streaming=true;
+    signal();
+    playback_game.failed=true;
+    assert(!dongle_playback_defer_scan());
+    playback_game.failed=false;
+    game_eligible=false;
+    assert(!dongle_playback_defer_scan());
+    game_eligible=true;
+    assert(dongle_playback_defer_scan());
+    playback_peer_suspended=true;
+    assert(!dongle_playback_defer_scan());
+    playback_peer_suspended=false;
+    assert(dongle_playback_defer_scan());
+    owned=false;
+    assert(!dongle_playback_defer_scan());
+    playback_game.requested=false;
+    owned=true;
+    assert(!dongle_playback_defer_scan()); // Old session cannot hold the scan on a new owner.
+    playback_game.requested=true;
+    a2dp_is_connected_flag=false;
+    assert(!dongle_playback_defer_scan());
+    a2dp_is_connected_flag=true;
+    cur_codec=2;
+    assert(!dongle_playback_defer_scan());
+}
 int main(void) {
+    test_priority_scope();
     test_wear_and_signal();test_cached_startup_presence();test_owner_and_manual_fences();test_conversation_scope();
+    test_scan_follows_real_usb_playback();test_scan_relay_and_route_loss();
     puts("driverless accessory bridge: actual event/poll wiring, scope, signal, manual controls and relay duck passed");
 }

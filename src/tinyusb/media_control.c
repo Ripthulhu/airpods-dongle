@@ -7,6 +7,9 @@
 #include <stddef.h>
 #include "tusb.h"
 #include "pico/time.h"
+#if AIRPODS_HEAD_TRACKING
+#include "motion_usb.h"
+#endif
 
 #define MEDIA_QUEUE_LENGTH 8u
 
@@ -96,6 +99,9 @@ void usb_media_cancel_automatic(void) {
 }
 
 void usb_media_set_available(bool available) {
+#if AIRPODS_HEAD_TRACKING
+    usb_motion_reset();
+#endif
     dongle_control_available(available);
     dongle_rpc_available(available);
     uint32_t old = atomic_load_explicit(&host_state, memory_order_relaxed);
@@ -141,11 +147,17 @@ void tud_hid_report_failed_cb(uint8_t instance, hid_report_type_t type,
                               uint8_t const *report, uint16_t length) {
     (void)report;
     (void)length;
-    if (instance == 0 && type == HID_REPORT_TYPE_INPUT) receipt_pending = false;
-    // An accepted press still gets a release before any later queued key.
+    if (instance == 0 && type == HID_REPORT_TYPE_INPUT) {
+        receipt_pending = false;
+        // A failed release can leave the host holding the previous key.
+        release_pending = true;
+    }
 }
 
 void usb_media_task(void) {
+#if AIRPODS_HEAD_TRACKING
+    usb_motion_task();
+#endif
     uint32_t state = atomic_load_explicit(&host_state, memory_order_acquire);
     if (!(state & 1u)) return;
     if (release_pending) {
@@ -178,6 +190,13 @@ void usb_media_task(void) {
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type, uint8_t *buffer,
                                uint16_t requested) {
+#if AIRPODS_HEAD_TRACKING
+    if (instance == USB_MOTION_INSTANCE && report_id == USB_MOTION_RATE_ID &&
+        report_type == HID_REPORT_TYPE_FEATURE && buffer && requested) {
+        buffer[0] = usb_motion_rate();
+        return 1;
+    }
+#endif
     if (instance == 0 && report_id == 2 && report_type == HID_REPORT_TYPE_FEATURE)
         return dongle_control_get(buffer, requested);
     if (instance == 0 && report_id == 3 && report_type == HID_REPORT_TYPE_FEATURE)
@@ -192,6 +211,11 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type, uint8_t const *buffer,
                            uint16_t size) {
+#if AIRPODS_HEAD_TRACKING
+    if (instance == USB_MOTION_INSTANCE && report_id == USB_MOTION_RATE_ID &&
+        report_type == HID_REPORT_TYPE_FEATURE && buffer && size == 1)
+        usb_motion_set_rate(buffer[0]);
+#endif
     if (instance == 0 && report_id == 2 && report_type == HID_REPORT_TYPE_FEATURE)
         dongle_control_set(buffer, size);
     if (instance == 0 && report_id == 3 && report_type == HID_REPORT_TYPE_FEATURE)

@@ -8,6 +8,7 @@ set(PICOTOOL_GIT_BRANCH 2041936441b48a3cc53ae3da9e805229fe8f4e18)
 include(pico_sdk_import.cmake)
 project(airpods_dongle VERSION 0.1.70 LANGUAGES C CXX ASM)
 option(AIRPODS_USB_FLOAT "Expose float and integer PCM32 USB input alongside S16 compatibility" ON)
+option(AIRPODS_HEAD_TRACKING "Expose the AirPods Pro 3 motion preview over USB HID" OFF)
 option(AIRPODS_ENABLE_BLUETOOTH_CALLS "Experimental HFP/SCO calls; CYW43 firmware can stall (pico-sdk issue 1461)" OFF)
 option(AIRPODS_EXPERIMENTAL_RADIO0076 "Offline-review .0076 radio preview; not hardware-qualified" OFF)
 set(AACELD_CBR_BANDWIDTH 20000 CACHE STRING "AAC-ELD CBR bandwidth in Hz; 0 uses FDK automatic selection")
@@ -92,6 +93,9 @@ set(airpods_project_sources
     src/tinyusb/dongle_rpc.c
     src/tinyusb/dongle_features.c
 )
+if(AIRPODS_HEAD_TRACKING)
+    list(APPEND airpods_project_sources src/btstack/head_motion.c src/tinyusb/motion_usb.c)
+endif()
 # The project's own C is held to the same warning bar as the host tests; SDK, BTstack,
 # TinyUSB and 3rd-party sources keep their upstream flags.
 set(airpods_project_warning_flags -Wall -Wextra -Werror)
@@ -157,6 +161,7 @@ target_compile_definitions(airpods_dongle PRIVATE
     AIRPODS_DONGLE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
     AACELD_CBR_BANDWIDTH=${AACELD_CBR_BANDWIDTH}
     AIRPODS_USB_FLOAT=$<BOOL:${AIRPODS_USB_FLOAT}>
+    AIRPODS_HEAD_TRACKING=$<BOOL:${AIRPODS_HEAD_TRACKING}>
     AIRPODS_ENABLE_BLUETOOTH_CALLS=$<BOOL:${AIRPODS_ENABLE_BLUETOOTH_CALLS}>
     CYW43_LWIP=0 CYW43_PIO_CLOCK_DIV_DYNAMIC=1 ENABLE_RIJNDAEL_DECRYPT=1 PICO_MALLOC_PANIC=0 PICO_USE_MALLOC_MUTEX=1
     PICO_CORE1_STACK_SIZE=0 PICO_STACK_SIZE=16384 PICO_USE_STACK_GUARDS=1

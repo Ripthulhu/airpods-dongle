@@ -28,6 +28,9 @@ uint16_t dongle_playback_inspect(uint8_t *p,uint16_t n) {(void)p;(void)n;return 
 void dongle_playback_inspect_enable(bool active) {(void)active;}
 void ble_scan_diagnostic_pause(bool paused) {(void)paused;}
 bool bt_hci_airpods_flush_comparison(bool enabled) {return !enabled;}
+bool bt_hci_priority_comparison(bool enabled) {return !enabled;}
+void bt_hci_priority_snapshot(uint8_t out[9]) {(void)out;}
+void bt_hci_priority_transition(enum priority_reason reason) {(void)reason;}
 bool bt_hci_radio_diagnostics(bt_hci_radio_diagnostics_t *out) {(void)out;return false;}
 uint16_t dongle_playback_adaptive_snapshot(uint8_t *out,uint16_t cap) {(void)out;(void)cap;return 0;}
 void dongle_playback_poll(void) {}

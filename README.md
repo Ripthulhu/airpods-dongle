@@ -107,7 +107,7 @@ its implementation and validation boundaries.
 - Bluetooth relay supports guarded LHDC, aptX and SBC phone input.
 - Bluetooth phone calls remain experimental and disabled by default. See the
   [phone transport record](docs/PHONE-TRANSPORT.md).
-- Sensor streaming and case ringing are not implemented.
+- The unified firmware includes the [AirPods Pro 3 USB head-tracking preview](docs/USB-CONTROL.md#head-tracking-preview). Motion starts when a host requests it. Case ringing remains unavailable.
 
 A successful CI build verifies code, codec and linked-memory checks. Hardware
 listening, weak-signal behavior, microphone lifecycle and end-to-end latency
@@ -129,7 +129,7 @@ C/C++ toolchain with newlib, and `qemu-system-arm`. Use a separate SDK checkout:
 
 ```sh
 python3 tools/prepare_sdk.py --sdk .sdk/pico-sdk
-cmake -S . -B build -G Ninja -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" -DCMAKE_BUILD_TYPE=Release -DAIRPODS_EXPERIMENTAL_RADIO0076=ON
+cmake -S . -B build -G Ninja -DPICO_SDK_PATH="$PWD/.sdk/pico-sdk" -DCMAKE_BUILD_TYPE=Release -DAIRPODS_EXPERIMENTAL_RADIO0076=ON -DAIRPODS_HEAD_TRACKING=ON
 cmake --build build --parallel
 ```
 

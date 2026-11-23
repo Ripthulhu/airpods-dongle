@@ -13,11 +13,10 @@
 
 typedef struct {
     uint8_t status[DONGLE_REPORT_SIZE], command[DONGLE_REPORT_SIZE];
-    volatile bool available, pending;
+    volatile bool available, pending, initialized;
     volatile uint32_t epoch;
     uint32_t seen_epoch, generation, last_sequence;
     uint8_t last_result, last_opcode;
-    bool initialized;
 } control_client_t;
 static control_client_t controls[DONGLE_CLIENT_COUNT];
 static uint32_t last_session;
@@ -31,6 +30,7 @@ void dongle_control_client_available(uint8_t client, bool on) {
     if (client >= DONGLE_CLIENT_COUNT) return;
     controls[client].available = on;
     controls[client].pending = false;
+    controls[client].initialized = false;
     ++controls[client].epoch;
 }
 void dongle_control_available(bool on) { dongle_control_client_available(DONGLE_CLIENT_USB, on); }
@@ -107,8 +107,10 @@ void dongle_control_poll(void) {
             c->last_sequence = c->last_result = c->last_opcode = 0;
         }
         if (changed || reset || !c->generation) {
+            c->initialized = false;
             if (!++c->generation) ++c->generation;
         }
+        if (!c->available) continue;
         uint8_t request[DONGLE_REPORT_SIZE], next[DONGLE_REPORT_SIZE];
         uint32_t irq = save_and_disable_interrupts();
         bool take = c->pending && c->available;
@@ -151,7 +153,7 @@ void dongle_control_poll(void) {
         next[DONGLE_STATUS_OFFSET_CASE_OBSERVED_COMPONENTS] = case_source;
         irq = save_and_disable_interrupts();
         memcpy(c->status, next, DONGLE_REPORT_SIZE);
-        c->initialized = true;
+        c->initialized = c->seen_epoch == c->epoch;
         restore_interrupts(irq);
     }
 }

@@ -39,7 +39,17 @@ def elf_symbol(data, name):
     return found[0]
 
 
-def validate(data, float_enabled=True):
+MOTION_REPORT = bytes.fromhex(
+    '06 31 ff 09 03 a1 01 15 00 26 ff 00 75 08 85 01 '
+    '95 32 09 01 81 02 85 02 95 01 09 02 b1 02 c0')
+MOTION_INTERFACE = bytes((
+    9, 4, 6, 0, 1, 3, 0, 0, 0,
+    9, 0x21, 0x11, 1, 0, 1, 0x22, len(MOTION_REPORT), 0,
+    7, 5, 0x86, 3, 64, 0, 5,
+))
+
+
+def validate(data, float_enabled=True, motion_enabled=False):
     if len(data) < 9 or data[:2] != b'\x09\x02' or struct.unpack_from('<H', data, 2)[0] != len(data):
         raise ValueError('Incorrect configuration descriptor length')
     formats, interfaces = {}, set()
@@ -78,8 +88,11 @@ def validate(data, float_enabled=True):
     if float_enabled:
         expected[(1, 2)] = dict(format=4, channels=2, subslot=4, bits=32, endpoint=1, packet_bytes=392, interval=1)
         expected[(1, 3)] = dict(format=1, channels=2, subslot=4, bits=32, endpoint=1, packet_bytes=392, interval=1)
-    if formats != expected or interfaces != set(range(6)) or data[4] != 6:
+    count = 6 + motion_enabled
+    if formats != expected or interfaces != set(range(count)) or data[4] != count:
         raise ValueError('Linked USB interfaces or audio alternatives do not match their contract: %r' % formats)
+    if motion_enabled and not data.endswith(MOTION_INTERFACE):
+        raise ValueError('Linked USB motion interface does not match its endpoint contract')
     return {f'{itf}:{alt}': value for (itf, alt), value in formats.items()}
 
 
@@ -140,10 +153,16 @@ def validate_firmware(data, float_enabled=True):
             struct.unpack_from('<HH', descriptor, 8) != (0xcafe, pid) or
             descriptor[14:18] != b'\x01\x02\x03\x01'):
             raise ValueError('Incorrect USB device identity')
-    if devices[0][:10] + devices[0][12:] != devices[1][:10] + devices[1][12:]:
-        raise ValueError('USB personalities must preserve device fields other than product ID')
+    revision, control_revision = (struct.unpack_from('<H', device, 12)[0] for device in devices)
+    if control_revision != 0x0100 or revision not in (0x0100, 0x0101):
+        raise ValueError('Incorrect USB device revision')
+    if devices[0][:10] + devices[0][14:] != devices[1][:10] + devices[1][14:]:
+        raise ValueError('USB personalities must preserve device fields other than product ID and revision')
+    motion_enabled = revision == 0x0101
+    if motion_enabled and elf_symbol(data, 'desc_hid_motion') != MOTION_REPORT:
+        raise ValueError('Incorrect USB motion report descriptor')
     validate_control(elf_symbol(data, 'desc_configuration_control'))
-    return validate(elf_symbol(data, 'desc_configuration'), float_enabled)
+    return validate(elf_symbol(data, 'desc_configuration'), float_enabled, motion_enabled)
 
 
 def main():

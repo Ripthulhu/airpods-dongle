@@ -202,7 +202,8 @@
     {"name": "request_routing_handover", "value": 21, "request_size": 10},
     {"name": "reserved_output_continuity", "value": 22, "reserved": true},
     {"name": "reconnect_policy", "value": 23, "request_size": [1, 2]},
-    {"name": "read_firmware_version", "value": 24, "request_size": 1}
+    {"name": "read_firmware_version", "value": 24, "request_size": 1},
+    {"name": "diagnostic_a2dp_priority", "value": 25, "request_size": 1, "clients": ["usb"]}
   ],
   "settings_snapshot_selectors": [{"name": "legacy", "request": [2]}, {"name": "extended", "request": [2, 1], "selector": 1}],
   "reconnect_policies": [{"name": "manual", "value": 0}, {"name": "automatic", "value": 1}],

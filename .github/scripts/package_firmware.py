@@ -15,6 +15,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIGURATION = {"PICO_BOARD": "pico2_w", "CMAKE_BUILD_TYPE": "Release", "AIRPODS_USB_FLOAT": "ON",
+                 "AIRPODS_HEAD_TRACKING": "ON",
                  "AIRPODS_EXPERIMENTAL_RADIO0076": "ON", "AIRPODS_ENABLE_BLUETOOTH_CALLS": "OFF",
                  "AACELD_CBR_BANDWIDTH": "20000"}
 FIRMWARE = {"airpods_dongle.uf2", "airpods_dongle.bin", "airpods_dongle.elf", "airpods_dongle.elf.map", "memory-check.json"}
@@ -214,7 +215,9 @@ def self_test():
         seal()
         assert len(validate_package(root, commit, "0.1.62")) == 13
         for changes in ({"commit": "b" * 40}, {"version": "0.1.61"},
-                        {"configuration": {**CONFIGURATION, "AIRPODS_EXPERIMENTAL_RADIO0076": "OFF"}}):
+                        {"configuration": {**CONFIGURATION, "AIRPODS_EXPERIMENTAL_RADIO0076": "OFF"}},
+                        {"configuration": {k: v for k, v in CONFIGURATION.items() if k != "AIRPODS_HEAD_TRACKING"}},
+                        {"configuration": {**CONFIGURATION, "AIRPODS_HEAD_TRACKING": "OFF"}}):
             saved = json.loads((root / "BUILD.json").read_text())
             (root / "BUILD.json").write_text(json.dumps({**saved, **changes}))
             (root / "SHA256SUMS").write_text("".join(f"{digest(root / name)}  {name}\n" for name in sorted(PAYLOADS)))

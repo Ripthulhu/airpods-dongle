@@ -12,9 +12,9 @@ typedef struct {
     uint32_t ceiling, current, target;
     uint32_t window_since, stable_since, clean_since, last_change;
     uint32_t last_flushes, last_pressure, window_flushes, window_pressure, window_elapsed;
-    uint32_t changes, errors;
-    uint8_t bad_windows, reason;
-    bool active, frozen, fault, variable, urgent;
+    uint32_t changes, errors, near_since;
+    uint8_t bad_windows, reason, near_episodes;
+    bool active:1, frozen:1, fault:1, variable:1, urgent:1, near_seen:1, near_latched:1;
 } playback_bitrate_t;
 
 static inline void playback_bitrate_reset(playback_bitrate_t *s, uint32_t ceiling, bool variable) {
@@ -46,6 +46,7 @@ static inline void playback_bitrate_observe(playback_bitrate_t *s, uint32_t now,
     if (!s->ceiling) return;
     if (!eligible || s->fault) {
         s->active = false; s->frozen = true; s->bad_windows = 0;
+        s->near_episodes = s->near_seen = s->near_latched = 0;
         if (!s->urgent || s->target >= s->current || s->fault) s->target = s->current;
         s->stable_since = s->clean_since = s->window_since = now;
         s->last_flushes = flushes; s->last_pressure = pressure;
@@ -71,10 +72,19 @@ static inline void playback_bitrate_observe(playback_bitrate_t *s, uint32_t now,
     s->window_flushes = flushes - s->last_flushes;
     s->window_pressure = pressure - s->last_pressure;
     s->last_flushes = flushes; s->last_pressure = pressure; s->window_since = now;
-    if (elapsed > 2500u) { s->bad_windows = 0; s->clean_since = now; return; }
+    // A burst already credited as a near-deadline episode cannot also earn a window strike.
+    unsigned strikes = s->near_episodes;
+    if (!strikes && !s->near_seen && (s->window_flushes || s->window_pressure >= 2u)) strikes = 1;
+    s->near_episodes = s->near_seen = 0;
+    if (elapsed > 2500u) {
+        s->near_latched = false;
+        s->bad_windows = 0;
+        s->clean_since = now;
+        return;
+    }
     if (s->window_flushes || s->window_pressure) s->clean_since = now;
-    if (s->window_flushes || s->window_pressure >= 2u) {
-        if (s->bad_windows < 2u) ++s->bad_windows;
+    if (strikes || s->window_flushes >= 3u) {
+        s->bad_windows += strikes; // At most one carried strike and two new episodes.
         if (s->window_flushes >= 3u || s->bad_windows >= 2u) {
             s->target = playback_bitrate_rung(s, false);
             s->reason = PLAYBACK_RATE_PRESSURE;
@@ -93,6 +103,8 @@ static inline void playback_bitrate_observe(playback_bitrate_t *s, uint32_t now,
 }
 static inline void playback_bitrate_applied(playback_bitrate_t *s, uint32_t now, bool success) {
     s->urgent = false;
+    s->bad_windows = s->near_episodes = 0;
+    if (s->near_latched) s->near_since = now;
     if (success) {
         if (s->current != s->target) ++s->changes;
         s->current = s->target; s->last_change = s->clean_since = now;

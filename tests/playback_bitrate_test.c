@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include "../src/btstack/playback_bitrate.h"
@@ -22,7 +23,13 @@ static playback_game_t playback_game;
 static playback_usb_verification_t usb_game_verification;
 static playback_adjust_t playback_adjust;
 static uint32_t aaceld_bitrate, bitrate_pressure, bitrate_discontinuities, bitrate_radio_epoch, now;
-static void playback_encoder_invalidate(void) {}
+static struct { atomic_uint epoch; } encoder_job;
+static bool control_ready;
+static uint32_t session;
+static uint32_t aacp_control_session(void) {return session;}
+static bool aacp_control_ready(void) {return control_ready;}
+static void playback_encoder_invalidate(void) {++encoder_job.epoch;}
+#define PB_EVENT(kind,a,b) playback_trace_record(&playback_trace,now*1000u,kind,a,b)
 static uint8_t bitrate_input;
 static bool bitrate_game_requested, aaceld_variable_allowed;
 static uint16_t aaceld_frame_sequence;
@@ -45,7 +52,8 @@ static bool radio_known, radio_active;
 static playback_continuity_t phone_continuity;
 static bool is_streaming,recovery_reset_encoder;
 static unsigned suspend_recovery_timer;
-static bool playback_pcm_warm(void) {return warm;}
+static unsigned warm_reads;
+static bool playback_pcm_warm(void) {++warm_reads;return warm;}
 static bool aacp_audio_owned(void) {return owned;}
 static bool aacp_mic_requested(void) {return mic_requested;}
 static bool aacp_mic_active(void) {return mic_active;}
@@ -105,6 +113,99 @@ static void ready(void) {
 }
 static void window(uint32_t flushes,uint32_t pressure) {
     now+=1000;radio_state.flush_events+=flushes;bitrate_pressure+=pressure;playback_bitrate_poll(now);
+}
+static void game_ready(void) {
+    fixture(false,255200);
+    playback_game.requested=playback_game.changed=playback_game.low_latency_confirmed=true;
+    playback_game.phase=GAME_CONFIRMED;playback_game.target=60;
+    ready();
+}
+static void game_packet(uint32_t wait_us,uint32_t gap_us) {
+    if (wait_us>20000u || gap_us>40000u) ++bitrate_pressure;
+    playback_bitrate_game_packet(wait_us,gap_us);
+}
+static void test_game_transport_episodes(void) {
+    game_ready();
+    game_packet(31000,40065);window(0,0); // Recorded mild event.
+    game_packet(44000,54695);window(0,0); // Recorded near miss, no flush or drop.
+    assert(playback_bitrate.current==255200 && playback_bitrate.target==255200 && playback_bitrate.bad_windows==1);
+    game_packet(0,10000); // Nominal ELD packet rearms the counter.
+    for(unsigned i=0;i<30;++i)window(0,0);
+    assert(!playback_bitrate.bad_windows);
+    game_packet(44000,54695);window(0,0);
+    assert(playback_bitrate.target==255200 && playback_bitrate.bad_windows==1);
+
+    // Replay the severe observation twice. Whether a 1 s observation cuts through them is immaterial.
+    for(unsigned crossed=0;crossed<=1;++crossed) {
+        game_ready();
+        bitrate_pressure=playback_bitrate.last_pressure=UINT32_MAX;
+        uint32_t start=now;
+        now=start+940;game_packet(44000,54695);
+        now=start+960;game_packet(0,10000);
+        if(crossed) { now=start+1000;playback_bitrate_poll(now); }
+        now=start+(crossed?1050:990);game_packet(44000,54695);
+        now=start+(crossed?2000:1000);playback_bitrate_poll(now);
+        assert(playback_bitrate.target==220000 && !playback_bitrate.urgent);
+        assert(playback_bitrate_apply(&media_tracker) && playback_bitrate.changes==1);
+        // Still in the same late burst. Raw pressure and a coincident flush cannot charge it again.
+        game_packet(44000,54695);game_packet(44000,54695);window(1,0);
+        assert(playback_bitrate.target==220000 && !playback_bitrate.bad_windows);
+        game_packet(0,10000);
+        for(unsigned i=0;i<29;++i)window(0,0);
+        assert(playback_bitrate.target==220000);
+        window(0,0);assert(playback_bitrate.target==255200);
+    }
+    // One uninterrupted cluster cannot make two strikes by spanning an observation boundary.
+    game_ready();
+    now+=950;game_packet(44000,54695);
+    now+=50;playback_bitrate_poll(now);
+    now+=60;game_packet(44000,54695);
+    now+=60;game_packet(44000,54695);
+    now+=880;playback_bitrate_poll(now);
+    assert(playback_bitrate.target==255200 && playback_bitrate.bad_windows==1);
+    game_packet(44000,54695);window(0,0); // Still stalled a full second later.
+    assert(playback_bitrate.target==220000);
+    game_ready();
+    now=playback_bitrate.window_since=UINT32_MAX-500u;
+    game_packet(44000,54695);now+=600u;game_packet(44000,54695);
+    assert(playback_bitrate.near_episodes==1);
+    now+=400u;game_packet(44000,54695);playback_bitrate_poll(now);
+    assert(playback_bitrate.target==220000);
+    // Without a can-send wait, a delayed source alone is insufficient.
+    game_ready();
+    for(unsigned sec=0;sec<4;++sec) {game_packet(0,10000);game_packet(0,54695);window(0,0);}
+    assert(playback_bitrate.target==255200 && !playback_bitrate.bad_windows);
+    // A corroborated late send still counts when its gap exceeds the target. Restart drops its evidence.
+    game_ready();game_packet(52000,63000);
+    assert(playback_bitrate.near_episodes==1 && !playback_bitrate.urgent);
+    playback_transport_stale=true;playback_bitrate_poll(++now);
+    assert(playback_bitrate.frozen && !playback_bitrate.near_episodes && !playback_bitrate.bad_windows);
+    playback_transport_stale=false;ready();game_packet(44000,54695);window(0,0);
+    assert(playback_bitrate.target==255200 && playback_bitrate.bad_windows==1);
+}
+static void test_game_transport_episode_scope(void) {
+    game_ready();
+    game_packet(44000,54695);window(0,0);
+    playback_game.requested=false;playback_game.phase=GAME_OFF;playback_bitrate_poll(++now);
+    assert(!playback_bitrate.bad_windows && !playback_bitrate.near_latched);
+    for(unsigned sec=0;sec<8;++sec) {game_packet(0,10000);game_packet(44000,54695);window(0,0);}
+    assert(playback_bitrate.target==255200 && !playback_bitrate.bad_windows);
+
+    game_ready();game_packet(44000,54695);
+    ++radio_state.epoch;playback_bitrate_poll(++now); // Before the strike is consumed.
+    assert(playback_bitrate.frozen && !playback_bitrate.near_episodes);
+    game_packet(44000,54695);assert(!playback_bitrate.near_episodes);
+    ready();
+    owned=false;game_packet(44000,54695);assert(!playback_bitrate.near_episodes);
+    owned=true;usb_game_verification.needed=true;
+    game_packet(44000,54695);assert(!playback_bitrate.near_episodes);
+    usb_game_verification.needed=false;phone_active=true;is_usb_streaming=false;
+    ready();game_packet(44000,54695);assert(!playback_bitrate.near_episodes);
+    phone_active=false;is_usb_streaming=true;ready();
+    for(unsigned i=0;i<300;++i){game_packet(0,10000);game_packet(44000,54695);}
+    assert(playback_bitrate.near_episodes==2); // Saturates even before the next poll.
+    now+=3000;playback_bitrate_poll(now);
+    assert(!playback_bitrate.near_episodes && !playback_bitrate.bad_windows && playback_bitrate.target==255200);
 }
 static void test_live_updates_and_queued_old_units(void) {
     fixture(false,256000);ready();window(1,0);assert(playback_bitrate.target==256000);
@@ -308,7 +409,47 @@ static void test_effective_cbr_ceiling_and_fixed_only_permission(void) {
     assert(playback_bitrate.current==256000 && playback_bitrate.target==256000);
     assert(playback_bitrate_apply(&media_tracker) && sets==before);
 }
+static void test_selected_credit_gaps_require_continuous_eld(void) {
+    fixture(false,256000);
+    aaceld_variable_allowed=false; // The read-only event also covers a fixed-rate-only peer.
+    session=8;control_ready=true;now=200;
+    dongle_playback_airpods_credits(0,1);
+    unsigned reads=warm_reads;
+    for(unsigned i=0;i<100;++i)dongle_playback_airpods_credits(10,1);
+    dongle_playback_airpods_credits(39,4);
+    assert(warm_reads==reads); // Ordinary credits do not take the PCM lock.
+    dongle_playback_airpods_credits(40,2);
+    assert(playback_trace.count==1 && playback_trace.events[0].a==40);
+    for(unsigned state=0;state<7;++state) {
+        switch(state) {
+        case 0: owned=false;break;
+        case 1: control_ready=false;break;
+        case 2: is_usb_streaming=false;break;
+        case 3: cur_codec=2;break;
+        case 4: call_opened=true;break;
+        case 5: playback_game.waiting_tx=true;break;
+        case 6: warm=false;break;
+        }
+        dongle_playback_airpods_credits(70,7);
+        owned=control_ready=is_usb_streaming=warm=true;
+        cur_codec=4;call_opened=playback_game.waiting_tx=false;
+        dongle_playback_airpods_credits(70,7); // First report after re-arming is a baseline.
+        assert(playback_trace.count==1);
+    }
+    // No intervening report during stop/start, AACP reconnect or buffer transition.
+    playback_encoder_invalidate();dongle_playback_airpods_credits(70,7);
+    ++session;dongle_playback_airpods_credits(70,7);
+    ++playback_game.sent_since;dongle_playback_airpods_credits(70,7);
+    assert(playback_trace.count==1);
+    now+=70;dongle_playback_airpods_credits(70,7);
+    playback_trace_event_t event=playback_trace.events[1];
+    assert(playback_trace.count==2 && event.kind==TRACE_CREDIT_GAP && event.us==now*1000u);
+    assert(event.a==70 && event.b==7);
+}
 int main(void) {
+    test_game_transport_episodes();
+    test_game_transport_episode_scope();
+    test_selected_credit_gaps_require_continuous_eld();
     test_live_updates_and_queued_old_units();
     test_vbr_limits_freezes_and_pressure_without_radio_queries();
     test_errors_rollback_and_cap_validation();

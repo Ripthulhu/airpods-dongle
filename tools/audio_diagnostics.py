@@ -39,6 +39,11 @@ class Hid:
                         self.ioctl(fd, 0x81004808, unique, True)  # HIDIOCGRAWUNIQ(256)
                         if unique.split(b'\0', 1)[0].decode('utf-8', 'replace') != serial:
                             continue
+                    # The motion interface shares the serial and report ID 2, but only controls return APDG status.
+                    status = bytearray(64)
+                    status[0] = 2
+                    if self.ioctl(fd, 0xC0404807, status, True) != 64 or status[:7] != b'\x02' + HEADER:
+                        continue
                     found.append(fd)
                     keep = True
                 except OSError:
@@ -233,7 +238,7 @@ TRACE_STATS = ('usb_packets', 'usb_frames', 'usb_gap_max_us', 'usb_bad_packets',
                'ble_scan_requested', 'usb_alternate_setting', 'encode_unit_max_us')
 TRACE_EVENTS = {1: 'drop', 2: 'zero_fill', 3: 'timer_late', 4: 'send_wait',
                 5: 'timeline_recovery', 6: 'controller_flush', 7: 'usb_error',
-                8: 'format', 9: 'game'}
+                8: 'format', 9: 'game', 10: 'airpods_credit_gap'}
 
 
 def decode_trace(data):
@@ -245,7 +250,10 @@ def decode_trace(data):
     result['events'] = []
     for i in range(data[2]):
         us, kind, a, b = struct.unpack_from('<4I', data, 128 + 16*i)
-        result['events'].append(dict(time_us_wrapped=us, kind=TRACE_EVENTS.get(kind, kind), a=a, b=b))
+        event = dict(time_us_wrapped=us, kind=TRACE_EVENTS.get(kind, kind), a=a, b=b)
+        if kind == 10:
+            event.update(gap_ms=a, completed_acl_packets=b)
+        result['events'].append(event)
     return result
 
 

@@ -93,29 +93,36 @@ class AudioDiagnosticsTests(unittest.TestCase):
 
     def test_linux_selects_serial_across_audio_and_control_personalities(self):
         devices = {10: (0xcafe, 0x4015, 'PC'), 11: (0xcafe, 0x4005, 'PHONE'),
-                   12: (0xcafe, 0x4016, 'OTHER')}
+                   12: (0xcafe, 0x4016, 'OTHER'), 13: (0xcafe, 0x4015, 'PC')}
         def ioctl(fd, command, data, mutable):
             vid, pid, serial = devices[fd]
             self.assertTrue(mutable)
             if command == 0x80084803:
                 struct.pack_into('<IHH', data, 0, 3, vid, pid)
+            elif command == 0xC0404807:
+                self.assertEqual(data[0], 2)
+                if fd == 13:  # Motion interface, same serial and report ID.
+                    data[1] = 30
+                    return 2
+                data[1:7] = diagnostics.HEADER
+                return 64
             else:
                 self.assertEqual(command, 0x81004808)
                 data[:len(serial)] = serial.encode()
         with patch.dict(sys.modules, {'fcntl': SimpleNamespace(ioctl=ioctl)}), \
              patch.multiple(diagnostics.os, name='posix', O_CLOEXEC=0, create=True), \
-             patch.object(diagnostics.glob, 'glob', return_value=['a', 'b', 'c']), \
-             patch.object(diagnostics.os, 'open', side_effect=lambda path, _: {'a':10,'b':11,'c':12}[path]), \
+             patch.object(diagnostics.glob, 'glob', return_value=['a', 'b', 'c', 'd']), \
+             patch.object(diagnostics.os, 'open', side_effect=lambda path, _: {'a':10,'b':11,'c':12,'d':13}[path]), \
              patch.object(diagnostics.os, 'close') as close:
             device = diagnostics.Hid('PHONE')
             self.assertEqual(device.handle, 11)
-            self.assertEqual([call.args[0] for call in close.call_args_list], [10, 12])
+            self.assertEqual([call.args[0] for call in close.call_args_list], [10, 12, 13])
             device.close()
             self.assertEqual(close.call_args.args, (11,))
             close.reset_mock()
             with self.assertRaisesRegex(RuntimeError, 'exactly one matching'):
                 diagnostics.Hid()
-            self.assertEqual(sorted(call.args[0] for call in close.call_args_list), [10, 11, 12])
+            self.assertEqual(sorted(call.args[0] for call in close.call_args_list), [10, 11, 12, 13])
             close.reset_mock()
             device = diagnostics.Hid('PC')
             self.assertEqual(device.handle, 10)
@@ -172,12 +179,17 @@ class AudioDiagnosticsTests(unittest.TestCase):
 
     def test_trace_layout_and_bounds(self):
         data = bytearray(512)
-        data[:3] = bytes((1, 16, 1))
+        data[:3] = bytes((1, 16, 3))
         struct.pack_into('<I', data, 32 + 22*4, 2)
         struct.pack_into('<4I', data, 128, 1234, 6, 42, 0)
+        struct.pack_into('<4I', data, 144, 71300, 10, 70, 7)
+        struct.pack_into('<4I', data, 160, 72000, 255, 3, 4)
         decoded = diagnostics.decode_trace(data)
         self.assertEqual(decoded['stats']['usb_alternate_setting'], 2)
         self.assertEqual(decoded['events'][0]['kind'], 'controller_flush')
+        self.assertEqual(decoded['events'][1], dict(time_us_wrapped=71300,
+                         kind='airpods_credit_gap', a=70, b=7, gap_ms=70, completed_acl_packets=7))
+        self.assertEqual(decoded['events'][2]['kind'], 255)
         for bad in (data[:-1], bytes(512)):
             with self.assertRaises(RuntimeError):
                 diagnostics.decode_trace(bad)

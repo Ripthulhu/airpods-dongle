@@ -8,6 +8,7 @@
 
 #ifndef PICOW_USB_BT_AUDIO_BTSTACK_HCI_H
 #define PICOW_USB_BT_AUDIO_BTSTACK_HCI_H
+#include "a2dp_priority.h"
 
 void bt_hci_init(void);
 

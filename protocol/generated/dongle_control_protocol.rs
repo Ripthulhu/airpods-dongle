@@ -220,6 +220,7 @@ pub mod feature {
     pub const RESERVED_OUTPUT_CONTINUITY: u8 = 22;
     pub const RECONNECT_POLICY: u8 = 23;
     pub const READ_FIRMWARE_VERSION: u8 = 24;
+    pub const DIAGNOSTIC_A2DP_PRIORITY: u8 = 25;
 }
 
 pub mod settings_lease_action {

@@ -93,6 +93,7 @@ void dongle_rpc_available(bool on) { dongle_rpc_client_available(DONGLE_CLIENT_U
 bool dongle_rpc_client_get(uint8_t client, uint8_t out[64]) {
     if (client>=DONGLE_CLIENT_COUNT || !out || !clients[client].online ||
         clients[client].seen_epoch!=clients[client].epoch ||
+        clients[client].target!=dongle_control_client_generation(client) ||
         clients[client].published[DONGLE_HEADER_OFFSET_REPORT_ID]!=DONGLE_RPC_REPORT_ID) return false;
     memcpy(out,clients[client].published,DONGLE_REPORT_SIZE); return true;
 }
@@ -194,6 +195,8 @@ void dongle_rpc_poll(void) {
         rpc_client_t *c=&clients[client];
         uint32_t gen=dongle_control_client_generation((uint8_t)client);
         if(c->seen_epoch!=c->epoch || c->target!=gen){
+            // USB can read status while the main loop prepares the new generation.
+            c->published[DONGLE_HEADER_OFFSET_REPORT_ID]=0;
             abort_operation(client);
             if(lease_owner==(int)client)release_lease();
             if(c->seen_epoch!=c->epoch)dongle_features_disconnect((uint8_t)client);

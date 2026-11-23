@@ -223,7 +223,9 @@ def validate(args, directory, root, output, receipt, firmware):
     if usb_mode:
         checked=subprocess.run([sys.executable,str(root/"tools/check_usb_audio.py"),str(firmware),
                                 *(["--s16-only"] if usb_mode=="s16" else [])],
-                               check=True,capture_output=True,text=True,timeout=10)
+                               capture_output=True,text=True,timeout=10)
+        if checked.returncode:
+            raise ValueError("USB descriptor validation failed:\n" + checked.stderr)
         usb_formats=json.loads(checked.stdout)
     firmware_data = firmware.read_bytes()
     verify_library(firmware_data, before["codec_sha256"])

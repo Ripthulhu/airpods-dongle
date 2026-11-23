@@ -84,10 +84,10 @@ enum {
 };
 typedef struct {
     bool requested, changed, failed, restore_failed, active;
-    bool waiting_tx, waiting_report, low_latency_confirmed;
+    bool waiting_tx, waiting_report, low_latency_confirmed, restore_admitting;
     uint8_t phase;
     uint16_t target;
-    uint32_t active_since, sent_since, tx_revision, report_revision;
+    uint32_t active_since, sent_since, tx_revision, report_revision, usb_start_revision;
 } playback_game_t;
 // One post-priming USB check; TX/report/adjustment remain in playback_game_t.
 typedef struct {
@@ -97,10 +97,14 @@ typedef struct {
     bool needed, queued, unverified;
 } playback_usb_verification_t;
 static inline void playback_game_request(playback_game_t *s, bool enabled) {
-    if (s->requested==enabled) {
-        if (!enabled && s->restore_failed) { s->restore_failed=false; s->waiting_tx=s->waiting_report=false; }
+    if (!enabled && (s->failed || s->restore_failed) && !s->waiting_tx && !s->waiting_report) {
+        // A local clock fault can follow a valid normal-buffer report; remeasure on retry.
+        s->requested=s->failed=s->restore_failed=s->restore_admitting=false;
+        if (!s->changed) s->target=0;
+        s->phase=GAME_RESTORING;
         return;
     }
+    if (s->requested==enabled) return;
     s->requested=enabled;
     if (enabled) {
         bool retry_restore=s->restore_failed && s->changed;
@@ -112,6 +116,7 @@ static inline void playback_game_request(playback_game_t *s, bool enabled) {
 }
 static inline void playback_game_queued(playback_game_t *s, uint16_t target,
                                          uint32_t now, uint32_t tx_revision) {
+    s->restore_admitting=false;
     s->target=target; s->changed=true; s->waiting_tx=true; s->waiting_report=false;
     if (target!=60) s->low_latency_confirmed=false;
     s->sent_since=now; s->tx_revision=tx_revision;
@@ -126,10 +131,19 @@ static inline void playback_game_observe_send(playback_game_t *s, uint32_t now,
     s->phase=s->target==60 ? GAME_SENT : GAME_RESTORING;
 }
 static inline void playback_game_session_lost(playback_game_t *s) {
-    s->low_latency_confirmed=false;
+    s->low_latency_confirmed=s->restore_admitting=false;
     s->waiting_tx=s->waiting_report=false;
     if (s->changed) s->phase=GAME_RESTORING;
     else { s->target=0; s->phase=s->requested ? GAME_PENDING : GAME_OFF; }
+}
+static inline uint16_t playback_game_queue_restore(playback_game_t *s, uint32_t now) {
+    s->phase=GAME_RESTORING;
+    if (!s->restore_admitting) { s->restore_admitting=true; s->sent_since=now; }
+    if ((uint32_t)(now-s->sent_since)<2000u) return 150;
+    s->restore_admitting=false;
+    s->failed=s->restore_failed=true;
+    s->phase=GAME_FAILED;
+    return 0;
 }
 // Returns a bounded 60/150-ms command; transport acceptance is recorded separately.
 static inline uint16_t playback_game_step(playback_game_t *s, bool available,
@@ -158,17 +172,13 @@ static inline uint16_t playback_game_step(playback_game_t *s, bool available,
         // A queued/uncertain target must be restored even when capture cancels it.
         if (s->target==60) s->waiting_tx=s->waiting_report=false;
         s->phase=GAME_RESTORING;
-        return available && !s->waiting_tx && !s->waiting_report ? 150 : 0;
+        return available && !s->waiting_tx && !s->waiting_report ? playback_game_queue_restore(s,now) : 0;
     }
     if (s->changed || s->waiting_tx || s->waiting_report || s->failed) return 0;
     if (!s->requested) {
-        if (s->target==0 && available && eligible && active) {
-            // Establish normal buffering once per fresh control epoch; no fake prior60.
-            if (s->phase!=GAME_RESTORING) { s->phase=GAME_RESTORING; s->sent_since=now; }
-            if ((uint32_t)(now-s->sent_since)>=2000u) {
-                s->failed=s->restore_failed=true; s->phase=GAME_FAILED; return 0;
-            }
-            return 150;
+        if (s->target==0) {
+            if (available && eligible && active) return playback_game_queue_restore(s,now);
+            if (s->phase==GAME_RESTORING) return 0;
         }
         s->phase=GAME_OFF; return 0;
     }

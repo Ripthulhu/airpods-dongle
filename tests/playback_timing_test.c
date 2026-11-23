@@ -13,12 +13,12 @@
 #include "../src/runtime_watch.h"
 #include "../src/btstack/playback_inspect.h"
 #include "../src/btstack/playback_pcm.h"
-#include "../src/btstack/playback_tempo.h"
 #include "../src/btstack/playback_duck.h"
 static playback_inspect_t playback_inspect;
+#ifdef PLAYBACK_PIPELINE
 static playback_pcm_t playback_pcm;
-static union { playback_resample_t resample; playback_tempo_work_t tempo; } encoder_work;
-#define encoder_resample encoder_work.resample
+static playback_resample_t encoder_resample;
+#endif
 static bool inspect_enabled;
 static playback_adjust_t playback_adjust;
 static playback_game_t playback_game;
@@ -149,12 +149,12 @@ static void btstack_sbc_encoder_process_data(void *a) { (void)a; }
 static unsigned time_us_32(void) { return now*1000u; }
 static void playback_encode_measured(unsigned a) { (void)a; }
 #ifndef PLAYBACK_PIPELINE
-static bool playback_encoder_tempo_run(void) {assert(!encoder_job.tempo);(void)tempo_read;(void)tempo_fraction;return true;}
-static void audio_pcm_read(unsigned frames) {
-    encoder_job.tempo=false;
-    consumed += frames;
-    source_consumed += frames * playback_adjust_interval(&playback_adjust) / 10;
+static uint16_t audio_pcm_read(uint16_t frames) {
+    uint16_t source_frames=frames*playback_adjust_interval(&playback_adjust)/10u;
+    consumed+=frames;
+    source_consumed+=source_frames;
     if(pcm_read_hook)pcm_read_hook();
+    return source_frames;
 }
 #else
 #include "../src/btstack/playback_pcm.h"
@@ -194,10 +194,12 @@ static void critical_section_exit(void *p) {(void)p;assert(pcm_locked);pcm_locke
 static void pipeline_render(const playback_resample_t *work,int16_t *dst) {
     assert(!pcm_locked);playback_pcm_render(work,dst);
     pipeline_filter_cost();
+    if(pcm_read_hook)pcm_read_hook();
 }
 static void pipeline_render_q31(const playback_resample_t *work,int32_t *dst) {
     assert(!pcm_locked);playback_pcm_render_q31(work,dst);
     pipeline_filter_cost();
+    if(pcm_read_hook)pcm_read_hook();
 }
 #define playback_pcm_render pipeline_render
 #define playback_pcm_render_q31 pipeline_render_q31
@@ -354,7 +356,7 @@ static void initialize(unsigned codec, unsigned samples, unsigned bytes, unsigne
     encode_error = encode_consumed_delta = 0;last_configuration = 0;
     pcm_read_hook = pcm_lock_hook = NULL;
     control_session = usb_playback_revision = 1;
-    usb_ingress_frames=encoder_tempo_ingress=tempo_ingress_after=0;
+    usb_ingress_frames=0;
     playback_continuity_reset(&phone_continuity);
     phone_buffer_started=false;audio_owned=true;
     playback_adjust_cancel(&playback_adjust);

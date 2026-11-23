@@ -198,6 +198,26 @@ static void test_volume_completion(void) {
     tick();
 }
 
+static void test_failed_release_is_retried(void) {
+    fresh_host();
+    uint32_t sent = usb_media_volume_sent();
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    assert(usb_media_enqueue(USB_MEDIA_VOLUME_UP));
+    tick();
+    tick();
+    assert(count == 2 && reports[0] == 0xe9 && reports[1] == 0);
+    for (unsigned i = 0; i < 2; ++i) {
+        complete_transfer(false);
+        usb_media_task();
+        assert(count == 3 + i && reports[count - 1] == 0);
+        assert(usb_media_volume_sent() == sent + 1);
+    }
+    tick();
+    tick();
+    assert(count == 6 && reports[4] == 0xe9 && reports[5] == 0);
+    assert(usb_media_volume_sent() == sent + 2);
+}
+
 static void test_automatic_pause_is_not_a_toggle(void) {
     fresh_host();
     assert(usb_media_enqueue(USB_MEDIA_PAUSE_ONLY));tick();tick();
@@ -364,6 +384,7 @@ int main(void) {
     assert(reports[count - 1] == 0);
     test_volume_queue();
     test_volume_completion();
+    test_failed_release_is_retried();
     test_automatic_pause_is_not_a_toggle();
     test_automatic_media_completion();
     puts("media controls: bounded queue, ordered releases, volume and absolute Play/Pause completion receipts/epochs/expiry, suspend/reset and retry passed");

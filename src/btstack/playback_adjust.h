@@ -7,10 +7,11 @@
 #define PLAYBACK_ADJUST_CATCH_UP_UNITS 4u
 
 typedef struct {
-    bool pending, running, failed;
-    uint8_t interval;
+    bool pending, running, failed, source_started;
+    uint8_t interval, losing_units;
     uint16_t target;
     uint32_t goal_frames, started, sent_frames, next_unit_ms;
+    uint32_t source_cursor;
 } playback_adjust_t;
 
 static inline bool playback_adjust_busy(const playback_adjust_t *s) {
@@ -21,6 +22,22 @@ static inline void playback_adjust_cancel(playback_adjust_t *s) {
 }
 static inline uint8_t playback_adjust_interval(const playback_adjust_t *s) {
     return s->running ? s->interval : 10;
+}
+// Follow fixed-rate USB arrivals without turning each millisecond of ingress jitter into pitch modulation.
+static inline uint16_t playback_adjust_source_frames(playback_adjust_t *s, uint32_t ingress) {
+    int nominal=48*s->interval;
+    if (!s->source_started) {
+        s->source_cursor=ingress;
+        s->source_started=true;
+        return (uint16_t)nominal;
+    }
+    int32_t error=(int32_t)(ingress-s->source_cursor)-nominal;
+    int frames=nominal+error/8;
+    if (frames<384) frames=384;
+    if (frames>528) frames=528;
+    frames=(frames+1)/3*3;
+    s->source_cursor+=(uint32_t)frames;
+    return (uint16_t)frames;
 }
 // Match the captured finite +/-10% interval change, with 10 ms of entry headroom.
 static inline void playback_adjust_request(playback_adjust_t *s, uint16_t delay,
@@ -55,8 +72,18 @@ static inline void playback_adjust_sent(playback_adjust_t *s, uint32_t frames,
     s->sent_frames += frames;
     int32_t drift = (int32_t)((uint32_t)(now - s->started) * 48u) -
                     (int32_t)s->sent_frames;
-    if (s->interval == 9) drift = -drift;
-    else if (!caught_up) return; // Only slowing down can mistake a stall for progress.
+    if (s->interval == 9) {
+        // A losing refill consumes the receiver's reserve. Allow a short packet burst to catch up.
+        int32_t starting_frames = (int32_t)s->target * 48 - (int32_t)s->goal_frames;
+        if (s->target == 150 && drift > starting_frames / 2) {
+            if (++s->losing_units >= PLAYBACK_ADJUST_CATCH_UP_UNITS) {
+                s->running = false;
+                s->failed = true;
+                return;
+            }
+        } else s->losing_units = 0;
+        drift = -drift;
+    } else if (!caught_up) return; // Only slowing down can mistake a stall for progress.
     if (drift >= (int32_t)s->goal_frames) s->running = false;
 }
 // A common denominator preserves fractional frame debt when the interval changes.

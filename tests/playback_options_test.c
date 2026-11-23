@@ -195,7 +195,30 @@ static void test_game_faults_wrap_and_session_loss(void) {
     // A new report outside the bounded wait cannot confirm the expired request.
     assert(s.phase==GAME_RESTORING);
 }
+static void test_off_retry_rechecks_normal_buffer(void) {
+    for (unsigned target=0;target<=150;target+=150) {
+        // Admission failed before a write, or local timing failed after the 150 ms receipt.
+        playback_game_t s={.target=(uint16_t)target,.failed=true,.phase=GAME_FAILED};
+        s.restore_failed=target==0;
+        playback_game_request(&s,false);
+        assert(!playback_game_step(&s,false,true,true,100,3,1000) && s.phase==GAME_RESTORING);
+        assert(playback_game_step(&s,true,true,true,200,3,1000)==150);
+        playback_game_request(&s,false); // Duplicate requests cannot extend an admission timeout.
+        assert(!playback_game_step(&s,true,true,true,2200,3,1000) && s.restore_failed);
+        assert(!playback_game_step(&s,true,true,true,2300,4,1500));
+        playback_game_request(&s,false);
+        assert(playback_game_step(&s,true,true,true,2301,4,1500)==150);
+        playback_game_queued(&s,150,2301,2);
+        playback_game_request(&s,false);
+        assert(!playback_game_step(&s,true,true,true,2302,5,1500) && s.waiting_tx);
+        playback_game_observe_send(&s,2303,3,150,5);
+        assert(!playback_game_step(&s,true,true,true,2304,5,1500) && s.waiting_report);
+        assert(!playback_game_step(&s,true,true,true,2305,6,1500) && s.phase==GAME_OFF && !s.failed);
+        assert(!playback_game_step(&s,true,true,true,7000,7,1500));
+    }
+}
 int main(void) {
+    test_off_retry_rechecks_normal_buffer();
     test_profiles(); test_eld_wire_ceiling_and_received_configuration(); test_catalog_preflight();
     test_game_confirmation_and_restore(); test_game_faults_wrap_and_session_loss();
     test_normal_boot_preparation();

@@ -55,6 +55,9 @@
    ITF_NUM_CDC,        // CDC-ACM control interface (debug console)
    ITF_NUM_CDC_DATA,   // CDC-ACM data interface
    ITF_NUM_HID,
+   #if AIRPODS_HEAD_TRACKING
+   ITF_NUM_MOTION,
+   #endif
    ITF_NUM_TOTAL
  };
 

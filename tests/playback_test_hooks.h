@@ -6,6 +6,7 @@
 static playback_bitrate_t playback_bitrate;
 static uint32_t bitrate_pressure;
 #define playback_bitrate_transport_stalled() ((void)0)
+#define playback_bitrate_game_packet(wait_us,gap_us) ((void)(wait_us),(void)(gap_us))
 #define playback_bitrate_apply(context) ((void)(context), true)
 #define PB_ADD(stat,value) ((void)(stat),(void)(value))
 #define PB_MAX(stat,value) ((void)(stat),(void)(value))

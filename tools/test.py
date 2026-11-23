@@ -96,8 +96,9 @@ def playback_lifecycle_sources(directory):
     (directory / "playback_encoder_job.inc").write_text("\n".join(encoder))
     (directory / "playback_encoder_lifecycle.inc").write_text("\n".join(lifecycle))
     bitrate_functions = []
-    for signature in ["static int playback_eld_rate_update(", "static bool playback_bitrate_eligible(",
-                      "static void playback_bitrate_transport_stalled(",
+    for signature in ["static int playback_eld_rate_update(", "static bool playback_eld_steady_route(",
+                      "static bool playback_bitrate_eligible(", "void dongle_playback_airpods_credits(",
+                      "static void playback_bitrate_game_packet(", "static void playback_bitrate_transport_stalled(",
                       "static bool playback_bitrate_apply(", "static void playback_bitrate_poll(",
                       "static void a2dp_demo_timer_stop(a2dp_media_sending_context_t * context)",
                       "uint16_t dongle_playback_adaptive_snapshot("]:
@@ -180,11 +181,9 @@ def playback_lifecycle_sources(directory):
         end = source.index("\n}", start) + 2
         functions.append(source[start:end])
     production_pcm = []
-    for signature in ["static const float *playback_tempo_source(", "static bool playback_tempo_checkpoint(",
-                      "static bool playback_encoder_tempo_run(",
-                      "static void playback_pcm_push_measured(", "static void audio_slot_push_data(",
+    for signature in ["static void playback_pcm_push_measured(", "static void audio_slot_push_data(",
                       "void audio_slot_push_samples(", "void audio_slot_push_float(",
-                      "static void audio_pcm_read(", "static void playback_audio_work("]:
+                      "static uint16_t audio_pcm_read(", "static void playback_audio_work("]:
         start = source.index("\n" + signature) + 1
         end = source.index("\n}", start) + 2
         production_pcm.append(source[start:end])
@@ -215,7 +214,7 @@ def playback_lifecycle_sources(directory):
                       "static void call_clock_init(",
                       "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
                       "static bool playback_claim_transport_current(", "static bool playback_claim_current(",
-                      "static bool playback_claim_begin(", "static void playback_claim_suspend(",
+                      "static uint8_t playback_request_start(", "static bool playback_claim_begin(", "static void playback_claim_suspend(",
                       "static void playback_idle_poll(", "void dongle_playback_ownership_changed(bool owned)",
                       "bool bridge_phone_open(void)", "void bridge_phone_start_requested(void)", "bool bridge_phone_ready(void)",
                       "static bool phone_output_recovery_owned(", "bool bridge_phone_recovering(void)",
@@ -228,8 +227,8 @@ def playback_lifecycle_sources(directory):
         end = source.index("\n}", start) + 2
         functions.append(source[start:end])
     (directory / "playback_idle.inc").write_text("\n".join(functions))
-    start = source.index("        case  AVDTP_SI_START:")
-    end = source.index("        case AVDTP_SI_ABORT:", start)
+    start = source.index("        case AVDTP_SI_ACCEPT_START:")
+    end = source.index("        default:", start)
     (directory / "playback_accept.inc").write_text(source[start:end])
     for name in ("playback_timing", "playback_bitrate", "playback_idle", "playback_lifecycle"):
         path = directory / (name + ".inc")
@@ -290,7 +289,7 @@ def main_button_sources(directory):
         "    mic_decoder_lifecycle_t decoder=*state; bool mic_wanted;\n"+
         source[start:end]+"\n    *state=decoder;\n}\n")
     start=source.index("        // The idle microphone decoder")
-    end=source.index("        ble_scan_set_paused(BLE_SCAN_PAUSE_USB_SUSPEND",start)
+    end=source.index("        ble_scan_set_runtime_pauses(",start)
     (directory / "main_phone_handover.inc").write_text(
         "static void main_phone_handover(mic_decoder_lifecycle_t *state) {\n"
         "    mic_decoder_lifecycle_t decoder=*state;\n"+
@@ -327,6 +326,7 @@ def main():
         "playback_duck": ["tests/playback_duck_test.c", "-lm"],
         "accessory_automation": ["tests/accessory_automation_test.c"],
         "playback_accessory": ["tests/playback_accessory_test.c", "-lm"],
+        "playback_accessory_radio0076": ["-DAIRPODS_EXPERIMENTAL_RADIO0076=1", "tests/playback_accessory_test.c", "-lm"],
         "slot": ["-Itests/slot_stubs", "tests/slot_test.c"],
         "hci": ["-Itests/hci_stubs", "tests/hci_test.c"],
         "phone_sink": ["-Itests/phone_sink_stubs", "tests/phone_sink_test.c"],
@@ -344,7 +344,6 @@ def main():
         "playback_options": ["tests/playback_options_test.c"],
         "playback_bitrate": ["tests/playback_bitrate_test.c"],
         "playback_adjust": ["tests/playback_adjust_test.c"],
-        "playback_tempo": ["tests/playback_tempo_test.c", "-lm"],
         "playback_delay": ["-DHOST_TEST_VISIBILITY", "-Itests/codec_stubs", "tests/playback_delay_test.c",
                            "src/btstack/a2dp_codec_configuration.c", "tests/codec_stubs/codec_link_defaults.c"],
         "playback_lifecycle": ["tests/playback_lifecycle_test.c"],
@@ -407,6 +406,8 @@ def main():
                                   "tests/mic_worker_thread_test.c", "-lm", "-pthread"],
         "media_control": ["-Itests/media_stubs", "tests/media_control_test.c",
                           "src/tinyusb/media_control.c"],
+        "head_motion": ["-Itests/media_stubs", "-Itests/cdc_stubs", "tests/head_motion_test.c",
+                        "src/btstack/head_motion.c", "src/tinyusb/motion_usb.c"],
         "debug_cdc": ["-Itests/cdc_stubs", "tests/debug_cdc_test.c"],
     }
     with tempfile.TemporaryDirectory(prefix="airpods-tests-") as tmp:

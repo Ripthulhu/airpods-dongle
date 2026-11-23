@@ -28,6 +28,9 @@
 #include "tusb.h"
 #include "usb_descriptors.h"
 #include "dongle_protocol_spec.h"
+#if AIRPODS_HEAD_TRACKING
+#include "motion_usb.h"
+#endif
 
 /* A combination of interfaces must have a unique product id, since PC will save device driver after the first plug.
  * Same VID/PID with different interface e.g MSC (first), then CDC (later) will possibly cause system error on PC.
@@ -35,7 +38,7 @@
  * Auto ProductID layout's Bitmap:
  *   [MSB]     AUDIO | MIDI | HID | MSC | CDC          [LSB]
  */
-#define _PID_MAP(itf, n)  ( (CFG_TUD_##itf) << (n) )
+#define _PID_MAP(itf, n)  ( ((CFG_TUD_##itf) != 0) << (n) )
 #define USB_PID           (0x4000 | _PID_MAP(CDC, 0) | _PID_MAP(MSC, 1) | _PID_MAP(HID, 2) | \
     _PID_MAP(MIDI, 3) | _PID_MAP(AUDIO, 4) | _PID_MAP(VENDOR, 5) )
 // The control protocol publishes both identities; clients find the dongle by them.
@@ -61,7 +64,7 @@ tusb_desc_device_t const desc_device =
 
     .idVendor           = DONGLE_USB_VENDOR_ID,
     .idProduct          = DONGLE_USB_PRODUCT_ID_AUDIO,
-    .bcdDevice          = 0x0100,
+    .bcdDevice          = CFG_TUD_HID == 2 ? 0x0101 : 0x0100,
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -166,7 +169,25 @@ static const uint8_t desc_hid_report[] = {
     HID_COLLECTION_END
 };
 
+#if AIRPODS_HEAD_TRACKING
+#define EPNUM_MOTION_IN   0x86
+static const uint8_t desc_hid_motion[] = {
+    HID_USAGE_PAGE_N(DONGLE_USB_VENDOR_USAGE_PAGE, 2),
+    HID_USAGE(USB_MOTION_USAGE),
+    HID_COLLECTION(HID_COLLECTION_APPLICATION),
+    HID_LOGICAL_MIN(0), HID_LOGICAL_MAX_N(255, 2), HID_REPORT_SIZE(8),
+    HID_REPORT_ID(USB_MOTION_INPUT_ID)
+    HID_REPORT_COUNT(USB_MOTION_SIZE), HID_USAGE(1), HID_INPUT(HID_DATA | HID_VARIABLE | HID_ABSOLUTE),
+    HID_REPORT_ID(USB_MOTION_RATE_ID)
+    HID_REPORT_COUNT(1), HID_USAGE(2), HID_FEATURE(HID_DATA | HID_VARIABLE | HID_ABSOLUTE),
+    HID_COLLECTION_END
+};
+#endif
+
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
+#if AIRPODS_HEAD_TRACKING
+    if (instance == USB_MOTION_INSTANCE) return desc_hid_motion;
+#endif
     return instance == 0 ? desc_hid_report : NULL;
 }
 
@@ -181,7 +202,11 @@ uint8_t const desc_configuration[] =
     // CDC-ACM debug console: control itf, string idx, notif EP, notif size, data OUT, data IN, data EP size
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 6, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
     TUD_HID_DESCRIPTOR(ITF_NUM_HID, 7, HID_ITF_PROTOCOL_NONE,
-                       sizeof(desc_hid_report), EPNUM_HID_IN, 16, 5)
+                       sizeof(desc_hid_report), EPNUM_HID_IN, 16, 5),
+#if AIRPODS_HEAD_TRACKING
+    TUD_HID_DESCRIPTOR(ITF_NUM_MOTION, 0, HID_ITF_PROTOCOL_NONE,
+                       sizeof(desc_hid_motion), EPNUM_MOTION_IN, 64, 5),
+#endif
 
   };
 

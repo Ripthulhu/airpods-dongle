@@ -252,6 +252,8 @@ internal object DongleControlProtocol {
         const val RESERVED_OUTPUT_CONTINUITY = 22
         const val RECONNECT_POLICY = 23
         const val READ_FIRMWARE_VERSION = 24
+        /** Accepted only from the USB client. */
+        const val DIAGNOSTIC_A2DP_PRIORITY = 25
     }
 
     object SettingsLeaseAction {

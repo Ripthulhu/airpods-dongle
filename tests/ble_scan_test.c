@@ -98,6 +98,32 @@ static void lifecycle(void) {
     assert(starts == 4 && scan_state.stats.scan_requested && scan_state.stats.le_supported);
 }
 
+static void game_pause_respects_other_scan_users(void) {
+    reset();
+    ble_scan_set_runtime_pauses(false, false, true);
+    ble_scan_set_runtime_pauses(false, false, true);
+    assert(stops == 1 && starts == 1 && !scan_state.stats.scan_requested);
+    // Transfer the last reason directly between game, mic and suspended USB.
+    ble_scan_set_runtime_pauses(false, true, false);
+    assert(scan_state.stats.pause_reasons == BLE_SCAN_PAUSE_MIC);
+    ble_scan_set_runtime_pauses(true, false, false);
+    assert(scan_state.stats.pause_reasons == BLE_SCAN_PAUSE_USB_SUSPEND);
+    ble_scan_set_runtime_pauses(false, false, true);
+    assert(scan_state.stats.pause_reasons == BLE_SCAN_PAUSE_GAME_PLAYBACK && starts == 1);
+    ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, true);
+    ble_scan_diagnostic_pause(true);
+    ble_scan_set_runtime_pauses(false, false, false);
+    assert(scan_state.stats.pause_reasons == (BLE_SCAN_PAUSE_INQUIRY | BLE_SCAN_PAUSE_DIAGNOSTIC));
+    ble_scan_set_paused(BLE_SCAN_PAUSE_INQUIRY, false);
+    assert(starts == 1 && !scan_state.stats.scan_requested);
+    ble_scan_set_runtime_pauses(false, false, true);
+    now += 120000;
+    ble_scan_set_runtime_pauses(false, false, true);
+    assert(scan_state.stats.pause_reasons == BLE_SCAN_PAUSE_GAME_PLAYBACK && starts == 1);
+    ble_scan_set_runtime_pauses(false, false, false);
+    assert(scan_state.stats.scan_requested && starts == 2 && stops == 1);
+}
+
 static void retain_exact_reports(void) {
     reset();
     uint8_t proximity[31] = {30, 0xff, 0x4c, 0, 7, 25};
@@ -216,6 +242,7 @@ static void bounded_cache_and_wrap(void) {
 
 int main(void) {
     lifecycle();
+    game_pause_respects_other_scan_users();
     retain_exact_reports();
     reject_malformed();
     bounded_cache_and_wrap();

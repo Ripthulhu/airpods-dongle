@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <assert.h>
+#include "../src/btstack/a2dp_priority.h"
 #include <stdio.h>
 #include <string.h>
 #include "../src/btstack/playback_options.h"
@@ -34,6 +35,13 @@ static unsigned codec_configuration_releases;
 static void a2dp_codec_configuration_released(void) { ++codec_configuration_releases; }
 static playback_options_t playback_options, profile_previous;
 #include "playback_defaults.inc"
+static unsigned priority_mode_changes;
+void bt_hci_priority_transition(enum priority_reason reason) {
+    if(reason==PRIORITY_ARM || reason==PRIORITY_OFF) {
+        assert(playback_game.requested==(reason==PRIORITY_ARM));
+        ++priority_mode_changes;
+    }
+}
 static uint8_t address[6], profile_peer[6], game_peer[6], connected_address[6];
 static uint8_t cur_active_device[6];
 static uint8_t cur_codec, cur_capability;
@@ -797,11 +805,15 @@ static void microphone_prepares_normal_buffer_and_binds_repair(bool call) {
 
 static void game_changes_reset_continuity_without_packets(void) {
     playback_game=(playback_game_t){0};game_eligible=true;
+    unsigned before=priority_mode_changes;
     phone_continuity=(playback_continuity_t){.armed=true,.deficit_us=80000,.last_us=1000};
     assert(dongle_playback_game_mode(true)==DONGLE_ACCEPTED && !phone_continuity.armed);
+    assert(priority_mode_changes==before+1);
     phone_continuity.armed=true;phone_continuity.deficit_us=1000;
     assert(dongle_playback_game_mode(true)==DONGLE_ACCEPTED && phone_continuity.armed);
+    assert(priority_mode_changes==before+1);
     assert(dongle_playback_game_mode(false)==DONGLE_ACCEPTED && !phone_continuity.armed);
+    assert(priority_mode_changes==before+2);
     phone_continuity.armed=true;
     playback_adjust_cancel(&playback_adjust);
     playback_adjust_cancel_stream(&media_tracker,now,10);

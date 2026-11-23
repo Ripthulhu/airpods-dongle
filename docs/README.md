@@ -9,7 +9,7 @@ Living reference documents, kept current with the firmware:
 - [HOST-VOLUME.md](HOST-VOLUME.md): how USB host volume and AirPods gain share authority.
 - [VOLUME-EVIDENCE.md](VOLUME-EVIDENCE.md): the dated measurements and regression evidence behind the volume policy.
 - [AUDIO-CONTINUITY.md](AUDIO-CONTINUITY.md): USB audio continuity, PCM formats and float transport.
-- [GAME-TRANSITION.md](GAME-TRANSITION.md): the pitch-preserving USB Game Mode transition.
+- [USB Game Mode transitions](GAME-TRANSITION.md) covers playback timing and receiver-buffer recovery.
 - [PHONE-TRANSPORT.md](PHONE-TRANSPORT.md): the phone Bluetooth bridge, audio ownership and the experimental call path.
 - [CYW43-TRANSPORT.md](CYW43-TRANSPORT.md): the shared CYW43 bus repair carried as SDK patches.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md): reviewed differences from the upstream forks this firmware derives from.

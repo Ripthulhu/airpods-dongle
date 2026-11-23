@@ -12,6 +12,9 @@ static bool inspection_active;
 static unsigned volume_reads,volume_writes,volume_disconnects;
 static unsigned flush_comparison_calls;
 static bool flush_comparison_active,flush_comparison_ready=true;
+static unsigned priority_reads;
+void bt_hci_priority_snapshot(uint8_t out[9]) {++priority_reads;memset(out,0,9);out[0]=3;out[6]=UINT8_MAX;}
+void bt_hci_priority_transition(enum priority_reason reason) {assert(reason==PRIORITY_USB_LOST);}
 uint32_t btstack_run_loop_get_time_ms(void) {return 12345;}
 static unsigned radio_reads,adaptive_reads;
 static unsigned routing_reads,routing_writes;
@@ -114,6 +117,16 @@ void dongle_finder_disconnect(uint8_t client) {assert(client<2);stops++;}
 
 int main(void) {
     uint8_t out[64],p[64]={1,0x28,0xef,0xcd,0xab,0x89};uint16_t n=99;
+    uint8_t priority_request[9]={25};
+    assert(dongle_features_request(1,priority_request,1,out,64,&n)==7 && !n);
+    assert(dongle_features_request(0,priority_request,1,out,8,&n)==1 && !n);
+    for(unsigned value=0;value<=1;++value) {
+        priority_request[1]=(uint8_t)value;
+        assert(dongle_features_request(0,priority_request,2,out,64,&n)==7 && !n);
+    }
+    assert(!priority_reads);
+    assert(!dongle_features_request(0,priority_request,1,priority_request,sizeof(priority_request),&n));
+    assert(n==9 && priority_request[0]==3 && priority_request[6]==255 && priority_reads==1);
     assert(dongle_features_request(1,NULL,1,out,64,&n)==1);
     assert(dongle_features_request(1,p,0,out,64,&n)==1);
     assert(dongle_features_request(1,p,6,out,64,NULL)==1);

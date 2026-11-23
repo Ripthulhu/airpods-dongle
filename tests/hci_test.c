@@ -17,6 +17,15 @@ uint16_t hci_usable_acl_packet_types(void);
 void avdtp_source_establish_stream(void);
 bool get_usb_streaming(void);
 bool dongle_playback_transitioning(void);
+static bool priority_eligible;
+static uint16_t priority_media_cid;
+static uint32_t priority_session;
+bool dongle_playback_priority_scope(uint16_t *cid) {*cid=priority_media_cid;return priority_eligible;}
+uint32_t aacp_control_session(void) {return priority_session;}
+static unsigned selected_credit_calls,selected_credit_gap,selected_credit_packets;
+void dongle_playback_airpods_credits(uint32_t gap_ms,uint16_t packets) {
+    ++selected_credit_calls;selected_credit_gap=gap_ms;selected_credit_packets=packets;
+}
 void dongle_playback_controller_event(const uint8_t *p,uint16_t size) {(void)p;(void)size;}
 #include "../src/btstack/btstack_hci.c"
 
@@ -31,6 +40,9 @@ static uint16_t flush_handle, flush_slots;
 static bool command_ready;
 static uint8_t command_result;
 static unsigned packet_writes;
+static unsigned priority_writes;
+static uint8_t priority_value, priority_submit_status;
+static uint16_t priority_handle;
 static uint16_t packet_handle, packet_mask, usable_packet_mask;
 static uint8_t packet_result;
 static bool packet_sync_complete, consume_command_credit;
@@ -93,6 +105,13 @@ uint8_t hci_send_cmd(const hci_cmd_t *cmd, ...) {
     va_list args;
     va_start(args, cmd);
     uint16_t handle = (uint16_t)va_arg(args, int);
+    if (cmd->opcode == 0xfd1a) {
+        assert(!strcmp(cmd->format,"H11"));
+        priority_handle=handle;priority_value=(uint8_t)va_arg(args,int);
+        assert(va_arg(args,int)==0);++priority_writes;va_end(args);
+        if(consume_command_credit)command_ready=false;
+        return priority_submit_status;
+    }
     if(cmd==&hci_read_rssi || cmd==&hci_read_link_quality || cmd==&hci_read_transmit_power_level || cmd->opcode==0x1406) {
         radio_opcode=cmd->opcode;radio_handle=handle;++radio_writes;
         radio_power_type=cmd==&hci_read_transmit_power_level?(uint8_t)va_arg(args,int):0;
@@ -175,7 +194,7 @@ uint16_t hci_number_free_acl_slots_for_connection_type(uint8_t address_type) {
     assert(address_type==BD_ADDR_TYPE_ACL);return credit_free_slots;
 }
 bool hci_is_packet_buffer_reserved(void) { return credit_packet_reserved; }
-uint8_t gap_security_level(uint16_t handle) { assert(handle == 1); return security_level; }
+uint8_t gap_security_level(uint16_t handle) { assert(handle == 1 || handle == 0x11 || handle == 0x44); return security_level; }
 uint8_t gap_disconnect(uint16_t handle) { assert(handle == 1); ++disconnect_calls; return 0; }
 bool get_usb_streaming(void) { return (busy_routes & 1u) != 0; }
 bool dongle_playback_transitioning(void) { return (busy_routes & 2u) != 0; }
@@ -243,6 +262,7 @@ bool write_slot2_mac(const uint8_t mac[MAC_LEN]) {
 }
 
 static void fixture(void) {
+    selected_credit_calls=selected_credit_gap=selected_credit_packets=0;
     memset(saved, 0xff, sizeof(saved));
     memset(device_addr, 0, sizeof(device_addr));
     memset(device_addr_list, 0, sizeof(device_addr_list));
@@ -258,6 +278,7 @@ static void fixture(void) {
     command_ready = true;command_result = 0;
     packet_writes=0;packet_handle=packet_mask=0;usable_packet_mask=0xcc18;packet_result=0;
     packet_sync_complete=false;
+    priority_writes=0;priority_submit_status=0;priority_eligible=true;priority_media_cid=7;priority_session=1;
     consume_command_credit=false;
     radio_writes=0;radio_opcode=radio_handle=0;radio_power_type=radio_result=0;
     ble_ready = false;
@@ -884,23 +905,30 @@ static void test_credit_diagnostics(void) {
     bt_hci_credit_diagnostics(&data);
     assert(data.airpods.events==2 && data.airpods.packets==2 && data.airpods.max_active_gap_ms==20);
     assert(data.phone.events==2 && data.phone.packets==3 && data.phone.max_active_gap_ms==20);
+    assert(selected_credit_calls==2 && selected_credit_gap==20 && selected_credit_packets==1);
     memcpy(credit_connections[2].address, nearby, 6);
     credit_connections[2].address_type = BD_ADDR_TYPE_SCO;
     credit_completion(0x33, 10);
     bt_hci_credit_diagnostics(&data);
     assert(data.phone.events==2 && data.phone.packets==3); // Voice credits are not ACL delivery evidence.
+    assert(selected_credit_calls==2);
     busy_routes=0;bt_hci_phone_poll();now=5000;credit_completion(0x11,1);
+    assert(!selected_credit_gap);
     busy_routes=1;now=9000;credit_completion(0x11,1);now=9025;credit_completion(0x11,1);
     bt_hci_credit_diagnostics(&data);assert(data.airpods.max_active_gap_ms==25); // Idle duration is excluded.
     uint8_t disconnect[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
     hci_packet_handler(HCI_EVENT_PACKET,0,disconnect,sizeof(disconnect));
     now=20000;credit_completion(0x11,1);bt_hci_credit_diagnostics(&data);
-    assert(data.airpods.max_active_gap_ms==25); // Reconnection is a new gap epoch.
+    assert(data.airpods.max_active_gap_ms==25 && !selected_credit_gap); // Reconnection is a new gap epoch.
     credit_connections[0].con_handle=0x44;now=30000;credit_completion(0x44,1);
+    assert(!selected_credit_gap);
     bt_hci_credit_diagnostics(&data);assert(data.airpods.max_active_gap_ms==25);
     busy_routes=0;bt_hci_phone_poll();busy_routes=1;
     now=UINT32_MAX-9u;credit_completion(0x44,1);now=5;credit_completion(0x44,1);
     bt_hci_credit_diagnostics(&data);assert(data.airpods.max_active_gap_ms==25);
+    assert(selected_credit_gap==15);
+    credit_completion(0x44,0);now=75;credit_completion(0x44,7);
+    assert(selected_credit_gap==70 && selected_credit_packets==7);
     credit_roles[0].totals.events=UINT32_MAX;credit_roles[0].totals.packets=UINT32_MAX-1u;
     credit_completion(0x44,2);bt_hci_credit_diagnostics(&data);
     assert(data.airpods.events==UINT32_MAX && data.airpods.packets==UINT32_MAX);
@@ -1465,7 +1493,261 @@ static void test_unanswered_controller_commands_recover_after_grace(void) {
     }
     puts("Controller waits: finite recovery, late replies, reconnect and clock wrap passed");
 }
+static void priority_ack(uint8_t status) {
+    uint8_t p[]={HCI_EVENT_COMMAND_COMPLETE,4,1,0x1a,0xfd,status};
+    hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void key_notification(const uint8_t address[6]) {
+    uint8_t p[25]={HCI_EVENT_LINK_KEY_NOTIFICATION,23};
+    for (unsigned i=0;i<6;++i) p[2+i]=address[5-i];
+    hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+}
+static void test_fresh_bond_gets_priority_without_reboot(void) {
+    for (unsigned selected=1;selected<=2;++selected) {
+        fixture();
+        slot=selected;
+        if (selected == 2) {
+            memcpy(saved[slot-1],first,6);
+            has_key[slot-1]=true;
+        }
+        bt_hci_init();
+        assert(gap_start_scanning());
+        uint8_t p[27];
+        result(p,sizeof(p),second,0x240404);
+        has_key[slot-1]=false;  // No key for the replacement yet.
+        hci_packet_handler(HCI_EVENT_PACKET,0,p,sizeof(p));
+        credit_connections[0]=(hci_connection_t){.con_handle=0x11,.address_type=BD_ADDR_TYPE_ACL,.state=OPEN};
+        memcpy(credit_connections[0].address,second,6);
+        bt_hci_priority_transition(PRIORITY_START);
+        assert(!priority_writes);
+        key_notification(second);
+        assert(!selected_bonded);
+        has_key[slot-1]=true;
+        key_notification(nearby);
+        bt_hci_phone_poll();
+        assert(!priority_writes);
+        key_notification(second);
+        bt_hci_phone_poll();
+        assert(priority_writes==1 && priority_handle==0x11 && priority_value==1);
+        assert(device_addr_bonded[slot-1] && !memcmp(device_addr_list[slot-1],second,6));
+    }
+}
+static void test_a2dp_priority_tracks_stream(void) {
+    uint8_t out[9];
+    flush_fixture();
+    bt_hci_phone_poll();
+    bt_hci_priority_snapshot(out);
+    assert(!priority_writes && out[0]==3 && out[6]==UINT8_MAX);
+
+    priority_eligible=false;
+    bt_hci_priority_transition(PRIORITY_START);
+    bt_hci_phone_poll();
+    assert(!priority_writes);
+    command_ready=false;
+    priority_eligible=true;
+    bt_hci_phone_poll();
+    assert(!priority_writes);
+    command_ready=true;
+    bt_hci_phone_poll();
+    assert(priority_writes==1 && priority_handle==0x11 && priority_value==1);
+    uint8_t accepted[]={HCI_EVENT_COMMAND_STATUS,4,0,1,0x1a,0xfd};
+    uint8_t malformed[]={HCI_EVENT_COMMAND_COMPLETE,5,1,0x1a,0xfd,0,0};
+    hci_packet_handler(HCI_EVENT_PACKET,0,accepted,sizeof(accepted));
+    hci_packet_handler(HCI_EVENT_PACKET,0,malformed,sizeof(malformed));
+    bt_hci_priority_snapshot(out);
+    assert((out[1]&2) && out[6]==UINT8_MAX);
+    priority_ack(0);
+    now=UINT32_MAX-200;
+    bt_hci_priority_transition(PRIORITY_START);
+    now+=300001;
+    bt_hci_phone_poll();
+    assert(priority_writes==1);
+    bt_hci_priority_snapshot(out);
+    assert((out[1]&4) && out[6]==1 && out[7]==1);
+
+    bt_hci_priority_transition(PRIORITY_SUSPEND);
+    assert(priority_writes==2 && priority_value==0);
+    bt_hci_priority_transition(PRIORITY_START);
+    bt_hci_phone_poll();
+    assert(priority_writes==2);
+    priority_ack(0);
+    bt_hci_phone_poll();
+    assert(priority_writes==3 && priority_value==1);
+    priority_ack(0);
+    priority_eligible=false;
+    bt_hci_phone_poll();
+    assert(priority_writes==4 && priority_value==0);
+    priority_ack(0);
+    bt_hci_phone_poll();
+    assert(priority_writes==4);
+    priority_eligible=true;
+    bt_hci_phone_poll();
+    assert(priority_writes==5 && priority_value==1);
+    priority_ack(0);
+}
+
+static void test_a2dp_priority_stays_on_selected_scope(void) {
+    flush_fixture();
+    security_level=0;
+    bt_hci_priority_transition(PRIORITY_START);
+    security_level=LEVEL_2;
+    priority_eligible=false;
+    bt_hci_priority_transition(PRIORITY_START);
+    priority_eligible=true;
+    selected_bonded=false;
+    bt_hci_priority_transition(PRIORITY_START);
+    selected_bonded=true;
+    priority_session=0;
+    bt_hci_priority_transition(PRIORITY_START);
+    assert(!priority_writes);
+
+    for (unsigned loss=0;loss<6;++loss) {
+        flush_fixture();
+        bt_hci_priority_transition(PRIORITY_START);
+        assert(priority_writes==1 && priority_value==1 && priority_handle==0x11);
+        priority_ack(0);
+        switch(loss) {
+            case 0: ++priority_media_cid; break;
+            case 1: ++priority_session; break;
+            case 2: priority_eligible=false; break;
+            case 3: memcpy(device_addr,nearby,6); break;
+            case 4: bt_hci_priority_transition(PRIORITY_CLOSE); break;
+            case 5: bt_hci_priority_transition(PRIORITY_USB_LOST); break;
+        }
+        bt_hci_phone_poll();
+        assert(priority_writes==2 && priority_value==0 && priority_handle==0x11);
+        priority_ack(0);
+        bt_hci_phone_poll();
+        assert(priority_writes==2);
+        if(loss==0 || loss==1) {
+            bt_hci_priority_transition(PRIORITY_START);
+            assert(priority_writes==3 && priority_value==1 && priority_handle==0x11);
+            priority_ack(0);
+        }
+    }
+}
+
+static void test_a2dp_priority_reply_fencing(void) {
+    uint8_t out[9];
+    flush_fixture();
+    now=UINT32_MAX-100;
+    bt_hci_priority_transition(PRIORITY_START);
+    now+=2000;
+    bt_hci_phone_poll();
+    bt_hci_priority_snapshot(out);
+    assert(priority_writes==1 && (out[1]&2) && (out[1]&16) && out[6]==UINT8_MAX);
+    bt_hci_priority_transition(PRIORITY_START);
+    bt_hci_phone_poll();
+    assert(priority_writes==1);
+    priority_ack(0);
+    bt_hci_phone_poll();
+    assert(priority_writes==2 && !priority_value);
+    priority_ack(0);
+
+    const uint16_t handles[]={0x11,0x44};
+    for(unsigned i=0;i<sizeof(handles)/sizeof(*handles);++i) {
+        flush_fixture();
+        bt_hci_priority_transition(PRIORITY_START);
+        uint8_t disconnected[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x11,0,0x13};
+        hci_packet_handler(HCI_EVENT_PACKET,0,disconnected,sizeof(disconnected));
+        credit_connections[0].con_handle=handles[i];
+        ++priority_session;
+        bt_hci_priority_transition(PRIORITY_START);
+        now+=2100;
+        bt_hci_phone_poll();
+        assert(priority_writes==1);
+        priority_ack(0);
+        bt_hci_priority_snapshot(out);
+        assert(out[6]==UINT8_MAX);
+        bt_hci_phone_poll();
+        assert(priority_writes==2 && priority_value==1 && priority_handle==handles[i]);
+        priority_ack(0);
+    }
+
+    for (unsigned source=0;source<3;++source) {
+        flush_fixture();
+        if (source==2) priority_submit_status=0x0c;
+        bt_hci_priority_transition(PRIORITY_START);
+        if (source==0) priority_ack(1);
+        if (source==1) {
+            uint8_t rejected[]={HCI_EVENT_COMMAND_STATUS,4,1,1,0x1a,0xfd};
+            hci_packet_handler(HCI_EVENT_PACKET,0,rejected,sizeof(rejected));
+        }
+        bt_hci_priority_snapshot(out);
+        assert((out[1]&8) && out[2]==(source==2 ? 0x0c : 1) && out[6]==UINT8_MAX && out[7]==source+1);
+        now+=300000;
+        bt_hci_phone_poll();
+        assert(priority_writes==1);
+        bt_hci_priority_transition(PRIORITY_SUSPEND);
+        priority_submit_status=0;
+        bt_hci_priority_transition(PRIORITY_START);
+        assert(priority_writes==(source==2 ? 2u : 1u));
+    }
+}
+
+static void test_a2dp_priority_restore_failures(void) {
+    uint8_t out[9];
+    flush_fixture();
+    bt_hci_priority_transition(PRIORITY_START);
+    priority_ack(0);
+    bt_hci_priority_transition(PRIORITY_SUSPEND);
+    for(unsigned attempt=0;attempt<3;++attempt) {
+        assert(priority_writes==2+attempt && !priority_value);
+        priority_ack(0x0c);
+        bt_hci_priority_snapshot(out);
+        assert(out[6]==1 && (out[1]&8) && !(out[1]&1));
+        now+=499;
+        bt_hci_phone_poll();
+        assert(priority_writes==2+attempt);
+        ++now;
+        bt_hci_phone_poll();
+    }
+    now+=300000;
+    bt_hci_phone_poll();
+    bt_hci_priority_snapshot(out);
+    assert(priority_writes==4 && out[6]==1 && (out[1]&8));
+    bt_hci_priority_transition(PRIORITY_START);
+    bt_hci_phone_poll();
+    assert(priority_writes==4);
+    bt_hci_priority_transition(PRIORITY_SUSPEND);
+    bt_hci_phone_poll();
+    assert(priority_writes==5 && !priority_value);
+    priority_ack(0);
+    bt_hci_priority_snapshot(out);
+    assert(out[6]==0 && !(out[1]&8));
+}
+
+static void test_reopened_media_can_recover_failed_priority_restore(void) {
+    flush_fixture();
+    bt_hci_priority_transition(PRIORITY_START);
+    priority_ack(0);
+    bt_hci_priority_transition(PRIORITY_CLOSE);
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        assert(priority_writes == 2 + attempt && !priority_value);
+        priority_ack(0x0c);
+        now += 500;
+        bt_hci_phone_poll();
+    }
+    assert(priority_writes == 4);
+    ++priority_media_cid;
+    ++priority_session;
+    bt_hci_priority_transition(PRIORITY_START);
+    assert(priority_writes == 5 && !priority_value);
+    priority_ack(0);
+    bt_hci_phone_poll();
+    assert(priority_writes == 6 && priority_value == 1);
+    priority_ack(0);
+    bt_hci_priority_transition(PRIORITY_SUSPEND);
+    assert(priority_writes == 7 && !priority_value);
+}
+
 int main(void) {
+    test_fresh_bond_gets_priority_without_reboot();
+    test_a2dp_priority_tracks_stream();
+    test_a2dp_priority_stays_on_selected_scope();
+    test_a2dp_priority_reply_fencing();
+    test_a2dp_priority_restore_failures();
+    test_reopened_media_can_recover_failed_priority_restore();
     test_unanswered_controller_commands_recover_after_grace();
     test_retired_pair_has_no_ram_target_but_keeps_authenticated_discovery_hint();
     test_unrelated_speaker_cannot_win_airpods_pairing();

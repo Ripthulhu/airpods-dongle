@@ -1,8 +1,9 @@
 # Dongle and Android protocol comparison, 16 November 2026
 
 Version 0.1.67 incorporates the baseline-preserving Game Mode policy from
-LibrePods Pixel145 (`1625f49`). The pitch-preserving USB transition from 0.1.61 is
-retained. Transport-specific feature declarations and audio ownership remain
+LibrePods Pixel145 (`1625f49`). That release retained the pitch-preserving
+USB transition. The current preview uses [variable-speed USB playback](GAME-TRANSITION.md).
+Transport-specific feature declarations and audio ownership remain
 separate; an undocumented flag is not enabled merely because another host sends it.
 
 | Area | Dongle | Android | Assessment |

@@ -139,6 +139,13 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
             if(size!=2 || p[1]>1)return DONGLE_RPC_ERROR_MALFORMED;
             if(client!=DONGLE_CLIENT_USB)return DONGLE_RPC_ERROR_UNSUPPORTED;
             return bt_hci_airpods_flush_comparison(p[1]!=0)?0:DONGLE_RPC_ERROR_BUSY;
+        case DONGLE_FEATURE_DIAGNOSTIC_A2DP_PRIORITY:
+            if (client != DONGLE_CLIENT_USB) return DONGLE_RPC_ERROR_UNSUPPORTED;
+            if (capacity < 9 || (size != 1 && (size != 2 || p[1] > 1))) return DONGLE_RPC_ERROR_MALFORMED;
+            if (size == 2) return DONGLE_RPC_ERROR_UNSUPPORTED;
+            bt_hci_priority_snapshot(out);
+            *length = 9;
+            return 0;
         case DONGLE_FEATURE_READ_RADIO_AND_BITRATE:
             if(size!=1)return DONGLE_RPC_ERROR_MALFORMED;
             *length=radio_snapshot(out,capacity);return *length?0:DONGLE_RPC_ERROR_UNSUPPORTED;
@@ -165,6 +172,9 @@ uint8_t dongle_features_request(uint8_t client,const uint8_t *p,uint16_t size,
 }
 void dongle_features_disconnect(uint8_t client) {
     dongle_finder_disconnect(client);dongle_volume_client_disconnect(client);
-    if(client==DONGLE_CLIENT_USB)(void)bt_hci_airpods_flush_comparison(false);
+    if(client==DONGLE_CLIENT_USB) {
+        (void)bt_hci_airpods_flush_comparison(false);
+        bt_hci_priority_transition(PRIORITY_USB_LOST);
+    }
 }
 void dongle_features_poll(void) { dongle_playback_poll();dongle_finder_poll(); }

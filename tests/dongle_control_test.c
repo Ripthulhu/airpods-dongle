@@ -16,9 +16,15 @@ static bool takeover_authorized, takeover_allowed=true;
 static unsigned takeover_requests;
 static dongle_readback_t readback;
 static bool case_fallback;
+static bool reconnect_during_status;
 void dongle_case_battery_poll(void) {}
 void dongle_case_battery_merge(dongle_readback_t *out, bool healthy, uint8_t *present, uint8_t *source) {
     (void)healthy;
+    if (reconnect_during_status) {
+        reconnect_during_status = false;
+        dongle_control_available(false);
+        dongle_control_available(true);
+    }
     *present=*source=0;
     for (unsigned i=0;i<3;++i) if (out->known[i] && out->battery[i]<=100) *present|=1u<<i;
     if (case_fallback) {
@@ -152,5 +158,14 @@ int main(void) {
     send(r);assert(takeover_requests==previous_requests+1); // A denied duplicate cannot authorize later.
     takeover_allowed=true;request(r,1,2);send(r);
     assert(takeover_requests==previous_requests+2 && reconnects==previous_reconnects+1);
+    reconnect_during_status = true;
+    dongle_control_poll();
+    assert(!dongle_control_get(out, 63));
+    dongle_control_poll();
+    assert(dongle_control_get(out, 63) == 63 && controls[0].last_sequence == 0);
+    dongle_control_client_available(1, true);
+    assert(!dongle_control_client_get(1, phone_report));
+    dongle_control_poll();
+    assert(dongle_control_client_get(1, phone_report));
     puts("dongle controls: silent discovery, target generations, duplicate commands, backpressure and USB loss passed");
 }

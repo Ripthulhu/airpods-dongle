@@ -11,6 +11,7 @@
 #define BTSTACK_EVENT_STATE 0x60
 #define HCI_STATE_WORKING 2
 #define HCI_EVENT_PIN_CODE_REQUEST 0x16
+#define HCI_EVENT_LINK_KEY_NOTIFICATION 0x18
 #define HCI_EVENT_USER_CONFIRMATION_REQUEST 0x33
 #define HCI_EVENT_USER_PASSKEY_REQUEST 0x34
 #define HCI_EVENT_COMMAND_STATUS 0x0f
@@ -91,6 +92,9 @@ static inline uint16_t hci_event_command_status_get_command_opcode(const uint8_t
 }
 static inline void hci_event_pin_code_request_get_bd_addr(const uint8_t *p, bd_addr_t address) {
     for (unsigned i = 0; i < 6; ++i) address[i] = p[7 - i];
+}
+static inline void hci_event_link_key_request_get_bd_addr(const uint8_t *p, bd_addr_t address) {
+    hci_event_pin_code_request_get_bd_addr(p, address);
 }
 static inline void hci_event_user_confirmation_request_get_bd_addr(const uint8_t *p, bd_addr_t address) {
     hci_event_pin_code_request_get_bd_addr(p, address);

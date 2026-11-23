@@ -101,7 +101,11 @@ extern "C" {
 //------------- CLASS -------------//
 #define CFG_TUD_CDC               1   // debug logging over USB serial (see debug_cdc.c)
 #define CFG_TUD_MSC               0
+#if AIRPODS_HEAD_TRACKING
+#define CFG_TUD_HID               2
+#else
 #define CFG_TUD_HID               1
+#endif
 #define CFG_TUD_HID_EP_BUFSIZE    64
 #define CFG_TUD_MIDI              0
 #define CFG_TUD_AUDIO             1

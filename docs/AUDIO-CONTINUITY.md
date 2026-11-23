@@ -286,7 +286,13 @@ window deltas and events during confirmed steady playback.
 Event kinds: 1 drop (frames, occupancy); 2 zero-fill (frames, occupancy); 3 late
 timer (ms, debt); 4 delayed send (wait us, send gap us); 5 recovery (discarded PCM,
 discarded debt); 6 flush (handle, 0); 7 USB error (bad=1/short=2, frames); 8 format
-(alternate, 0); 9 reserved for Game transitions. Microseconds and counters wrap
+(alternate, 0); 9 reserved for Game transitions. Event 10 records the gap in
+milliseconds between positive ACL credit reports for the selected AirPods and
+the number of packets completed in the latest report. It records gaps of at
+least 40 ms during steady, owned AAC-ELD playback, excluding pauses and
+reconnects. The controller can return several credits together. Only a receiver
+measurement can establish when the corresponding audio was delivered.
+Microseconds and counters wrap
 modulo u32. History retains the last 24 events across serial wrap. No audio
 payloads, Bluetooth keys or personal profiles are exported.
 
@@ -318,8 +324,10 @@ python tools/audio_profile.py --scan off --seconds 60 --serial YOUR_PICO_SERIAL 
 ```
 
 The collector is read-only. The separate profiling tool changes one test variable
-and restores it on completion or a capture exception. Scan pauses also expire in
-firmware if the host vanishes. Profile captures last at most 90 seconds. Game
+and restores it on completion or a capture exception. A diagnostic scan pause
+expires if the host vanishes. The independent Game Mode scan pause follows
+playback and can be observed with the read-only collector. Profile captures
+last at most 90 seconds. Game
 Mode restoration needs a surviving connection; capture errors are reported.
 The collector restricts reads to audio status/performance/trace, validates target
 generation and paging, and refuses an already busy transaction. It works on
