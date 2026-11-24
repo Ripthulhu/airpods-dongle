@@ -267,7 +267,17 @@ static void test_scan_relay_and_route_loss(void) {
     cur_codec=2;
     assert(!dongle_playback_defer_scan());
 }
+static void test_program_excludes_dither_and_nonfinite_pcm(void) {
+    fixture();atomic_store(&usb_program_stamp,0);
+    const float quiet[]={NAN,4.0f/32768.0f,-4.0f/32768.0f,0.0f};
+    const int16_t dither[]={4,-4};
+    playback_accessory_signal(quiet,2,true);playback_accessory_signal(dither,1,false);
+    assert(atomic_load(&usb_signal_stamp)==now+1 && !atomic_load(&usb_program_stamp));
+    playback_accessory_signal((const float[]){0,-0.001f},1,true);assert(atomic_load(&usb_program_stamp)==now+1);
+    ++now;playback_accessory_signal((const int16_t[]){0,8},1,false);assert(atomic_load(&usb_program_stamp)==now+1);
+}
 int main(void) {
+    test_program_excludes_dither_and_nonfinite_pcm();
     test_priority_scope();
     test_wear_and_signal();test_cached_startup_presence();test_owner_and_manual_fences();test_conversation_scope();
     test_scan_follows_real_usb_playback();test_scan_relay_and_route_loss();

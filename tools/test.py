@@ -133,7 +133,7 @@ def playback_lifecycle_sources(directory):
     for signature in ["static int playback_encoder_failed(",
                       "bool get_a2dp_connected_flag()", "bool avdtp_disconnect_and_scan(void)",
                       "bool bridge_phone_open(void)",
-                      "void avdtp_source_establish_stream(void)",
+                      "static void signaling_connect_failed(", "static void connect_selected_media(", "void avdtp_source_establish_stream(void)",
                       "void dongle_playback_connect_requested(void)",
                       "static void playback_release_close(void)",
                       "uint16_t dongle_routing_snapshot(", "uint8_t dongle_routing_request(",
@@ -214,8 +214,10 @@ def playback_lifecycle_sources(directory):
                       "static void call_clock_init(",
                       "static bool a2dp_demo_timer_start(a2dp_media_sending_context_t * context){",
                       "static bool playback_claim_transport_current(", "static bool playback_claim_current(",
-                      "static uint8_t playback_request_start(", "static bool playback_claim_begin(", "static void playback_claim_suspend(",
-                      "static void playback_idle_poll(", "void dongle_playback_ownership_changed(bool owned)",
+                      "static uint8_t playback_request_start(", "static bool playback_claim_begin(", "static bool playback_park_unowned_open(", "static void playback_claim_suspend(",
+                      "bool dongle_playback_auto_standby(", "uint32_t dongle_playback_return_signal(", "static bool passive_start_ready(",
+                      "static void playback_idle_poll(",
+                      "void dongle_playback_ownership_changed(bool owned)",
                       "bool bridge_phone_open(void)", "void bridge_phone_start_requested(void)", "bool bridge_phone_ready(void)",
                       "static bool phone_output_recovery_owned(", "bool bridge_phone_recovering(void)",
                       "static void suspend_recovery_handler(",
@@ -242,6 +244,7 @@ def usb_game_verification_sources(directory):
     source = (ROOT / "src/btstack/btstack_avdtp_source.c").read_text()
     functions=[]
     for signature in ["static void playback_media_sent(void)", "static bool playback_usb_verify_scope(",
+                      "void dongle_playback_automatic_returned(",
                       "static void playback_usb_verify_cancel(", "static void playback_usb_verify_started(",
                       "static bool playback_usb_verify_poll(", "static void playback_usb_verify_sent("]:
         match=re.search(r"(?m)^"+re.escape(signature)+r"[^;]*?\{",source)

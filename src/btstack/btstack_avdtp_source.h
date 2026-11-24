@@ -65,6 +65,7 @@ bool dongle_playback_priority_scope(uint16_t *media_cid);
 bool dongle_playback_game_timing(void);
 uint16_t dongle_playback_status(uint8_t *out, uint16_t capacity);
 void dongle_playback_connect_requested(void);
+void dongle_playback_automatic_returned(void);
 uint16_t dongle_routing_snapshot(uint8_t *out, uint16_t capacity);
 uint8_t dongle_routing_request(uint8_t action, uint32_t expected, uint32_t nonce);
 uint8_t dongle_reconnect_policy(bool set, bool automatic, bool *current);

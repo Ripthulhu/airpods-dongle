@@ -644,6 +644,7 @@ int main() {
         phone_control_poll();
         if (debug_cdc_take_timing_request()) { ble_diagnostics_task();realtime_metrics_print();phone_sink_report();phone_call_report();bt_volume_report();aacp_routing_report(); }
         if (!debug_cdc_output_pending() && debug_cdc_take_work_request()) realtime_work_print();
+        if (!debug_cdc_output_pending() && debug_cdc_take_route_request()) aacp_route_history_report();
         volume_trace_console_poll(&volume_console, now_ms);
         bool enter_bootsel = bootsel_request_poll(&bootsel, now_ms);
         // Snapshot under the Bluetooth lock; USB ingress keeps running in its IRQ.

@@ -68,9 +68,10 @@ void usb_motion_invalidate(void) {
     restore_interrupts(irq);
 }
 
-void usb_motion_publish(uint32_t owner, uint32_t now, const uint8_t report[USB_MOTION_SIZE]) {
+void usb_motion_publish(uint32_t owner, const uint8_t report[USB_MOTION_SIZE]) {
     uint32_t irq = save_and_disable_interrupts();
-    expire(now_ms());
+    uint32_t now = now_ms();
+    expire(now);
     if (owner && owner == lease) {
         memcpy(latest, report, sizeof(latest));
         arrived = now;

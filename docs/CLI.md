@@ -134,7 +134,11 @@ python tools/airpods.py reconnect-policy manual
 ```
 
 `reconnect-policy auto` is an explicit opt-in to automatic outgoing reconnects.
-It can reclaim AirPods that another host is using. The change takes effect on
+The multipoint preview reconnects the saved pair's A2DP signaling in standby,
+so the host can enumerate USB audio. It then opens the AirPods control channel.
+The first PC media Start requires positive ownership and real audio. When the phone
+finishes, ongoing or newly started PC audio can take over. Earlier firmware
+can reclaim AirPods during another host's playback. The change takes effect on
 subsequent eligible attempts, which may happen immediately. A previous
 `disconnect` hold still overrides Auto until Connect, a button press or reboot.
 The policy is retained across restarts; the temporary disconnect hold is not.

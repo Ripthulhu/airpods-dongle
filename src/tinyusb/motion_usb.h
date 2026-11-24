@@ -15,5 +15,5 @@ void usb_motion_set_rate(uint8_t rate);
 uint8_t usb_motion_rate(void);
 uint32_t usb_motion_lease(uint8_t *rate);
 void usb_motion_invalidate(void);
-void usb_motion_publish(uint32_t lease, uint32_t now, const uint8_t report[USB_MOTION_SIZE]);
+void usb_motion_publish(uint32_t lease, const uint8_t report[USB_MOTION_SIZE]);
 void usb_motion_task(void);

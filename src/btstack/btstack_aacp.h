@@ -24,6 +24,7 @@ void aacp_init(void);
 // Call once the A2DP signaling connection to the same device is established.
 // A short settle delay is applied internally before the outgoing connect.
 void aacp_connect(bd_addr_t addr);
+bool aacp_secure_control_peer(const uint8_t addr[6]);
 
 // Tear down the AACP channel if open.
 void aacp_disconnect(void);
@@ -45,6 +46,9 @@ bool aacp_audio_owned(void);
 bool aacp_takeover_request(const uint8_t peer[6]);
 // Outgoing media connections require a current, peer-bound user request.
 bool aacp_takeover_pending(const uint8_t peer[6]);
+// A current, audible USB sample on the selected media link, or zero when automatic return is unavailable.
+uint32_t dongle_playback_return_signal(const uint8_t peer[6], uint32_t now);
+bool dongle_playback_auto_standby(const uint8_t peer[6]);
 typedef struct {
     uint32_t revision, age_ms, nonce;
     uint8_t flags, stage, action;
@@ -54,6 +58,8 @@ aacp_routing_state_t aacp_routing_state(void);
 void aacp_routing_override(void);
 void aacp_routing_receipt(uint32_t nonce, uint8_t action);
 void aacp_routing_report(void);
+void aacp_route_history_report(void);
+void aacp_route_avdtp_event(uint8_t stage,uint8_t status);
 // Cancel only unsent receiver-buffer changes when another host owns audio.
 void aacp_receive_buffer_cancel(void);
 

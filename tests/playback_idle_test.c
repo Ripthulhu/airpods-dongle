@@ -36,6 +36,9 @@ static playback_adjust_t playback_adjust;
 #define AVDTP_SI_SET_CONFIGURATION 5
 #define AVDTP_SI_ABORT 6
 #define AVDTP_SI_CLOSE 7
+#define AVDTP_SI_DISCOVER 8
+#define AVDTP_SI_GET_CAPABILITIES 9
+#define AVDTP_SI_GET_ALL_CAPABILITIES 10
 enum { PLAYBACK_RUNNING, PLAYBACK_SUSPENDING, PLAYBACK_SUSPENDED, PLAYBACK_STARTING, PLAYBACK_CLAIMING };
 static uint8_t playback_idle_phase, cur_codec = 4;
 static struct {
@@ -47,7 +50,8 @@ static struct {
 static bool playback_idle_counting, phone_opened, phone_active, phone_buffer_started;
 static bool playback_peer_suspended;
 static uint32_t usb_playback_revision, playback_peer_suspend_revision;
-static atomic_uint usb_signal_stamp;
+static atomic_uint usb_signal_stamp, usb_program_stamp;
+static bool reconnect_automatic;
 static bool call_active, call_opened, call_capture;
 static bool phone_output_recovery;
 static uint16_t phone_output_recovery_cid;
@@ -87,7 +91,11 @@ static void aacp_receive_buffer_cancel(void) {
 static bool usb_media_enqueue(unsigned command) {assert(command==USB_MEDIA_PAUSE_ONLY);++usb_pauses;return true;}
 static void phone_sink_pause_for_takeover(void) {++phone_pauses;}
 static void usb_media_cancel_pause(void) {++usb_pause_cancels;}
-typedef struct { unsigned l2cap_media_cid; } test_endpoint_t;
+enum {AVDTP_STREAM_ENDPOINT_OPENED=7,AVDTP_STREAM_ENDPOINT_STREAMING};
+typedef struct { unsigned l2cap_media_cid, state; } test_endpoint_t;
+bool dongle_playback_auto_standby(const uint8_t peer[6]);
+uint32_t dongle_playback_return_signal(const uint8_t peer[6],uint32_t now);
+static void aacp_route_avdtp_event(uint8_t stage,uint8_t status) {(void)stage;(void)status;}
 static test_endpoint_t endpoint;
 static struct { test_endpoint_t *local_stream_endpoint; } sc={&endpoint};
 static uint16_t mic_recovery_cid;
@@ -101,6 +109,7 @@ static uint8_t claim_peer[6], claim_stage;
 static bool claim_known, claim_pending;
 typedef struct {uint32_t revision,age_ms,nonce;uint8_t flags,stage,action;} aacp_routing_state_t;
 static inline bool aacp_control_ready(void) {return control_ready;}
+static inline bool aacp_secure_control_peer(const uint8_t peer[6]) {return control_ready && !memcmp(peer,selected_peer,6);}
 static inline uint32_t aacp_control_session(void) {return control_session;}
 static inline bool aacp_takeover_pending(const uint8_t *peer) {
     return peer && claim_pending && !memcmp(peer,claim_peer,6) && (uint32_t)(now-claim_since)<10000u;
@@ -120,7 +129,7 @@ static bool encoder_ready = true;
 static bool game_eligible;
 static playback_game_t playback_game;
 static bool playback_game_eligible(void) { return game_eligible; }
-static struct { unsigned recoveries; } playback_metrics;
+static struct { unsigned recoveries, pcm_drops; } playback_metrics;
 static void *handleAAC = (void *)1;
 static void playback_encoder_invalidate(void) {}
 static struct { unsigned deferred_size; } encoder_job;
@@ -175,6 +184,10 @@ static unsigned avdtp_source_start_stream(unsigned cid, unsigned seid) {
     ++starts;
     return start_error;
 }
+static unsigned start_rejections;
+static void avdtp_start_stream_reject(unsigned cid,unsigned seid) {
+    assert(cid==media_tracker.avdtp_cid && seid==media_tracker.local_seid);++start_rejections;
+}
 static void avdtp_start_stream_accept(unsigned cid,unsigned seid) {
     assert(cid==10 && seid==5);
     priority_at_peer_accept=priority_starts;
@@ -189,6 +202,11 @@ static uint8_t avdtp_subevent_signaling_accept_get_local_seid(const uint8_t *p) 
 static void set_led_mode_on(void) { }
 bool bridge_phone_recovering(void);
 #include "playback_idle.inc"
+static uint16_t avdtp_subevent_signaling_reject_get_avdtp_cid(const uint8_t *p) {return p[3];}
+static uint8_t avdtp_subevent_signaling_reject_get_local_seid(const uint8_t *p) {return p[5];}
+static uint8_t avdtp_subevent_signaling_reject_get_is_initiator(const uint8_t *p) {return p[6];}
+static uint8_t avdtp_subevent_signaling_reject_get_signal_identifier(const uint8_t *p) {return p[7];}
+#include "playback_reject.inc"
 
 static void accept(unsigned signal, uint8_t seid) {
     const uint8_t *packet = &seid;
@@ -212,7 +230,7 @@ static void fixture(void) {
     profile_pending = a2dp_connect_pending = false;
     is_usb_streaming = phone_opened = phone_active = mic_requested = mic_active = false;
     call_active = call_opened = call_capture = false;
-    audio_owned=true;call_in_progress=false;endpoint.l2cap_media_cid=0x40;
+    audio_owned=true;call_in_progress=false;endpoint.l2cap_media_cid=0x40;endpoint.state=AVDTP_STREAM_ENDPOINT_STREAMING;
     buffer_cancels=usb_pauses=phone_pauses=usb_pause_cancels=0;
     playback_peer_suspended=false;
     usb_playback_revision=playback_peer_suspend_revision=0;
@@ -222,6 +240,7 @@ static void fixture(void) {
     memcpy(claim_peer,selected_peer,6);
     control_session=claim_revision=1;control_ready=true;
     reconnect_auto_intent=playback_released=claim_known=claim_pending=false;
+    reconnect_automatic=false;atomic_store(&usb_program_stamp,0);
     claim_since=0;claim_stage=0;claim_cancels=0;
     cur_codec = 4;
     media_mtu=986;sbc_frame_bytes=118;
@@ -759,7 +778,69 @@ static void claim_ownership_loss_suspends_without_pcm(void) {
     }
 }
 
+static void crossed_phone_suspend_keeps_the_selected_transport(void) {
+    for(unsigned rejected=0;rejected<2;++rejected) {
+        fixture();reconnect_automatic=reconnect_auto_intent=is_usb_streaming=true;
+        endpoint.state=AVDTP_STREAM_ENDPOINT_OPENED;accept(AVDTP_SI_SUSPEND,5);
+        playback_idle_phase=PLAYBACK_SUSPENDED;
+        atomic_store(&usb_program_stamp,now+1);playback_idle_poll(now);
+        assert(starts==1 && playback_idle_phase==PLAYBACK_STARTING);
+        audio_owned=false;dongle_playback_ownership_changed(false);
+        assert(!media_tracker.streaming && !usb_pauses);
+        if(rejected) {
+            endpoint.state=AVDTP_STREAM_ENDPOINT_STREAMING;accept(AVDTP_SI_START,5);
+            assert(suspends==1 && !media_tracker.streaming); // Accepted after the phone resumed.
+        }
+        endpoint.state=AVDTP_STREAM_ENDPOINT_OPENED;accept(AVDTP_SI_SUSPEND,5);
+        uint8_t late[8]={0,0,0,10,0,5,1,rejected ? AVDTP_SI_SUSPEND : AVDTP_SI_START};
+        signaling_command_rejected(late,sizeof(late));
+        assert(!closes && finish_scan_avdtp_codec && media_tracker.avdtp_cid==10 &&
+               endpoint.l2cap_media_cid==0x40 && playback_idle_phase==PLAYBACK_SUSPENDED && !media_tracker.streaming);
+        now+=900;audio_owned=true;dongle_playback_ownership_changed(true);atomic_store(&usb_program_stamp,now+1);
+        playback_idle_poll(now);assert(starts==2);
+        endpoint.state=AVDTP_STREAM_ENDPOINT_STREAMING;accept(AVDTP_SI_START,5);
+        assert(media_tracker.streaming && !closes && !usb_pauses);
+    }
+}
+static void automatic_return_requires_live_selected_usb_audio(void) {
+    crossed_phone_suspend_keeps_the_selected_transport();
+    fixture();reconnect_automatic=is_usb_streaming=true;
+    assert(!dongle_playback_return_signal(selected_peer,now));
+    atomic_store(&usb_program_stamp,now+1);
+    assert(dongle_playback_return_signal(selected_peer,now));
+    assert(!dongle_playback_return_signal(selected_peer,now+150));
+    assert(!dongle_playback_return_signal((uint8_t[6]){0},now));
+    call_in_progress=true;assert(!dongle_playback_return_signal(selected_peer,now));call_in_progress=false;
+    playback_released=true;assert(!dongle_playback_return_signal(selected_peer,now));playback_released=false;
+    // USB overran just before the phone took over and the worker has not serviced it.
+    usb_recovery_drops=48;playback_metrics.pcm_drops=96;
+    media_tracker.streaming=true;audio_owned=false;dongle_playback_ownership_changed(false);
+    assert(!usb_pauses); // Leave an independently playing PC source running through the phone interruption.
+    assert(!usb_recovery_drops && playback_metrics.pcm_drops==96);
+    accept(AVDTP_SI_SUSPEND,5);
+    audio_owned=true;dongle_playback_ownership_changed(true);playback_idle_poll(++now);
+    assert(starts==1 && is_usb_streaming);
+    accept(AVDTP_SI_START,5);assert(media_tracker.streaming && !usb_recovery_drops);
+    set_usb_streaming(false);assert(!atomic_load(&usb_program_stamp));
+}
+
+static void passive_media_open_does_not_start_silent_pc(void) {
+    fixture();
+    reconnect_automatic=reconnect_auto_intent=is_usb_streaming=true;
+    media_tracker.streaming=is_streaming=false;playback_idle_phase=PLAYBACK_SUSPENDED;
+    start_rejections=0;
+    playback_idle_poll(++now);assert(!starts && reconnect_auto_intent);
+    accept(AVDTP_SI_ACCEPT_START,5);assert(start_rejections==1);
+    atomic_store(&usb_program_stamp,now+1);audio_owned=false;
+    playback_idle_poll(++now);accept(AVDTP_SI_ACCEPT_START,5);assert(!starts && start_rejections==2);
+    audio_owned=true;
+    playback_idle_poll(++now);assert(starts==1);
+    accept(AVDTP_SI_START,5);assert(media_tracker.streaming && !reconnect_auto_intent);
+    now+=1000;playback_idle_poll(now);assert(media_tracker.streaming); // Quiet passages leave the owned stream intact.
+}
 int main(void) {
+    passive_media_open_does_not_start_silent_pc();
+    automatic_return_requires_live_selected_usb_audio();
     fixture();
     atomic_store(&usb_signal_stamp, 100);
     set_usb_streaming(true);

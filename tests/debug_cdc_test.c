@@ -62,6 +62,7 @@ static void reset(void) {
     input_size = input_offset = read_calls = read_flush_calls = 0;
     atomic_store(&timing_requested, false);
     atomic_store(&work_requested, false);
+    atomic_store(&route_requested, false);
     atomic_store(&volume_trace_requested, 0);
     atomic_store(&bootsel_requested, false);
     atomic_store(&terminal_connected, false);
@@ -182,6 +183,10 @@ int main(void) {
     // Every fragmentation point, including immediately before/after 't', works.
     reset();
     connected = true;
+    receive("r");assert(debug_cdc_take_route_request() && !debug_cdc_take_route_request());
+    receive("\nxr\n");assert(!debug_cdc_take_route_request());
+    receive("r");connected=false;tud_cdc_line_state_cb(0,false,false);assert(!debug_cdc_take_route_request());
+    connected=true;
     const char command[] = "bootsel\n";
     for (unsigned split = 1; split < sizeof(command) - 1u; ++split) {
         char fragment[sizeof(command)];

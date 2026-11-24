@@ -172,6 +172,29 @@ static void manual_live_on_already_uses_live_adjustment(void) {
     for(unsigned i=0;i<100;++i){now+=10;production_game_poll();}
     assert(requests_60==1 && !requests_150);
 }
+static void automatic_return_defers_only_a_slow_owned_refill(void) {
+    for (unsigned automatic=0;automatic<2;++automatic) {
+        claim_game_fixture(true);
+        accept(AVDTP_SI_START,5);
+        audio_owned=true;claim_pending=false;
+        if (automatic) dongle_playback_automatic_returned();
+        dongle_playback_ownership_changed(true);production_game_poll();
+        prime_with_real_packet_receipts();now+=500;production_game_poll();
+        assert(requests_60==1 && playback_game.waiting_report);
+        fresh_report(340);
+        assert(playback_adjust.pending && playback_adjust.interval==9 &&
+               playback_adjust.goal_frames==16u*48u && playback_adjust.automatic_refill==(automatic!=0));
+        playback_adjust_start(&playback_adjust,now);
+        for (unsigned n=0;n<45 && playback_adjust.running;++n) {
+            now+=10;playback_adjust_sent(&playback_adjust,480,now,true);
+        }
+        if (!automatic) {assert(playback_adjust.running && !playback_adjust.deferred);continue;}
+        assert(playback_adjust.deferred && !playback_adjust.failed && !playback_adjust.running);
+        production_game_poll();now+=11000;production_game_poll();
+        assert(playback_game.phase==GAME_CONFIRMED && low_latency_flush && requests_60==1 && !requests_150);
+        assert(!playback_game.returning_to_usb && !playback_adjust_busy(&playback_adjust));
+    }
+}
 static void start_ack_before_pre_live_report_still_verifies(void) {
     reset_test();a2dp_demo_timer_stop(&media_tracker);
     assert(playback_pcm_reset(&playback_pcm,7680,false));set_usb_streaming(true);
@@ -266,6 +289,7 @@ static void failed_off_retries_once_on_fresh_owned_usb_playback(void) {
     assert(requests_150==2 && !requests_60);
 }
 int main(void) {
+    automatic_return_defers_only_a_slow_owned_refill();
     failed_off_retries_once_on_fresh_owned_usb_playback();
     claimed_start_proves_buffer_only_after_media();
     claiming_defers_old_restoration_without_faking_receipt();

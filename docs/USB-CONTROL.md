@@ -28,7 +28,10 @@ does not expose motion.
   GET returns the requested rate. Measure the delivered rate from the AirPods'
   sample timestamps. A new USB rate request discards pending motion from the
   old request. The Game Mode cap updates the existing stream in place.
-  The dongle restarts the stream once if valid reports stop for three seconds.
+  After three seconds without a valid report, the dongle restarts only motion.
+  If the restart also times out, it asks the AirPods to advertise their services
+  again. After three unanswered discovery requests it probes every ten seconds
+  while the host keeps its lease. Game Mode's rate cap still applies on recovery.
   USB suspend or detach revokes the request. The dongle waits for its AirPods
   audio ownership, a known bud role and the advertised Pro 3 motion service.
   Microphone use suspends motion.

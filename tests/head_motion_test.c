@@ -29,7 +29,7 @@ bool tud_hid_n_report(uint8_t instance, uint8_t id, const void *report, uint16_t
     ++reports;
     if (publish_during_send) {
         uint8_t next[USB_MOTION_SIZE] = {2};
-        usb_motion_publish(publish_during_send, now, next);
+        usb_motion_publish(publish_during_send, next);
         publish_during_send = 0;
     }
     return true;
@@ -108,7 +108,7 @@ static void test_mailbox_idle_and_publish_during_send(void) {
     assert(readiness_checks == 0 && absolute_time_reads == reads);
 
     uint8_t first[USB_MOTION_SIZE] = {1};
-    usb_motion_publish(owner, now, first);
+    usb_motion_publish(owner, first);
     hid_ready = hid_accepts = true;
     publish_during_send = owner;
     usb_motion_task();
@@ -280,7 +280,46 @@ int main(void) {
     feature(16, 1, 0);
     head_motion_poll(++now, 100, send);
     feature(16, 4, 10);
+    // If the first restart produced no samples, discover the service again.
+    head_motion_poll(++now, 30, send);
+    assert(sent_size == 16 && sent[14] == 0x22);
     before = writes;
-    head_motion_poll(++now, 100, send);
-    assert(writes == before);
+    for (unsigned second = 1; second <= 12; ++second) {
+        now += 1000;
+        usb_motion_set_rate(100);
+        head_motion_poll(now, 30, send);
+        assert(writes == before + (second >= 1) + (second >= 2) + (second == 12));
+    }
+    uint8_t moved[sizeof(motion_announcement)];
+    memcpy(moved, motion_announcement, sizeof(moved));
+    moved[20] = 17;
+    head_motion_receive(moved, sizeof(moved), now);
+    head_motion_poll(now, 30, send);
+    feature(17, 4, 1);
+    head_motion_poll(now, 30, send);
+    feature(17, 1, 33333);
+    // The USB freshness window starts at publication; BTstack owns the report clock.
+    uint32_t bt_now = now + 1234;
+    length = make_report(frame, 3, 17, 1);
+    head_motion_receive(frame, length, bt_now);
+    usb_motion_task();
+    assert(reports == 132 && output[14] == 1 && output[6] != stable_generation);
+    // A healthy stream restores the fast restart allowance even after another dropout.
+    for (unsigned stall = 0; stall < 2; ++stall) {
+        now += 2000;
+        usb_motion_set_rate(100);
+        now += 1000;
+        bt_now += 3000;
+        head_motion_poll(bt_now, 30, send);
+        feature(17, 1, 0);
+        head_motion_poll(bt_now, 30, send);
+        feature(17, 4, 10);
+        head_motion_poll(bt_now, 30, send);
+        feature(17, 4, 1);
+        head_motion_poll(bt_now, 30, send);
+        feature(17, 1, 33333);
+        head_motion_receive(frame, length, bt_now);
+        usb_motion_task();
+        assert(reports == 133 + stall);
+    }
 }

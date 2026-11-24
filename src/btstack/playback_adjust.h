@@ -7,7 +7,7 @@
 #define PLAYBACK_ADJUST_CATCH_UP_UNITS 4u
 
 typedef struct {
-    bool pending, running, failed, source_started;
+    bool pending, running, failed, source_started, automatic_refill, deferred;
     uint8_t interval, losing_units;
     uint16_t target;
     uint32_t goal_frames, started, sent_frames, next_unit_ms;
@@ -75,16 +75,28 @@ static inline void playback_adjust_sent(playback_adjust_t *s, uint32_t frames,
     if (s->interval == 9) {
         // A losing refill consumes the receiver's reserve. Allow a short packet burst to catch up.
         int32_t starting_frames = (int32_t)s->target * 48 - (int32_t)s->goal_frames;
-        if (s->target == 150 && drift > starting_frames / 2) {
-            if (++s->losing_units >= PLAYBACK_ADJUST_CATCH_UP_UNITS) {
+        if (s->target == 150) {
+            if (drift <= starting_frames / 2) s->losing_units = 0;
+            else if (++s->losing_units >= PLAYBACK_ADJUST_CATCH_UP_UNITS) {
                 s->running = false;
                 s->failed = true;
                 return;
             }
-        } else s->losing_units = 0;
+        }
         drift = -drift;
     } else if (!caught_up) return; // Only slowing down can mistake a stall for progress.
-    if (drift >= (int32_t)s->goal_frames) s->running = false;
+    if (drift >= (int32_t)s->goal_frames) { s->running = false; return; }
+    if (s->automatic_refill) {
+        // A 9 ms sender can gain 1 ms per 9 ms. Allow 200 ms to settle, then
+        // require just 1 ms per 40 ms, ignoring short gaps between receipts.
+        uint32_t elapsed = now - s->started;
+        if (elapsed < 300u || drift >= (int32_t)((elapsed - 200u) * 48u / 40u))
+            s->losing_units = 0;
+        else if (++s->losing_units >= PLAYBACK_ADJUST_CATCH_UP_UNITS) {
+            s->running = false;
+            s->deferred = true;
+        }
+    }
 }
 // A common denominator preserves fractional frame debt when the interval changes.
 static inline uint32_t playback_adjust_samples(uint8_t interval, uint32_t elapsed,

@@ -12,6 +12,10 @@
 #define L2CAP_EVENT_CHANNEL_CLOSED 0x71
 #define L2CAP_EVENT_CAN_SEND_NOW 0x79
 typedef uint8_t bd_addr_t[6];
+enum {BD_ADDR_TYPE_ACL=0, OPEN=1, LEVEL_2=2};
+typedef struct {int state;uint16_t con_handle;} hci_connection_t;
+hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t *addr,unsigned type);
+unsigned gap_security_level(uint16_t handle);
 typedef void (*btstack_packet_handler_t)(uint8_t, uint16_t, uint8_t *, uint16_t);
 typedef struct btstack_timer_source {
     void (*handler)(struct btstack_timer_source *);

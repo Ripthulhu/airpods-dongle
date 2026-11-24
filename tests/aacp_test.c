@@ -3,7 +3,16 @@
 #include "../src/btstack/btstack_aacp.c"
 
 static uint32_t now;
+static uint32_t program_stamp;
+static bool standby_watch;
+bool dongle_playback_auto_standby(const uint8_t peer[6]) {return peer && standby_watch;}
+uint32_t dongle_playback_return_signal(const uint8_t peer[6],uint32_t time) {
+    assert(peer);
+    return program_stamp && time-(program_stamp-1u)<150u ? program_stamp : 0;
+}
 static uint16_t next_cid, last_disconnected;
+static bool model_channel_pool;
+static struct {uint16_t cid;uint8_t state;} channel_pool[11]; // 1 pending, 2 open, 3 stranded before ACL.
 static unsigned connects, disconnects, sends, starts, stops, decoded, resets;
 static unsigned modern_init_sends,legacy_init_sends,capability_sends;
 static unsigned setting_sends;
@@ -35,8 +44,16 @@ bool dongle_playback_mic_recover(void) {
 uint32_t dongle_playback_mic_recovery_revision(void) {return playback_recovery_revision;}
 void dongle_playback_mic_recovery_abort(void) {++playback_aborts;aacp_mic_recovery_failed();aacp_disconnect();}
 static bd_addr_t peer = {1, 2, 3, 4, 5, 6};
+static hci_connection_t fixture_acl;
+static unsigned fixture_security;
+hci_connection_t *hci_connection_for_bd_addr_and_type(const uint8_t *addr,unsigned type) {
+    return type==BD_ADDR_TYPE_ACL && !memcmp(addr,peer,6) ? &fixture_acl : NULL;
+}
+unsigned gap_security_level(uint16_t handle) {assert(handle==fixture_acl.con_handle);return fixture_security;}
 static const uint8_t local_host[6] = {10,11,12,13,14,15};
 static unsigned ownership_changes, route_claims, route_media, route_hijacks, can_send_requests;
+static unsigned automatic_completions;
+void dongle_playback_automatic_returned(void) { ++automatic_completions; }
 void gap_local_bd_addr(bd_addr_t address) {memcpy(address,local_host,6);}
 void dongle_playback_ownership_changed(bool owned) {(void)owned;++ownership_changes;}
 static unsigned connect_requests;
@@ -57,9 +74,19 @@ uint8_t l2cap_create_channel(btstack_packet_handler_t handler, bd_addr_t addr,
     assert(psm == AACP_PSM);
     connects++;
     if (create_result == 0) *cid = next_cid++;
+    if (model_channel_pool && !create_result) {
+        for (unsigned i=0;i<11;i++) if (!channel_pool[i].state) {
+            channel_pool[i].cid=*cid;channel_pool[i].state=1;return 0;
+        }
+        return 0x56;
+    }
     return create_result;
 }
-void l2cap_disconnect(uint16_t cid) { disconnects++; last_disconnected = cid; }
+void l2cap_disconnect(uint16_t cid) {
+    disconnects++;last_disconnected=cid;
+    if (model_channel_pool) for (unsigned i=0;i<11;i++) if (channel_pool[i].cid==cid)
+        channel_pool[i].state=channel_pool[i].state==1 ? 3 : 0;
+}
 void l2cap_request_can_send_now_event(uint16_t cid) { assert(cid != 0);++can_send_requests; }
 void dongle_playback_receive_buffer_sent(uint32_t sent_at) {
     assert(sent_at==now && aacp_receive_buffer_serial()!=0);
@@ -123,6 +150,8 @@ static void event(uint8_t type, uint16_t cid) {
     aacp_packet_handler(HCI_EVENT_PACKET, 0, p, sizeof(p));
 }
 static void opened(uint16_t cid, uint8_t status, bd_addr_t addr) {
+    if (model_channel_pool) for(unsigned i=0;i<11;i++) if(channel_pool[i].cid==cid && channel_pool[i].state==1)
+        channel_pool[i].state=status ? 0 : 2; // Page failure only reclaims pending channels.
     uint8_t p[26] = {L2CAP_EVENT_CHANNEL_OPENED, 24, status};
     for (unsigned i = 0; i < 6; ++i) p[3 + i] = addr[5 - i];
     p[13] = (uint8_t)cid;
@@ -152,7 +181,12 @@ static void quiet_after_stop(void) {
     }
 }
 static void fixture(void) {
+    program_stamp=0;
+    standby_watch=false;
+    model_channel_pool=false;
+    fixture_acl=(hci_connection_t){OPEN,12};fixture_security=LEVEL_2;
     aacp_init();
+    retiring_aacp_cid=0; // The fixture starts with a freshly reset controller.
     aacp_research_cancel();
     aacp_setting_cancel();
     remote_mtu = 512;
@@ -162,7 +196,7 @@ static void fixture(void) {
     connects = disconnects = sends = starts = stops = decoded = resets = 0;
     modern_init_sends=legacy_init_sends=capability_sends=0;
     setting_sends = 0;
-    ownership_changes=route_claims=route_media=route_hijacks=can_send_requests=0;
+    ownership_changes=route_claims=route_media=route_hijacks=can_send_requests=automatic_completions=0;
     atomic_store(&audio_authority,true); // Existing capture fixtures assume a resolved sole host.
     buffer_send_callbacks = 0;
     create_result = send_result = 0;
@@ -462,7 +496,9 @@ static void test_bounded_connect_and_send_timeouts(void) {
     fire(&aacp_connect_timer);
     now = AACP_CHANNEL_TIMEOUT_MS;
     aacp_poll();
-    assert(aacp_cid == 0 && disconnects == 1 && aacp_connect_timer.active);
+    assert(aacp_cid && !disconnects && !aacp_connect_timer.active); // Paging is still owned by BTstack.
+    opened(aacp_cid,0x04,peer);
+    assert(!aacp_cid && !disconnects && aacp_connect_timer.active);
 }
 
 static void test_audio_requires_complete_current_requested_sdu(void) {
@@ -1317,10 +1353,173 @@ static void route_devices(bool include_other) {
     aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,packet,include_other?25:17);
 }
 static void route_steps(void) {for(unsigned i=0;i<8;++i){aacp_poll();drain();}}
+static void pc_play_for(uint32_t elapsed) {now+=elapsed;program_stamp=now+1;route_steps();}
 static void route_source(const uint8_t source[6],uint8_t type) {
     uint8_t packet[]={4,0,4,0,0x0e,0,0,0,0,0,0,0,type};
     if(source)for(unsigned i=0;i<6;++i)packet[6+i]=source[5-i];
     aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,packet,sizeof(packet));
+}
+static void standby_subscription_fixture(void) {
+    fixture(); connect_open(); drain(); service_response(aacp_cid,3);
+    assert(aacp_control_ready() && !aacp_audio_owned());
+    standby_watch=true; route_steps(); now+=299; route_steps(); assert(!source_read.subscribed);
+    ++now;route_steps();assert(source_read.subscribed && !source_read.count);
+}
+static void cold_read_fixture(void) {
+    standby_subscription_fixture();
+    now+=SOURCE_REPLY_MS;program_stamp=now+1;route_steps();
+    assert(source_read.count==1 && source_read.awaiting && !route_claims);
+    assert(sizeof(aacp_request_source)==6 && !memcmp(aacp_request_source,(uint8_t[]){4,0,4,0,13,0},6));
+}
+static void test_solicited_source_snapshot_and_topology(void) {
+    const uint8_t phone[]={20,21,22,23,24,25}, wrong[]={30,31,32,33,34,35};
+    uint8_t list[17]={4,0,4,0,0x2e,0,0,0,1};
+    memcpy(list+9,phone,6);
+    standby_subscription_fixture();now+=18;route_source(local_host,0);now+=2;route_devices(true);
+    now++;program_stamp=now+1;route_steps();
+    assert(routing.remote==REMOTE_UNKNOWN && source_read.count==0 && !route_claims);
+    standby_subscription_fixture();now+=18;route_source(phone,2);now+=2;route_devices(true);
+    assert(routing.remote==REMOTE_ACTIVE && !route_claims);
+    now+=SOURCE_REPLY_MS;route_source(NULL,0);pc_play_for(AUTO_IDLE_SETTLE_MS);
+    assert(route_claims==1 && !source_read.count); // Ordinary notification release works without polling.
+    for (unsigned first=0;first<2;++first) {
+        cold_read_fixture();
+        if(first) aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,list,sizeof(list));
+        now+=58; route_source(phone,0); now+=4;
+        if(!first) aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,list,sizeof(list));
+        assert(routing.remote==REMOTE_IDLE && !routing.pending && !route_claims);
+        pc_play_for(AUTO_IDLE_SETTLE_MS);
+        assert(route_claims==1 && routing.automatic_returns==1 && !aacp_audio_owned());
+    }
+    for (unsigned n=0;n<6;++n) {
+        cold_read_fixture();
+        if(n==0)route_source(NULL,0);
+        if(n==1)route_source(local_host,0);
+        if(n==2)route_source(wrong,0);
+        if(n>=3)route_source(phone,0);
+        if(n==3)now+=SOURCE_REPLY_MS;
+        if(n==4){aacp_disconnect();connect_open();drain();service_response(aacp_cid,3);}
+        if(n==5)route_source(phone,1); // A newer call wins before the list arrives.
+        aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,list,sizeof(list));
+        if(n==5)route_source(phone,0); // Delayed response within the old read window cannot end this call.
+        pc_play_for(AUTO_IDLE_SETTLE_MS);
+        assert(!route_claims && !routing.pending && (n!=5 || foreign_call));
+    }
+    cold_read_fixture();
+    now+=12000;route_steps();assert(source_read.count==1); // Paused PC sends no periodic requests.
+    program_stamp=now+1;route_steps();assert(source_read.count==2 && !route_claims);
+    now+=39;route_source(phone,2);now+=4;route_devices(true);
+    assert(routing.remote==REMOTE_ACTIVE && !route_claims);
+    ++now;route_source(NULL,0);assert(routing.remote==REMOTE_ACTIVE);
+    now+=SOURCE_REPLY_MS;route_source(NULL,0);assert(routing.remote==REMOTE_IDLE);
+    pc_play_for(AUTO_IDLE_SETTLE_MS);assert(route_claims==1);
+    route_owned(true);route_steps();assert(aacp_audio_owned());
+    now+=SOURCE_REFRESH_MS;program_stamp=now+1;route_steps();assert(source_read.count==2);
+    cold_read_fixture(); now+=SOURCE_REFRESH_MS;program_stamp=now+1;aacp_poll();
+    assert(source_read.queued);standby_watch=false;program_stamp=0;drain();
+    assert(source_read.count==1 && !source_read.queued); // Release/pause before actual transmission.
+}
+static void test_automatic_multipoint(void) {
+    const uint8_t phone[6]={20,21,22,23,24,25}, unknown[6]={40,41,42,43,44,45};
+    fixture();ready();route_devices(true);route_source(phone,2);route_source(NULL,0);
+    pc_play_for(161);assert(!route_claims);route_source(phone,2);pc_play_for(600);
+    assert(!route_claims && routing.remote==REMOTE_ACTIVE); // Lock sound during the first quiet interval.
+    route_source(NULL,0);pc_play_for(AUTO_IDLE_SETTLE_MS);assert(route_claims==1 && !route_hijacks && !route_media);
+    assert(!automatic_completions);
+    pc_play_for(83);route_owned(true);route_steps();assert(aacp_audio_owned() && !route_hijacks && !route_media);
+    assert(automatic_completions==1);
+    pc_play_for(78);route_source(phone,2);assert(!aacp_audio_owned() && !routing.pending);
+    route_source(NULL,0);pc_play_for(AUTO_IDLE_SETTLE_MS);assert(route_claims==2 && !route_hijacks && !route_media);
+    route_owned(true);route_steps();assert(aacp_audio_owned() && routing.automatic_returns==2);
+    assert(automatic_completions==2);
+    fixture();ready();route_devices(true);route_source(phone,2);route_source(NULL,0);pc_play_for(AUTO_IDLE_SETTLE_MS);
+    pc_play_for(249);assert(route_claims==1 && !route_media && !route_hijacks);
+    pc_play_for(1);assert(route_media==1 && route_hijacks==1 && routing.stage==3); // Bounded fallback.
+    for (unsigned end=0;end<4;++end) {
+        fixture();ready();route_devices(true);
+        route_source(phone,end==3?1:2);assert(!aacp_audio_owned() && aacp_secure_control_peer(peer));
+        now=100;program_stamp=now+1;route_steps();
+        assert(!route_claims); // Playing PC cannot take over a busy phone, including a call.
+        ++now;
+        if (end==2) route_devices(false);
+        else route_source(end==1?phone:NULL,0);
+        assert(aacp_secure_control_peer(peer));
+        route_steps();assert(!route_claims); // Last packet predates remote release.
+        if (end==1) now+=10000; // PC was paused, then starts a new track on the existing connection.
+        pc_play_for(AUTO_IDLE_SETTLE_MS);assert(route_claims==1);
+        route_owned(true);route_steps();assert(aacp_audio_owned() && !routing.pending && routing.automatic_returns==1);
+        route_source(NULL,0);route_steps();assert(route_claims==1);
+    }
+    for(unsigned interrupt=0;interrupt<5;++interrupt) {
+        fixture();ready();route_devices(true);route_source(phone,2);route_source(NULL,0);
+        now+=AUTO_IDLE_SETTLE_MS;program_stamp=now+1;aacp_poll();assert(routing.queued);
+        if (interrupt==0) route_source(phone,2);
+        if (interrupt==1) route_source(phone,1);
+        if (interrupt==2) { now+=150; aacp_poll(); }
+        if (interrupt==3) aacp_routing_override();
+        if (interrupt==4) aacp_media_disconnected();
+        drain();route_steps();assert(!route_claims && !routing.pending && !aacp_audio_owned());
+    }
+    fixture();ready();route_owned(false);route_devices(true);route_source(NULL,0);
+    ++now;program_stamp=now+1;route_steps();assert(!route_claims && aacp_secure_control_peer(peer));
+    route_source(unknown,2);route_source(NULL,0);++now;program_stamp=now+1;route_steps();assert(!route_claims);
+    route_source(phone,2);route_source(unknown,0);++now;program_stamp=now+1;route_steps();assert(!route_claims);
+    route_source(phone,1);route_source(local_host,0);route_source(unknown,0);
+    ++now;program_stamp=now+1;route_steps();assert(!route_claims && foreign_call && aacp_secure_control_peer(peer));
+    uint8_t hijack[144];unsigned length=aacp_route_build(hijack,sizeof(hijack),AACP_ROUTE_HIJACK,local_host,phone);
+    assert(length);hijack[4]=0x11;
+    aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,hijack,(uint16_t)length);
+    assert(routing.remote==REMOTE_HANDOFF);
+    route_source(NULL,0);++now;program_stamp=now+1;route_steps();assert(!route_claims);
+    aacp_channel_failed();ready();route_devices(true);route_source(NULL,0);
+    ++now;program_stamp=now+1;route_steps();assert(!route_claims);
+}
+
+static void test_pause_soon_after_same_phone_media_snapshot(void) {
+    const uint8_t phone[]={20,21,22,23,24,25}, other[]={30,31,32,33,34,35};
+    for (unsigned interrupt=0;interrupt<4;++interrupt) {
+        standby_subscription_fixture();route_devices(true);route_source(phone,interrupt==3 ? 1 : 2);
+        pc_play_for(SOURCE_REPLY_MS);assert(source_read.count==1 && source_read.awaiting);
+        now+=62;route_source(phone,interrupt==3 ? 1 : 2); // Same named source as before the poll.
+        assert(!source_read.awaiting && source_read.reply_class==SOURCE_PEER);
+        now+=38;
+        if(interrupt==1)route_source(phone,1);
+        if(interrupt==2)route_source(other,2);
+        now+=100;route_source(NULL,0); // +200 ms from 0D, well inside its 800 ms window.
+        pc_play_for(AUTO_IDLE_SETTLE_MS-1);assert(!route_claims && !routing.pending);
+        pc_play_for(1);
+        if (!interrupt)assert(route_claims==1 && routing.automatic_returns==1);
+        else assert(!route_claims && !routing.pending && !aacp_audio_owned());
+        if(interrupt==1 || interrupt==3)assert(foreign_call);
+    }
+}
+
+static void test_cold_link_attaches_without_claiming_the_only_listed_phone(void) {
+    const uint8_t phone[]={20,21,22,23,24,25}, replacement[]={30,31,32,33,34,35};
+    uint8_t list[17]={4,0,4,0,0x2e,0,0,0,1};
+    for (unsigned call=0;call<2;call++) {
+        fixture();
+        assert(!aacp_secure_control_peer(peer));aacp_connect(peer);
+        fire(&aacp_connect_timer);opened(aacp_cid,0,peer);drain();control(aacp_cid);
+        fixture_security=0;assert(!aacp_secure_control_peer(peer));fixture_security=LEVEL_2;
+        route_owned(false);memcpy(list+9,phone,6);
+        aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,list,sizeof(list));
+        assert(routing.topology==TOPO_FOREIGN_ONLY && !routing.pending && !route_claims);
+        assert(aacp_secure_control_peer(peer));
+        route_source(phone,0);route_source(NULL,0);++now;program_stamp=now+1;route_steps();
+        assert(!route_claims && routing.remote==REMOTE_UNKNOWN); // A single-host snapshot alone cannot prove an end.
+        route_source(phone,call?1:2);++now;program_stamp=now+1;route_steps();
+        assert(!route_claims && !aacp_audio_owned() && aacp_secure_control_peer(peer));
+        if (call) {
+            memcpy(list+9,replacement,6);aacp_packet_handler(L2CAP_DATA_PACKET,aacp_cid,list,sizeof(list));
+            route_source(NULL,0);route_source(replacement,0);route_steps();
+            assert(foreign_call && !routing.pending && !route_claims);
+        } else {
+            route_source(NULL,0);now+=200;route_steps();assert(!route_claims);
+            pc_play_for(AUTO_IDLE_SETTLE_MS);assert(route_claims==1 && !aacp_audio_owned());
+            route_owned(true);route_steps();assert(aacp_audio_owned());
+        }
+    }
 }
 static void test_source_none_is_known_without_ownership(void) {
     fixture();atomic_store(&audio_authority,false);connect_open();drain();
@@ -1339,6 +1538,7 @@ static void test_source_none_is_known_without_ownership(void) {
     assert(aacp_takeover_request(peer));route_steps();
     assert(routing.stage==3 && routing.pending && route_claims==1 && !aacp_audio_owned());
     route_owned(true);aacp_poll();assert(aacp_audio_owned());
+    assert(!automatic_completions);
 
     fixture();ready();before=sends;changes=ownership_changes;
     route_source(NULL,0);route_steps();
@@ -1677,7 +1877,35 @@ static void test_connection_permission_is_peer_bound_and_expires(void) {
     routing_revision=UINT32_MAX;aacp_routing_receipt(99,1);aacp_routing_override();
     assert(aacp_routing_state().revision==1 && !aacp_routing_state().nonce);
 }
+static void test_preopen_l2cap_is_retired_only_after_the_stack_completes(void) {
+    fixture();model_channel_pool=true;memset(channel_pool,0,sizeof(channel_pool));
+    for (unsigned trial=0;trial<24;trial++) {
+        aacp_connect(peer);fire(&aacp_connect_timer);
+        uint16_t cid=aacp_cid;assert(cid && !retiring_aacp_cid);
+        unsigned allocations=connects,closes=disconnects;
+        now+=30000;aacp_poll();
+        assert(aacp_cid==cid && connects==allocations && disconnects==closes);
+        if (trial%2) {
+            aacp_media_disconnected();aacp_connect(peer);fire(&aacp_connect_timer);
+            assert(!aacp_cid && retiring_aacp_cid==cid && connects==allocations && disconnects==closes);
+            bool late_success=(trial%4)==1;
+            opened(cid,late_success ? 0 : 4,peer);
+            assert(!retiring_aacp_cid && !aacp_connected && disconnects==closes+(unsigned)late_success);
+        } else {
+            opened(cid,4,peer);assert(!aacp_cid && disconnects==closes);
+        }
+        aacp_disconnect();
+        for(unsigned i=0;i<11;i++)assert(!channel_pool[i].state);
+    }
+    assert(now>600000);ready();assert(aacp_control_ready());
+    aacp_disconnect();model_channel_pool=false;
+}
 int main(void) {
+    test_pause_soon_after_same_phone_media_snapshot();
+    test_solicited_source_snapshot_and_topology();
+    test_preopen_l2cap_is_retired_only_after_the_stack_completes();
+    test_cold_link_attaches_without_claiming_the_only_listed_phone();
+    test_automatic_multipoint();
     test_startup_wire_and_service_acceptance();
     test_startup_rejects_unparsed_readiness();
     test_startup_fallback_is_bounded_and_preserves_queue_room();

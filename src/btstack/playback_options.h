@@ -83,7 +83,7 @@ enum {
     GAME_RESTORING=DONGLE_AUDIO_PROFILE_GAME_MODE_STATE_RESTORING,
 };
 typedef struct {
-    bool requested, changed, failed, restore_failed, active;
+    bool requested, changed, failed, restore_failed, active, returning_to_usb;
     bool waiting_tx, waiting_report, low_latency_confirmed, restore_admitting;
     uint8_t phase;
     uint16_t target;
@@ -105,6 +105,7 @@ static inline void playback_game_request(playback_game_t *s, bool enabled) {
         return;
     }
     if (s->requested==enabled) return;
+    s->returning_to_usb=false;
     s->requested=enabled;
     if (enabled) {
         bool retry_restore=s->restore_failed && s->changed;
@@ -131,6 +132,7 @@ static inline void playback_game_observe_send(playback_game_t *s, uint32_t now,
     s->phase=s->target==60 ? GAME_SENT : GAME_RESTORING;
 }
 static inline void playback_game_session_lost(playback_game_t *s) {
+    s->returning_to_usb=false;
     s->low_latency_confirmed=s->restore_admitting=false;
     s->waiting_tx=s->waiting_report=false;
     if (s->changed) s->phase=GAME_RESTORING;

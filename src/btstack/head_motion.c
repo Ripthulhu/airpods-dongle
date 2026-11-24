@@ -23,7 +23,7 @@ static uint32_t fragment_ms, generation, active_lease, probe_ms, last_sample_ms;
 static uint64_t announcement, last_timestamp;
 static uint16_t tx_sequence;
 static uint8_t role[4], service, probes, applied_rate;
-static bool receive_enabled, timed_out, retried;
+static bool receive_enabled, rediscover_after_stop, retried;
 static realtime_metric_t rx_work;
 static enum { STOPPED, START_FIFO_SET, RUNNING, STOP_REQUESTED, STOP_INTERVAL_SET } stream;
 
@@ -39,7 +39,7 @@ static void new_source(void) {
     ++generation;
     last_timestamp = 0;
     probes = 0;
-    timed_out = false;
+    rediscover_after_stop = false;
     retried = false;
     usb_motion_invalidate();
 }
@@ -186,6 +186,7 @@ static void sample(bytes_t record, uint32_t now) {
     if (timestamp <= last_timestamp || (timestamp >> 63)) return;
     last_timestamp = timestamp;
     last_sample_ms = now;
+    retried = false;
     uint8_t report[USB_MOTION_SIZE] = {1, record.size == 58};
     memcpy(report + 2, role, sizeof(role));
     put32(report + 6, generation);
@@ -194,7 +195,7 @@ static void sample(bytes_t record, uint32_t now) {
     if (report[1]) memcpy(report + 22, p + 54, 4);
     memcpy(report + 26, p + 20, 12);
     memcpy(report + 38, p + 38, 12);
-    usb_motion_publish(active_lease, now, report);
+    usb_motion_publish(active_lease, report);
 }
 
 static void payload(bytes_t b, uint32_t now) {
@@ -245,7 +246,7 @@ static void payload(bytes_t b, uint32_t now) {
         if (mapped && !replaced) service = mapped;
         return;
     }
-    if (stream != RUNNING || timed_out || !service || !role[0] || !!packed.p == !!command.p) return;
+    if (stream != RUNNING || !service || !role[0] || !!packed.p == !!command.p) return;
     if (packed.p) {
         if ((packed.size != 58 && packed.size != 60) || (trailer && packed.size != 58) ||
             packed.p[0] != service || packed.p[1]) return;
@@ -345,21 +346,24 @@ void head_motion_poll(uint32_t now, uint8_t max_rate, bool (*send)(uint8_t *, ui
         ++generation;
         last_timestamp = 0;
         used = 0;
-        timed_out = retried;
+        rediscover_after_stop = retried;
         retried = true;
         stream = STOP_REQUESTED;
     }
-    if (!lease || timed_out || stream == STOP_REQUESTED || stream == STOP_INTERVAL_SET) {
+    if (!lease || stream == STOP_REQUESTED || stream == STOP_INTERVAL_SET) {
         if (stream == RUNNING || stream == START_FIFO_SET || stream == STOP_REQUESTED) {
             if (request(1, 0, send)) stream = STOP_INTERVAL_SET;
         } else if (stream == STOP_INTERVAL_SET && request(4, 10, send)) {
             stream = STOPPED;
+            // Two silent starts can mean the buds moved motion to a different service.
+            if (rediscover_after_stop) forget_service();
         }
         return;
     }
     if (!service) {
-        if (probes < 3 && (!probes || (uint32_t)(now - probe_ms) >= 1000u) && request(0, 0, send)) {
-            ++probes;
+        uint32_t interval_ms = probes < 3 ? 1000u : 10000u;
+        if ((!probes || (uint32_t)(now - probe_ms) >= interval_ms) && request(0, 0, send)) {
+            if (probes < 3) ++probes;
             probe_ms = now;
         }
     } else if (role[0] && stream == STOPPED) {

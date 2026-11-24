@@ -126,8 +126,19 @@ button press, basic Connect or feature-21 acquisition still grants the existing
 bounded takeover intent; a saved AirPods pair may also initiate an incoming
 connection. Automatic authorizes outgoing retries only to the selected saved
 address with a valid bond, using the existing 1/2/4/8-second backoff. It never
-starts discovery. **Automatic may interrupt another host using that pair**;
-Manual is recommended when the AirPods are shared between devices.
+starts discovery. On the standby preview, retries establish A2DP signaling
+directly with the selected bonded pair so Windows can see the playback endpoint.
+The AirPods control channel starts after signaling connects. BTstack owns each
+pending raw channel until its page succeeds or fails, even across app release.
+On an automatic standby connection the dongle repeats the notification
+subscription 300 ms after the control service becomes ready. If audible PC
+media is waiting, it can then read the current audio source once every four
+seconds. These reads stop when the dongle owns the audio route.
+This attachment sends no takeover request. Playback waits for ownership
+and a real source. An open USB endpoint sending silence cannot start it.
+Once the PC is playing, a confirmed end to phone playback allows an automatic
+return. An active phone stream or call takes precedence. Older builds with
+feature 23 can actively claim audio as soon as they reconnect.
 
 A successful policy write takes effect on subsequent eligible retries, which
 may happen immediately. Explicit release suppresses incoming connections and automatic retries
@@ -418,7 +429,13 @@ drift goal, minus 10 ms of headroom on entry when the difference exceeds 10 ms.
 The adjustment begins between complete media packets. USB PCM is resampled at
 the matching ratio so fixed-rate ingress does not become a new latency backlog.
 Successful media sends measure drift against nominal elapsed frames; reaching
-the goal returns pacing to normal. A ten-second deadline fails the adjustment
+the goal returns pacing to normal. After an automatic multipoint return, a fresh
+60 ms receipt can report less than 60 ms already buffered. If the USB stream
+keeps playing but four successive packets show too little net refill progress
+after 300 ms, the dongle resumes normal pacing and logs `[GAME] clock deferred`.
+The confirmed low-latency setting stays enabled. This stream keeps its measured
+fill and does not repeat the adjustment. Manual toggles and 150 ms restoration
+use their original deadlines. A ten-second deadline fails an outstanding adjustment
 and requests restoration rather than claiming completion. Pauses, microphone
 use, peer/session changes and transport stops cancel the temporary rate.
 Gaming ELD packets hold at most two access units, versus three normally.

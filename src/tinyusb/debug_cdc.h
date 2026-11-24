@@ -29,6 +29,7 @@ void debug_cdc_task(void);
 bool debug_cdc_take_timing_request(void);
 // Separate bare 'w' keeps the cumulative-work report within the bounded output ring.
 bool debug_cdc_take_work_request(void);
+bool debug_cdc_take_route_request(void);
 
 enum { DEBUG_CDC_VOLUME_TRACE_ARM = 1, DEBUG_CDC_VOLUME_TRACE_DUMP = 2 };
 // Bare v arms/reset a 60-second capture; V freezes/dumps. IRQ publishes only.

@@ -1138,6 +1138,31 @@ static void game_transition_insufficient_throughput(void) {
     waveform_check_joins(0,waveform_frames);
     waveform_fixture=false;
 }
+static void automatic_return_refills_at_available_throughput(void) {
+    const unsigned slow_start_ms[]={0,180,10000};
+    for (unsigned mode=0;mode<3;++mode) {
+        waveform_start(40,997,false,true);
+        playback_game.failed=false;playback_pcm.fraction=634880;
+        sink_frames=34u*48u;sink_started=true;sink_underruns=0;
+        playback_adjust_request(&playback_adjust,340,60);playback_game.target=60;
+        playback_adjust.automatic_refill=true;
+        unsigned start=now,initial_emitted=emitted;
+        do {
+            bool slow=now-start<slow_start_ms[mode];
+            encode_cost=slow?7:6;transition_cost=slow?3:0;
+            step();
+        } while(playback_adjust_busy(&playback_adjust) && now-start<500);
+        assert(!playback_adjust_busy(&playback_adjust) && !playback_game.failed);
+        int lead_ms=(int)((emitted-initial_emitted)/48)-(int)(now-start);
+        if (mode<2) assert(lead_ms>=14 && now-start<300);
+        else assert(lead_ms<5 && now-start>=300 && now-start<400);
+        unsigned end=now+300;
+        while(now<end)step();
+        assert(!playback_metrics.pcm_underflows && !playback_metrics.pcm_drops &&
+               !playback_metrics.recoveries && !sink_underruns && playback_adjust_interval(&playback_adjust)==10);
+        waveform_fixture=false;
+    }
+}
 
 static void losing_restore_returns_to_normal_before_receiver_underrun(void) {
     waveform_start(40,997,false,true);
@@ -1156,6 +1181,7 @@ static void losing_restore_returns_to_normal_before_receiver_underrun(void) {
 }
 
 int main(void) {
+    automatic_return_refills_at_available_throughput();
     conversation_duck_reaches_actual_encoder_and_adjusted_output();
     game_transition_waveforms();
     game_transition_cancel_and_reverse();

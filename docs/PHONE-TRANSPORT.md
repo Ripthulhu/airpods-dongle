@@ -232,13 +232,50 @@ The attempt retains the original three-second
 transition deadline within the ten-second request and is bound to its peer,
 control session and request revision. Cancellation, a newer remote request or
 scope loss suspends it; a peer Suspend does not automatically retry the same
-intent. Standby and automatic reconnect cannot initiate this negotiation.
+intent. The multipoint preview also uses this bounded negotiation for a
+qualified automatic return.
 An authoritative foreign CALL source report cancels pending takeover work and
 blocks a new media takeover until a valid noncall report or session reset clears
-it. Clearing that flag does not create a new request or reclaim playback.
-A validated Audio Source NONE report marks routing as observed without changing
-ownership or creating a request. This allows a later explicit takeover from an
-idle phone while keeping unsolicited startup passive.
+it. With Automatic enabled, the firmware opens A2DP signaling directly to the
+selected bonded pair in standby, then opens AACP. This exposes USB audio to
+Windows while the phone can retain media
+ownership. The initial USB playback Start requires both positive ownership
+and real PCM. A connected-device list alone cannot identify which host is playing.
+
+On a two-host link, Audio Source NONE can name the other host directly. An
+all-zero source address counts only after a foreign Media/Call report on that
+same topology and control session. A takeover message alone cannot establish
+that a phone audio stream has ended. Two saved Android
+traces show this all-zero NONE 195 and 232 ms after Suspend Accept. A fresh
+sole-local list after the peer leaves also resolves the interruption. Ownership
+still requires positive evidence after the bounded request. Fresh USB PCM
+above four PCM16 steps (or its float equivalent) after the idle report authorizes
+the request once the phone has stayed idle for 350 ms. A second phone sound
+restarts the wait. Automatic return first asks for ownership and waits up to
+250 ms for confirmation before using the peer-directed handover sequence.
+A confirmed ownership reply skips those extra messages. A button press still
+requests immediate handover. Digital silence or dither cannot trigger it. A renewed phone
+source, call, takeover, pair or session change cancels the pending return.
+A list naming only one foreign host can appear before the dongle is listed as an
+audio host. In that topology, accept idle only after observing media or a call
+from that exact host during the same session, or after an explicit source read
+returns idle naming that host. A directed reply can precede its matching device
+list. The dongle holds it for up to 800 ms from the request and discards it on a
+newer source, takeover, invalid list or session change. An idle report naming
+the dongle cannot release another host's audio. A source read that confirms
+music on the same already-active phone leaves its next idle notification
+eligible, including inside the read's 800 ms response window. A new active
+source or a call still fences ambiguous late idle replies in that window.
+On a standby link the notification subscription is rearmed once, 300 ms after
+control readiness. A live PC Pro 3 returned source and topology 18 and 20 ms
+after a late subscription. The dongle leaves this response window clear before
+sending the captured six-byte `04 00 04 00 0d 00` source read. Subsequent reads
+are at least four seconds apart and require fresh, meaningful PC audio waiting
+for ownership. Source reads and notification subscription do not request ownership.
+If phone audio resumes during Start, a rejected Start or crossed Suspend can
+leave the media channel established in BTstack's OPENED state. On a verified
+unowned standby link, the dongle parks that channel for the next eligible Start.
+Actual media-channel release still requires transport recovery.
 Unknown routing stays passive, including at startup; standalone automatic start
 therefore needs a valid local-owner/source or sole-local device report. Older
 models and cold standalone startup require hardware verification.
@@ -263,9 +300,11 @@ Subsequent manual setting/reconnect experiments use a new session and are exclud
 Actual interrupt-mask latency, acoustic latency, weak signal and live calls were
 not measured in this check. LibrePods and the phone dongle were unchanged.
 
-A confirmed competing owner requests Pause from this dongle's active music host and
-suspends its outgoing media while retaining the control connection. Fresh USB
-input cannot override that loss. Volume, microphone acquisition and Game Mode's
+A confirmed competing owner suspends the dongle's outgoing media while retaining
+the control connection. Manual requests Pause from the active music host. In
+Automatic the USB host can continue supplying program audio while the phone
+plays. A user pause stops the meaningful PCM required for automatic return.
+Volume, microphone acquisition and Game Mode's
 receiver-buffer writes also stay passive. A takeover invalidates stale gain:
 only a new host volume SET deferred during standby or a fresh native AVRCP
 readback can establish the next baseline. Active calls are not answered or ended
@@ -273,7 +312,25 @@ as a side effect. A standby dongle does not automatically claim ownership for an
 incoming Bluetooth call; existing preparation timeouts release an unusable voice
 link. Physical takeover is blocked while local capture is requested. Call handoff
 remains unverified. Manual `t` diagnostics include
-a bounded `[ROUTING]` state line without printing routing traffic continuously.
+a bounded `[ROUTING]` state line. `remote` reports unknown (0), active (1),
+qualified idle (2), automatic return pending (3), consumed/canceled (4), or
+other-host takeover without a source report (5).
+`returns` counts admitted automatic requests in the current pair context.
+Bare CDC `r` returns a bounded `[ROUTE]` history independently of the long
+timing dump. The eight newest events are ordered oldest first. Entries contain
+uptime in milliseconds, kind and two small arguments. `d` gives host count
+and local membership, `x` an invalid list, `s` source type and address class
+(zero, local, listed peer, other or invalid numbered 0–4), `o` ownership,
+`e` session reset, `a` AVDTP stage/status (0 submission, 1 signaling
+result, 2 release, 3 pending-profile retirement, 4 retained open media channel,
+5 rejected Start/Suspend with its signal ID, 6 released media channel), and `c` AACP stage/status
+(0 channel submission, 1 current open result, 2 retired open result).
+`sub` records the sent standby subscription. `reads` counts source requests
+actually sent in this session, `read_age` is milliseconds since the last send
+and `reply` identifies its first source report by the same address class as
+`s` (255 until a response arrives).
+`top` values 0–3 denote unknown, local only, both and
+foreign only. No Bluetooth addresses are recorded.
 
 In 0.1.43, phone takeover Pause takes priority over old queued media commands.
 Input stops immediately; media teardown waits for AVRCP operation completion

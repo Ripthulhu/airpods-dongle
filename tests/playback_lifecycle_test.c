@@ -132,6 +132,19 @@ static int avdtp_source_connect(uint8_t *peer, uint16_t *cid) {
 }
 static void a2dp_demo_timer_stop(void *p) { (void)p; media_tracker.streaming = is_streaming = false; }
 static void aacp_disconnect(void) {game_ready=false;}
+static struct {uint8_t peer[6];uint16_t cid;uint32_t since;} passive_attempt;
+enum {AVDTP_SIGNALING_CONNECTION_OPENED=1,AVDTP_SIGNALING_CONNECTION_W4_L2CAP_DISCONNECTED};
+typedef struct {uint8_t remote_addr[6];unsigned state;} avdtp_connection_t;
+static avdtp_connection_t sdk_attempt;
+static avdtp_connection_t *avdtp_get_connection_for_avdtp_cid(uint16_t cid) {return cid==20 ? &sdk_attempt : NULL;}
+static unsigned passive_expirations;
+static void signaling_connect_failed(uint16_t cid,const uint8_t address[6]);
+static uint8_t avdtp_disconnect(uint16_t cid) {
+    assert(cid==20 && !passive_attempt.cid && !a2dp_connect_pending && !media_tracker.avdtp_cid);
+    signaling_connect_failed(cid,sdk_attempt.remote_addr); // The pinned profile emits its terminal event inline.
+    ++passive_expirations;return 0;
+}
+static void aacp_route_avdtp_event(uint8_t stage,uint8_t status) {(void)stage;(void)status;}
 static void aacp_media_disconnected(void) {aacp_disconnect();}
 static void aacp_mic_recovery_failed(void) {}
 static uint32_t aacp_control_session(void) { return control_session; }
@@ -241,6 +254,7 @@ static uint16_t avdtp_subevent_signaling_reject_get_avdtp_cid(const uint8_t *p) 
 static inline uint8_t avdtp_subevent_signaling_reject_get_is_initiator(const uint8_t *p) {return p[6];}
 static inline uint8_t avdtp_subevent_signaling_reject_get_local_seid(const uint8_t *p) {return p[5];}
 static uint8_t avdtp_subevent_signaling_reject_get_signal_identifier(const uint8_t *p) {return p[7];}
+static bool playback_park_unowned_open(void) {return false;} // Production SEP state is exercised by playback_idle_test.
 #include "playback_reject.inc"
 static void signaling_rejected(uint16_t cid, uint8_t seid, uint8_t signal, uint8_t initiator, bool general, unsigned size) {
     const uint8_t event[8]={0xD1,6,(uint8_t)(general?0x1E:0x1D),(uint8_t)cid,(uint8_t)(cid>>8),seid,initiator,signal};
@@ -922,6 +936,7 @@ static void handover_restores_game_mode_only_on_its_original_owner(void) {
     }
 }
 static void reconnect_policy_fixture(void) {
+    passive_attempt.cid=0;passive_expirations=0;sdk_attempt=(avdtp_connection_t){.remote_addr={1}};
     is_usb_streaming=phone_opened=phone_active=call_active=call_opened=call_capture=false;
     usb_mic_wanted=mic_requested=mic_active=profile_pending=profile_reconnect=a2dp_connect_pending=a2dp_is_connected_flag=false;
     mic_prepare_open=mic_recovery_pending=phone_output_recovery=suspend_recovery_pending=false;
@@ -942,7 +957,7 @@ static void reconnect_policy_is_verified_and_respects_manual_release(void) {
     assert(dongle_reconnect_policy(true,true,&automatic)==DONGLE_ACCEPTED && automatic);
     assert(!connects && !connection_requested); // Saving a preference is not a Connect action.
     now+=1000;playback_reconnect_poll(now);
-    assert(connects==1 && reconnect_auto_intent && connection_requested);
+    assert(connects==1 && reconnect_auto_intent && !connection_requested);
     assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_BUSY); // Physical connect is still in flight.
     a2dp_connect_pending=false;
     assert(dongle_reconnect_policy(true,false,&automatic)==DONGLE_ACCEPTED && !automatic && !connection_requested);
@@ -958,6 +973,10 @@ static void reconnect_policy_is_verified_and_respects_manual_release(void) {
     a2dp_accept_incoming=true;now+=60000;playback_reconnect_poll(now);assert(!connects);
     playback_released=false;a2dp_accept_incoming=false;now+=60000;playback_reconnect_poll(now);assert(!connects);
     assert(aacp_takeover_request(address));now+=1000;playback_reconnect_poll(now);assert(connects==1);
+
+    reconnect_policy_fixture();stored_automatic=true;playback_reconnect_policy_load();
+    now=1000;playback_reconnect_poll(now);
+    assert(!game_ready && !is_usb_streaming && connects==1 && passive_attempt.cid==20 && !connection_requested);
 
     reconnect_policy_fixture();stored_automatic=true;playback_reconnect_policy_load();
     now=1000;playback_reconnect_poll(now);a2dp_connect_pending=connection_requested=false;
@@ -1007,7 +1026,34 @@ static void reconnect_policy_is_verified_and_respects_manual_release(void) {
     reconnect_policy_fixture();
 }
 
+static void passive_profile_survives_long_absence_and_one_lost_sdk_callback(void) {
+    reconnect_policy_fixture();stored_automatic=true;playback_reconnect_policy_load();now=1000;
+    for(unsigned trial=0;trial<24;++trial) {
+        playback_reconnect_poll(now);
+        assert(connects==trial+1 && a2dp_connect_pending && !connection_requested && !game_ready);
+        uint16_t cid=media_tracker.avdtp_cid;
+        now+=25000;playback_reconnect_poll(now);
+        assert(a2dp_connect_pending && passive_attempt.cid==cid && !passive_expirations);
+        signaling_connect_failed(cid+1,address);signaling_connect_failed(cid,(uint8_t[6]){7});
+        assert(a2dp_connect_pending);
+        signaling_connect_failed(cid,address); // Authoritative SDP page failure frees the profile.
+        assert(!a2dp_connect_pending && !media_tracker.avdtp_cid);
+        now+=reconnect_delay;
+    }
+    assert(now>600000);
+    playback_reconnect_poll(now);now+=60000;playback_reconnect_poll(now);
+    assert(passive_expirations==1 && !a2dp_connect_pending && connects==25);
+    playback_reconnect_poll(++now);assert(passive_expirations==1 && !a2dp_connect_pending);
+    now+=reconnect_delay;playback_reconnect_poll(now);assert(a2dp_connect_pending && !connection_requested);
+    sdk_attempt.state=AVDTP_SIGNALING_CONNECTION_OPENED;
+    now+=60000;playback_reconnect_poll(now);
+    assert(passive_expirations==1 && a2dp_connect_pending); // Never tear down an opened SDK profile.
+    a2dp_is_connected_flag=true;a2dp_connect_pending=false;playback_reconnect_poll(++now);
+    assert(!passive_attempt.cid && !connection_requested && reconnect_delay==1000);
+    reconnect_policy_fixture();
+}
 int main(int argc,char **argv) {
+    passive_profile_survives_long_absence_and_one_lost_sdk_callback();
     if(argc==2 && !strcmp(argv[1],"pair_selection_race")) {selected_pair_waits_for_the_old_signaling_release();return 0;}
     if(argc==2 && !strcmp(argv[1],"pair_retirement")) {pairing_cannot_reconnect_an_unsaved_ram_peer();return 0;}
     if(argc==2 && !strcmp(argv[1],"startup_reject")) {startup_rejection_cannot_leave_connected_but_silent_output();return 0;}

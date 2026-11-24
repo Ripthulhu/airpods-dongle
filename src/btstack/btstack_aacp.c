@@ -130,6 +130,7 @@ static const uint8_t aacp_request_notifications[] = {
 };
 static const uint8_t aacp_request_keys[] = {4,0,4,0,0x30,0,5,0};
 static const uint8_t aacp_request_capabilities[] = {4,0,4,0,1,0,8};
+static const uint8_t aacp_request_source[] = {4,0,4,0,0x0d,0};
 
 // --- Mic stream control byte sequences (verbatim from librepods) ---
 
@@ -183,16 +184,45 @@ static bool pair_irk_known, pair_case_supported;
 static uint32_t control_session;
 // Validated AudioSource CALL state belongs to the current AACP peer/session.
 static bool foreign_call;
+enum remote_playback { REMOTE_UNKNOWN, REMOTE_ACTIVE, REMOTE_IDLE, REMOTE_RETURNING, REMOTE_CONSUMED, REMOTE_HANDOFF };
+enum route_topology { TOPO_UNKNOWN, TOPO_LOCAL, TOPO_BOTH, TOPO_FOREIGN_ONLY };
+enum route_source_class { SOURCE_ANONYMOUS, SOURCE_LOCAL, SOURCE_PEER, SOURCE_OTHER, SOURCE_INVALID };
+#define SOURCE_REPLY_MS 800u
+#define SOURCE_REFRESH_MS 4000u
+// Source requests have no wire transaction ID. Only retain a directed reply long
+// enough for the companion device list, and cancel it on newer routing activity.
+static struct {
+    uint32_t sent, count, settle_since, subscribed_at;
+    uint8_t host[6], type, reply_class;
+    bool settling, subscribed, queued, awaiting, directed, busy_seen;
+} source_read;
 // One immutable queued packet at a time, not a new packet queue or audio buffer.
 static struct {
     uint8_t peer[6], other[6];
     uint8_t tx[144], stage, tx_kind;
     bool have_other, known, relinquished, pending, queued, confirmed;
-    uint32_t since;
+    enum route_topology topology;
+    uint8_t call_host[6];
+    enum remote_playback remote;
+    uint32_t idle_since, automatic_returns;
+    uint32_t since, own_sent;
 } routing;
 static uint32_t routing_revision = 1, routing_nonce;
+// Only routing changes are recorded. Formatting happens on a dedicated CDC read.
+static struct route_event {uint32_t ms; char kind; uint8_t a,b;} route_events[8];
+static uint32_t route_sequence;
+static uint8_t route_event_count;
+static void route_event(char kind, unsigned a, unsigned b) {
+    route_events[route_sequence++ % 8u]=(struct route_event){btstack_run_loop_get_time_ms(),kind,(uint8_t)a,(uint8_t)b};
+    if (route_event_count<8) ++route_event_count;
+}
+void aacp_route_avdtp_event(uint8_t stage,uint8_t status) {route_event('a',stage,status);}
+static bool routing_peer_listed(void) {
+    return routing.topology==TOPO_BOTH || routing.topology==TOPO_FOREIGN_ONLY;
+}
 static uint8_t routing_action;
 #define AACP_TAKEOVER_MS 10000u
+#define AUTO_IDLE_SETTLE_MS 350u
 static void routing_poll(uint32_t now);
 static void routing_packet(const uint8_t *packet, uint16_t size);
 static void routing_cancel(void);
@@ -207,9 +237,15 @@ static void control_reset(void) {
     head_motion_reset();
 #endif
     ++control_session;
+    route_event('e',0,0);
     dongle_readback_clear(&control_readback);
     settings_reset(&settings);
     routing.queued = routing.confirmed = routing.known = routing.have_other = false;
+    if (routing.remote == REMOTE_RETURNING) routing.pending = false;
+    routing.remote = REMOTE_UNKNOWN;
+    routing.topology = TOPO_UNKNOWN;
+    memset(&source_read,0,sizeof(source_read));
+    source_read.reply_class=255;
     foreign_call=false;
     routing.stage = 0;
     routing_authority(false);
@@ -226,7 +262,8 @@ static void control_reset(void) {
         setting_result = 2;
     }
 }
-static uint16_t aacp_cid;
+static uint16_t aacp_cid, retiring_aacp_cid;
+static bd_addr_t retiring_aacp_peer;
 static bool aacp_session, aacp_connected, aacp_got_control, aacp_init_sent, aacp_init_retried;
 static bd_addr_t aacp_addr;
 static uint8_t aacp_attempts;
@@ -268,15 +305,26 @@ static void aacp_mic_teardown(void) {
     aacp_mic_pcm_reset();
 }
 
+static uint16_t aacp_detach_channel(void) {
+    uint16_t cid = aacp_cid;
+    aacp_cid=0;
+    if (cid && !aacp_connected) {
+        // BTstack still owns this pending page. A raw disconnect here removes
+        // its WAIT_CONNECTION_COMPLETE state and leaks a channel on page failure.
+        retiring_aacp_cid=cid;memcpy(retiring_aacp_peer,aacp_addr,6);
+        return 0;
+    }
+    return cid;
+}
+
 // Clear ownership before disconnect: a late event must not revive this channel.
 void aacp_disconnect(void) {
     if (aacp_mic_restore_required && aacp_mic_restore_started)
         aacp_mic_recovery_failed();
     control_reset();
     routing_cancel();
-    uint16_t cid = aacp_cid;
+    uint16_t cid=aacp_detach_channel();
     aacp_session = false;
-    aacp_cid = 0;
     aacp_connected = aacp_got_control = aacp_init_sent = aacp_init_retried = false;
     aacp_mic_remote_active = false;
     aacp_mic_stopping = false;
@@ -284,11 +332,11 @@ void aacp_disconnect(void) {
     aacp_tx_head = aacp_tx_count = 0;
     btstack_run_loop_remove_timer(&aacp_connect_timer);
     aacp_mic_teardown();
-    if (cid != 0) l2cap_disconnect(cid);
+    if (cid) l2cap_disconnect(cid);
 }
 
 void aacp_media_disconnected(void) {
-    bool requested = routing.stage == 0 && aacp_takeover_pending(routing.peer);
+    bool requested = routing.remote != REMOTE_RETURNING && routing.stage == 0 && aacp_takeover_pending(routing.peer);
     uint32_t since = routing.since;
     aacp_disconnect();
     routing.pending = requested;
@@ -312,11 +360,12 @@ void aacp_init(void) {
 
 static void aacp_do_connect(btstack_timer_source_t *ts) {
     UNUSED(ts);
-    if (!aacp_session || aacp_cid != 0) return;
+    if (!aacp_session || aacp_cid || retiring_aacp_cid) return;
     aacp_attempts++;
     aacp_channel_since_ms = btstack_run_loop_get_time_ms();
     uint8_t status = l2cap_create_channel(aacp_packet_handler, aacp_addr, AACP_PSM,
                                          AACP_LOCAL_MTU, &aacp_cid);
+    route_event('c',0,status);
     if (status != ERROR_CODE_SUCCESS) {
         printf("[AACP] channel request failed: 0x%02x\n", status);
         aacp_cid = 0;
@@ -407,6 +456,7 @@ static void routing_cancel(void) {
     }
     aacp_tx_count = (uint8_t)kept;
     routing.pending = routing.queued = routing.confirmed = false;
+    if (routing.remote == REMOTE_RETURNING) routing.remote = REMOTE_CONSUMED;
     routing.stage = 0;
 }
 
@@ -428,15 +478,17 @@ static void routing_authority(bool allowed) {
 #endif
 }
 
-bool aacp_takeover_request(const uint8_t peer[6]) {
+static bool routing_request_takeover(const uint8_t peer[6],bool automatic) {
     if (!peer || !peer_address_valid(peer) || usb_mic_requested() ||
         phone_call_mic_requested() || aacp_mic_active() ||
         (foreign_call && !memcmp(peer,aacp_addr,6))) return false;
     if (routing.pending && !aacp_takeover_pending(routing.peer)) routing_cancel();
     if (routing.pending && memcmp(peer, routing.peer, 6)) return false;
+    source_read.awaiting=source_read.directed=source_read.busy_seen=false;
+    routing.remote = automatic ? REMOTE_RETURNING : REMOTE_CONSUMED;
     if (!++routing_revision) ++routing_revision;
     routing_nonce=0; routing_action=0;
-    dongle_playback_connect_requested();
+    if (!automatic) dongle_playback_connect_requested();
     if (routing.pending) return true;
     if (memcmp(peer, routing.peer, 6)) {
         routing_cancel();
@@ -450,9 +502,11 @@ bool aacp_takeover_request(const uint8_t peer[6]) {
     routing.since = btstack_run_loop_get_time_ms();
     return true;
 }
+bool aacp_takeover_request(const uint8_t peer[6]) { return routing_request_takeover(peer,false); }
 
 bool aacp_takeover_pending(const uint8_t peer[6]) {
     return peer && routing.pending && !(foreign_call && !memcmp(peer,aacp_addr,6)) && !memcmp(peer, routing.peer, 6) &&
+           (routing.remote != REMOTE_RETURNING || dongle_playback_return_signal(peer, btstack_run_loop_get_time_ms())) &&
            (uint32_t)(btstack_run_loop_get_time_ms() - routing.since) < AACP_TAKEOVER_MS;
 }
 
@@ -469,22 +523,70 @@ void aacp_routing_override(void) {
     routing_nonce=0; routing_action=0;
     if(!aacp_audio_owned()) routing.relinquished=true;
     routing_cancel();
+    source_read.awaiting=source_read.directed=source_read.busy_seen=false;
+    routing.remote = REMOTE_CONSUMED;
 }
 
 void aacp_routing_receipt(uint32_t nonce, uint8_t action) {
     routing_nonce=nonce; routing_action=action;
 }
 
+static bool routing_source_fresh(uint32_t now) {
+    return source_read.subscribed && now-(source_read.count ? source_read.sent : source_read.subscribed_at)<SOURCE_REPLY_MS;
+}
+static void routing_source_poll(uint32_t now) {
+    if (!routing_source_fresh(now))
+        source_read.awaiting=source_read.directed=source_read.busy_seen=false;
+    if (source_read.queued || routing.pending || aacp_audio_owned() || !aacp_control_ready() || aacp_tx_count) return;
+    if (!source_read.subscribed) {
+        if (!source_read.settling) {
+            if (!dongle_playback_auto_standby(aacp_addr)) return;
+            source_read.settling=true;source_read.settle_since=now;
+        }
+        if (now-source_read.settle_since<300u || !dongle_playback_auto_standby(aacp_addr)) return;
+        source_read.queued=true; // Re-arm notifications after the service reported ready.
+        if (!aacp_tx_enqueue(aacp_request_notifications,sizeof(aacp_request_notifications))) source_read.queued=false;
+        return;
+    }
+    if (routing.remote==REMOTE_IDLE || routing_source_fresh(now) ||
+        (source_read.count && now-source_read.sent<SOURCE_REFRESH_MS) || !dongle_playback_return_signal(aacp_addr,now)) return;
+    source_read.queued=true;
+    if (!aacp_tx_enqueue(aacp_request_source,sizeof(aacp_request_source))) source_read.queued=false;
+}
 static void routing_poll(uint32_t now) {
+    routing_source_poll(now);
+    if (routing.remote == REMOTE_IDLE && !routing.pending && !aacp_audio_owned() &&
+        aacp_control_ready() && !memcmp(routing.peer, aacp_addr, 6)) {
+        uint32_t signal = dongle_playback_return_signal(aacp_addr, now);
+        // Require sound after the remote stopped, even when Windows kept sending USB silence.
+        if (signal && now-routing.idle_since>=AUTO_IDLE_SETTLE_MS &&
+            now - (signal - 1u) < now - routing.idle_since && routing_request_takeover(aacp_addr,true)) {
+            ++routing.automatic_returns;
+        }
+    } else if (routing.remote == REMOTE_RETURNING && !dongle_playback_return_signal(aacp_addr, now)) {
+        routing_cancel();
+        routing.remote = REMOTE_IDLE;
+        routing.idle_since = now;
+    }
     if (routing.pending && (uint32_t)(now - routing.since) >= AACP_TAKEOVER_MS) {
         if (!aacp_audio_owned()) routing.relinquished = true;
         routing_cancel();
         return;
     }
     if (!aacp_control_ready() || routing.queued || memcmp(routing.peer, aacp_addr, 6)) return;
+    // The phone has already yielded. Give OWN a chance to complete on its own
+    // before asking the other host to hand over or negotiating an unowned Start.
+    if (routing.remote==REMOTE_RETURNING && routing.pending && routing.stage && routing.stage<3) {
+        if (routing.confirmed) routing.stage=3;
+        else if (now-routing.own_sent<250u) return;
+    }
     if (routing.pending && routing.stage >= 3) {
         if (routing.confirmed || aacp_audio_owned()) {
             routing.pending = routing.relinquished = false;
+            if (routing.remote == REMOTE_RETURNING) {
+                routing.remote = REMOTE_CONSUMED;
+                dongle_playback_automatic_returned();
+            }
             bool already_owned = aacp_audio_owned();
             routing_authority(true);
             if (already_owned) dongle_playback_ownership_changed(true);
@@ -513,13 +615,30 @@ static void routing_poll(uint32_t now) {
     if (!aacp_tx_enqueue(routing.tx, length)) routing.queued = false;
 }
 
+static void routing_remote_changed(enum remote_playback remote) {
+    if (routing.remote == REMOTE_RETURNING) routing_cancel();
+    if (remote == REMOTE_IDLE && routing.remote != REMOTE_IDLE)
+        routing.idle_since = btstack_run_loop_get_time_ms();
+    routing.remote = remote;
+}
+
+static void routing_match_source_reply(void) {
+    if (!source_read.directed || !routing_peer_listed()) return;
+    source_read.directed=false;
+    if (!routing_source_fresh(btstack_run_loop_get_time_ms()) ||
+        memcmp(source_read.host,routing.other,6) || (!source_read.type && foreign_call)) return;
+    routing_remote_changed(source_read.type ? REMOTE_ACTIVE : REMOTE_IDLE);
+}
+
 static void routing_packet(const uint8_t *packet, uint16_t size) {
     uint8_t local[6], other[6], source[6], type;
     bool owned, sole;
     gap_local_bd_addr(local);
     if (aacp_route_ownership(packet, size, &owned)) {
+        route_event('o',owned,0);
         routing.known = true;
         if (owned) {
+            source_read.awaiting=source_read.directed=source_read.busy_seen=false;
             if (routing.pending) routing.confirmed = routing.stage != 0;
             else if (!routing.relinquished) routing_authority(true);
         } else {
@@ -532,6 +651,8 @@ static void routing_packet(const uint8_t *packet, uint16_t size) {
     } else if (aacp_route_devices(packet, size, local, other, &sole)) {
         if(sole)foreign_call=false;
         bool changed = memcmp(other, routing.other, 6) != 0;
+        bool peer_left = sole && routing_peer_listed() &&
+            (routing.remote == REMOTE_ACTIVE || routing.remote == REMOTE_IDLE || routing.remote == REMOTE_HANDOFF);
         bool sole_claim = sole && routing.pending && routing.stage;
         if (changed && routing.have_other && routing.pending) {
             if (!sole_claim && !aacp_audio_owned()) routing.relinquished = true;
@@ -543,10 +664,66 @@ static void routing_packet(const uint8_t *packet, uint16_t size) {
         }
         memcpy(routing.other, other, 6);
         routing.have_other = aacp_route_address_valid(other);
+        bool local_member = sole || packet[8] == 2;
+        route_event('d',packet[8],local_member);
+        // A controls-only dongle need not be listed as an audio host. In that
+        // case only an observed source transition on this named peer can qualify idle.
+        routing.topology = sole ? TOPO_LOCAL : packet[8] == 2 ? TOPO_BOTH :
+            packet[8] == 1 && routing.have_other ? TOPO_FOREIGN_ONLY : TOPO_UNKNOWN;
+        if (peer_left || (sole && routing.relinquished && routing.remote == REMOTE_UNKNOWN))
+            routing_remote_changed(REMOTE_IDLE);
+        else if (changed || routing.topology==TOPO_UNKNOWN) routing_remote_changed(REMOTE_UNKNOWN);
         if (sole && !routing.relinquished && !routing.pending) routing_authority(true);
         if (sole && routing.pending && routing.stage) routing.confirmed = true;
+        if (sole || routing.topology==TOPO_UNKNOWN) source_read.directed=false;
+        routing_match_source_reply();
     } else if (aacp_route_source(packet, size, source, &type)) {
-        foreign_call=type==1 && memcmp(source,local,6)!=0;
+        bool from_other = routing_peer_listed() && !memcmp(source, routing.other, 6);
+        bool from_local = !memcmp(source, local, 6);
+        bool anonymous = !memcmp(source, (uint8_t[6]){0}, 6);
+        uint8_t source_class=anonymous ? SOURCE_ANONYMOUS : from_local ? SOURCE_LOCAL :
+            from_other ? SOURCE_PEER : aacp_route_address_valid(source) ? SOURCE_OTHER : SOURCE_INVALID;
+        route_event('s',type,source_class);
+        bool fresh=routing_source_fresh(btstack_run_loop_get_time_ms());
+        if (!type && fresh && source_read.busy_seen) return; // A late reply cannot end a newer call or stream.
+        if (fresh && type) {
+            // A 0D snapshot of the same phone's already-active music does not start a new stream.
+            bool confirms_media=source_read.awaiting && source_read.count && type==2 && from_other &&
+                routing.remote==REMOTE_ACTIVE && !foreign_call;
+            if (!confirms_media) source_read.busy_seen=true;
+        }
+        source_read.directed=false;
+        if (fresh && source_read.awaiting) {
+            source_read.awaiting=false;
+            if (source_read.count) source_read.reply_class=source_class;
+            if ((type || source_read.count) &&
+                (from_other || (!from_local && aacp_route_address_valid(source) && routing.topology==TOPO_UNKNOWN)) &&
+                (!foreign_call || type || !memcmp(source,routing.call_host,6))) {
+                source_read.directed=true; source_read.type=type;
+                memcpy(source_read.host,source,6);
+            }
+        }
+        if (type == 1 && !from_local) {
+            foreign_call = true;
+            memcpy(routing.call_host,source,6);
+        } else if (foreign_call) {
+            bool same_caller = !memcmp(source,routing.call_host,6);
+            bool anonymous_end = anonymous && !type &&
+                (!routing_peer_listed() || !memcmp(routing.other,routing.call_host,6));
+            if (!same_caller && !anonymous_end && !(from_local && type)) return;
+            foreign_call = false;
+        }
+        if (type && memcmp(source, local, 6)) {
+            if (routing.topology==TOPO_LOCAL) routing.topology=TOPO_UNKNOWN;
+            routing_remote_changed(from_other ? REMOTE_ACTIVE : REMOTE_UNKNOWN);
+        }
+        else if (type == 0 && routing_peer_listed() &&
+                 ((from_other && (routing.remote == REMOTE_ACTIVE || (routing.topology==TOPO_BOTH &&
+                                (routing.remote == REMOTE_UNKNOWN || routing.remote == REMOTE_HANDOFF)))) ||
+                  (anonymous && routing.remote == REMOTE_ACTIVE)))
+            routing_remote_changed(REMOTE_IDLE);
+        else if (type && routing.remote != REMOTE_RETURNING)
+            routing_remote_changed(REMOTE_UNKNOWN);
         if(foreign_call) {
             if(!memcmp(routing.peer,aacp_addr,6)) {
                 routing.known=routing.relinquished=true;
@@ -556,6 +733,7 @@ static void routing_packet(const uint8_t *packet, uint16_t size) {
             return;
         }
         routing.known = true;
+        routing_match_source_reply();
         if(!type)return;
         if (!memcmp(source, local, 6)) {
             if (routing.pending) routing.confirmed = routing.stage != 0;
@@ -567,21 +745,47 @@ static void routing_packet(const uint8_t *packet, uint16_t size) {
             routing_authority(false);
         }
     } else if (routing.have_other && aacp_route_hijack(packet, size, routing.other)) {
+        source_read.awaiting=source_read.directed=false;
+        source_read.busy_seen=true;
         routing.known = routing.relinquished = true;
         routing_cancel(); // The other host's explicit newer intent wins; do not fight it.
+        routing_remote_changed(routing_peer_listed() ? REMOTE_HANDOFF : REMOTE_UNKNOWN);
         routing_authority(false);
+    } else if (aacp_route_header(packet, size, 0x2e)) {
+        source_read.awaiting=source_read.directed=false;
+        route_event('x',size>=9 ? packet[8] : 255,0);
+        routing.topology = TOPO_UNKNOWN;
+        routing_remote_changed(REMOTE_UNKNOWN);
     }
 }
 
 void aacp_routing_report(void) {
-    printf("[ROUTING] known=%u owned=%u yielded=%u other=%u pending=%u stage=%u queued=%u confirmed=%u age_ms=%lu\n",
+    printf("[ROUTING] known=%u owned=%u yielded=%u other=%u pending=%u stage=%u queued=%u confirmed=%u age_ms=%lu remote=%u returns=%lu\n",
         routing.known, aacp_audio_owned(), routing.relinquished, routing.have_other,
         routing.pending, routing.stage, routing.queued, routing.confirmed,
-        (unsigned long)(routing.pending ? btstack_run_loop_get_time_ms() - routing.since : 0));
+        (unsigned long)(routing.pending ? btstack_run_loop_get_time_ms() - routing.since : 0),
+        (unsigned)routing.remote, (unsigned long)routing.automatic_returns);
 }
 
 uint32_t aacp_control_session(void) { return control_session; }
+void aacp_route_history_report(void) {
+    printf("[ROUTE] epoch=%lu top=%u remote=%u call=%u pending=%u owned=%u returns=%lu sub=%u reads=%lu read_age=%lu reply=%u seq=%lu hist=",
+        (unsigned long)control_session,(unsigned)routing.topology,(unsigned)routing.remote,foreign_call,
+        routing.pending,aacp_audio_owned(),(unsigned long)routing.automatic_returns,source_read.subscribed,(unsigned long)source_read.count,
+        (unsigned long)(source_read.count ? btstack_run_loop_get_time_ms()-source_read.sent : 0),
+        source_read.reply_class,(unsigned long)route_sequence);
+    for (unsigned i=0;i<route_event_count;i++) {
+        const struct route_event *event=&route_events[(route_sequence-route_event_count+i)%8u];
+        printf("%s%lu:%c:%u:%u",i?",":"",(unsigned long)event->ms,event->kind,event->a,event->b);
+    }
+    printf("\n");
+}
 bool aacp_control_ready(void) { return aacp_connected && aacp_got_control && aacp_init_sent; }
+bool aacp_secure_control_peer(const uint8_t addr[6]) {
+    if (!aacp_control_ready() || !addr || memcmp(addr,aacp_addr,6)) return false;
+    const hci_connection_t *acl = hci_connection_for_bd_addr_and_type(aacp_addr,BD_ADDR_TYPE_ACL);
+    return acl && acl->state==OPEN && gap_security_level(acl->con_handle)>=LEVEL_2;
+}
 bool aacp_control_address(bd_addr_t address) {
     if (!address || !aacp_control_ready()) return false;
     memcpy(address, aacp_addr, sizeof(bd_addr_t));
@@ -814,8 +1018,7 @@ static void aacp_channel_failed(void) {
     // A healthy channel starts a fresh recovery budget; incomplete handshakes do not.
     if (aacp_control_ready()) aacp_attempts = 0;
     control_reset();
-    uint16_t cid = aacp_cid;
-    aacp_cid = 0;
+    uint16_t cid=aacp_detach_channel();
     aacp_connected = aacp_got_control = aacp_init_sent = aacp_init_retried = false;
     aacp_mic_remote_active = false;
     aacp_mic_stopping = false;
@@ -938,9 +1141,20 @@ static void aacp_handle_can_send_now(void) {
     if (!aacp_connected || aacp_tx_count == 0) return;
     aacp_pkt_t p = aacp_tx_queue[aacp_tx_head];
     uint32_t now=btstack_run_loop_get_time_ms();
+    bool resubscribe=source_read.queued && p.data==aacp_request_notifications;
+    if ((p.data==aacp_request_source || resubscribe) && (routing.pending || aacp_audio_owned() ||
+        (resubscribe ? !dongle_playback_auto_standby(aacp_addr) : !dongle_playback_return_signal(aacp_addr,now)))) {
+        aacp_tx_head=(uint8_t)((aacp_tx_head+1u)%AACP_TX_QUEUE_LEN); --aacp_tx_count;
+        source_read.queued=false;
+        if (aacp_tx_count) l2cap_request_can_send_now_event(aacp_cid);
+        return;
+    }
     if (p.data==routing.tx && !aacp_takeover_pending(aacp_addr)) {
+        bool pc_paused = routing.remote == REMOTE_RETURNING && now-routing.since<AACP_TAKEOVER_MS &&
+            !dongle_playback_return_signal(aacp_addr,now);
         if (!aacp_audio_owned()) routing.relinquished=true;
         routing_cancel();
+        if (pc_paused) routing_remote_changed(REMOTE_IDLE);
         if (aacp_tx_count) l2cap_request_can_send_now_event(aacp_cid);
         return;
     }
@@ -1000,6 +1214,11 @@ static void aacp_handle_can_send_now(void) {
     }
     aacp_tx_head = (uint8_t)((aacp_tx_head + 1) % AACP_TX_QUEUE_LEN);
     aacp_tx_count--;
+    if (resubscribe || p.data==aacp_request_source) {
+        if (resubscribe) { source_read.subscribed=true;source_read.subscribed_at=now; }
+        else { source_read.sent=now; ++source_read.count; source_read.reply_class=255; }
+        source_read.awaiting=true;source_read.queued=source_read.busy_seen=source_read.directed=false;
+    }
     // Pro 3 can leave Allow Off unreported; a sent choice is not a device report.
     if (p.data==setting_tx && setting_tx[AACP_CONTROL_COMMAND_OFFSET_IDENTIFIER]==DONGLE_SETTING_ALLOW_OFF &&
         settings.profile && settings.profile->silent_allow_off)
@@ -1015,7 +1234,7 @@ static void aacp_handle_can_send_now(void) {
     }
     if (p.data == routing.tx) {
         routing.queued = false;
-        if (routing.tx_kind == AACP_ROUTE_OWN) routing.stage = 1;
+        if (routing.tx_kind == AACP_ROUTE_OWN) {routing.stage = 1;routing.own_sent=now;}
         else if (routing.tx_kind == AACP_ROUTE_MEDIA) routing.stage = 2;
         else if (routing.tx_kind == AACP_ROUTE_HIJACK) routing.stage = 3;
     }
@@ -1074,9 +1293,8 @@ void aacp_poll(void) {
         aacp_setting_cancel();
         setting_result=2;
     }
-    if (aacp_cid != 0 &&
-        ((!aacp_connected || !aacp_got_control || !aacp_init_sent) &&
-         (uint32_t)(now - aacp_channel_since_ms) >= AACP_CHANNEL_TIMEOUT_MS)) {
+    if (aacp_connected && (!aacp_got_control || !aacp_init_sent) &&
+        (uint32_t)(now - aacp_channel_since_ms) >= AACP_CHANNEL_TIMEOUT_MS) {
         aacp_channel_failed();
         return;
     }
@@ -1304,12 +1522,22 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
             uint16_t cid = l2cap_event_channel_opened_get_local_cid(packet);
             bd_addr_t addr;
             l2cap_event_channel_opened_get_address(packet, addr);
-            if (!aacp_session || aacp_cid == 0 || cid != aacp_cid ||
-                memcmp(addr, aacp_addr, sizeof(addr)) != 0) {
+            if (cid && cid==retiring_aacp_cid) {
+                if (memcmp(addr,retiring_aacp_peer,6)) return;
+                route_event('c',2,status);
+                retiring_aacp_cid=0;
+                if (status==ERROR_CODE_SUCCESS) l2cap_disconnect(cid);
+                aacp_schedule_retry();
+                return;
+            }
+            if (aacp_cid && cid==aacp_cid && memcmp(addr,aacp_addr,6)) return;
+            if (!aacp_session || aacp_cid == 0 || cid != aacp_cid) {
                 if (status == ERROR_CODE_SUCCESS) l2cap_disconnect(cid);
                 return;
             }
+            route_event('c',1,status);
             if (status != ERROR_CODE_SUCCESS) {
+                aacp_cid=0; // BTstack frees failed channels immediately after this callback.
                 aacp_channel_failed();
                 return;
             }
@@ -1325,9 +1553,14 @@ static void aacp_packet_handler(uint8_t type, uint16_t channel, uint8_t *packet,
                 aacp_handle_can_send_now();
             break;
         case L2CAP_EVENT_CHANNEL_CLOSED:
-            if (size >= 4 && aacp_session &&
-                l2cap_event_channel_closed_get_local_cid(packet) == aacp_cid)
+            if (size<4) break;
+            if (retiring_aacp_cid && l2cap_event_channel_closed_get_local_cid(packet)==retiring_aacp_cid) {
+                retiring_aacp_cid=0;
+                aacp_schedule_retry();
+            } else if (aacp_session && aacp_cid && l2cap_event_channel_closed_get_local_cid(packet)==aacp_cid) {
+                aacp_cid=0; // This channel is already closed.
                 aacp_channel_failed();
+            }
             break;
         default:
             break;
